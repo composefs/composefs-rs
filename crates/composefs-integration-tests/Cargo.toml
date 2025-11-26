@@ -36,6 +36,7 @@ composefs = { workspace = true }
 # Only the test_util module is used — for creating test OCI images.
 # All verification must go through the cfsctl CLI.
 composefs-oci = { workspace = true, features = ["test", "boot", "containers-storage"] }
+composefs-ostree = { workspace = true }
 # Used by the varlink tests to drive the service through zlink's native typed
 # proxy bindings (alongside the external `varlinkctl` CLI), and to assert on the
 # typed wire reply/error types.
