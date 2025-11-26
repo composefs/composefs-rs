@@ -17,10 +17,11 @@ name = "cfsctl"
 path = "src/main.rs"
 
 [features]
-default = ['pre-6.15', 'oci', 'containers-storage']
+default = ['pre-6.15', 'oci', 'containers-storage', 'ostree']
 http = ['composefs-http']
 oci = ['composefs-oci', 'composefs-oci/varlink']
 containers-storage = ['composefs-oci/containers-storage', 'cstorage']
+ostree = ['composefs-ostree']
 rhel9 = ['composefs/rhel9']
 'pre-6.15' = ['composefs/pre-6.15']
 
@@ -34,6 +35,7 @@ composefs-boot = { workspace = true }
 composefs-oci = { workspace = true, optional = true, features = ["boot"] }
 composefs-http = { workspace = true, optional = true }
 cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.7.0", features = ["userns-helper"], optional = true }
+composefs-ostree = { workspace = true, optional = true }
 env_logger = { version = "0.11.0", default-features = false }
 hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.17.0", default-features = false }

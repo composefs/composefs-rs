@@ -32,7 +32,7 @@ jobs:
       options: "--privileged --pid=host -v /var/tmp:/var/tmp --tmpfs /tmp:rw,exec,nosuid,nodev -v /:/run/host"
 
     steps:
-    - run: dnf -y install cargo clippy composefs-devel e2fsprogs just rustfmt gcc-c++
+    - run: dnf -y install cargo clippy composefs-devel e2fsprogs just ostree rustfmt gcc-c++
     - name: Enable fs-verity on /
       run: tune2fs -O verity $(findmnt -vno SOURCE /run/host)
     - uses: actions/checkout@v7
@@ -53,6 +53,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
+      - name: Install ostree
+        run: sudo apt-get update && sudo apt-get install -y ostree
       - run: just test-integration
 
   # Fuzz smoke test — runs each fuzz target briefly to catch panics
@@ -122,6 +124,9 @@ jobs:
       - uses: taiki-e/install-action@nextest
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install ostree
+        run: sudo apt-get update && sudo apt-get install -y ostree
 
       - name: Run integration tests (unprivileged + privileged via VM)
         run: just test-integration-vm

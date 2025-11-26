@@ -11,6 +11,7 @@ default-members = [
     "crates/composefs-http",
     "crates/composefs-ioctls",
     "crates/composefs-oci",
+    "crates/composefs-ostree",
     "crates/composefs-setup-root",
     "crates/composefs-storage",
     "crates/composefs-erofs-debug",
@@ -38,6 +39,7 @@ composefs-ioctls = { version = "0.7.0", path = "crates/composefs-ioctls", defaul
 composefs-oci = { version = "0.7.0", path = "crates/composefs-oci", default-features = false }
 composefs-boot = { version = "0.7.0", path = "crates/composefs-boot", default-features = false }
 composefs-http = { version = "0.7.0", path = "crates/composefs-http", default-features = false }
+composefs-ostree = { version = "0.7.0", path = "crates/composefs-ostree", default-features = false }
 cap-std-ext = "5.1.2"
 ocidir = "0.7.2"
 

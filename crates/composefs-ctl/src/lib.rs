@@ -42,7 +42,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-#[cfg(feature = "oci")]
+#[cfg(any(feature = "oci", feature = "ostree"))]
 use comfy_table::{Table, presets::UTF8_FULL};
 #[cfg(any(feature = "oci", feature = "http"))]
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -501,6 +501,76 @@ enum OciCommand {
     },
 }
 
+#[cfg(feature = "ostree")]
+#[derive(Debug, Subcommand)]
+enum OstreeCommand {
+    PullLocal {
+        ostree_repo_path: PathBuf,
+        /// Ostree ref name or commit ID (64-character hex)
+        ostree_ref: String,
+        #[clap(long)]
+        base_name: Option<String>,
+    },
+    Pull {
+        ostree_repo_url: String,
+        /// Ostree ref name or commit ID (64-character hex)
+        ostree_ref: String,
+        #[clap(long)]
+        base_name: Option<String>,
+    },
+    /// Mount an ostree commit's composefs EROFS at the given mountpoint
+    Mount {
+        /// Ostree commit ref or commit ID
+        commit: String,
+        /// Target mountpoint
+        mountpoint: String,
+        /// Writable upper layer directory for overlayfs
+        #[arg(long, requires = "workdir")]
+        upperdir: Option<PathBuf>,
+        /// Work directory for overlayfs (required with --upperdir)
+        #[arg(long, requires = "upperdir")]
+        workdir: Option<PathBuf>,
+        /// Mount read-write (requires --upperdir)
+        #[arg(long, requires = "upperdir")]
+        read_write: bool,
+    },
+    /// Dump the filesystem of an ostree commit as a composefs dumpfile to stdout
+    Dump {
+        /// Ostree commit ref name
+        commit_name: String,
+    },
+    /// Compute the composefs image ID of an ostree commit
+    ComputeId {
+        /// Ostree commit ref name
+        commit_name: String,
+    },
+    /// Show the contents of an ostree commit
+    Inspect {
+        /// Ostree ref name, commit ID, or commit ID prefix
+        source: String,
+        /// Print only the commit metadata key-value pairs
+        #[clap(long)]
+        metadata: bool,
+    },
+    /// Tag an ostree commit with a name
+    ///
+    /// The source can be an ostree commit checksum or an existing ref name.
+    Tag {
+        /// Ostree commit checksum (hex) or existing ref name
+        source: String,
+        /// Tag name to assign
+        name: String,
+    },
+    /// Remove a named ostree reference
+    Untag {
+        /// Tag name to remove
+        name: String,
+    },
+    /// List all ostree commits in the repository
+    #[clap(name = "images")]
+    ListCommits,
+}
+
 /// Common options for reading a filesystem from a path
 #[derive(Debug, Parser)]
 struct FsReadOptions {
@@ -569,6 +639,11 @@ enum Command {
     Oci {
         #[clap(subcommand)]
         cmd: OciCommand,
+    },
+    #[cfg(feature = "ostree")]
+    Ostree {
+        #[clap(subcommand)]
+        cmd: OstreeCommand,
     },
     /// Mounts a composefs image, possibly enforcing fsverity of the image
     Mount {
@@ -1564,6 +1639,111 @@ where
             }
             OciCommand::Varlink { .. } => {
                 unreachable!("oci varlink is handled before opening a repository");
+            }
+        },
+        #[cfg(feature = "ostree")]
+        Command::Ostree { cmd: ostree_cmd } => match ostree_cmd {
+            OstreeCommand::PullLocal {
+                ref ostree_repo_path,
+                ref ostree_ref,
+                base_name,
+            } => {
+                eprintln!("Fetching {ostree_ref}");
+                let (verity, stats) = composefs_ostree::pull_local(
+                    &repo,
+                    ostree_repo_path,
+                    ostree_ref,
+                    base_name.as_deref(),
+                )
+                .await?;
+
+                let image_id = composefs_ostree::get_image_ref(&repo, &stats.commit_id)?;
+                println!("commit  {}", stats.commit_id);
+                println!("verity  {}", verity.to_hex());
+                println!("image   {}", image_id.to_hex());
+                if !composefs_ostree::is_commit_id(ostree_ref) {
+                    println!("tagged  {ostree_ref}");
+                }
+                println!(
+                    "objects {} metadata + {} files fetched",
+                    stats.metadata_fetched, stats.files_fetched
+                );
+            }
+            OstreeCommand::Pull {
+                ref ostree_repo_url,
+                ref ostree_ref,
+                base_name,
+            } => {
+                eprintln!("Fetching {ostree_ref}");
+                let (verity, stats) = composefs_ostree::pull(
+                    &repo,
+                    ostree_repo_url,
+                    ostree_ref,
+                    base_name.as_deref(),
+                )
+                .await?;
+
+                let image_id = composefs_ostree::get_image_ref(&repo, &stats.commit_id)?;
+                println!("commit  {}", stats.commit_id);
+                println!("verity  {}", verity.to_hex());
+                println!("image   {}", image_id.to_hex());
+                if !composefs_ostree::is_commit_id(ostree_ref) {
+                    println!("tagged  {ostree_ref}");
+                }
+                println!(
+                    "objects {} metadata + {} files fetched",
+                    stats.metadata_fetched, stats.files_fetched
+                );
+            }
+            OstreeCommand::Mount {
+                ref commit,
+                ref mountpoint,
+                ref upperdir,
+                ref workdir,
+                read_write,
+            } => {
+                let mount_options =
+                    get_mount_options(upperdir.as_deref(), workdir.as_deref(), read_write)?;
+                let image_id = composefs_ostree::get_image_ref(&repo, commit)?;
+                repo.mount_at(&image_id.to_hex(), mountpoint.as_str(), &mount_options)?;
+            }
+            OstreeCommand::Dump { ref commit_name } => {
+                let fs = composefs_ostree::create_filesystem(&repo, commit_name)?;
+                fs.print_dumpfile()?;
+            }
+            OstreeCommand::ComputeId { ref commit_name } => {
+                let image_id = composefs_ostree::ensure_ostree_erofs(&repo, commit_name)?;
+                println!("{}", image_id.to_hex());
+            }
+            OstreeCommand::Inspect {
+                ref source,
+                metadata,
+            } => {
+                composefs_ostree::inspect(&repo, source, metadata)?;
+            }
+            OstreeCommand::Tag {
+                ref source,
+                ref name,
+            } => {
+                composefs_ostree::tag(&repo, source, name)?;
+                println!("Tagged {source} as {name}");
+            }
+            OstreeCommand::Untag { ref name } => {
+                composefs_ostree::untag(&repo, name)?;
+            }
+            OstreeCommand::ListCommits => {
+                let commits = composefs_ostree::list_commits(&repo)?;
+                if commits.is_empty() {
+                    println!("No ostree commits found");
+                } else {
+                    let mut table = Table::new();
+                    table.load_preset(UTF8_FULL);
+                    table.set_header(["NAME", "COMMIT"]);
+                    for c in commits {
+                        table.add_row([c.name.as_str(), &c.commit_id]);
+                    }
+                    println!("{table}");
+                }
             }
         },
         Command::CreateImage {
