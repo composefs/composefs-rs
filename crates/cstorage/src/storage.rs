@@ -437,6 +437,27 @@ impl Storage {
             }
         }
 
+        // Try matching short name without tag (e.g., "busybox" matches "docker.io/library/busybox:latest")
+        // This handles the common case of just specifying the image name
+        let name_with_tag = if name.contains(':') {
+            name.to_string()
+        } else {
+            format!("{}:latest", name)
+        };
+
+        for entry in &entries {
+            if let Some(names) = &entry.names {
+                for image_name in names {
+                    // Check if image_name ends with /name:tag pattern
+                    if let Some(prefix) = image_name.strip_suffix(&name_with_tag) {
+                        if prefix.is_empty() || prefix.ends_with('/') {
+                            return self.get_image(&entry.id);
+                        }
+                    }
+                }
+            }
+        }
+
         Err(StorageError::ImageNotFound(name.to_string()))
     }
 

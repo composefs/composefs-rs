@@ -51,6 +51,14 @@ integration-container: build integration-container-build
         CFSCTL_PATH=$(pwd)/target/debug/cfsctl \
         cargo run -p integration-tests
 
+# Run all tests with all features enabled
+test-all:
+    cargo test --workspace --all-features
+
+# Build with containers-storage feature
+build-cstorage:
+    cargo build --workspace --features containers-storage
+
 # Clean build artifacts
 clean:
     cargo clean

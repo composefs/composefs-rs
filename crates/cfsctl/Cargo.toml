@@ -14,9 +14,10 @@ version.workspace = true
 path = "src/lib.rs"
 
 [features]
-default = ['pre-6.15', 'oci']
+default = ['pre-6.15', 'oci', 'containers-storage']
 http = ['composefs-http']
 oci = ['composefs-oci']
+containers-storage = ['composefs-oci/containers-storage']
 rhel9 = ['composefs/rhel9']
 'pre-6.15' = ['composefs/pre-6.15']
 

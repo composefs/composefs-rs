@@ -104,7 +104,7 @@ pub fn split(
                 .repo()
                 .finalize_object_tmpfile(tmpfile, actual_size as u64)?;
             match method {
-                ObjectStoreMethod::Copied => {
+                ObjectStoreMethod::Copied | ObjectStoreMethod::Reflinked => {
                     stats.objects_copied += 1;
                     stats.bytes_copied += actual_size as u64;
                 }

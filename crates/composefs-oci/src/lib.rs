@@ -9,9 +9,12 @@
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
 //! - Sealing containers with fs-verity hashes for integrity verification
+//! - Importing from containers-storage with zero-copy reflinks (optional feature)
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "containers-storage")]
+pub mod cstor;
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
@@ -71,7 +74,7 @@ impl ImportStats {
         };
         for &(size, method) in &ss.external_objects {
             match method {
-                ObjectStoreMethod::Copied => {
+                ObjectStoreMethod::Copied | ObjectStoreMethod::Reflinked => {
                     stats.objects_copied += 1;
                     stats.bytes_copied += size;
                 }
@@ -95,13 +98,17 @@ pub struct PullResult<ObjectID> {
     pub stats: ImportStats,
 }
 
-type ContentAndVerity<ObjectID> = (String, ObjectID);
+// Re-export the composefs crate for consumers who only need composefs-oci
+pub use composefs;
 
-fn layer_identifier(diff_id: &str) -> String {
+/// A tuple of (content digest, fs-verity ObjectID).
+pub type ContentAndVerity<ObjectID> = (String, ObjectID);
+
+pub(crate) fn layer_identifier(diff_id: &str) -> String {
     format!("oci-layer-{diff_id}")
 }
 
-fn config_identifier(config: &str) -> String {
+pub(crate) fn config_identifier(config: &str) -> String {
     format!("oci-config-{config}")
 }
 

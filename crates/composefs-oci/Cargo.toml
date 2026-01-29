@@ -10,13 +10,19 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+default = ["containers-storage"]
+containers-storage = ["dep:cstorage"]
+
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
 async-compression = { version = "0.4.0", default-features = false, features = ["tokio", "zstd", "gzip"] }
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 bytes = { version = "1", default-features = false }
 composefs = { workspace = true }
 containers-image-proxy = { version = "0.9.2", default-features = false }
+cstorage = { path = "../cstorage", version = "0.3.0", optional = true }
 hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.17.0", default-features = false, features = ["tokio"] }
 oci-spec = { version = "0.8.0", default-features = false }

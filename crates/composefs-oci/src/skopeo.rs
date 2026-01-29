@@ -226,7 +226,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 
                 let mut stats = ImportStats::default();
                 match method {
-                    ObjectStoreMethod::Copied => {
+                    ObjectStoreMethod::Copied | ObjectStoreMethod::Reflinked => {
                         stats.objects_copied += 1;
                         stats.bytes_copied += size;
                     }

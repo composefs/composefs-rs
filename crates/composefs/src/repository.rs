@@ -118,11 +118,14 @@ use crate::{
 
 /// How an object was stored in the repository.
 ///
-/// Returned by [`Repository::ensure_object_from_file_with_stats`] to indicate
-/// whether the operation used a regular copy or found an existing object.
+/// Returned by [`Repository::ensure_object_from_file`] to indicate
+/// whether the operation used zero-copy reflinks, a regular copy, or found
+/// an existing object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectStoreMethod {
-    /// Object was stored via regular file copy.
+    /// Object was stored via reflink (zero-copy, FICLONE ioctl).
+    Reflinked,
+    /// Object was stored via regular file copy (reflink not supported).
     Copied,
     /// Object already existed in the repository (deduplicated).
     AlreadyPresent,
@@ -332,9 +335,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// * `src` - An open file descriptor to read from
     /// * `size` - The size of the source file in bytes
     ///
-    /// # Returns
-    /// The fs-verity ObjectID of the stored object.
-    pub fn ensure_object_from_file(&self, src: &std::fs::File, size: u64) -> Result<ObjectID> {
+    pub fn ensure_object_from_file(
+        &self,
+        src: &std::fs::File,
+        size: u64,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
         use rustix::fs::{fstat, ioctl_ficlone};
 
         // Create tmpfile in objects directory
@@ -348,7 +353,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         // Try reflink first
         let mut tmpfile = File::from(tmpfile_fd);
-        match ioctl_ficlone(&tmpfile, src) {
+        let used_reflink = match ioctl_ficlone(&tmpfile, src) {
             Ok(()) => {
                 // Reflink succeeded - verify size matches
                 let stat = fstat(&tmpfile)?;
@@ -358,6 +363,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     size,
                     stat.st_size
                 );
+                true
             }
             Err(Errno::OPNOTSUPP | Errno::XDEV) => {
                 // Reflink not supported or cross-device, fall back to copy
@@ -365,15 +371,25 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 let mut src_clone = src.try_clone()?;
                 src_clone.seek(SeekFrom::Start(0))?;
                 std::io::copy(&mut src_clone, &mut tmpfile)?;
+                false
             }
             Err(e) => {
                 // Other errors (EACCES, ENOSPC, etc.) should be propagated
                 return Err(e).context("Reflinking source file to objects directory")?;
             }
-        }
+        };
 
         // Finalize the tmpfile (enable verity, link into objects/)
-        self.finalize_object_tmpfile(tmpfile, size)
+        let (object_id, method) = self.finalize_object_tmpfile(tmpfile, size)?;
+
+        // Refine: finalize only knows Copied vs AlreadyPresent,
+        // but we know whether reflink was used for the initial copy.
+        let method = match method {
+            ObjectStoreMethod::Copied if used_reflink => ObjectStoreMethod::Reflinked,
+            other => other,
+        };
+
+        Ok((object_id, method))
     }
 
     /// Finalize a tmpfile as an object.

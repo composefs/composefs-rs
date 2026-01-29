@@ -425,8 +425,24 @@ where
             OciCommand::Pull { ref image, name } => {
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
+                let repo = Arc::new(repo);
+
+                #[cfg(feature = "containers-storage")]
+                if let Some(image_id) = composefs_oci::cstor::parse_containers_storage_ref(image) {
+                    let (digest, verity) = composefs_oci::cstor::import_from_containers_storage(
+                        &repo,
+                        image_id,
+                        Some(tag_name),
+                    )
+                    .await?;
+                    println!("config {digest}");
+                    println!("verity {}", verity.to_hex());
+                    println!("tagged {tag_name}");
+                    return Ok(());
+                }
+
                 let (result, stats) =
-                    composefs_oci::pull_image(&Arc::new(repo), image, Some(tag_name), None).await?;
+                    composefs_oci::pull_image(&repo, image, Some(tag_name), None).await?;
 
                 println!("manifest {}", result.manifest_digest);
                 println!("config   {}", result.config_digest);
