@@ -319,6 +319,63 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         tokio::task::spawn_blocking(move || self_.finalize_object_tmpfile(tmpfile_fd.into(), size))
     }
 
+    /// Ensure an object exists by reflinking from a source file.
+    ///
+    /// This method attempts to use FICLONE (reflink) to copy the source file
+    /// to the objects directory without duplicating data on disk. If reflinks
+    /// are not supported, it falls back to a regular copy.
+    ///
+    /// This is particularly useful for importing from containers-storage where
+    /// we already have the file on disk and want to avoid copying data.
+    ///
+    /// # Arguments
+    /// * `src` - An open file descriptor to read from
+    /// * `size` - The size of the source file in bytes
+    ///
+    /// # Returns
+    /// The fs-verity ObjectID of the stored object.
+    pub fn ensure_object_from_file(&self, src: &std::fs::File, size: u64) -> Result<ObjectID> {
+        use rustix::fs::{fstat, ioctl_ficlone};
+
+        // Create tmpfile in objects directory
+        let objects_dir = self.objects_dir()?;
+        let tmpfile_fd = openat(
+            objects_dir,
+            ".",
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )?;
+
+        // Try reflink first
+        let mut tmpfile = File::from(tmpfile_fd);
+        match ioctl_ficlone(&tmpfile, src) {
+            Ok(()) => {
+                // Reflink succeeded - verify size matches
+                let stat = fstat(&tmpfile)?;
+                anyhow::ensure!(
+                    stat.st_size as u64 == size,
+                    "Reflink size mismatch: expected {}, got {}",
+                    size,
+                    stat.st_size
+                );
+            }
+            Err(Errno::OPNOTSUPP | Errno::XDEV) => {
+                // Reflink not supported or cross-device, fall back to copy
+                use std::io::{Seek, SeekFrom};
+                let mut src_clone = src.try_clone()?;
+                src_clone.seek(SeekFrom::Start(0))?;
+                std::io::copy(&mut src_clone, &mut tmpfile)?;
+            }
+            Err(e) => {
+                // Other errors (EACCES, ENOSPC, etc.) should be propagated
+                return Err(e).context("Reflinking source file to objects directory")?;
+            }
+        }
+
+        // Finalize the tmpfile (enable verity, link into objects/)
+        self.finalize_object_tmpfile(tmpfile, size)
+    }
+
     /// Finalize a tmpfile as an object.
     ///
     /// This method should be called from a blocking context (e.g., `spawn_blocking`)
@@ -2251,6 +2308,38 @@ mod tests {
         assert!(result.objects_bytes > 0);
         assert_eq!(result.images_pruned, 1);
         assert_eq!(result.streams_pruned, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_ensure_object_from_file() -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let test_data = generate_test_data(64 * 1024, 0xBE);
+        let mut temp_file = crate::test::tempfile();
+        temp_file.write_all(&test_data)?;
+        temp_file.seek(SeekFrom::Start(0))?;
+
+        // First store should return Copied or Reflinked (depending on fs)
+        let (object_id, method) =
+            repo.ensure_object_from_file(&temp_file, test_data.len() as u64)?;
+        assert_ne!(method, ObjectStoreMethod::AlreadyPresent);
+        assert!(test_object_exists(&tmp, &object_id)?);
+
+        // Read back and verify contents match
+        let stored_data = repo.read_object(&object_id)?;
+        assert_eq!(stored_data, test_data);
+
+        // Second store of same data should return AlreadyPresent
+        temp_file.seek(SeekFrom::Start(0))?;
+        let (object_id_2, method_2) =
+            repo.ensure_object_from_file(&temp_file, test_data.len() as u64)?;
+        assert_eq!(object_id, object_id_2);
+        assert_eq!(method_2, ObjectStoreMethod::AlreadyPresent);
+
         Ok(())
     }
 }
