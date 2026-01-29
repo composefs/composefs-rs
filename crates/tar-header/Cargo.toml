@@ -1,0 +1,23 @@
+[package]
+name = "tar-header"
+description = "Zerocopy-based raw tar header structs for safe parsing"
+keywords = ["tar", "zerocopy", "header"]
+
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror = { version = "2.0", default-features = false }
+zerocopy = { version = "0.8.0", default-features = false, features = ["derive", "std"] }
+
+[dev-dependencies]
+proptest = "1"
+tar = "0.4"
+tempfile = "3"
+
+[lints]
+workspace = true
