@@ -55,8 +55,18 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
             content,
         })),
         TarItem::Hardlink(target) => {
-            let (dir, filename) = filesystem.root.split(&target)?;
-            Inode::Leaf(dir.ref_leaf(filename)?)
+            let (dir, filename) = filesystem.root.split(&target).with_context(|| {
+                format!(
+                    "Looking up hardlink target directory for {:?} -> {:?}",
+                    entry.path, target
+                )
+            })?;
+            Inode::Leaf(dir.ref_leaf(filename).with_context(|| {
+                format!(
+                    "Looking up hardlink target {:?} for {:?}",
+                    target, entry.path
+                )
+            })?)
         }
     };
 

@@ -24,7 +24,8 @@ use std::{
 use anyhow::{bail, ensure, Result};
 use bytes::Bytes;
 use rustix::fs::makedev;
-use tar::{EntryType, Header, PaxExtensions};
+use tar::PaxExtensions;
+use tar_header::{EntryType, Header};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt},
     sync::mpsc,
@@ -301,7 +302,37 @@ impl<ObjectID: FsVerityHashValue> fmt::Display for TarEntry<ObjectID> {
     }
 }
 
-fn path_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf {
+/// Build a file path from tar metadata (PAX > GNU > header name + UStar prefix).
+fn path_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, header: &Header) -> PathBuf {
+    // Prepend leading /
+    let mut path = vec![b'/'];
+
+    if let Some(name) = pax {
+        // PAX extended header has highest priority
+        path.extend(name);
+    } else if !gnu.is_empty() {
+        // GNU long name has second priority
+        path.extend(gnu);
+    } else {
+        // Standard header - check for UStar prefix field
+        if let Some(prefix) = header.prefix() {
+            if !prefix.is_empty() {
+                path.extend(prefix);
+                path.push(b'/');
+            }
+        }
+        path.extend(header.path_bytes());
+    }
+
+    // Drop trailing '/' characters in case of directories.
+    path.pop_if(|x| x == &b'/');
+
+    PathBuf::from(OsString::from_vec(path))
+}
+
+/// Build a link target path from tar metadata (PAX > GNU > header link_name).
+/// Link targets don't use the UStar prefix field - they use the linkname field directly.
+fn link_target_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf {
     // Prepend leading /
     let mut path = vec![b'/'];
     if let Some(name) = pax {
@@ -312,7 +343,7 @@ fn path_from_tar(pax: Option<Box<[u8]>>, gnu: Vec<u8>, short: &[u8]) -> PathBuf 
         path.extend(short);
     }
 
-    // Drop trailing '/' characters in case of directories.
+    // Drop trailing '/' characters.
     path.pop_if(|x| x == &b'/');
 
     PathBuf::from(OsString::from_vec(path))
@@ -356,7 +387,7 @@ pub fn get_entry<ObjectID: FsVerityHashValue>(
             return Ok(None);
         }
 
-        let header = tar::Header::from_byte_slice(&buf);
+        let header = Header::from_bytes_exact(&buf);
 
         let size = header.entry_size()?;
         let stored_size = size.next_multiple_of(512);
@@ -373,19 +404,22 @@ pub fn get_entry<ObjectID: FsVerityHashValue>(
                 _ => bail!("Unsupported external-chunked entry {header:?} {id:?}"),
             },
             SplitStreamData::Inline(content) => match header.entry_type() {
-                EntryType::GNULongLink => {
+                EntryType::GnuLongLink => {
                     gnu_longlink.extend(content);
                     gnu_longlink.pop_if(|x| *x == b'\0');
 
                     continue;
                 }
-                EntryType::GNULongName => {
+                EntryType::GnuLongName => {
                     gnu_longname.extend(content);
                     gnu_longname.pop_if(|x| *x == b'\0');
                     continue;
                 }
                 EntryType::XGlobalHeader => {
-                    todo!();
+                    // Global PAX headers affect all subsequent entries.
+                    // For simplicity, we skip them (matching tar-rs and TarStreamParser behavior).
+                    // A more complete implementation would merge them into parser state.
+                    continue;
                 }
                 EntryType::XHeader => {
                     for item in PaxExtensions::new(&content) {
@@ -413,16 +447,12 @@ pub fn get_entry<ObjectID: FsVerityHashValue>(
                     TarItem::Leaf(LeafContent::Regular(RegularFile::Inline(content)))
                 }
                 EntryType::Link => TarItem::Hardlink({
-                    let Some(link_name) = header.link_name_bytes() else {
-                        bail!("link without a name?")
-                    };
-                    OsString::from(path_from_tar(pax_longlink, gnu_longlink, &link_name))
+                    let link_name = header.link_name_bytes();
+                    link_target_from_tar(pax_longlink, gnu_longlink, link_name).into_os_string()
                 }),
                 EntryType::Symlink => TarItem::Leaf(LeafContent::Symlink({
-                    let Some(link_name) = header.link_name_bytes() else {
-                        bail!("symlink without a name?")
-                    };
-                    symlink_target_from_tar(pax_longlink, gnu_longlink, &link_name)
+                    let link_name = header.link_name_bytes();
+                    symlink_target_from_tar(pax_longlink, gnu_longlink, link_name)
                 })),
                 EntryType::Block => TarItem::Leaf(LeafContent::BlockDevice(
                     match (header.device_major()?, header.device_minor()?) {
@@ -444,7 +474,7 @@ pub fn get_entry<ObjectID: FsVerityHashValue>(
         };
 
         return Ok(Some(TarEntry {
-            path: path_from_tar(pax_longname, gnu_longname, &header.path_bytes()),
+            path: path_from_tar(pax_longname, gnu_longname, header),
             stat: Stat {
                 st_uid: header.uid()? as u32,
                 st_gid: header.gid()? as u32,
@@ -825,7 +855,7 @@ mod tests {
             let mut builder = Builder::new(&mut tar_data);
             let mut header = tar::Header::new_gnu();
             header.set_mode(0o777);
-            header.set_entry_type(EntryType::Symlink);
+            header.set_entry_type(tar::EntryType::Symlink);
             header.set_size(0);
             header.set_uid(0);
             header.set_gid(0);
@@ -1090,6 +1120,335 @@ mod tests {
                 );
             } else {
                 panic!("Expected external regular file for file{}.bin", i);
+            }
+        }
+    }
+
+    // ==========================================================================
+    // Long path format tests using proptest
+    // ==========================================================================
+    //
+    // Tar archives use different mechanisms for paths > 100 characters:
+    // - GNU LongName: type 'L' entry before actual entry (used by tar crate with new_gnu())
+    // - UStar prefix: 155-byte prefix field + 100-byte name field (max ~255 bytes)
+    // - PAX extended: type 'x' entry with key=value pairs (unlimited length)
+
+    /// Table-driven test for specific path length edge cases and format triggers.
+    #[test]
+    fn test_longpath_formats() {
+        // (description, path generator, use_gnu_header)
+        // The tar crate auto-selects format based on path length and header type
+        let cases: &[(&str, fn() -> String, bool)] = &[
+            // Basic name field (≤100 chars)
+            ("short path", || "short.txt".to_string(), false),
+            ("exactly 100 chars", || "x".repeat(100), false),
+            // UStar prefix (101-255 chars with /)
+            (
+                "ustar prefix",
+                || format!("{}/{}", "dir".repeat(40), "file.txt"),
+                false,
+            ),
+            (
+                "max ustar (~254 chars)",
+                || format!("{}/{}", "p".repeat(154), "n".repeat(99)),
+                false,
+            ),
+            // GNU LongName (>100 chars with gnu header)
+            (
+                "gnu longname",
+                || format!("{}/{}", "a".repeat(80), "b".repeat(50)),
+                true,
+            ),
+            // PAX (>255 chars, any header)
+            (
+                "pax extended",
+                || format!("{}/{}", "sub/".repeat(60), "file.txt"),
+                false,
+            ),
+        ];
+
+        for (desc, make_path, use_gnu) in cases {
+            let path = make_path();
+            let content = b"test content";
+
+            let mut tar_data = Vec::new();
+            {
+                let mut builder = Builder::new(&mut tar_data);
+                let mut header = if *use_gnu {
+                    tar::Header::new_gnu()
+                } else {
+                    tar::Header::new_ustar()
+                };
+                header.set_mode(0o644);
+                header.set_uid(1000);
+                header.set_gid(1000);
+                header.set_mtime(1234567890);
+                header.set_size(content.len() as u64);
+                header.set_entry_type(tar::EntryType::Regular);
+                builder
+                    .append_data(&mut header, &path, &content[..])
+                    .unwrap();
+                builder.finish().unwrap();
+            }
+
+            let entries = read_all_via_splitstream(tar_data).unwrap();
+            assert_eq!(entries.len(), 1, "{desc}: expected 1 entry");
+            assert_eq!(
+                entries[0].path,
+                PathBuf::from(format!("/{}", path)),
+                "{desc}: path mismatch (len={})",
+                path.len()
+            );
+        }
+    }
+
+    /// Table-driven test for hardlinks with long targets.
+    #[test]
+    fn test_longpath_hardlinks() {
+        let cases: &[(&str, fn() -> String, bool)] = &[
+            ("short target", || "target.txt".to_string(), true),
+            (
+                "gnu longlink",
+                || format!("{}/{}", "c".repeat(80), "d".repeat(50)),
+                true,
+            ),
+            (
+                "pax linkpath",
+                || format!("{}/{}", "sub/".repeat(60), "target.txt"),
+                false,
+            ),
+        ];
+
+        for (desc, make_target, use_gnu) in cases {
+            let target_path = make_target();
+            let link_name = "hardlink";
+            let content = b"target content";
+
+            let mut tar_data = Vec::new();
+            {
+                let mut builder = Builder::new(&mut tar_data);
+
+                // Create target file
+                let mut header = if *use_gnu {
+                    tar::Header::new_gnu()
+                } else {
+                    tar::Header::new_ustar()
+                };
+                header.set_mode(0o644);
+                header.set_uid(1000);
+                header.set_gid(1000);
+                header.set_mtime(1234567890);
+                header.set_size(content.len() as u64);
+                header.set_entry_type(tar::EntryType::Regular);
+                builder
+                    .append_data(&mut header, &target_path, &content[..])
+                    .unwrap();
+
+                // Create hardlink
+                let mut link_header = if *use_gnu {
+                    tar::Header::new_gnu()
+                } else {
+                    tar::Header::new_ustar()
+                };
+                link_header.set_mode(0o644);
+                link_header.set_uid(1000);
+                link_header.set_gid(1000);
+                link_header.set_mtime(1234567890);
+                link_header.set_size(0);
+                link_header.set_entry_type(tar::EntryType::Link);
+                builder
+                    .append_link(&mut link_header, link_name, &target_path)
+                    .unwrap();
+
+                builder.finish().unwrap();
+            }
+
+            let entries = read_all_via_splitstream(tar_data).unwrap();
+            assert_eq!(entries.len(), 2, "{desc}: expected 2 entries");
+            assert_eq!(
+                entries[0].path,
+                PathBuf::from(format!("/{}", target_path)),
+                "{desc}"
+            );
+            assert_eq!(
+                entries[1].path,
+                PathBuf::from(format!("/{}", link_name)),
+                "{desc}"
+            );
+
+            match &entries[1].item {
+                TarItem::Hardlink(target) => {
+                    assert_eq!(
+                        target.to_str().unwrap(),
+                        format!("/{}", target_path),
+                        "{desc}: hardlink target mismatch"
+                    );
+                }
+                _ => panic!("{desc}: expected hardlink entry"),
+            }
+        }
+    }
+
+    /// Verify UStar prefix field is actually used for paths > 100 chars.
+    #[test]
+    fn test_ustar_prefix_field_used() {
+        // Path must be > 100 chars to trigger prefix usage, but filename must be <= 100 chars
+        let dir_path =
+            "usr/lib/python3.12/site-packages/some-very-long-package-name-here/__pycache__/subdir";
+        let filename = "module_name_with_extra_stuff.cpython-312.opt-2.pyc";
+        let full_path = format!("{dir_path}/{filename}");
+
+        // Verify our test setup: full path > 100 chars, filename <= 100 chars
+        assert!(
+            full_path.len() > 100,
+            "full path must exceed 100 chars to use prefix"
+        );
+        assert!(filename.len() <= 100, "filename must fit in name field");
+
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = Builder::new(&mut tar_data);
+            let mut header = tar::Header::new_ustar();
+            header.set_mode(0o644);
+            header.set_size(4);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_path(&full_path).unwrap();
+            header.set_cksum();
+            builder.append(&header, b"test".as_slice()).unwrap();
+            builder.finish().unwrap();
+        }
+
+        // Verify prefix field (bytes 345-500) is populated
+        let prefix_field = &tar_data[345..500];
+        let prefix_str = std::str::from_utf8(prefix_field)
+            .unwrap()
+            .trim_end_matches('\0');
+        assert_eq!(
+            prefix_str, dir_path,
+            "UStar prefix field should contain directory"
+        );
+
+        let entries = read_all_via_splitstream(tar_data).unwrap();
+        assert_eq!(entries[0].path, PathBuf::from(format!("/{full_path}")));
+    }
+
+    /// Property-based tests for tar path handling.
+    mod proptest_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy for generating valid path components.
+        fn path_component() -> impl Strategy<Value = String> {
+            proptest::string::string_regex("[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,30}")
+                .expect("valid regex")
+                .prop_filter("non-empty", |s| !s.is_empty())
+        }
+
+        /// Strategy for generating paths with a target total length.
+        fn path_with_length(min_len: usize, max_len: usize) -> impl Strategy<Value = String> {
+            prop::collection::vec(path_component(), 1..20)
+                .prop_map(|components| components.join("/"))
+                .prop_filter("length in range", move |p| {
+                    p.len() >= min_len && p.len() <= max_len
+                })
+        }
+
+        /// Create a tar archive with a single file and verify round-trip.
+        fn roundtrip_path(path: &str) {
+            let content = b"proptest content";
+
+            let mut tar_data = Vec::new();
+            {
+                let mut builder = Builder::new(&mut tar_data);
+                let mut header = tar::Header::new_ustar();
+                header.set_mode(0o644);
+                header.set_uid(1000);
+                header.set_gid(1000);
+                header.set_mtime(1234567890);
+                header.set_size(content.len() as u64);
+                header.set_entry_type(tar::EntryType::Regular);
+                builder
+                    .append_data(&mut header, path, &content[..])
+                    .unwrap();
+                builder.finish().unwrap();
+            }
+
+            let entries = read_all_via_splitstream(tar_data).unwrap();
+            assert_eq!(entries.len(), 1, "expected 1 entry for path: {path}");
+            assert_eq!(
+                entries[0].path,
+                PathBuf::from(format!("/{path}")),
+                "path mismatch"
+            );
+        }
+
+        /// Create a tar archive with a hardlink and verify round-trip.
+        fn roundtrip_hardlink(target_path: &str) {
+            let link_name = "link";
+            let content = b"target content";
+
+            let mut tar_data = Vec::new();
+            {
+                let mut builder = Builder::new(&mut tar_data);
+
+                let mut header = tar::Header::new_ustar();
+                header.set_mode(0o644);
+                header.set_uid(1000);
+                header.set_gid(1000);
+                header.set_mtime(1234567890);
+                header.set_size(content.len() as u64);
+                header.set_entry_type(tar::EntryType::Regular);
+                builder
+                    .append_data(&mut header, target_path, &content[..])
+                    .unwrap();
+
+                let mut link_header = tar::Header::new_ustar();
+                link_header.set_mode(0o644);
+                link_header.set_uid(1000);
+                link_header.set_gid(1000);
+                link_header.set_mtime(1234567890);
+                link_header.set_size(0);
+                link_header.set_entry_type(tar::EntryType::Link);
+                builder
+                    .append_link(&mut link_header, link_name, target_path)
+                    .unwrap();
+
+                builder.finish().unwrap();
+            }
+
+            let entries = read_all_via_splitstream(tar_data).unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].path, PathBuf::from(format!("/{target_path}")));
+
+            match &entries[1].item {
+                TarItem::Hardlink(target) => {
+                    assert_eq!(target.to_str().unwrap(), format!("/{target_path}"));
+                }
+                _ => panic!("expected hardlink"),
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
+            #[test]
+            fn test_short_paths(path in path_with_length(1, 100)) {
+                roundtrip_path(&path);
+            }
+
+            #[test]
+            fn test_medium_paths(path in path_with_length(101, 255)) {
+                roundtrip_path(&path);
+            }
+
+            #[test]
+            fn test_long_paths(path in path_with_length(256, 500)) {
+                roundtrip_path(&path);
+            }
+
+            #[test]
+            fn test_hardlink_targets(target in path_with_length(1, 400)) {
+                roundtrip_hardlink(&target);
             }
         }
     }
