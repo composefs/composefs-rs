@@ -25,8 +25,9 @@
 //! use composefs_oci::cstor::import_from_containers_storage;
 //!
 //! let repo = Arc::new(Repository::open_user()?);
-//! let result = import_from_containers_storage(&repo, "sha256:abc123...", None).await?;
+//! let (result, stats) = import_from_containers_storage(&repo, "sha256:abc123...", None).await?;
 //! println!("Imported config: {}", result.0);
+//! println!("Stats: {:?}", stats);
 //! ```
 
 use std::io::{Read, Seek, SeekFrom};
@@ -38,12 +39,66 @@ use indicatif::{ProgressBar, ProgressStyle};
 use sha2::Digest;
 use tokio::task::spawn_blocking;
 
-use composefs::{fsverity::FsVerityHashValue, repository::Repository, INLINE_CONTENT_MAX};
+use composefs::{
+    fsverity::FsVerityHashValue,
+    repository::{ObjectStoreMethod, Repository},
+    INLINE_CONTENT_MAX,
+};
 
 use cstorage::{Image, Layer, Storage, TarSplitFdStream, TarSplitItem};
 
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::{config_identifier, layer_identifier, ContentAndVerity};
+
+/// Statistics from a containers-storage import operation.
+#[derive(Debug, Clone, Default)]
+pub struct ImportStats {
+    /// Number of layers in the image.
+    pub layers: u64,
+    /// Number of layers that were already present (skipped).
+    pub layers_already_present: u64,
+    /// Number of objects stored via reflink (zero-copy).
+    pub objects_reflinked: u64,
+    /// Number of objects stored via regular copy (reflink not supported).
+    pub objects_copied: u64,
+    /// Number of objects that were already present (deduplicated).
+    pub objects_already_present: u64,
+    /// Total bytes stored via reflink.
+    pub bytes_reflinked: u64,
+    /// Total bytes stored via regular copy.
+    pub bytes_copied: u64,
+    /// Total bytes inlined in splitstreams (small files + headers).
+    pub bytes_inlined: u64,
+}
+
+impl ImportStats {
+    /// Merge stats from another ImportStats into this one.
+    pub fn merge(&mut self, other: &ImportStats) {
+        self.layers += other.layers;
+        self.layers_already_present += other.layers_already_present;
+        self.objects_reflinked += other.objects_reflinked;
+        self.objects_copied += other.objects_copied;
+        self.objects_already_present += other.objects_already_present;
+        self.bytes_reflinked += other.bytes_reflinked;
+        self.bytes_copied += other.bytes_copied;
+        self.bytes_inlined += other.bytes_inlined;
+    }
+
+    /// Returns true if any objects were stored via reflink.
+    pub fn used_reflinks(&self) -> bool {
+        self.objects_reflinked > 0
+    }
+
+    /// Total number of objects processed.
+    pub fn total_objects(&self) -> u64 {
+        self.objects_reflinked + self.objects_copied + self.objects_already_present
+    }
+
+    /// Total bytes processed (external objects only, not inline).
+    pub fn total_external_bytes(&self) -> u64 {
+        self.bytes_reflinked + self.bytes_copied
+    }
+}
 
 /// Import a container image from containers-storage into the composefs repository.
 ///
@@ -56,12 +111,12 @@ use crate::{config_identifier, layer_identifier, ContentAndVerity};
 /// * `reference` - Optional reference name to assign to the imported config
 ///
 /// # Returns
-/// A tuple of (config_digest, config_verity_id) for the imported image.
+/// A tuple of ((config_digest, config_verity_id), import_stats).
 pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     image_id: &str,
     reference: Option<&str>,
-) -> Result<ContentAndVerity<ObjectID>> {
+) -> Result<(ContentAndVerity<ObjectID>, ImportStats)> {
     let repo = Arc::clone(repo);
     let image_id = image_id.to_owned();
     let reference = reference.map(|s| s.to_owned());
@@ -81,7 +136,9 @@ fn import_from_containers_storage_blocking<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     image_id: &str,
     reference: Option<&str>,
-) -> Result<ContentAndVerity<ObjectID>> {
+) -> Result<(ContentAndVerity<ObjectID>, ImportStats)> {
+    let mut stats = ImportStats::default();
+
     // Open containers-storage
     let storage = Storage::discover().context("Failed to discover containers-storage")?;
 
@@ -112,6 +169,8 @@ fn import_from_containers_storage_blocking<ObjectID: FsVerityHashValue>(
         diff_ids.len()
     );
 
+    stats.layers = storage_layer_ids.len() as u64;
+
     // Import each layer with progress bar
     let progress = ProgressBar::new(storage_layer_ids.len() as u64);
     progress.set_style(
@@ -128,12 +187,15 @@ fn import_from_containers_storage_blocking<ObjectID: FsVerityHashValue>(
 
         let layer_verity = if let Some(existing) = repo.has_stream(&content_id)? {
             progress.set_message(format!("Already have {short_id}..."));
+            stats.layers_already_present += 1;
             existing
         } else {
             progress.set_message(format!("Importing {short_id}..."));
             let layer = Layer::open(&storage, storage_layer_id)
                 .with_context(|| format!("Failed to open layer {}", storage_layer_id))?;
-            import_layer_with_writer(repo, &storage, &layer, diff_id)?
+            let (verity, layer_stats) = import_layer_with_writer(repo, &storage, &layer, diff_id)?;
+            stats.merge(&layer_stats);
+            verity
         };
 
         layer_refs.push((diff_id.clone(), layer_verity));
@@ -170,7 +232,7 @@ fn import_from_containers_storage_blocking<ObjectID: FsVerityHashValue>(
         repo.write_stream(writer, &content_id, reference)?
     };
 
-    Ok((config_digest, config_verity))
+    Ok(((config_digest, config_verity), stats))
 }
 
 /// Import a single layer from containers-storage using the writer pattern.
@@ -179,12 +241,16 @@ fn import_from_containers_storage_blocking<ObjectID: FsVerityHashValue>(
 /// - For large files: reflinks the file content to the objects directory
 /// - For small files: embeds content inline in the splitstream
 /// - Writes tar headers and padding as inline data
+///
+/// Returns the layer's verity ID and import statistics for this layer.
 fn import_layer_with_writer<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     storage: &Storage,
     layer: &Layer,
     diff_id: &str,
-) -> Result<ObjectID> {
+) -> Result<(ObjectID, ImportStats)> {
+    let mut stats = ImportStats::default();
+
     let mut stream = TarSplitFdStream::new(storage, layer)
         .with_context(|| format!("Failed to create tar-split stream for layer {}", layer.id()))?;
 
@@ -195,6 +261,7 @@ fn import_layer_with_writer<ObjectID: FsVerityHashValue>(
         match item {
             TarSplitItem::Segment(bytes) => {
                 // Write raw segment bytes (tar headers, padding) as inline data
+                stats.bytes_inlined += bytes.len() as u64;
                 writer.write_inline(&bytes);
             }
             TarSplitItem::FileContent { fd, size, name } => {
@@ -203,9 +270,23 @@ fn import_layer_with_writer<ObjectID: FsVerityHashValue>(
 
                 if size as usize > INLINE_CONTENT_MAX {
                     // Large file: use reflink to store as external object
-                    let (object_id, _method) = repo
+                    let (object_id, method) = repo
                         .ensure_object_from_file(&file, size)
                         .with_context(|| format!("Failed to store object for {}", name))?;
+
+                    match method {
+                        ObjectStoreMethod::Reflinked => {
+                            stats.objects_reflinked += 1;
+                            stats.bytes_reflinked += size;
+                        }
+                        ObjectStoreMethod::Copied => {
+                            stats.objects_copied += 1;
+                            stats.bytes_copied += size;
+                        }
+                        ObjectStoreMethod::AlreadyPresent => {
+                            stats.objects_already_present += 1;
+                        }
+                    }
 
                     writer.add_external_size(size);
                     writer.write_reference(object_id)?;
@@ -215,6 +296,7 @@ fn import_layer_with_writer<ObjectID: FsVerityHashValue>(
                     let mut file = file;
                     file.seek(SeekFrom::Start(0))?;
                     file.read_exact(&mut content)?;
+                    stats.bytes_inlined += size;
                     writer.write_inline(&content);
                 }
             }
@@ -222,7 +304,8 @@ fn import_layer_with_writer<ObjectID: FsVerityHashValue>(
     }
 
     // Write the stream with the content identifier
-    repo.write_stream(writer, &content_id, None)
+    let verity = repo.write_stream(writer, &content_id, None)?;
+    Ok((verity, stats))
 }
 
 /// Check if an image reference uses the containers-storage transport.

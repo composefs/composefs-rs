@@ -166,79 +166,52 @@ impl TarHeader {
     /// # Errors
     ///
     /// Returns an error if the header is too short or has an invalid checksum.
-    pub fn from_bytes(header: &[u8]) -> Result<Self> {
-        if header.len() < 512 {
-            return Err(StorageError::TarSplitError(format!(
-                "TAR header too short: {} bytes",
-                header.len()
-            )));
-        }
+    pub fn from_bytes(header_bytes: &[u8]) -> Result<Self> {
+        let header = tar_header::Header::from_bytes(header_bytes).map_err(|e| {
+            StorageError::TarSplitError(format!("Failed to parse TAR header: {}", e))
+        })?;
 
-        // Verify checksum first
-        let stored_checksum = {
-            let checksum_bytes = &header[148..156];
-            let null_pos = checksum_bytes
-                .iter()
-                .position(|&b| b == 0 || b == b' ')
-                .unwrap_or(checksum_bytes.len());
-            let s = std::str::from_utf8(&checksum_bytes[..null_pos])
-                .map_err(|_| StorageError::TarSplitError("Invalid checksum field".to_string()))?
-                .trim();
-            if s.is_empty() {
-                return Err(StorageError::TarSplitError(
-                    "Empty checksum field".to_string(),
-                ));
-            }
-            u32::from_str_radix(s, 8).map_err(|e| {
-                StorageError::TarSplitError(format!("Invalid checksum '{}': {}", s, e))
-            })?
-        };
+        header.verify_checksum().map_err(|e| {
+            StorageError::TarSplitError(format!("TAR header checksum error: {}", e))
+        })?;
 
-        let computed_checksum: u32 = header[..148]
-            .iter()
-            .chain(std::iter::repeat_n(&b' ', 8)) // checksum field treated as spaces
-            .chain(header[156..512].iter())
-            .map(|&b| b as u32)
-            .sum();
-
-        if stored_checksum != computed_checksum {
-            return Err(StorageError::TarSplitError(format!(
-                "Checksum mismatch: stored {} != computed {}",
-                stored_checksum, computed_checksum
-            )));
-        }
-
-        // Extract null-terminated string from byte range
-        let extract_string = |start: usize, end: usize| -> String {
-            let bytes = &header[start..end];
-            let null_pos = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            String::from_utf8_lossy(&bytes[..null_pos]).to_string()
-        };
-
-        // Parse octal field from byte range
-        let parse_octal = |start: usize, end: usize| -> Result<u64> {
-            let s = extract_string(start, end);
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                return Ok(0);
-            }
-            u64::from_str_radix(trimmed, 8).map_err(|e| {
-                StorageError::TarSplitError(format!("Failed to parse octal '{}': {}", trimmed, e))
-            })
-        };
-
-        let name = extract_string(0, 100);
-        let mode = parse_octal(100, 108)? as u32;
-        let uid = parse_octal(108, 116)? as u32;
-        let gid = parse_octal(116, 124)? as u32;
-        let size = parse_octal(124, 136)?;
-        let mtime = parse_octal(136, 148)? as i64;
-        let typeflag = header[156];
-        let linkname = extract_string(157, 257);
-        let uname = extract_string(265, 297);
-        let gname = extract_string(297, 329);
-        let devmajor = parse_octal(329, 337)? as u32;
-        let devminor = parse_octal(337, 345)? as u32;
+        let name = String::from_utf8_lossy(header.path_bytes()).to_string();
+        let mode = header
+            .mode()
+            .map_err(|e| StorageError::TarSplitError(format!("Invalid mode: {}", e)))?;
+        let uid = header
+            .uid()
+            .map_err(|e| StorageError::TarSplitError(format!("Invalid uid: {}", e)))?
+            as u32;
+        let gid = header
+            .gid()
+            .map_err(|e| StorageError::TarSplitError(format!("Invalid gid: {}", e)))?
+            as u32;
+        let size = header
+            .entry_size()
+            .map_err(|e| StorageError::TarSplitError(format!("Invalid size: {}", e)))?;
+        let mtime = header
+            .mtime()
+            .map_err(|e| StorageError::TarSplitError(format!("Invalid mtime: {}", e)))?
+            as i64;
+        let typeflag = header.entry_type().to_byte();
+        let linkname = String::from_utf8_lossy(header.link_name_bytes()).to_string();
+        let uname = header
+            .username()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_default();
+        let gname = header
+            .groupname()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_default();
+        let devmajor = header
+            .device_major()
+            .map_err(|e| StorageError::TarSplitError(format!("Invalid devmajor: {}", e)))?
+            .unwrap_or(0);
+        let devminor = header
+            .device_minor()
+            .map_err(|e| StorageError::TarSplitError(format!("Invalid devminor: {}", e)))?
+            .unwrap_or(0);
 
         Ok(TarHeader {
             name,

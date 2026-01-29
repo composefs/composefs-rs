@@ -87,17 +87,6 @@ impl ImportStats {
     }
 }
 
-/// Result of a pull operation.
-#[derive(Debug)]
-pub struct PullResult<ObjectID> {
-    /// The config digest (sha256:...).
-    pub config_digest: String,
-    /// The fs-verity hash of the config splitstream.
-    pub config_verity: ObjectID,
-    /// Import statistics.
-    pub stats: ImportStats,
-}
-
 // Re-export the composefs crate for consumers who only need composefs-oci
 pub use composefs;
 
@@ -153,14 +142,47 @@ pub fn ls_layer<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
+/// Result of a pull operation.
+#[derive(Debug)]
+pub struct PullResult<ObjectID> {
+    /// The config digest (sha256:...).
+    pub config_digest: String,
+    /// The fs-verity hash of the config splitstream.
+    pub config_verity: ObjectID,
+    /// Import statistics.
+    pub stats: ImportStats,
+}
+
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
+///
+/// When the `containers-storage` feature is enabled and the image reference
+/// starts with `containers-storage:`, this uses the native cstor import path
+/// which supports zero-copy reflinks. Otherwise, it uses skopeo.
 pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<PullResult<ObjectID>> {
+    #[cfg(feature = "containers-storage")]
+    if let Some(image_id) = cstor::parse_containers_storage_ref(imgref) {
+        let ((config_digest, config_verity), cstor_stats) =
+            cstor::import_from_containers_storage(repo, image_id, reference).await?;
+        // Convert cstor::ImportStats to our ImportStats
+        let stats = ImportStats {
+            objects_copied: cstor_stats.objects_reflinked + cstor_stats.objects_copied,
+            objects_already_present: cstor_stats.objects_already_present,
+            bytes_copied: cstor_stats.bytes_reflinked + cstor_stats.bytes_copied,
+            bytes_inlined: cstor_stats.bytes_inlined,
+        };
+        return Ok(PullResult {
+            config_digest,
+            config_verity,
+            stats,
+        });
+    }
+
     let (config_digest, config_verity, stats) =
         skopeo::pull(repo, imgref, reference, img_proxy_config).await?;
     Ok(PullResult {
