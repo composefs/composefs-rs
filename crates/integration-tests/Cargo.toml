@@ -1,8 +1,12 @@
 [package]
 name = "integration-tests"
-version = "0.1.0"
-edition = "2021"
 publish = false
+
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [[bin]]
 name = "cfsctl-integration-tests"
@@ -11,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 cap-std-ext = "4.0"
-composefs = { path = "../composefs" }
+composefs = { workspace = true }
 libtest-mimic = "0.8"
 linkme = "0.3"
 ocidir = "0.6"
