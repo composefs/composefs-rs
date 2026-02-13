@@ -46,6 +46,7 @@ use containers_image_proxy::oci_spec::image::{
 };
 use rustix::fs::{openat, readlinkat, unlinkat, AtFlags, Dir, Mode, OFlags};
 use rustix::io::Errno;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
@@ -99,6 +100,8 @@ pub struct OciImage<ObjectID: FsVerityHashValue> {
     manifest: ImageManifest,
     /// The config digest (sha256 content hash)
     config_digest: String,
+    /// The fs-verity ID of the config splitstream
+    config_verity: ObjectID,
     /// The parsed OCI config (may be empty for artifacts)
     config: Option<ImageConfiguration>,
     /// Map from layer diff_id to its fs-verity object ID
@@ -136,13 +139,14 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         let config_key = format!("config:{config_digest}");
         let config_verity = named_refs
             .get(config_key.as_str())
-            .context("Manifest missing config reference")?;
+            .context("Manifest missing config reference")?
+            .clone();
 
         let config_id = crate::config_identifier(&config_digest);
         let (config_data, config_named_refs) = read_external_splitstream(
             repo,
             &config_id,
-            Some(config_verity),
+            Some(&config_verity),
             Some(OCI_CONFIG_CONTENT_TYPE),
         )?;
 
@@ -181,6 +185,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             manifest_digest: manifest_digest.to_string(),
             manifest,
             config_digest,
+            config_verity,
             config,
             layer_refs,
             manifest_verity,
@@ -334,6 +339,60 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             .and_then(|c| c.config().as_ref())
             .and_then(|cfg| cfg.labels().as_ref())
     }
+
+    /// Reads the raw manifest JSON bytes from the repository.
+    ///
+    /// This retrieves the original manifest JSON as stored, which may differ
+    /// slightly from re-serializing the parsed manifest (e.g., whitespace).
+    pub fn read_manifest_json(&self, repo: &Repository<ObjectID>) -> Result<Vec<u8>> {
+        let manifest_id = manifest_identifier(&self.manifest_digest);
+        let (data, _) = read_external_splitstream(
+            repo,
+            &manifest_id,
+            Some(&self.manifest_verity),
+            Some(OCI_MANIFEST_CONTENT_TYPE),
+        )?;
+        Ok(data)
+    }
+
+    /// Reads the raw config JSON bytes from the repository.
+    ///
+    /// This retrieves the original config JSON as stored, which may differ
+    /// slightly from re-serializing the parsed config (e.g., whitespace).
+    pub fn read_config_json(&self, repo: &Repository<ObjectID>) -> Result<Vec<u8>> {
+        let config_id = crate::config_identifier(&self.config_digest);
+        let (data, _) = read_external_splitstream(
+            repo,
+            &config_id,
+            Some(&self.config_verity),
+            Some(OCI_CONFIG_CONTENT_TYPE),
+        )?;
+        Ok(data)
+    }
+
+    /// Returns the full inspect output as a JSON value.
+    ///
+    /// This includes the manifest, config, and referrers in a single JSON object.
+    /// The manifest and config are included as their original JSON structure.
+    pub fn inspect_json(&self, repo: &Repository<ObjectID>) -> Result<serde_json::Value> {
+        let manifest_json = self.read_manifest_json(repo)?;
+        let config_json = self.read_config_json(repo)?;
+        let referrers = list_referrers(repo, &self.manifest_digest)?;
+
+        let manifest_value: serde_json::Value = serde_json::from_slice(&manifest_json)?;
+        let config_value: serde_json::Value = serde_json::from_slice(&config_json)?;
+
+        let referrers_value: Vec<serde_json::Value> = referrers
+            .iter()
+            .map(|(digest, _verity)| serde_json::json!({ "digest": digest }))
+            .collect();
+
+        Ok(serde_json::json!({
+            "manifest": manifest_value,
+            "config": config_value,
+            "referrers": referrers_value,
+        }))
+    }
 }
 
 // =============================================================================
@@ -425,7 +484,8 @@ pub fn list_refs<ObjectID: FsVerityHashValue>(
 /// FIXME change this to just have a struct of manifest+config JSON
 /// plus a few helper methods. We shouldn't be re-parsing created timestamp here
 /// callers should directly access that etc
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImageInfo {
     /// The tag/name of the image
     pub name: String,
@@ -443,6 +503,8 @@ pub struct ImageInfo {
     pub sealed: bool,
     /// Number of layers/blobs
     pub layer_count: usize,
+    /// Number of OCI referrers (signatures, attestations, etc.)
+    pub referrer_count: usize,
 }
 
 /// Lists all tagged images with their metadata.
@@ -454,6 +516,7 @@ pub fn list_images<ObjectID: FsVerityHashValue>(
     for (name, digest) in list_refs(repo)? {
         match OciImage::open(repo, &digest, None) {
             Ok(img) => {
+                let referrer_count = list_referrers(repo, &digest).map(|r| r.len()).unwrap_or(0);
                 images.push(ImageInfo {
                     name,
                     manifest_digest: digest,
@@ -463,6 +526,7 @@ pub fn list_images<ObjectID: FsVerityHashValue>(
                     created: img.created().map(String::from),
                     sealed: img.is_sealed(),
                     layer_count: img.layer_descriptors().len(),
+                    referrer_count,
                 });
             }
             Err(e) => {
@@ -855,6 +919,142 @@ pub fn cleanup_dangling_referrers<ObjectID: FsVerityHashValue>(
     }
 
     Ok(removed)
+}
+
+// =============================================================================
+// Layer Inspection
+// =============================================================================
+
+/// Metadata about a layer stored in the repository.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerInfo {
+    /// The layer diff_id (sha256 hash of uncompressed content)
+    pub diff_id: String,
+    /// The fs-verity hash of the layer splitstream
+    pub verity: String,
+    /// Size of the uncompressed tar layer in bytes
+    pub size: u64,
+    /// Number of files/entries in the layer
+    pub entry_count: usize,
+    /// Splitstream metadata
+    pub splitstream: SplitstreamInfo,
+}
+
+/// Metadata about the splitstream representation of a layer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SplitstreamInfo {
+    /// Number of external object references (large files stored separately)
+    pub external_objects: usize,
+    /// Total size of external objects in bytes
+    pub external_size: u64,
+    /// Size of inline data in bytes (small files + tar headers)
+    pub inline_size: u64,
+}
+
+/// Opens a layer by its diff_id and returns metadata about it.
+///
+/// The diff_id should be in the `sha256:...` format used by OCI.
+pub fn layer_info<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    diff_id: &str,
+) -> Result<LayerInfo> {
+    let content_id = crate::layer_identifier(diff_id);
+    let verity = repo
+        .has_stream(&content_id)?
+        .with_context(|| format!("Layer {diff_id} not found"))?;
+
+    let mut stream = repo.open_stream(
+        &content_id,
+        Some(&verity),
+        Some(crate::skopeo::TAR_LAYER_CONTENT_TYPE),
+    )?;
+
+    // Get the total size from the splitstream header (this is the merged/tar size)
+    let size = stream.total_size;
+
+    // Count external object references (this doesn't consume the stream)
+    let mut external_objects = 0usize;
+    stream.get_object_refs(|_| external_objects += 1)?;
+
+    // Iterate entries and gather sizes
+    let mut entry_count = 0usize;
+    let mut external_size = 0u64;
+
+    while let Some(entry) = crate::tar::get_entry(&mut stream)? {
+        entry_count += 1;
+        if let crate::tar::TarItem::Leaf(composefs::tree::LeafContent::Regular(
+            composefs::tree::RegularFile::External(_, file_size),
+        )) = entry.item
+        {
+            external_size += file_size;
+        }
+    }
+
+    // inline_size includes tar headers, small files, and other metadata
+    let inline_size = size.saturating_sub(external_size);
+
+    Ok(LayerInfo {
+        diff_id: diff_id.to_string(),
+        verity: verity.to_hex(),
+        size,
+        entry_count,
+        splitstream: SplitstreamInfo {
+            external_objects,
+            external_size,
+            inline_size,
+        },
+    })
+}
+
+/// Writes the layer contents in composefs dumpfile format.
+///
+/// Each entry is written on its own line in the composefs dumpfile format,
+/// which includes path, size, mode, ownership, timestamps, and content references.
+pub fn layer_dumpfile<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    diff_id: &str,
+    output: &mut impl std::io::Write,
+) -> Result<()> {
+    let content_id = crate::layer_identifier(diff_id);
+    let verity = repo
+        .has_stream(&content_id)?
+        .with_context(|| format!("Layer {diff_id} not found"))?;
+
+    let mut stream = repo.open_stream(
+        &content_id,
+        Some(&verity),
+        Some(crate::skopeo::TAR_LAYER_CONTENT_TYPE),
+    )?;
+
+    while let Some(entry) = crate::tar::get_entry(&mut stream)? {
+        writeln!(output, "{entry}")?;
+    }
+
+    Ok(())
+}
+
+/// Reconstitutes and writes the original tar layer.
+///
+/// This merges the splitstream back into the original tar format by
+/// combining inline data with external object references.
+pub fn layer_tar<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    diff_id: &str,
+    output: &mut impl std::io::Write,
+) -> Result<()> {
+    let content_id = crate::layer_identifier(diff_id);
+    let verity = repo
+        .has_stream(&content_id)?
+        .with_context(|| format!("Layer {diff_id} not found"))?;
+
+    repo.merge_splitstream(
+        &content_id,
+        Some(&verity),
+        Some(crate::skopeo::TAR_LAYER_CONTENT_TYPE),
+        output,
+    )
 }
 
 #[cfg(test)]

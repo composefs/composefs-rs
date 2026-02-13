@@ -144,7 +144,7 @@ mod test {
         fsverity::Sha256HashValue,
         tree::{LeafContent, RegularFile, Stat},
     };
-    use std::{cell::RefCell, collections::BTreeMap, io::BufRead, io::Read, path::PathBuf};
+    use std::{cell::RefCell, collections::BTreeMap, io::BufRead, path::PathBuf};
 
     use super::*;
 

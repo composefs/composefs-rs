@@ -6,6 +6,7 @@
 
 use std::{
     fs::create_dir_all,
+    io::IsTerminal,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -103,12 +104,25 @@ enum OciCommand {
     },
     /// List all tagged OCI images in the repository
     #[clap(name = "images")]
-    ListImages,
+    ListImages {
+        /// Output as JSON array
+        #[clap(long)]
+        json: bool,
+    },
     /// Show information about an OCI image
+    ///
+    /// By default, outputs JSON with manifest, config, and referrers.
+    /// Use --manifest or --config to output just that raw JSON.
     #[clap(name = "inspect")]
     Inspect {
         /// Image reference (tag name or manifest digest)
         image: String,
+        /// Output only the raw manifest JSON (as originally stored)
+        #[clap(long, conflicts_with = "config")]
+        manifest: bool,
+        /// Output only the raw config JSON (as originally stored)
+        #[clap(long, conflicts_with = "manifest")]
+        config: bool,
     },
     /// Tag an image with a new name
     Tag {
@@ -121,6 +135,21 @@ enum OciCommand {
     Untag {
         /// Tag name to remove
         name: String,
+    },
+    /// Inspect a stored layer
+    ///
+    /// By default, outputs the raw tar stream to stdout.
+    /// Use --dumpfile for composefs dumpfile format, or --json for metadata.
+    #[clap(name = "layer")]
+    LayerInspect {
+        /// Layer diff_id (sha256:...)
+        layer: String,
+        /// Output as composefs dumpfile format (one entry per line)
+        #[clap(long, conflicts_with = "json")]
+        dumpfile: bool,
+        /// Output layer metadata as JSON
+        #[clap(long, conflicts_with = "dumpfile")]
+        json: bool,
     },
     /// Compute the composefs image object id of the rootfs of a stored OCI image
     ComputeId {
@@ -390,15 +419,17 @@ where
                 println!("verity   {}", result.manifest_verity.to_hex());
                 println!("tagged   {tag_name}");
             }
-            OciCommand::ListImages => {
+            OciCommand::ListImages { json } => {
                 let images = composefs_oci::oci_image::list_images(&repo)?;
 
-                if images.is_empty() {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&images)?);
+                } else if images.is_empty() {
                     println!("No images found");
                 } else {
                     println!(
-                        "{:<30} {:<12} {:<10} {:<8} {:<6}",
-                        "NAME", "DIGEST", "ARCH", "SEALED", "LAYERS"
+                        "{:<30} {:<12} {:<10} {:<8} {:<6} {:<5}",
+                        "NAME", "DIGEST", "ARCH", "SEALED", "LAYERS", "REFS"
                     );
                     for img in images {
                         let digest_short = img
@@ -411,7 +442,7 @@ where
                             digest_short
                         };
                         println!(
-                            "{:<30} {:<12} {:<10} {:<8} {:<6}",
+                            "{:<30} {:<12} {:<10} {:<8} {:<6} {:<5}",
                             img.name,
                             digest_display,
                             if img.architecture.is_empty() {
@@ -420,58 +451,37 @@ where
                                 &img.architecture
                             },
                             if img.sealed { "yes" } else { "no" },
-                            img.layer_count
+                            img.layer_count,
+                            img.referrer_count
                         );
                     }
                 }
             }
-            OciCommand::Inspect { ref image } => {
+            OciCommand::Inspect {
+                ref image,
+                manifest,
+                config,
+            } => {
                 let img = if image.starts_with("sha256:") {
                     composefs_oci::oci_image::OciImage::open(&repo, image, None)?
                 } else {
                     composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
                 };
 
-                println!("Manifest:     {}", img.manifest_digest());
-                println!("Config:       {}", img.config_digest());
-                println!(
-                    "Type:         {}",
-                    if img.is_container_image() {
-                        "container"
-                    } else {
-                        "artifact"
-                    }
-                );
-
-                if img.is_container_image() {
-                    println!("Architecture: {}", img.architecture());
-                    println!("OS:           {}", img.os());
-                }
-
-                if let Some(created) = img.created() {
-                    println!("Created:      {created}");
-                }
-
-                println!(
-                    "Sealed:       {}",
-                    if img.is_sealed() { "yes" } else { "no" }
-                );
-                if let Some(seal) = img.seal_digest() {
-                    println!("Seal digest:  {seal}");
-                }
-
-                println!("Layers:       {}", img.layer_descriptors().len());
-                for (i, layer) in img.layer_descriptors().iter().enumerate() {
-                    println!("  [{i}] {} ({} bytes)", layer.digest(), layer.size());
-                }
-
-                if let Some(labels) = img.labels() {
-                    if !labels.is_empty() {
-                        println!("Labels:");
-                        for (k, v) in labels {
-                            println!("  {k}: {v}");
-                        }
-                    }
+                if manifest {
+                    // Output raw manifest JSON exactly as stored
+                    let manifest_json = img.read_manifest_json(&repo)?;
+                    std::io::Write::write_all(&mut std::io::stdout(), &manifest_json)?;
+                    println!();
+                } else if config {
+                    // Output raw config JSON exactly as stored
+                    let config_json = img.read_config_json(&repo)?;
+                    std::io::Write::write_all(&mut std::io::stdout(), &config_json)?;
+                    println!();
+                } else {
+                    // Default: output combined JSON with manifest, config, and referrers
+                    let output = img.inspect_json(&repo)?;
+                    println!("{}", serde_json::to_string_pretty(&output)?);
                 }
             }
             OciCommand::Tag {
@@ -484,6 +494,28 @@ where
             OciCommand::Untag { ref name } => {
                 composefs_oci::oci_image::untag_image(&repo, name)?;
                 println!("Removed tag {name}");
+            }
+            OciCommand::LayerInspect {
+                ref layer,
+                dumpfile,
+                json,
+            } => {
+                if json {
+                    let info = composefs_oci::layer_info(&repo, layer)?;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                } else if dumpfile {
+                    composefs_oci::layer_dumpfile(&repo, layer, &mut std::io::stdout())?;
+                } else {
+                    // Default: output raw tar, but not to a tty
+                    let mut out = std::io::stdout().lock();
+                    if out.is_terminal() {
+                        anyhow::bail!(
+                            "Refusing to write tar data to terminal. \
+                            Redirect to a file, pipe to tar, or use --json for metadata."
+                        );
+                    }
+                    composefs_oci::layer_tar(&repo, layer, &mut out)?;
+                }
             }
             OciCommand::Seal {
                 config_opts:
