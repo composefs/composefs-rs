@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use comfy_table::{presets::UTF8_FULL, Table};
 
 use rustix::fs::CWD;
 
@@ -427,10 +428,10 @@ where
                 } else if images.is_empty() {
                     println!("No images found");
                 } else {
-                    println!(
-                        "{:<30} {:<12} {:<10} {:<8} {:<6} {:<5}",
-                        "NAME", "DIGEST", "ARCH", "SEALED", "LAYERS", "REFS"
-                    );
+                    let mut table = Table::new();
+                    table.load_preset(UTF8_FULL);
+                    table.set_header(["NAME", "DIGEST", "ARCH", "SEALED", "LAYERS", "REFS"]);
+
                     for img in images {
                         let digest_short = img
                             .manifest_digest
@@ -441,20 +442,22 @@ where
                         } else {
                             digest_short
                         };
-                        println!(
-                            "{:<30} {:<12} {:<10} {:<8} {:<6} {:<5}",
-                            img.name,
+                        let arch = if img.architecture.is_empty() {
+                            "artifact"
+                        } else {
+                            &img.architecture
+                        };
+                        let sealed = if img.sealed { "yes" } else { "no" };
+                        table.add_row([
+                            img.name.as_str(),
                             digest_display,
-                            if img.architecture.is_empty() {
-                                "artifact"
-                            } else {
-                                &img.architecture
-                            },
-                            if img.sealed { "yes" } else { "no" },
-                            img.layer_count,
-                            img.referrer_count
-                        );
+                            arch,
+                            sealed,
+                            &img.layer_count.to_string(),
+                            &img.referrer_count.to_string(),
+                        ]);
                     }
+                    println!("{table}");
                 }
             }
             OciCommand::Inspect {

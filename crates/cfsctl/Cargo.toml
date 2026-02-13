@@ -21,6 +21,7 @@ rhel9 = ['composefs/rhel9']
 anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
 clap = { version = "4.5.0", default-features = false, features = ["std", "help", "usage", "derive", "wrap_help"] }
+comfy-table = { version = "7.1", default-features = false }
 composefs = { workspace = true }
 composefs-boot = { workspace = true }
 composefs-oci = { workspace = true, optional = true }
