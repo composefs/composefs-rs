@@ -2063,6 +2063,38 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(id)
     }
 
+    /// Store an object from a file descriptor, using reflink (FICLONE) when possible.
+    ///
+    /// Tries FICLONE first for an instant copy-on-write clone (works when the
+    /// source fd and the repository are on the same filesystem).  Falls back to
+    /// a buffered data copy using the caller-provided `buf`.  Passing a large
+    /// buffer avoids the small default used by `std::io::copy`.
+    #[context("Ensuring object from fd exists in repository")]
+    pub fn ensure_object_from_fd_reflink(
+        &self,
+        fd: OwnedFd,
+        size: u64,
+        buf: &mut [u8],
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        let tmpfile = self.create_object_tmpfile()?;
+        let src = File::from(fd);
+        let mut dst = File::from(tmpfile);
+
+        if rustix::fs::ioctl_ficlone(&dst, &src).is_err() {
+            let mut src = src;
+            loop {
+                let n = src.read(buf).context("reading from source fd")?;
+                if n == 0 {
+                    break;
+                }
+                dst.write_all(&buf[..n])
+                    .context("writing to repository tmpfile")?;
+            }
+        }
+
+        self.finalize_object_tmpfile(dst, size)
+    }
+
     #[context("Opening file '{filename}' with verity verification")]
     fn open_with_verity(&self, filename: &str, expected_verity: &ObjectID) -> Result<OwnedFd> {
         let fd = self
