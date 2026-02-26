@@ -1,0 +1,20 @@
+[package]
+name = "composefs-info"
+description = "Query information from composefs images"
+publish = false
+
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = { version = "1.0", default-features = false, features = ["std"] }
+clap = { version = "4.0", default-features = false, features = ["std", "help", "usage", "derive"] }
+composefs = { workspace = true }
+zerocopy = { version = "0.8.0", default-features = false }
+
+[lints]
+workspace = true

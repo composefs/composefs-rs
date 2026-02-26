@@ -224,8 +224,54 @@ fn unescape_to_path(s: &str) -> Result<Cow<'_, Path>> {
 /// which in particular removes `.` and extra `//`.
 ///
 /// We also deny uplinks `..` and empty paths.
+///
+/// Unlike Rust's path normalization which silently removes `.` and `//`,
+/// we reject these as invalid because:
+/// - The C mkcomposefs implementation rejects them
+/// - They indicate malformed input that should not be silently accepted
 fn unescape_to_path_canonical(s: &str) -> Result<Cow<'_, Path>> {
     let p = unescape_to_path(s)?;
+
+    // We need to validate the raw path bytes before using Rust's Path::components(),
+    // because components() normalizes away things we want to reject.
+    // Check for invalid path patterns in the raw bytes.
+    let path_bytes = p.as_os_str().as_bytes();
+
+    // Check for empty path components (// or trailing /) and dot components
+    // We iterate through path segments manually to detect these issues.
+    let mut i = 0;
+    while i < path_bytes.len() {
+        // Skip leading slash
+        if path_bytes[i] == b'/' {
+            i += 1;
+            // Check for empty component (consecutive slashes)
+            if i < path_bytes.len() && path_bytes[i] == b'/' {
+                anyhow::bail!("Empty path component");
+            }
+            // Check if we're at end (trailing slash on non-root path)
+            if i == path_bytes.len() && path_bytes.len() > 1 {
+                anyhow::bail!("Empty path component");
+            }
+            continue;
+        }
+
+        // Find end of this component
+        let start = i;
+        while i < path_bytes.len() && path_bytes[i] != b'/' {
+            i += 1;
+        }
+        let component = &path_bytes[start..i];
+
+        // Reject "." as a path component
+        if component == b"." {
+            anyhow::bail!("Invalid path component: .");
+        }
+        // Reject ".." as a path component (also caught below, but check here for clarity)
+        if component == b".." {
+            anyhow::bail!("Invalid \"..\" in path");
+        }
+    }
+
     let mut components = p.components();
     let mut r = std::path::PathBuf::new();
     let Some(first) = components.next() else {
@@ -237,8 +283,8 @@ fn unescape_to_path_canonical(s: &str) -> Result<Cow<'_, Path>> {
     r.push(first);
     for component in components {
         match component {
-            // Prefix is a windows thing; I don't think RootDir or CurDir are reachable
-            // after the first component has been RootDir.
+            // Prefix is a windows thing; CurDir should have been rejected above.
+            // RootDir can't appear after the first component.
             std::path::Component::Prefix(_)
             | std::path::Component::RootDir
             | std::path::Component::CurDir => {
@@ -749,6 +795,18 @@ mod tests {
         assert!(unescape_to_path_canonical("../blah").is_err());
         assert!(unescape_to_path_canonical("/foo/..").is_err());
         assert!(unescape_to_path_canonical("/foo/../blah").is_err());
+
+        // Invalid: dot components must be rejected (not normalized)
+        assert!(unescape_to_path_canonical("/.").is_err());
+        assert!(unescape_to_path_canonical("/foo/.").is_err());
+        assert!(unescape_to_path_canonical("/./foo").is_err());
+
+        // Invalid: empty components must be rejected (not normalized)
+        assert!(unescape_to_path_canonical("//").is_err());
+        assert!(unescape_to_path_canonical("/foo//bar").is_err());
+        assert!(unescape_to_path_canonical("///foo").is_err());
+        assert!(unescape_to_path_canonical("/foo/").is_err());
+
         // Verify that we return borrowed input where possible
         assert!(matches!(
             unescape_to_path_canonical("/foo").unwrap(),
@@ -759,16 +817,16 @@ mod tests {
             unescape_to_path_canonical(r#"/\x66oo"#).unwrap(),
             Cow::Owned(v) if v.to_str() == Some("/foo")
         ));
-        // Test successful normalization
+        // Valid paths
         assert_eq!(
-            unescape_to_path_canonical("///foo/bar//baz")
+            unescape_to_path_canonical("/foo/bar/baz")
                 .unwrap()
                 .to_str()
                 .unwrap(),
             "/foo/bar/baz"
         );
         assert_eq!(
-            unescape_to_path_canonical("/.").unwrap().to_str().unwrap(),
+            unescape_to_path_canonical("/").unwrap().to_str().unwrap(),
             "/"
         );
     }

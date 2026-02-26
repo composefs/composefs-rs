@@ -34,6 +34,7 @@ rand = { version = "0.9.1", default-features = true }
 
 [dev-dependencies]
 insta = "1.42.2"
+proptest = "1.6.0"
 similar-asserts = "1.7.0"
 tempfile = { version = "3.8.0", default-features = false }
 test-with = { version = "0.14", default-features = false, features = ["executable", "runtime"] }

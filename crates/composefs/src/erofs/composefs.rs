@@ -8,14 +8,19 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use crate::fsverity::FsVerityHashValue;
 
 /* From linux/fs/overlayfs/overlayfs.h struct ovl_metacopy */
+/// Overlay metacopy xattr structure containing fs-verity digest.
+///
+/// This structure is stored as the value of the `trusted.overlay.metacopy`
+/// extended attribute on composefs files that reference external backing storage.
 #[derive(Debug, FromBytes, Immutable, KnownLayout, IntoBytes)]
 #[repr(C)]
-pub(super) struct OverlayMetacopy<H: FsVerityHashValue> {
+pub struct OverlayMetacopy<H: FsVerityHashValue> {
     version: u8,
     len: u8,
     flags: u8,
     digest_algo: u8,
-    pub(super) digest: H,
+    /// The fs-verity digest of the backing file.
+    pub digest: H,
 }
 
 impl<H: FsVerityHashValue> OverlayMetacopy<H> {
@@ -29,7 +34,8 @@ impl<H: FsVerityHashValue> OverlayMetacopy<H> {
         }
     }
 
-    pub(super) fn valid(&self) -> bool {
+    /// Returns true if this metacopy structure has valid header fields.
+    pub fn valid(&self) -> bool {
         self.version == 0
             && self.len == size_of::<Self>() as u8
             && self.flags == 0

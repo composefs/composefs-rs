@@ -81,7 +81,7 @@ const INODE_DATALAYOUT_FLAT_INLINE: u16 = 4;
 const INODE_DATALAYOUT_CHUNK_BASED: u16 = 8;
 
 /// Data layout method for file content storage
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum DataLayout {
     /// File data stored in separate blocks
@@ -271,10 +271,40 @@ impl std::ops::BitOr<u32> for FileType {
 
 /// EROFS format version number
 pub const VERSION: U32 = U32::new(1);
-/// Composefs-specific version number
-pub const COMPOSEFS_VERSION: U32 = U32::new(2);
+/// Composefs-specific version number for Format 1.1 (extended inodes, no whiteout table)
+pub const COMPOSEFS_VERSION_V1_1: U32 = U32::new(2);
+/// Composefs-specific version number for Format 1.0 (compact inodes, whiteout table)
+pub const COMPOSEFS_VERSION_V1_0: U32 = U32::new(0);
 /// Magic number identifying composefs images
 pub const COMPOSEFS_MAGIC: U32 = U32::new(0xd078629a);
+
+/// Format version for composefs images
+///
+/// This enum represents the different format versions supported by composefs.
+/// The format version affects the composefs header version field and build time handling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FormatVersion {
+    /// Format 1.0: compact inodes, whiteout table, composefs_version=0
+    ///
+    /// This is the original format used by older versions of composefs.
+    /// Build time is set to the minimum mtime across all inodes.
+    V1_0,
+    /// Format 1.1: extended inodes, no whiteout table, composefs_version=2
+    ///
+    /// This is the current default format.
+    #[default]
+    V1_1,
+}
+
+impl FormatVersion {
+    /// Returns the composefs_version value for this format version
+    pub fn composefs_version(self) -> U32 {
+        match self {
+            FormatVersion::V1_0 => COMPOSEFS_VERSION_V1_0,
+            FormatVersion::V1_1 => COMPOSEFS_VERSION_V1_1,
+        }
+    }
+}
 
 /// Flag indicating the presence of ACL data
 pub const COMPOSEFS_FLAGS_HAS_ACL: U32 = U32::new(1 << 0);

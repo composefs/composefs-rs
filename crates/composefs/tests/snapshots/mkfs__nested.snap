@@ -1,0 +1,274 @@
+---
+source: crates/composefs/tests/mkfs.rs
+assertion_line: 187
+expression: debug_fs(fs)
+---
+00000000 ComposefsHeader
+      +0     magic: U32(3497550490)
+      +4     version: U32(1)
+      +c     composefs_version: U32(2)
+
+00000020 Padding
+    +3e0     # 992 nul bytes
+
+00000400 Superblock
+      +0     magic: U32(3774210530)
+      +8     feature_compat: U32(6)
+      +c     blkszbits: 12
+      +e     root_nid: U16(36)
+     +10     inos: U64(11)
+     +24     blocks: U32(1)
+
+# Filename "/"
+# nid #36
+00000480 ExtendedInodeHeader
+      +0     format: 5 = Extended | Ok(FlatInline)
+      +4     mode: 0040755 (directory)
+      +8     size: U64(74)
+     +14     ino: U32(36)
+     +2c     nlink: U32(4)
+     +40 --- inline directory entries ---
+      +0     inode_offset: U64(36)
+      +8     name_offset: U16(60)
+      +a     file_type: Directory
+     +3c     # name: "."
+
+      +c     inode_offset: U64(36)
+     +14     name_offset: U16(61)
+     +16     file_type: Directory
+     +3d     # name: ".."
+
+     +18     inode_offset: U64(41)
+     +20     name_offset: U16(63)
+     +22     file_type: Directory
+     +3f     # name: "a"
+
+     +24     inode_offset: U64(45)
+     +2c     name_offset: U16(64)
+     +2e     file_type: RegularFile
+     +40     # name: "root-file"
+
+     +30     inode_offset: U64(48)
+     +38     name_offset: U16(73)
+     +3a     file_type: Directory
+     +49     # name: "x"
+
+0000050a Padding
+     +16     # 22 nul bytes
+
+# Filename "/a"
+# nid #41
+00000520 ExtendedInodeHeader
+      +0     format: 5 = Extended | Ok(FlatInline)
+      +4     mode: 0040755 (directory)
+      +8     size: U64(64)
+     +14     ino: U32(41)
+     +2c     nlink: U32(3)
+     +40 --- inline directory entries ---
+      +0     inode_offset: U64(41)
+      +8     name_offset: U16(48)
+      +a     file_type: Directory
+     +30     # name: "."
+
+      +c     inode_offset: U64(36)
+     +14     name_offset: U16(49)
+     +16     file_type: Directory
+     +31     # name: ".."
+
+     +18     inode_offset: U64(52)
+     +20     name_offset: U16(51)
+     +22     file_type: Directory
+     +33     # name: "b"
+
+     +24     inode_offset: U64(56)
+     +2c     name_offset: U16(52)
+     +2e     file_type: RegularFile
+     +34     # name: "shallow-file"
+
+# Filename "/root-file"
+# nid #45
+000005a0 ExtendedInodeHeader
+      +0     format: 5 = Extended | Ok(FlatInline)
+      +4     mode: 0100000 (regular file)
+      +8     size: U64(4)
+     +14     ino: U32(45)
+     +2c     nlink: U32(1)
+     +40     inline: "root"
+
+000005e4 Padding
+     +1c     # 28 nul bytes
+
+# Filename "/x"
+# nid #48
+00000600 ExtendedInodeHeader
+      +0     format: 5 = Extended | Ok(FlatInline)
+      +4     mode: 0040755 (directory)
+      +8     size: U64(40)
+     +14     ino: U32(48)
+     +2c     nlink: U32(3)
+     +40 --- inline directory entries ---
+      +0     inode_offset: U64(48)
+      +8     name_offset: U16(36)
+      +a     file_type: Directory
+     +24     # name: "."
+
+      +c     inode_offset: U64(36)
+     +14     name_offset: U16(37)
+     +16     file_type: Directory
+     +25     # name: ".."
+
+     +18     inode_offset: U64(63)
+     +20     name_offset: U16(39)
+     +22     file_type: Directory
+     +27     # name: "y"
+
+00000668 Padding
+     +18     # 24 nul bytes
+
+# Filename "/a/b"
+# nid #52
+00000680 ExtendedInodeHeader
+      +0     format: 5 = Extended | Ok(FlatInline)
+      +4     mode: 0040755 (directory)
+      +8     size: U64(60)
+     +14     ino: U32(52)
+     +2c     nlink: U32(3)
+     +40 --- inline directory entries ---
+      +0     inode_offset: U64(52)
+      +8     name_offset: U16(48)
+      +a     file_type: Directory
+     +30     # name: "."
+
+      +c     inode_offset: U64(41)
+     +14     name_offset: U16(49)
+     +16     file_type: Directory
+     +31     # name: ".."
+
+     +18     inode_offset: U64(67)
+     +20     name_offset: U16(51)
+     +22     file_type: Directory
+     +33     # name: "c"
+
+     +24     inode_offset: U64(71)
+     +2c     name_offset: U16(52)
+     +2e     file_type: RegularFile
+     +34     # name: "mid-file"
+
+000006fc Padding
+      +4     # 4 nul bytes
+
+# Filename "/a/shallow-file"
+# nid #56
+00000700 ExtendedInodeHeader
+      +0     format: 9 = Extended | Ok(ChunkBased)
+      +2     xattr_icount: U16(37)
+      +4     mode: 0100000 (regular file)
+      +8     size: U64(4096)
+     +14     ino: U32(56)
+     +2c     nlink: U32(1)
+     +40     name_filter: U32(2147352575)
+     +4c     xattr: (4 16 36) trusted."overlay.metacopy" = 00240001abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd
+     +84     xattr: (4 16 66) trusted."overlay.redirect" = "/ab/cdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+     +d0                                       ff ff ff ff  |            ....|
+
+# Filename "/x/y"
+# nid #63
+000007e0 ExtendedInodeHeader
+      +0     format: 5 = Extended | Ok(FlatInline)
+      +4     mode: 0040755 (directory)
+      +8     size: U64(45)
+     +14     ino: U32(63)
+     +2c     nlink: U32(2)
+     +40 --- inline directory entries ---
+      +0     inode_offset: U64(63)
+      +8     name_offset: U16(36)
+      +a     file_type: Directory
+     +24     # name: "."
+
+      +c     inode_offset: U64(48)
+     +14     name_offset: U16(37)
+     +16     file_type: Directory
+     +25     # name: ".."
+
+     +18     inode_offset: U64(74)
+     +20     name_offset: U16(39)
+     +22     file_type: RegularFile
+     +27     # name: "z-file"
+
+0000084d Padding
+     +13     # 19 nul bytes
+
+# Filename "/a/b/c"
+# nid #67
+00000860 ExtendedInodeHeader
+      +0     format: 5 = Extended | Ok(FlatInline)
+      +4     mode: 0040755 (directory)
+      +8     size: U64(48)
+     +14     ino: U32(67)
+     +2c     nlink: U32(2)
+     +40 --- inline directory entries ---
+      +0     inode_offset: U64(67)
+      +8     name_offset: U16(36)
+      +a     file_type: Directory
+     +24     # name: "."
+
+      +c     inode_offset: U64(52)
+     +14     name_offset: U16(37)
+     +16     file_type: Directory
+     +25     # name: ".."
+
+     +18     inode_offset: U64(77)
+     +20     name_offset: U16(39)
+     +22     file_type: RegularFile
+     +27     # name: "deep-file"
+
+000008d0 Padding
+     +10     # 16 nul bytes
+
+# Filename "/a/b/mid-file"
+# nid #71
+000008e0 ExtendedInodeHeader
+      +0     format: 5 = Extended | Ok(FlatInline)
+      +4     mode: 0100000 (regular file)
+      +8     size: U64(11)
+     +14     ino: U32(71)
+     +2c     nlink: U32(1)
+     +40     inline: "mid content"
+
+0000092b Padding
+     +15     # 21 nul bytes
+
+# Filename "/x/y/z-file"
+# nid #74
+00000940 ExtendedInodeHeader
+      +0     format: 5 = Extended | Ok(FlatInline)
+      +4     mode: 0100000 (regular file)
+      +8     size: U64(3)
+     +14     ino: U32(74)
+     +2c     nlink: U32(1)
+     +40     inline: "xyz"
+
+00000983 Padding
+     +1d     # 29 nul bytes
+
+# Filename "/a/b/c/deep-file"
+# nid #77
+000009a0 ExtendedInodeHeader
+      +0     format: 5 = Extended | Ok(FlatInline)
+      +4     mode: 0100000 (regular file)
+      +8     size: U64(12)
+     +14     ino: U32(77)
+     +2c     nlink: U32(1)
+     +40     inline: "deep content"
+
+000009ec Padding
+    +614     # 1556 nul bytes
+
+
+Space statistics (total size 4096B):
+  extended inode = 1225B, 29.91%
+  header = 32B, 0.78%
+  superblock = 128B, 3.12%
+  padding extended inode -> eof = 1556B, 37.99%
+  padding extended inode -> extended inode = 163B, 3.98%
+  padding header -> superblock = 992B, 24.22%

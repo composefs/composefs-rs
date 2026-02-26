@@ -1,0 +1,20 @@
+[package]
+name = "mkcomposefs"
+description = "Create composefs images from directories or dumpfiles"
+publish = false
+
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = { version = "1.0", default-features = false, features = ["std"] }
+clap = { version = "4.0", default-features = false, features = ["std", "help", "usage", "derive"] }
+composefs = { workspace = true }
+rustix = { version = "1.0.0", default-features = false, features = ["fs"] }
+
+[lints]
+workspace = true

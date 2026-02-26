@@ -37,6 +37,20 @@ pub trait InodeHeader {
     fn size(&self) -> u64;
     /// Returns the union field value (block address, device number, etc.)
     fn u(&self) -> u32;
+    /// Returns the user ID
+    fn uid(&self) -> u32;
+    /// Returns the group ID
+    fn gid(&self) -> u32;
+    /// Returns the number of hard links
+    fn nlink(&self) -> u32;
+    /// Returns the modification time in seconds since epoch
+    fn mtime(&self) -> i64;
+    /// Returns the modification time nanoseconds component
+    fn mtime_nsec(&self) -> u32;
+    /// Returns the device number (for block/character devices, from the `u` field)
+    fn rdev(&self) -> u32 {
+        self.u()
+    }
 
     /// Calculates the number of additional bytes after the header
     fn additional_bytes(&self, blkszbits: u8) -> usize {
@@ -78,6 +92,26 @@ impl InodeHeader for ExtendedInodeHeader {
     fn u(&self) -> u32 {
         self.u.get()
     }
+
+    fn uid(&self) -> u32 {
+        self.uid.get()
+    }
+
+    fn gid(&self) -> u32 {
+        self.gid.get()
+    }
+
+    fn nlink(&self) -> u32 {
+        self.nlink.get()
+    }
+
+    fn mtime(&self) -> i64 {
+        self.mtime.get() as i64
+    }
+
+    fn mtime_nsec(&self) -> u32 {
+        self.mtime_nsec.get()
+    }
 }
 
 impl InodeHeader for CompactInodeHeader {
@@ -99,6 +133,28 @@ impl InodeHeader for CompactInodeHeader {
 
     fn u(&self) -> u32 {
         self.u.get()
+    }
+
+    fn uid(&self) -> u32 {
+        self.uid.get() as u32
+    }
+
+    fn gid(&self) -> u32 {
+        self.gid.get() as u32
+    }
+
+    fn nlink(&self) -> u32 {
+        self.nlink.get() as u32
+    }
+
+    fn mtime(&self) -> i64 {
+        // Compact inodes don't have mtime; return 0
+        0
+    }
+
+    fn mtime_nsec(&self) -> u32 {
+        // Compact inodes don't have mtime_nsec; return 0
+        0
     }
 }
 
@@ -192,6 +248,26 @@ impl<Header: InodeHeader> InodeHeader for &Inode<Header> {
     fn u(&self) -> u32 {
         self.header.u()
     }
+
+    fn uid(&self) -> u32 {
+        self.header.uid()
+    }
+
+    fn gid(&self) -> u32 {
+        self.header.gid()
+    }
+
+    fn nlink(&self) -> u32 {
+        self.header.nlink()
+    }
+
+    fn mtime(&self) -> i64 {
+        self.header.mtime()
+    }
+
+    fn mtime_nsec(&self) -> u32 {
+        self.header.mtime_nsec()
+    }
 }
 
 impl<Header: InodeHeader> InodeOps for &Inode<Header> {
@@ -275,6 +351,41 @@ impl InodeHeader for InodeType<'_> {
         match self {
             Self::Compact(inode) => inode.mode(),
             Self::Extended(inode) => inode.mode(),
+        }
+    }
+
+    fn uid(&self) -> u32 {
+        match self {
+            Self::Compact(inode) => inode.uid(),
+            Self::Extended(inode) => inode.uid(),
+        }
+    }
+
+    fn gid(&self) -> u32 {
+        match self {
+            Self::Compact(inode) => inode.gid(),
+            Self::Extended(inode) => inode.gid(),
+        }
+    }
+
+    fn nlink(&self) -> u32 {
+        match self {
+            Self::Compact(inode) => inode.nlink(),
+            Self::Extended(inode) => inode.nlink(),
+        }
+    }
+
+    fn mtime(&self) -> i64 {
+        match self {
+            Self::Compact(inode) => inode.mtime(),
+            Self::Extended(inode) => inode.mtime(),
+        }
+    }
+
+    fn mtime_nsec(&self) -> u32 {
+        match self {
+            Self::Compact(inode) => inode.mtime_nsec(),
+            Self::Extended(inode) => inode.mtime_nsec(),
         }
     }
 }
@@ -562,14 +673,29 @@ pub enum ErofsReaderError {
 type ReadResult<T> = Result<T, ErofsReaderError>;
 
 /// Collects object references from an EROFS image for garbage collection
-#[derive(Debug)]
-pub struct ObjectCollector<ObjectID: FsVerityHashValue> {
+pub struct ObjectCollector<'f, ObjectID: FsVerityHashValue> {
     visited_nids: HashSet<u64>,
     nids_to_visit: BTreeSet<u64>,
     objects: HashSet<ObjectID>,
+    /// Optional filters for top-level entries
+    filters: &'f [String],
+    /// Whether we're currently at the root directory
+    at_root: bool,
 }
 
-impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
+impl<ObjectID: FsVerityHashValue> std::fmt::Debug for ObjectCollector<'_, ObjectID> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectCollector")
+            .field("visited_nids", &self.visited_nids)
+            .field("nids_to_visit", &self.nids_to_visit)
+            .field("objects_count", &self.objects.len())
+            .field("filters", &self.filters)
+            .field("at_root", &self.at_root)
+            .finish()
+    }
+}
+
+impl<ObjectID: FsVerityHashValue> ObjectCollector<'_, ObjectID> {
     fn visit_xattr(&mut self, attr: &XAttr) {
         // This is the index of "trusted".  See XATTR_PREFIXES in format.rs.
         if attr.header.name_index != 4 {
@@ -595,9 +721,17 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
         Ok(())
     }
 
-    fn visit_directory_block(&mut self, block: &DirectoryBlock) {
+    fn visit_directory_block(&mut self, block: &DirectoryBlock, apply_filter: bool) {
         for entry in block.entries() {
             if entry.name != b"." && entry.name != b".." {
+                // Apply filter at root level if filters are specified
+                if apply_filter && !self.filters.is_empty() {
+                    let name_str = String::from_utf8_lossy(entry.name);
+                    if !self.filters.iter().any(|f| f == name_str.as_ref()) {
+                        continue;
+                    }
+                }
+
                 let nid = entry.nid();
                 if !self.visited_nids.contains(&nid) {
                     self.nids_to_visit.insert(nid);
@@ -617,13 +751,18 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
         }
 
         if inode.mode().is_dir() {
+            // Apply filters only when visiting the root directory
+            let apply_filter = self.at_root;
+            self.at_root = false;
+
             for blkid in inode.blocks(img.sb.blkszbits) {
-                self.visit_directory_block(img.directory_block(blkid));
+                self.visit_directory_block(img.directory_block(blkid), apply_filter);
             }
 
             if let Some(inline) = inode.inline() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
-                self.visit_directory_block(inline_block);
+                if let Ok(inline_block) = DirectoryBlock::ref_from_bytes(inline) {
+                    self.visit_directory_block(inline_block, apply_filter);
+                }
             }
         }
 
@@ -636,13 +775,21 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
 /// This function walks the directory tree and extracts fsverity object IDs
 /// from overlay.metacopy xattrs for garbage collection purposes.
 ///
+/// If `filters` is provided and non-empty, only top-level entries whose names
+/// match one of the filter strings will be traversed.
+///
 /// Returns a set of all referenced object IDs.
-pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<HashSet<ObjectID>> {
+pub fn collect_objects<ObjectID: FsVerityHashValue>(
+    image: &[u8],
+    filters: &[String],
+) -> ReadResult<HashSet<ObjectID>> {
     let img = Image::open(image);
     let mut this = ObjectCollector {
         visited_nids: HashSet::new(),
         nids_to_visit: BTreeSet::new(),
         objects: HashSet::new(),
+        filters,
+        at_root: true,
     };
 
     // nids_to_visit is initialized with the root directory.  Visiting directory nids will add
@@ -658,7 +805,8 @@ pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<
 mod tests {
     use super::*;
     use crate::{
-        dumpfile::dumpfile_to_filesystem, erofs::writer::mkfs_erofs, fsverity::Sha256HashValue,
+        dumpfile::dumpfile_to_filesystem, erofs::writer::mkfs_erofs_default,
+        fsverity::Sha256HashValue,
     };
     use std::collections::HashMap;
 
@@ -706,7 +854,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         // Root should have . and .. and empty_dir
@@ -749,7 +897,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         // Find dir1
@@ -792,7 +940,7 @@ mod tests {
         }
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(&dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         // Find bigdir
@@ -840,7 +988,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         // Navigate through the structure
@@ -893,7 +1041,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         let root_inode = img.root();
@@ -937,10 +1085,10 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
 
         // This should traverse all directories without error
-        let result = collect_objects::<Sha256HashValue>(&image);
+        let result = collect_objects::<Sha256HashValue>(&image, &[]);
         assert!(
             result.is_ok(),
             "Failed to collect objects: {:?}",
@@ -948,6 +1096,7 @@ mod tests {
         );
     }
 
+    #[test_with::executable(mkcomposefs)]
     #[test]
     fn test_pr188_empty_inline_directory() -> anyhow::Result<()> {
         // Regression test for https://github.com/containers/composefs-rs/pull/188
@@ -996,7 +1145,7 @@ mod tests {
         let image = std::fs::read(&erofs_path).expect("Failed to read generated erofs");
 
         // The C mkcomposefs creates directories with empty inline sections.
-        let r = collect_objects::<Sha256HashValue>(&image).unwrap();
+        let r = collect_objects::<Sha256HashValue>(&image, &[]).unwrap();
         assert_eq!(r.len(), 0);
 
         Ok(())
@@ -1013,7 +1162,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs_default(&fs);
         let img = Image::open(&image);
 
         // Verify root entries

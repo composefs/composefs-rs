@@ -9,7 +9,7 @@ use fn_error_context::context;
 
 use crate::{
     dumpfile::write_dumpfile,
-    erofs::writer::mkfs_erofs,
+    erofs::writer::mkfs_erofs_default,
     fsverity::{compute_verity, FsVerityHashValue},
     repository::Repository,
     tree::FileSystem,
@@ -29,7 +29,7 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
         repository: &Repository<ObjectID>,
         image_name: Option<&str>,
     ) -> Result<ObjectID> {
-        repository.write_image(image_name, &mkfs_erofs(self))
+        repository.write_image(image_name, &mkfs_erofs_default(self))
     }
 
     /// Computes the fsverity digest for this filesystem as an EROFS image.
@@ -40,7 +40,7 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     /// Note: Callers should ensure root metadata is set before calling this,
     /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
     pub fn compute_image_id(&self) -> ObjectID {
-        compute_verity(&mkfs_erofs(self))
+        compute_verity(&mkfs_erofs_default(self))
     }
 
     /// Prints this filesystem in dumpfile format to stdout.

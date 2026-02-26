@@ -1,6 +1,6 @@
 ---
 source: crates/composefs/tests/mkfs.rs
-assertion_line: 100
+assertion_line: 114
 expression: debug_fs(fs)
 ---
 00000000 ComposefsHeader
@@ -109,7 +109,6 @@ expression: debug_fs(fs)
       +2     xattr_icount: U16(37)
       +4     mode: 0100000 (regular file)
       +8     size: U64(1234)
-     +10     u: U32(31)
      +14     ino: U32(50)
      +2c     nlink: U32(1)
      +40     name_filter: U32(2147352575)
