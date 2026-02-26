@@ -13,7 +13,6 @@ use std::{cmp::Reverse, process::Command, thread::available_parallelism};
 use std::{iter::zip, sync::Arc};
 
 use anyhow::{Context, Result};
-use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
 use containers_image_proxy::{
     ConvertedLayerInfo, ImageProxy, ImageProxyConfig, OpenedImage, Transport,
 };
@@ -21,18 +20,15 @@ use fn_error_context::context;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, MediaType};
 use rustix::process::geteuid;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
-    sync::Semaphore,
-    task::JoinSet,
-};
+use tokio::{io::AsyncReadExt, sync::Semaphore, task::JoinSet};
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
 use crate::{
-    config_identifier, layer_identifier,
-    oci_image::{is_tar_media_type, manifest_identifier, tag_image},
-    tar::split_async,
+    config_identifier,
+    layer::{decompress_async, import_tar_async, is_tar_media_type, store_blob_async},
+    layer_identifier,
+    oci_image::{manifest_identifier, tag_image},
     ContentAndVerity,
 };
 
@@ -192,40 +188,16 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             let media_type = descriptor.media_type();
             let object_id = if is_tar_media_type(media_type) {
                 // Tar layers: decompress and split into a splitstream
-                let reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send> = match media_type {
-                    MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => {
-                        Box::new(BufReader::new(progress))
-                    }
-                    MediaType::ImageLayerGzip | MediaType::ImageLayerNonDistributableGzip => {
-                        Box::new(BufReader::new(GzipDecoder::new(BufReader::new(progress))))
-                    }
-                    MediaType::ImageLayerZstd | MediaType::ImageLayerNonDistributableZstd => {
-                        Box::new(BufReader::new(ZstdDecoder::new(BufReader::new(progress))))
-                    }
-                    _ => unreachable!("is_tar_media_type returned true"),
-                };
-                split_async(reader, self.repo.clone(), TAR_LAYER_CONTENT_TYPE).await?
+                let reader = decompress_async(progress, media_type)?;
+                import_tar_async(self.repo.clone(), reader).await?
             } else {
-                // Non-tar layers (OCI artifacts like SBOMs, disk images,
-                // etc.): stream the raw bytes into a repository object and
-                // create a splitstream with a single external reference.
-                // This avoids buffering arbitrarily large blobs in memory
-                // and lets callers get an fd to the object directly via
-                // open_object().
-                let tmpfile = self.repo.create_object_tmpfile()?;
-                let mut writer = tokio::fs::File::from(std::fs::File::from(tmpfile));
-                let mut reader = progress;
-                let size = tokio::io::copy(&mut reader, &mut writer).await?;
-                writer.flush().await?;
-                let tmpfile = writer.into_std().await;
+                // Non-tar layers (OCI artifacts): stream raw bytes to object store
+                let (object_id, size) = store_blob_async(&self.repo, progress).await?;
                 driver.await?;
-                let object_id = self.repo.finalize_object_tmpfile(tmpfile, size)?;
-
+                // Create splitstream with external reference and register it
                 let mut stream = self.repo.create_stream(OCI_BLOB_CONTENT_TYPE);
                 stream.add_external_size(size);
                 stream.write_reference(object_id)?;
-                // write_stream handles both object storage and stream
-                // registration, so we return directly.
                 return self.repo.write_stream(stream, &content_id, None);
             };
 
@@ -420,12 +392,21 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 ///
 /// Note: For backward compatibility, use `.into_config()` on the result to get
 /// the (config_digest, config_verity) tuple that was previously returned.
+///
+/// For `oci:` transport (local OCI layout directories), this uses a fast path
+/// that reads the layout directly without going through the skopeo proxy.
 pub async fn pull_image<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<PullResult<ObjectID>> {
+    // Fast path: local OCI layout directories
+    if let Some(result) = crate::oci_layout::try_pull_oci_layout(repo, imgref, reference).await? {
+        return Ok(result);
+    }
+
+    // Standard path: use skopeo proxy for other transports
     let op = Arc::new(ImageOp::new(repo, imgref, img_proxy_config).await?);
     let result = op
         .pull()

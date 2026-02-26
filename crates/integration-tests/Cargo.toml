@@ -14,11 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-cap-std-ext = "4.0"
+cap-std-ext = { workspace = true }
 composefs = { workspace = true }
 libtest-mimic = "0.8"
 linkme = "0.3"
-ocidir = "0.6"
+ocidir = { workspace = true }
 paste = "1"
 rustix = { version = "1.0.0", default-features = false, features = ["process"] }
 serde_json = "1.0"
