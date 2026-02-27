@@ -1,19 +1,21 @@
 //! Library for `cfsctl` command line utility
 
-use std::{
-    ffi::OsString,
-    fs::create_dir_all,
-    io::IsTerminal,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{ffi::OsString, path::PathBuf};
+
+#[cfg(feature = "oci")]
+use std::{fs::create_dir_all, io::IsTerminal, path::Path};
+
+#[cfg(any(feature = "oci", feature = "http"))]
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "oci")]
 use comfy_table::{presets::UTF8_FULL, Table};
 
 use rustix::fs::CWD;
 
+#[cfg(feature = "oci")]
 use composefs_boot::{write_boot, BootOps};
 
 use composefs::{
@@ -294,6 +296,7 @@ where
     }
 }
 
+#[cfg(feature = "oci")]
 fn verity_opt<ObjectID>(opt: &Option<String>) -> Result<Option<ObjectID>>
 where
     ObjectID: FsVerityHashValue,
