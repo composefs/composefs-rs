@@ -22,6 +22,8 @@ composefs-ioctls = { version = "0.3.0", path = "crates/composefs-ioctls", defaul
 composefs-oci = { version = "0.3.0", path = "crates/composefs-oci", default-features = false }
 composefs-boot = { version = "0.3.0", path = "crates/composefs-boot", default-features = false }
 composefs-http = { version = "0.3.0", path = "crates/composefs-http", default-features = false }
+cap-std-ext = "5.0"
+ocidir = { git = "https://github.com/cgwalters/ocidir-rs", branch = "add-platform-manifest-resolution" }
 
 [profile.dev.package.sha2]
 # this is *really* slow otherwise
