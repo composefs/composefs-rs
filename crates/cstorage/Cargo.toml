@@ -17,6 +17,7 @@ cap-std = { version = "4.0", default-features = false }
 cap-std-ext = { version = "4.0", default-features = false }
 crc = { version = "3.0", default-features = false }
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+jsonrpc-fdpass = { workspace = true, optional = true }
 oci-spec = { version = "0.8", default-features = false, features = ["image"] }
 rustix = { version = "1.0", default-features = false, features = ["fs", "std", "process", "thread"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -24,8 +25,14 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 tar-header = { path = "../tar-header" }
 thiserror = { version = "2.0", default-features = false }
+tokio = { version = "1.40", default-features = false, features = ["rt", "net", "sync"], optional = true }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+tracing = { version = "0.1", default-features = false, optional = true }
 zstd = { version = "0.13", default-features = false }
+
+[features]
+default = []
+userns-helper = ["dep:jsonrpc-fdpass", "dep:tokio", "dep:tracing"]
 
 [dev-dependencies]
 tempfile = { version = "3.8", default-features = false }

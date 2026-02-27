@@ -54,6 +54,11 @@ pub mod lockfile;
 pub mod storage;
 pub mod tar_split;
 
+// User namespace support for rootless access
+pub mod userns;
+#[cfg(feature = "userns-helper")]
+pub mod userns_helper;
+
 // Re-export commonly used types
 pub use config::{AdditionalLayerStore, StorageConfig};
 pub use error::{Result, StorageError};
@@ -62,6 +67,12 @@ pub use layer::Layer;
 pub use lockfile::LastWrite;
 pub use storage::{ImageRLockGuard, LayerMetadata, LayerRLockGuard, Storage};
 pub use tar_split::{TarHeader, TarSplitFdStream, TarSplitItem};
+pub use userns::can_bypass_file_permissions;
+#[cfg(feature = "userns-helper")]
+pub use userns_helper::{
+    init_if_helper, GetImageResult, HelperError, ImageInfo, ProxiedLayerStream,
+    ProxiedTarSplitItem, StorageProxy,
+};
 
 // Re-export OCI spec types for convenience
 pub use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest};

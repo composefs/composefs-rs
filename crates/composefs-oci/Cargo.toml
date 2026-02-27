@@ -12,7 +12,7 @@ version.workspace = true
 
 [features]
 default = ["containers-storage"]
-containers-storage = ["dep:cstorage"]
+containers-storage = ["dep:cstorage", "cstorage?/userns-helper"]
 
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
