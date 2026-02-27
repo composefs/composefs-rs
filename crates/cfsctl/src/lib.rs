@@ -435,8 +435,7 @@ where
 
                 if is_cstor {
                     // Use unified pull which handles containers-storage routing
-                    let result =
-                        composefs_oci::pull(&repo, image, Some(tag_name), None).await?;
+                    let result = composefs_oci::pull(&repo, image, Some(tag_name), None).await?;
 
                     println!("config {}", result.config_digest);
                     println!("verity {}", result.config_verity.to_hex());
