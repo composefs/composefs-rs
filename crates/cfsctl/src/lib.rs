@@ -1,7 +1,7 @@
 //! Library for `cfsctl` command line utility
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::create_dir_all,
     io::IsTerminal,
     path::{Path, PathBuf},
@@ -18,8 +18,11 @@ use composefs_boot::{write_boot, BootOps};
 
 use composefs::{
     fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue},
+    generic_tree::FileSystem,
     repository::Repository,
+    tree::RegularFile,
 };
+use serde::Serialize;
 
 /// cfsctl
 #[derive(Debug, Parser)]
@@ -50,7 +53,7 @@ pub struct App {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum, Default)]
-/// TODO: Hash type
+/// Hash type
 pub enum HashType {
     /// Sha256
     Sha256,
@@ -72,7 +75,8 @@ struct OCIConfigFilesystemOptions {
 /// Common options for operations using OCI config manifest streams
 #[derive(Debug, Parser)]
 struct OCIConfigOptions {
-    /// the name of the target OCI manifest stream, either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
+    /// the name of the target OCI manifest stream,
+    /// either a stream ID in format oci-config-<hash_type>:<hash_digest> or a reference in 'ref/'
     config_name: String,
     /// verity digest for the manifest stream to be verified against
     config_verity: Option<String>,
@@ -164,6 +168,15 @@ enum OciCommand {
         /// optional reference name for the image, use as 'ref/<name>' elsewhere
         #[clap(long)]
         image_name: Option<String>,
+    },
+    /// Given a file path, get the file corresponding to it in the object store
+    /// If the file if stored inline, returns an empty string
+    GetFileObjectRef {
+        #[clap(flatten)]
+        config_opts: OCIConfigFilesystemOptions,
+        /// The absolute path of the file to be found
+        #[clap(long)]
+        file_path: PathBuf,
     },
     /// Seal a stored OCI image by creating a cloned manifest with embedded verity digest (a.k.a. composefs image object ID)
     /// in the repo, then prints the stream and verity digest of the new sealed manifest
@@ -259,6 +272,15 @@ enum Command {
         #[clap(flatten)]
         fs_opts: FsReadOptions,
     },
+    /// Given a file path, get the file corresponding to it in the object store
+    /// If the file if stored inline, returns an empty string
+    GetFileObjectRef {
+        #[clap(flatten)]
+        fs_opts: FsReadOptions,
+        /// The absolute path of the file to be found
+        #[clap(long)]
+        file_path: PathBuf,
+    },
     /// Read rootfs located at a path, add all files to the repo, then dump full content of the rootfs to a composefs dumpfile
     /// and write to stdout.
     CreateDumpfile {
@@ -272,6 +294,17 @@ enum Command {
     },
     #[cfg(feature = "http")]
     Fetch { url: String, name: String },
+}
+
+/// The return object of GetFileObjectRef cmd
+#[derive(Debug, Serialize)]
+pub struct ObjectRef {
+    /// Whether the file is stored inline in the EROFS image
+    pub stored_inline: bool,
+    /// FsVerity digest of the file
+    pub digest: Option<String>,
+    /// Path to the file relative to the object store
+    pub path: Option<String>,
 }
 
 /// Acts as a proxy for the `cfsctl` CLI by executing the CLI logic programmatically
@@ -326,6 +359,62 @@ where
     Ok(repo)
 }
 
+fn load_filesystem_from_oci_image<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    opts: OCIConfigFilesystemOptions,
+) -> Result<FileSystem<RegularFile<ObjectID>>> {
+    let verity = verity_opt(&opts.base_config.config_verity)?;
+    let mut fs = composefs_oci::image::create_filesystem(
+        repo,
+        &opts.base_config.config_name,
+        verity.as_ref(),
+    )?;
+    if opts.bootable {
+        fs.transform_for_boot(repo)?;
+    }
+    Ok(fs)
+}
+
+fn load_filesystem_from_ondisk_fs<ObjectID: FsVerityHashValue>(
+    fs_opts: &FsReadOptions,
+    repo: &Repository<ObjectID>,
+) -> Result<FileSystem<RegularFile<ObjectID>>> {
+    let mut fs = if fs_opts.no_propagate_usr_to_root {
+        composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(repo))?
+    } else {
+        composefs::fs::read_container_root(CWD, &fs_opts.path, Some(repo))?
+    };
+    if fs_opts.bootable {
+        fs.transform_for_boot(repo)?;
+    }
+    Ok(fs)
+}
+
+fn get_obj_ref_for_filesystem<ObjectID: FsVerityHashValue>(
+    fs: &FileSystem<RegularFile<ObjectID>>,
+    file_path: &OsStr,
+) -> Result<ObjectRef> {
+    let (dir, file) = fs.root.split(file_path)?;
+
+    let obj_ref = dir.get_file(file)?;
+
+    let obj_ref = match obj_ref {
+        RegularFile::Inline(..) => ObjectRef {
+            stored_inline: true,
+            digest: None,
+            path: None,
+        },
+
+        RegularFile::External(id, _) => ObjectRef {
+            stored_inline: false,
+            digest: Some(id.to_hex()),
+            path: Some(id.to_object_pathname()),
+        },
+    };
+
+    Ok(obj_ref)
+}
+
 /// Run with cmd
 pub async fn run_cmd_with_repo<ObjectID>(repo: Repository<ObjectID>, args: App) -> Result<()>
 where
@@ -359,63 +448,28 @@ where
             OciCommand::LsLayer { name } => {
                 composefs_oci::ls_layer(&repo, &name)?;
             }
-            OciCommand::Dump {
-                config_opts:
-                    OCIConfigFilesystemOptions {
-                        base_config:
-                            OCIConfigOptions {
-                                ref config_name,
-                                ref config_verity,
-                            },
-                        bootable,
-                    },
-            } => {
-                let verity = verity_opt(config_verity)?;
-                let mut fs =
-                    composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
-                if bootable {
-                    fs.transform_for_boot(&repo)?;
-                }
+            OciCommand::Dump { config_opts } => {
+                let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
                 fs.print_dumpfile()?;
             }
-            OciCommand::ComputeId {
-                config_opts:
-                    OCIConfigFilesystemOptions {
-                        base_config:
-                            OCIConfigOptions {
-                                ref config_name,
-                                ref config_verity,
-                            },
-                        bootable,
-                    },
+            OciCommand::GetFileObjectRef {
+                config_opts,
+                file_path,
             } => {
-                let verity = verity_opt(config_verity)?;
-                let mut fs =
-                    composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
-                if bootable {
-                    fs.transform_for_boot(&repo)?;
-                }
+                let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
+                let obj_ref = get_obj_ref_for_filesystem(&fs, file_path.as_os_str())?;
+                serde_json::to_writer(std::io::stdout().lock(), &obj_ref)?;
+            }
+            OciCommand::ComputeId { config_opts } => {
+                let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
                 let id = fs.compute_image_id();
                 println!("{}", id.to_hex());
             }
             OciCommand::CreateImage {
-                config_opts:
-                    OCIConfigFilesystemOptions {
-                        base_config:
-                            OCIConfigOptions {
-                                ref config_name,
-                                ref config_verity,
-                            },
-                        bootable,
-                    },
+                config_opts,
                 ref image_name,
             } => {
-                let verity = verity_opt(config_verity)?;
-                let mut fs =
-                    composefs_oci::image::create_filesystem(&repo, config_name, verity.as_ref())?;
-                if bootable {
-                    fs.transform_for_boot(&repo)?;
-                }
+                let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
                 let image_id = fs.commit_image(&repo, image_name.as_deref())?;
                 println!("{}", image_id.to_id());
             }
@@ -595,41 +649,25 @@ where
             }
         },
         Command::ComputeId { fs_opts } => {
-            let mut fs = if fs_opts.no_propagate_usr_to_root {
-                composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(&repo))?
-            } else {
-                composefs::fs::read_container_root(CWD, &fs_opts.path, Some(&repo))?
-            };
-            if fs_opts.bootable {
-                fs.transform_for_boot(&repo)?;
-            }
+            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
             let id = fs.compute_image_id();
             println!("{}", id.to_hex());
+        }
+        Command::GetFileObjectRef { fs_opts, file_path } => {
+            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
+            let obj_ref = get_obj_ref_for_filesystem(&fs, file_path.as_os_str())?;
+            serde_json::to_writer(std::io::stdout().lock(), &obj_ref)?;
         }
         Command::CreateImage {
             fs_opts,
             ref image_name,
         } => {
-            let mut fs = if fs_opts.no_propagate_usr_to_root {
-                composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(&repo))?
-            } else {
-                composefs::fs::read_container_root(CWD, &fs_opts.path, Some(&repo))?
-            };
-            if fs_opts.bootable {
-                fs.transform_for_boot(&repo)?;
-            }
+            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
             let id = fs.commit_image(&repo, image_name.as_deref())?;
             println!("{}", id.to_id());
         }
         Command::CreateDumpfile { fs_opts } => {
-            let mut fs = if fs_opts.no_propagate_usr_to_root {
-                composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(&repo))?
-            } else {
-                composefs::fs::read_container_root(CWD, &fs_opts.path, Some(&repo))?
-            };
-            if fs_opts.bootable {
-                fs.transform_for_boot(&repo)?;
-            }
+            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
             fs.print_dumpfile()?;
         }
         Command::Mount { name, mountpoint } => {

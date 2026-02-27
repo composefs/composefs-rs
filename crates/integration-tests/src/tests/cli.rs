@@ -6,6 +6,7 @@
 //! smoke tests.
 
 use anyhow::Result;
+use rustix::path::Arg;
 use xshell::{cmd, Shell};
 
 use crate::{cfsctl, create_test_rootfs, integration_test};
@@ -454,3 +455,69 @@ fn test_oci_layer_inspect() -> Result<()> {
     Ok(())
 }
 integration_test!(test_oci_layer_inspect);
+
+fn test_get_file_obj_ref() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs} my-image"
+    )
+    .read()?;
+
+    let out_json = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} get-file-object-ref {rootfs} --file-path /usr/bin/hello"
+    )
+    .read()?;
+
+    let stored_inline = cmd!(sh, "jq -r .stored_inline")
+        .stdin(&out_json)
+        .read()?
+        .parse::<bool>()?;
+
+    assert!(
+        !stored_inline,
+        "usr/bin/hello should've been large enough to be stored in objects directory"
+    );
+
+    let path = cmd!(sh, "jq -r .path").stdin(&out_json).read()?;
+
+    let full_path = repo.join("objects").join(path);
+
+    assert!(full_path.exists());
+
+    let file_hash = cmd!(sh, "sha512sum")
+        .arg(rootfs.join("usr/bin/hello").as_str()?)
+        .read()?;
+    let file_hash = file_hash.split_whitespace().next().unwrap().trim();
+
+    let obj_file_hash = cmd!(sh, "sha512sum").arg(full_path.as_str()?).read()?;
+    let obj_file_hash = obj_file_hash.split_whitespace().next().unwrap().trim();
+
+    assert_eq!(file_hash, obj_file_hash);
+
+    let out_json = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} get-file-object-ref {rootfs} --file-path usr/lib/readme.txt"
+    )
+    .read()?;
+
+    let stored_inline = cmd!(sh, "jq -r .stored_inline")
+        .stdin(&out_json)
+        .read()?
+        .parse::<bool>()?;
+
+    assert!(
+        stored_inline,
+        "usr/lib/readme.txt should've been stored inline"
+    );
+
+    Ok(())
+}
+integration_test!(test_get_file_obj_ref);
