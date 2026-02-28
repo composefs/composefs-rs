@@ -116,6 +116,18 @@ use crate::{
     util::{proc_self_fd, replace_symlinkat, ErrnoFilter},
 };
 
+/// How an object was stored in the repository.
+///
+/// Returned by [`Repository::ensure_object_from_file_with_stats`] to indicate
+/// whether the operation used a regular copy or found an existing object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectStoreMethod {
+    /// Object was stored via regular file copy.
+    Copied,
+    /// Object already existed in the repository (deduplicated).
+    AlreadyPresent,
+}
+
 /// Call openat() on the named subdirectory of "dirfd", possibly creating it first.
 ///
 /// We assume that the directory will probably exist (ie: we try the open first), and on ENOENT, we
@@ -302,7 +314,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         self: &Arc<Self>,
         tmpfile_fd: OwnedFd,
         size: u64,
-    ) -> tokio::task::JoinHandle<Result<ObjectID>> {
+    ) -> tokio::task::JoinHandle<Result<(ObjectID, ObjectStoreMethod)>> {
         let self_ = Arc::clone(self);
         tokio::task::spawn_blocking(move || self_.finalize_object_tmpfile(tmpfile_fd.into(), size))
     }
@@ -322,7 +334,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// By letting the kernel compute the digest during verity enable, we avoid
     /// reading the file an extra time in userspace.
     #[context("Finalizing object tempfile")]
-    pub fn finalize_object_tmpfile(&self, file: File, size: u64) -> Result<ObjectID> {
+    pub fn finalize_object_tmpfile(
+        &self,
+        file: File,
+        size: u64,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
         // Re-open as read-only via /proc/self/fd (required for verity enable)
         let fd_path = proc_self_fd(&file);
         let ro_fd = open(&*fd_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
@@ -368,7 +384,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         match statat(objects_dir, &path, AtFlags::empty()) {
             Ok(stat) if stat.st_size as u64 == size => {
                 // Object already exists with correct size, skip storage
-                return Ok(id);
+                return Ok((id, ObjectStoreMethod::AlreadyPresent));
             }
             _ => {}
         }
@@ -385,8 +401,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             &path,
             AtFlags::SYMLINK_FOLLOW,
         ) {
-            Ok(()) => Ok(id),
-            Err(Errno::EXIST) => Ok(id), // Race: another task created it
+            Ok(()) => Ok((id, ObjectStoreMethod::Copied)),
+            Err(Errno::EXIST) => Ok((id, ObjectStoreMethod::AlreadyPresent)), // Race: another task created it
             Err(e) => Err(e).context("Linking tmpfile into objects directory")?,
         }
     }
@@ -736,21 +752,23 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// On success, the object ID of the new object is returned.  It is expected that this object
     /// ID will be used when referring to the stream from other linked streams.
     #[context("Ensuring stream '{content_identifier}' exists")]
-    pub fn ensure_stream(
+    pub fn ensure_stream<T: Default>(
         self: &Arc<Self>,
         content_identifier: &str,
         content_type: u64,
-        callback: impl FnOnce(&mut SplitStreamWriter<ObjectID>) -> Result<()>,
+        callback: impl FnOnce(&mut SplitStreamWriter<ObjectID>) -> Result<T>,
         reference: Option<&str>,
-    ) -> Result<ObjectID> {
+    ) -> Result<(ObjectID, T)> {
         let stream_path = Self::format_stream_path(content_identifier);
 
-        let object_id = match self.has_stream(content_identifier)? {
-            Some(id) => id,
+        let (object_id, extra) = match self.has_stream(content_identifier)? {
+            Some(id) => (id, T::default()),
             None => {
                 let mut writer = self.create_stream(content_type);
-                callback(&mut writer).context("Writing stream content via callback")?;
-                self.write_stream(writer, content_identifier, reference)?
+                let extra =
+                    callback(&mut writer).context("Writing stream content via callback")?;
+                let id = self.write_stream(writer, content_identifier, reference)?;
+                (id, extra)
             }
         };
 
@@ -759,7 +777,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             self.symlink(&reference_path, &stream_path)?;
         }
 
-        Ok(object_id)
+        Ok((object_id, extra))
     }
 
     /// Open a splitstream with the given name.
