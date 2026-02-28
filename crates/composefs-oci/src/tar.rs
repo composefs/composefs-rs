@@ -33,12 +33,14 @@ use tokio::{
 use composefs::{
     dumpfile,
     fsverity::FsVerityHashValue,
-    repository::Repository,
+    repository::{ObjectStoreMethod, Repository},
     splitstream::{SplitStreamBuilder, SplitStreamData, SplitStreamReader, SplitStreamWriter},
     tree::{LeafContent, RegularFile, Stat},
     util::{read_exactish, read_exactish_async},
     INLINE_CONTENT_MAX,
 };
+
+use crate::ImportStats;
 
 fn read_header<R: Read>(reader: &mut R) -> Result<Option<Header>> {
     let mut header = Header::new_gnu();
@@ -64,12 +66,14 @@ async fn read_header_async(reader: &mut (impl AsyncRead + Unpin)) -> Result<Opti
 pub fn split(
     tar_stream: &mut impl Read,
     writer: &mut SplitStreamWriter<impl FsVerityHashValue>,
-) -> Result<()> {
+) -> Result<ImportStats> {
+    let mut stats = ImportStats::default();
     let mut buffer = vec![0u8; 1024 * 1024];
 
     while let Some(header) = read_header(tar_stream)? {
         // the header always gets stored as inline data
         writer.write_inline(header.as_bytes());
+        stats.bytes_inlined += header.as_bytes().len() as u64;
 
         if header.as_bytes() == &[0u8; 512] {
             continue;
@@ -95,9 +99,18 @@ pub fn split(
             }
 
             let tmpfile = tmpfile.into_inner()?;
-            let object_id = writer
+            let (object_id, method) = writer
                 .repo()
                 .finalize_object_tmpfile(tmpfile, actual_size as u64)?;
+            match method {
+                ObjectStoreMethod::Copied => {
+                    stats.objects_copied += 1;
+                    stats.bytes_copied += actual_size as u64;
+                }
+                ObjectStoreMethod::AlreadyPresent => {
+                    stats.objects_already_present += 1;
+                }
+            }
             writer.add_external_size(actual_size as u64);
             writer.write_reference(object_id)?;
 
@@ -105,15 +118,17 @@ pub fn split(
             if padding_size > 0 {
                 tar_stream.read_exact(&mut buffer[..padding_size])?;
                 writer.write_inline(&buffer[..padding_size]);
+                stats.bytes_inlined += padding_size as u64;
             }
         } else {
             tar_stream
                 .take(storage_size as u64)
                 .read_exact(&mut buffer[..storage_size])?;
             writer.write_inline(&buffer[..storage_size]);
+            stats.bytes_inlined += storage_size as u64;
         }
     }
-    Ok(())
+    Ok(stats)
 }
 
 /// Receive data from channel, write to tmpfile, compute verity, and store object.
@@ -123,7 +138,7 @@ fn receive_and_finalize_object<ObjectID: FsVerityHashValue>(
     rx: mpsc::Receiver<Bytes>,
     size: u64,
     repo: &Repository<ObjectID>,
-) -> Result<ObjectID> {
+) -> Result<(ObjectID, ObjectStoreMethod)> {
     use std::io::Write;
 
     // Create tmpfile in the blocking context
@@ -161,12 +176,12 @@ fn receive_and_finalize_object<ObjectID: FsVerityHashValue>(
 /// * `repo` - The repository for creating tmpfiles and storing objects
 /// * `content_type` - The content type identifier for the splitstream
 ///
-/// Returns the fs-verity object ID of the stored splitstream.
+/// Returns the fs-verity object ID of the stored splitstream and import statistics.
 pub async fn split_async<ObjectID: FsVerityHashValue>(
     mut tar_stream: impl AsyncBufRead + Unpin,
     repo: Arc<Repository<ObjectID>>,
     content_type: u64,
-) -> Result<ObjectID> {
+) -> Result<(ObjectID, ImportStats)> {
     // Use the repository's shared semaphore to limit concurrent object storage
     let semaphore = repo.write_semaphore();
 
@@ -242,7 +257,8 @@ pub async fn split_async<ObjectID: FsVerityHashValue>(
     }
 
     // Finalize: await all handles, build stream, store it
-    builder.finish().await
+    let (object_id, ss_stats) = builder.finish().await?;
+    Ok((object_id, ImportStats::from_split_stream_stats(&ss_stats)))
 }
 
 /// Represents the content type of a tar entry.
@@ -503,7 +519,7 @@ mod tests {
         let repo = create_test_repository()?;
         let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
 
-        split(&mut tar_cursor, &mut writer)?;
+        let _stats = split(&mut tar_cursor, &mut writer)?;
         let object_id = writer.done()?;
 
         let mut reader: SplitStreamReader<Sha256HashValue> = SplitStreamReader::new(
@@ -912,7 +928,9 @@ mod tests {
 
             let start = Instant::now();
             rt.block_on(async {
-                split_async(&tar_data_clone[..], repo, TAR_LAYER_CONTENT_TYPE).await
+                split_async(&tar_data_clone[..], repo, TAR_LAYER_CONTENT_TYPE)
+                    .await
+                    .map(|(id, _stats)| id)
             })
             .unwrap();
             let elapsed = start.elapsed();
@@ -955,8 +973,8 @@ mod tests {
 
         let repo = create_test_repository().unwrap();
 
-        // Use split_async which returns the object_id directly
-        let object_id = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
+        // Use split_async which returns (object_id, stats)
+        let (object_id, _stats) = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
             .await
             .unwrap();
 
@@ -1034,7 +1052,7 @@ mod tests {
 
         let repo = create_test_repository().unwrap();
 
-        let object_id = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
+        let (object_id, _stats) = split_async(&tar_data[..], repo.clone(), TAR_LAYER_CONTENT_TYPE)
             .await
             .unwrap();
 

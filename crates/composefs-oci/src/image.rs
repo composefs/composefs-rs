@@ -327,7 +327,8 @@ mod test {
 
         let repo_dir = tempdir();
         let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir)?);
-        let verity = crate::import_layer(&repo, &diff_id, Some("layer"), &mut tar_data.as_slice())?;
+        let (verity, _stats) =
+            crate::import_layer(&repo, &diff_id, Some("layer"), &mut tar_data.as_slice())?;
 
         let mut stream = repo.open_stream("refs/layer", Some(&verity), None)?;
         let mut entries = vec![];
