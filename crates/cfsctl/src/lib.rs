@@ -348,7 +348,7 @@ where
         #[cfg(feature = "oci")]
         Command::Oci { cmd: oci_cmd } => match oci_cmd {
             OciCommand::ImportLayer { name, digest } => {
-                let object_id = composefs_oci::import_layer(
+                let (object_id, _stats) = composefs_oci::import_layer(
                     &Arc::new(repo),
                     &digest,
                     name.as_deref(),
@@ -422,13 +422,20 @@ where
             OciCommand::Pull { ref image, name } => {
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
-                let result =
+                let (result, stats) =
                     composefs_oci::pull_image(&Arc::new(repo), image, Some(tag_name), None).await?;
 
                 println!("manifest {}", result.manifest_digest);
                 println!("config   {}", result.config_digest);
                 println!("verity   {}", result.manifest_verity.to_hex());
                 println!("tagged   {tag_name}");
+                println!(
+                    "objects  {} copied, {} already present, {} bytes copied, {} bytes inlined",
+                    stats.objects_copied,
+                    stats.objects_already_present,
+                    stats.bytes_copied,
+                    stats.bytes_inlined,
+                );
             }
             OciCommand::ListImages { json } => {
                 let images = composefs_oci::oci_image::list_images(&repo)?;
