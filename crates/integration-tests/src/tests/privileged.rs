@@ -15,7 +15,7 @@ use xshell::{cmd, Shell};
 
 use crate::{cfsctl, create_test_rootfs, integration_test};
 
-/// Ensure we're running as root, or re-exec this test inside a VM.
+/// Ensure we're running in a privileged environment, or re-exec this test inside a VM.
 ///
 /// If already root (e.g. inside a bcvk VM), returns `Ok(None)` and the
 /// test proceeds normally.
@@ -26,7 +26,10 @@ use crate::{cfsctl, create_test_rootfs, integration_test};
 /// the test already ran in the VM.
 ///
 /// If not root and no test image is configured, returns an error.
-fn require_privileged(test_name: &str) -> Result<Option<()>> {
+///
+/// This is also used by cstor tests which need user namespace support
+/// (via `podman unshare`) that may not be available on GHA runners.
+pub fn require_privileged(test_name: &str) -> Result<Option<()>> {
     if rustix::process::getuid().is_root() {
         return Ok(None);
     }
@@ -39,6 +42,58 @@ fn require_privileged(test_name: &str) -> Result<Option<()>> {
     let image = std::env::var("COMPOSEFS_TEST_IMAGE").map_err(|_| {
         anyhow::anyhow!(
             "not root and COMPOSEFS_TEST_IMAGE not set; \
+             run `just build-test-image` or use `just test-integration-vm`"
+        )
+    })?;
+
+    let sh = Shell::new()?;
+    let bcvk = std::env::var("BCVK_PATH").unwrap_or_else(|_| "bcvk".into());
+    cmd!(
+        sh,
+        "{bcvk} ephemeral run-ssh {image} -- cfsctl-integration-tests --exact {test_name}"
+    )
+    .run()?;
+    Ok(Some(()))
+}
+
+/// Check if user namespaces work (needed for podman unshare).
+fn userns_works() -> bool {
+    std::process::Command::new("podman")
+        .args(["unshare", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Ensure user namespace support is available, or re-exec this test inside a VM.
+///
+/// Unlike `require_privileged`, this doesn't require root — it just needs
+/// working user namespaces (for `podman unshare`). If user namespaces work,
+/// the test proceeds normally. Otherwise, it dispatches to a VM.
+///
+/// Returns `Ok(None)` if the test should proceed, `Ok(Some(()))` if it was
+/// dispatched to a VM and the caller should return immediately.
+pub fn require_userns(test_name: &str) -> Result<Option<()>> {
+    // If we're root (e.g. in VM), userns works
+    if rustix::process::getuid().is_root() {
+        return Ok(None);
+    }
+
+    // Check if userns works on this host
+    if userns_works() {
+        return Ok(None);
+    }
+
+    // userns doesn't work — delegate to a VM
+    if std::env::var_os("COMPOSEFS_IN_VM").is_some() {
+        bail!("COMPOSEFS_IN_VM is set but userns doesn't work — VM setup is broken");
+    }
+
+    let image = std::env::var("COMPOSEFS_TEST_IMAGE").map_err(|_| {
+        anyhow::anyhow!(
+            "user namespaces not available and COMPOSEFS_TEST_IMAGE not set; \
              run `just build-test-image` or use `just test-integration-vm`"
         )
     })?;

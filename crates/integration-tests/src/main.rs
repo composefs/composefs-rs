@@ -3,6 +3,10 @@
 //! This binary uses [`libtest_mimic`] as a custom test harness (no `#[test]`).
 //! Tests are registered via the [`integration_test!`] macro in submodules
 //! and collected from the [`INTEGRATION_TESTS`] distributed slice at startup.
+//!
+//! IMPORTANT: This binary may be re-executed via `podman unshare` to act as a
+//! userns helper for rootless containers-storage access. The init_if_helper()
+//! call at the start of main() handles this.
 
 // linkme requires unsafe for distributed slices
 #![allow(unsafe_code)]
@@ -71,6 +75,11 @@ pub(crate) fn create_test_rootfs(parent: &Path) -> Result<PathBuf> {
 }
 
 fn main() {
+    // CRITICAL: Handle userns helper re-execution.
+    // When running rootless, this binary may be re-executed via `podman unshare`
+    // to act as a helper process for containers-storage access.
+    composefs_oci::cstor::init_if_helper();
+
     let args = Arguments::from_args();
 
     let tests: Vec<Trial> = INTEGRATION_TESTS

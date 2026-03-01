@@ -58,7 +58,6 @@
 //! retrieved from the file descriptor array passed alongside the stream.
 
 use std::io::{self, Read, Write};
-#[cfg(test)]
 use std::os::fd::AsFd;
 
 /// Maximum size for an inline chunk (256 MB).
@@ -247,7 +246,6 @@ impl<R: Read> SplitfdstreamReader<R> {
     }
 }
 
-#[cfg(test)]
 /// A helper that reads a file from offset 0 using positional reads.
 ///
 /// This allows reading the same file multiple times without seeking,
@@ -258,14 +256,12 @@ struct ReadAtReader<'a, F> {
     offset: u64,
 }
 
-#[cfg(test)]
 impl<'a, F: AsFd> ReadAtReader<'a, F> {
     fn new(file: &'a F) -> Self {
         Self { file, offset: 0 }
     }
 }
 
-#[cfg(test)]
 impl<F: AsFd> Read for ReadAtReader<'_, F> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = rustix::io::pread(self.file, buf, self.offset)?;
@@ -274,17 +270,30 @@ impl<F: AsFd> Read for ReadAtReader<'_, F> {
     }
 }
 
-#[cfg(test)]
 /// A `Read` adapter that reconstructs a byte stream from a splitfdstream.
 ///
 /// This struct implements `Read` by combining inline chunks and external file
-/// descriptor content into a contiguous byte stream.
+/// descriptor content into a contiguous byte stream. It can be used with
+/// `tar::Archive` to parse tar entries from a splitfdstream.
 ///
 /// External files are read using positional read (pread/read_at), so the
 /// same file can be referenced multiple times in the splitfdstream without
 /// needing to reopen or seek it.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::fs::File;
+/// use splitfdstream::SplitfdstreamTarReader;
+///
+/// let stream_data: &[u8] = &[/* splitfdstream bytes */];
+/// let files: Vec<File> = vec![/* external files */];
+///
+/// let mut reader = SplitfdstreamTarReader::new(stream_data, &files);
+/// // Use with tar::Archive or any Read consumer
+/// ```
 #[derive(Debug)]
-struct SplitfdstreamAsRead<'files, R: Read> {
+pub struct SplitfdstreamTarReader<'files, R: Read> {
     reader: SplitfdstreamReader<R>,
     files: &'files [std::fs::File],
     /// Buffer for inline data (partially consumed)
@@ -295,13 +304,12 @@ struct SplitfdstreamAsRead<'files, R: Read> {
     current_external: Option<ReadAtReader<'files, std::fs::File>>,
 }
 
-#[cfg(test)]
-impl<'files, R: Read> SplitfdstreamAsRead<'files, R> {
-    /// Create a new reader from a splitfdstream and files.
+impl<'files, R: Read> SplitfdstreamTarReader<'files, R> {
+    /// Create a new tar reader from a splitfdstream and files.
     ///
     /// The `files` slice provides the external files referenced by the
     /// splitfdstream. Each external chunk at index N reads from `files[N]`.
-    fn new(splitfdstream: R, files: &'files [std::fs::File]) -> Self {
+    pub fn new(splitfdstream: R, files: &'files [std::fs::File]) -> Self {
         Self {
             reader: SplitfdstreamReader::new(splitfdstream),
             files,
@@ -312,8 +320,7 @@ impl<'files, R: Read> SplitfdstreamAsRead<'files, R> {
     }
 }
 
-#[cfg(test)]
-impl<R: Read> Read for SplitfdstreamAsRead<'_, R> {
+impl<R: Read> Read for SplitfdstreamTarReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // First, drain any buffered inline data
         if self.inline_pos < self.inline_buffer.len() {
@@ -368,13 +375,34 @@ impl<R: Read> Read for SplitfdstreamAsRead<'_, R> {
     }
 }
 
-#[cfg(test)]
 /// Reconstruct a stream from splitfdstream + file descriptors.
 ///
 /// This function reads a splitfdstream and writes the reconstructed data to `output`.
 /// Inline chunks are written directly, while external chunks are read from the
 /// corresponding file descriptors in `files`.
-fn reconstruct<R, W>(splitfdstream: R, files: &[std::fs::File], output: &mut W) -> io::Result<u64>
+///
+/// # Arguments
+///
+/// * `splitfdstream` - A reader providing the splitfdstream data
+/// * `files` - Array of files for external chunks
+/// * `output` - Writer to receive the reconstructed stream
+///
+/// # Returns
+///
+/// The total number of bytes written to `output`.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// * Reading from the splitfdstream fails
+/// * An external chunk references a file index outside the bounds of `files`
+/// * Reading from an external file fails
+/// * Writing to the output fails
+pub fn reconstruct<R, W>(
+    splitfdstream: R,
+    files: &[std::fs::File],
+    output: &mut W,
+) -> io::Result<u64>
 where
     R: Read,
     W: Write,
@@ -1212,7 +1240,7 @@ mod tests {
             }
         }
 
-        /// Test SplitfdstreamAsRead with property-based approach
+        /// Test SplitfdstreamTarReader with property-based approach
         mod tar_reader_tests {
             use super::*;
 
@@ -1294,8 +1322,8 @@ mod tests {
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
 
-                // Read via SplitfdstreamAsRead
-                let mut tar_reader = SplitfdstreamAsRead::new(stream_buf.as_slice(), &files);
+                // Read via SplitfdstreamTarReader
+                let mut tar_reader = SplitfdstreamTarReader::new(stream_buf.as_slice(), &files);
                 let mut tar_output = Vec::new();
                 std::io::copy(&mut tar_reader, &mut tar_output)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
@@ -1308,7 +1336,7 @@ mod tests {
                 prop_assert_eq!(
                     tar_output,
                     reconstruct_output,
-                    "SplitfdstreamAsRead and reconstruct outputs differ"
+                    "TarReader and reconstruct outputs differ"
                 );
 
                 Ok(())

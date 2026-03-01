@@ -27,6 +27,8 @@ use rustix::{
     io::{pread, read},
 };
 use tokio::task::JoinHandle;
+
+use crate::repository::ObjectStoreMethod;
 use zerocopy::{
     little_endian::{I64, U16, U64},
     FromBytes, Immutable, IntoBytes, KnownLayout,
@@ -153,6 +155,15 @@ impl<T: Clone + Hash + Eq> UniqueVec<T> {
     }
 }
 
+/// Statistics from finalizing a [`SplitStreamBuilder`].
+#[derive(Debug, Clone, Default)]
+pub struct SplitStreamStats {
+    /// Total bytes of inline data written to the stream.
+    pub inline_bytes: u64,
+    /// Per-external-object (size, method) pairs describing how each was stored.
+    pub external_objects: Vec<(u64, ObjectStoreMethod)>,
+}
+
 /// An entry in the split stream being built.
 ///
 /// Used by `SplitStreamBuilder` to collect entries before serialization.
@@ -161,8 +172,8 @@ pub enum SplitStreamEntry<ObjectID: FsVerityHashValue> {
     Inline(Vec<u8>),
     /// External reference - will be resolved to ObjectID when the handle completes
     External {
-        /// Background task that will return the ObjectID
-        handle: JoinHandle<Result<ObjectID>>,
+        /// Background task that will return the ObjectID and how it was stored
+        handle: JoinHandle<Result<(ObjectID, ObjectStoreMethod)>>,
         /// Size of the external object in bytes
         size: u64,
     },
@@ -202,6 +213,7 @@ pub struct SplitStreamBuilder<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
     entries: Vec<SplitStreamEntry<ObjectID>>,
     total_external_size: u64,
+    total_inline_bytes: u64,
     content_type: u64,
     stream_refs: UniqueVec<ObjectID>,
     named_refs: BTreeMap<Box<str>, usize>,
@@ -225,6 +237,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamBuilder<ObjectID> {
             repo,
             entries: Vec::new(),
             total_external_size: 0,
+            total_inline_bytes: 0,
             content_type,
             stream_refs: UniqueVec::new(),
             named_refs: Default::default(),
@@ -238,6 +251,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamBuilder<ObjectID> {
         if data.is_empty() {
             return;
         }
+        self.total_inline_bytes += data.len() as u64;
         // Coalesce with the previous inline entry if possible
         if let Some(SplitStreamEntry::Inline(ref mut existing)) = self.entries.last_mut() {
             existing.extend_from_slice(data);
@@ -248,8 +262,12 @@ impl<ObjectID: FsVerityHashValue> SplitStreamBuilder<ObjectID> {
 
     /// Append an external object being stored in background.
     ///
-    /// The handle should resolve to the ObjectID when the storage completes.
-    pub fn push_external(&mut self, handle: JoinHandle<Result<ObjectID>>, size: u64) {
+    /// The handle should resolve to the (ObjectID, ObjectStoreMethod) when the storage completes.
+    pub fn push_external(
+        &mut self,
+        handle: JoinHandle<Result<(ObjectID, ObjectStoreMethod)>>,
+        size: u64,
+    ) {
         self.total_external_size += size;
         self.entries
             .push(SplitStreamEntry::External { handle, size });
@@ -273,8 +291,14 @@ impl<ObjectID: FsVerityHashValue> SplitStreamBuilder<ObjectID> {
     /// 3. Creates a SplitStreamWriter and replays all entries
     /// 4. Stores the final splitstream in the repository
     ///
-    /// Returns the fs-verity object ID of the stored splitstream.
-    pub async fn finish(self) -> Result<ObjectID> {
+    /// Returns the fs-verity object ID of the stored splitstream and
+    /// [`SplitStreamStats`] with inline byte counts and per-object storage methods.
+    pub async fn finish(self) -> Result<(ObjectID, SplitStreamStats)> {
+        let mut stats = SplitStreamStats {
+            inline_bytes: self.total_inline_bytes,
+            external_objects: Vec::new(),
+        };
+
         // First pass: await all handles to collect ObjectIDs
         // We need to preserve the order of entries, so we process them in sequence
         let mut resolved_entries: Vec<ResolvedEntry<ObjectID>> =
@@ -286,7 +310,8 @@ impl<ObjectID: FsVerityHashValue> SplitStreamBuilder<ObjectID> {
                     resolved_entries.push(ResolvedEntry::Inline(data));
                 }
                 SplitStreamEntry::External { handle, size } => {
-                    let id = handle.await??;
+                    let (id, method) = handle.await??;
+                    stats.external_objects.push((size, method));
                     resolved_entries.push(ResolvedEntry::External { id, size });
                 }
             }
@@ -322,7 +347,8 @@ impl<ObjectID: FsVerityHashValue> SplitStreamBuilder<ObjectID> {
         }
 
         // Finalize and store
-        tokio::task::spawn_blocking(move || writer.done()).await?
+        let id = tokio::task::spawn_blocking(move || writer.done()).await??;
+        Ok((id, stats))
     }
 }
 

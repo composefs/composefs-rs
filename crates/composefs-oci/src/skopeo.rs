@@ -27,13 +27,16 @@ use tokio::{
     task::JoinSet,
 };
 
-use composefs::{fsverity::FsVerityHashValue, repository::Repository};
+use composefs::{
+    fsverity::FsVerityHashValue,
+    repository::{ObjectStoreMethod, Repository},
+};
 
 use crate::{
     config_identifier, layer_identifier,
     oci_image::{is_tar_media_type, manifest_identifier, tag_image},
     tar::split_async,
-    ContentAndVerity,
+    ContentAndVerity, ImportStats,
 };
 
 /// Result of pulling an OCI image.
@@ -143,7 +146,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         descriptor: &Descriptor,
         uncompressed_layer_info: Option<Arc<Vec<ConvertedLayerInfo>>>,
         layer_idx: usize,
-    ) -> Result<ObjectID> {
+    ) -> Result<(ObjectID, ImportStats)> {
         // We need to use the per_manifest descriptor to download the compressed layer but it gets
         // stored in the repository via the per_config descriptor.  Our return value is the
         // fsverity digest for the corresponding splitstream.
@@ -152,7 +155,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         if let Some(layer_id) = self.repo.has_stream(&content_id)? {
             self.progress
                 .println(format!("Already have layer {diff_id}"))?;
-            Ok(layer_id)
+            Ok((layer_id, ImportStats::default()))
         } else {
             // Otherwise, we need to fetch it...
             let descriptor = match self.transport {
@@ -190,7 +193,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             self.progress.println(format!("Fetching layer {diff_id}"))?;
 
             let media_type = descriptor.media_type();
-            let object_id = if is_tar_media_type(media_type) {
+            let (object_id, layer_stats) = if is_tar_media_type(media_type) {
                 // Tar layers: decompress and split into a splitstream
                 let reader: Box<dyn tokio::io::AsyncBufRead + Unpin + Send> = match media_type {
                     MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => {
@@ -219,14 +222,26 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 writer.flush().await?;
                 let tmpfile = writer.into_std().await;
                 driver.await?;
-                let object_id = self.repo.finalize_object_tmpfile(tmpfile, size)?;
+                let (object_id, method) = self.repo.finalize_object_tmpfile(tmpfile, size)?;
+
+                let mut stats = ImportStats::default();
+                match method {
+                    ObjectStoreMethod::Copied | ObjectStoreMethod::Reflinked => {
+                        stats.objects_copied += 1;
+                        stats.bytes_copied += size;
+                    }
+                    ObjectStoreMethod::AlreadyPresent => {
+                        stats.objects_already_present += 1;
+                    }
+                }
 
                 let mut stream = self.repo.create_stream(OCI_BLOB_CONTENT_TYPE);
                 stream.add_external_size(size);
                 stream.write_reference(object_id)?;
                 // write_stream handles both object storage and stream
                 // registration, so we return directly.
-                return self.repo.write_stream(stream, &content_id, None);
+                let stream_id = self.repo.write_stream(stream, &content_id, None)?;
+                return Ok((stream_id, stats));
             };
 
             // skopeo is doing data checksums for us to make sure the content we received is equal
@@ -238,7 +253,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 .register_stream(&object_id, &content_id, None)
                 .await?;
 
-            Ok(object_id)
+            Ok((object_id, layer_stats))
         }
     }
 
@@ -253,6 +268,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         // FIXME change this string to be Digest - actually we may want to go stronger and have a
         // struct DiffID(Digest) newtype
         std::collections::HashMap<String, ObjectID>,
+        ImportStats,
     )> {
         let config_digest: &str = descriptor.digest().as_ref();
         let content_id = config_identifier(config_digest);
@@ -273,7 +289,12 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 .map(|(k, v)| (k.to_string(), v))
                 .collect();
 
-            Ok((config_digest.to_string(), config_id, layer_refs))
+            Ok((
+                config_digest.to_string(),
+                config_id,
+                layer_refs,
+                ImportStats::default(),
+            ))
         } else {
             // We need to add the config to the repo
             self.progress
@@ -335,10 +356,10 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 
                 layer_tasks.spawn(async move {
                     let _permit = permit;
-                    let verity = self_
+                    let (verity, layer_stats) = self_
                         .ensure_layer(&diff_id_, &descriptor, uncompressed_layer_info, layer_idx)
                         .await?;
-                    anyhow::Ok((idx, diff_id_, verity))
+                    anyhow::Ok((idx, diff_id_, verity, layer_stats))
                 });
             }
 
@@ -348,24 +369,26 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 .await
                 .into_iter()
                 .collect::<Result<_, _>>()?;
-            results.sort_by_key(|(idx, _, _)| *idx);
+            results.sort_by_key(|(idx, _, _, _)| *idx);
 
             let mut splitstream = self.repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
             let mut layer_refs = std::collections::HashMap::new();
-            for (_, diff_id, verity) in results {
+            let mut stats = ImportStats::default();
+            for (_, diff_id, verity, layer_stats) in results {
                 splitstream.add_named_stream_ref(&diff_id, &verity);
                 layer_refs.insert(diff_id, verity);
+                stats.merge(&layer_stats);
             }
 
             // Store config as external object for independent fsverity
             splitstream.write_external(&raw_config)?;
             let config_id = self.repo.write_stream(splitstream, &content_id, None)?;
-            Ok((config_digest.to_string(), config_id, layer_refs))
+            Ok((config_digest.to_string(), config_id, layer_refs, stats))
         }
     }
 
     /// Pull the image, storing manifest, config, and all layers.
-    pub async fn pull(self: &Arc<Self>) -> Result<PullResult<ObjectID>> {
+    pub async fn pull(self: &Arc<Self>) -> Result<(PullResult<ObjectID>, ImportStats)> {
         let (manifest_digest, raw_manifest) = self
             .proxy
             .fetch_manifest_raw_oci(&self.img)
@@ -375,7 +398,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         let manifest = oci_spec::image::ImageManifest::from_reader(raw_manifest.as_slice())?;
         let config_descriptor = manifest.config();
         let layers = manifest.layers();
-        let (config_digest, config_verity, layer_verities) = self
+        let (config_digest, config_verity, layer_verities, stats) = self
             .ensure_config_with_layers(layers, config_descriptor)
             .await
             .with_context(|| format!("Failed to pull config {config_descriptor:?}"))?;
@@ -404,12 +427,15 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 .write_stream(splitstream, &manifest_content_id, None)?
         };
 
-        Ok(PullResult {
-            manifest_digest,
-            manifest_verity,
-            config_digest,
-            config_verity,
-        })
+        Ok((
+            PullResult {
+                manifest_digest,
+                manifest_verity,
+                config_digest,
+                config_verity,
+            },
+            stats,
+        ))
     }
 }
 
@@ -425,9 +451,9 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
-) -> Result<PullResult<ObjectID>> {
+) -> Result<(PullResult<ObjectID>, ImportStats)> {
     let op = Arc::new(ImageOp::new(repo, imgref, img_proxy_config).await?);
-    let result = op
+    let (result, stats) = op
         .pull()
         .await
         .with_context(|| format!("Unable to pull container image {imgref}"))?;
@@ -435,13 +461,13 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     if let Some(name) = reference {
         tag_image(repo, &result.manifest_digest, name)?;
     }
-    Ok(result)
+    Ok((result, stats))
 }
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
 ///
-/// Returns (config_digest, config_verity) for backward compatibility.
+/// Returns (config_digest, config_verity, stats).
 /// Consider using `pull_image` for access to manifest information.
 #[context("Pulling image {imgref}")]
 pub async fn pull<ObjectID: FsVerityHashValue>(
@@ -449,7 +475,8 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
-) -> Result<(String, ObjectID)> {
-    let result = pull_image(repo, imgref, reference, img_proxy_config).await?;
-    Ok(result.into_config())
+) -> Result<(String, ObjectID, ImportStats)> {
+    let (result, stats) = pull_image(repo, imgref, reference, img_proxy_config).await?;
+    let (config_digest, config_verity) = result.into_config();
+    Ok((config_digest, config_verity, stats))
 }

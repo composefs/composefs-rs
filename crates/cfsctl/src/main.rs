@@ -10,8 +10,20 @@ use anyhow::Result;
 use clap::Parser;
 use composefs::fsverity::{Sha256HashValue, Sha512HashValue};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // If we were spawned as a userns helper process, handle that and exit.
+    // This MUST be called before the tokio runtime is created.
+    #[cfg(feature = "containers-storage")]
+    cstorage::init_if_helper();
+
+    // Now we can create the tokio runtime for the main application
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     env_logger::init();
 
     let args = App::parse();

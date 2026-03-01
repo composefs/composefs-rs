@@ -9,9 +9,12 @@
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
 //! - Sealing containers with fs-verity hashes for integrity verification
+//! - Importing from containers-storage with zero-copy reflinks (optional feature)
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "containers-storage")]
+pub mod cstor;
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
@@ -24,7 +27,11 @@ use containers_image_proxy::ImageProxyConfig;
 use oci_spec::image::ImageConfiguration;
 use sha2::{Digest, Sha256};
 
-use composefs::{fsverity::FsVerityHashValue, repository::Repository};
+use composefs::{
+    fsverity::FsVerityHashValue,
+    repository::{ObjectStoreMethod, Repository},
+    splitstream::SplitStreamStats,
+};
 
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 use crate::tar::get_entry;
@@ -35,15 +42,62 @@ pub use oci_image::{
     remove_referrer, remove_referrers_for_subject, resolve_ref, tag_image, untag_image, ImageInfo,
     LayerInfo, OciImage, SplitstreamInfo, OCI_REF_PREFIX,
 };
-pub use skopeo::{pull_image, PullResult};
+pub use skopeo::pull_image;
 
-type ContentAndVerity<ObjectID> = (String, ObjectID);
+/// Statistics from an image import operation.
+#[derive(Debug, Clone, Default)]
+pub struct ImportStats {
+    /// Number of objects stored via copy.
+    pub objects_copied: u64,
+    /// Number of objects that already existed (deduplicated).
+    pub objects_already_present: u64,
+    /// Total bytes stored as new objects.
+    pub bytes_copied: u64,
+    /// Total bytes inlined in splitstreams (small files + headers).
+    pub bytes_inlined: u64,
+}
 
-fn layer_identifier(diff_id: &str) -> String {
+impl ImportStats {
+    /// Merge another `ImportStats` into this one.
+    pub fn merge(&mut self, other: &ImportStats) {
+        self.objects_copied += other.objects_copied;
+        self.objects_already_present += other.objects_already_present;
+        self.bytes_copied += other.bytes_copied;
+        self.bytes_inlined += other.bytes_inlined;
+    }
+
+    /// Build import stats from [`SplitStreamStats`].
+    pub(crate) fn from_split_stream_stats(ss: &SplitStreamStats) -> Self {
+        let mut stats = ImportStats {
+            bytes_inlined: ss.inline_bytes,
+            ..Default::default()
+        };
+        for &(size, method) in &ss.external_objects {
+            match method {
+                ObjectStoreMethod::Copied | ObjectStoreMethod::Reflinked => {
+                    stats.objects_copied += 1;
+                    stats.bytes_copied += size;
+                }
+                ObjectStoreMethod::AlreadyPresent => {
+                    stats.objects_already_present += 1;
+                }
+            }
+        }
+        stats
+    }
+}
+
+// Re-export the composefs crate for consumers who only need composefs-oci
+pub use composefs;
+
+/// A tuple of (content digest, fs-verity ObjectID).
+pub type ContentAndVerity<ObjectID> = (String, ObjectID);
+
+pub(crate) fn layer_identifier(diff_id: &str) -> String {
     format!("oci-layer-{diff_id}")
 }
 
-fn config_identifier(config: &str) -> String {
+pub(crate) fn config_identifier(config: &str) -> String {
     format!("oci-config-{config}")
 }
 
@@ -52,13 +106,13 @@ fn config_identifier(config: &str) -> String {
 /// Converts the tar stream into a composefs split stream format and stores it in the repository.
 /// If a name is provided, creates a reference to the imported layer for easier access.
 ///
-/// Returns the fs-verity hash value of the stored split stream.
+/// Returns the fs-verity hash value and import statistics for the stored split stream.
 pub fn import_layer<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     diff_id: &str,
     name: Option<&str>,
     tar_stream: &mut impl Read,
-) -> Result<ObjectID> {
+) -> Result<(ObjectID, ImportStats)> {
     repo.ensure_stream(
         &layer_identifier(diff_id),
         TAR_LAYER_CONTENT_TYPE,
@@ -88,15 +142,54 @@ pub fn ls_layer<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
+/// Result of a pull operation.
+#[derive(Debug)]
+pub struct PullResult<ObjectID> {
+    /// The config digest (sha256:...).
+    pub config_digest: String,
+    /// The fs-verity hash of the config splitstream.
+    pub config_verity: ObjectID,
+    /// Import statistics.
+    pub stats: ImportStats,
+}
+
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
+///
+/// When the `containers-storage` feature is enabled and the image reference
+/// starts with `containers-storage:`, this uses the native cstor import path
+/// which supports zero-copy reflinks. Otherwise, it uses skopeo.
 pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
-) -> Result<(String, ObjectID)> {
-    skopeo::pull(repo, imgref, reference, img_proxy_config).await
+) -> Result<PullResult<ObjectID>> {
+    #[cfg(feature = "containers-storage")]
+    if let Some(image_id) = cstor::parse_containers_storage_ref(imgref) {
+        let ((config_digest, config_verity), cstor_stats) =
+            cstor::import_from_containers_storage(repo, image_id, reference).await?;
+        // Convert cstor::ImportStats to our ImportStats
+        let stats = ImportStats {
+            objects_copied: cstor_stats.objects_reflinked + cstor_stats.objects_copied,
+            objects_already_present: cstor_stats.objects_already_present,
+            bytes_copied: cstor_stats.bytes_reflinked + cstor_stats.bytes_copied,
+            bytes_inlined: cstor_stats.bytes_inlined,
+        };
+        return Ok(PullResult {
+            config_digest,
+            config_verity,
+            stats,
+        });
+    }
+
+    let (config_digest, config_verity, stats) =
+        skopeo::pull(repo, imgref, reference, img_proxy_config).await?;
+    Ok(PullResult {
+        config_digest,
+        config_verity,
+        stats,
+    })
 }
 
 fn hash(bytes: &[u8]) -> String {
@@ -250,7 +343,7 @@ mod test {
 
         let repo_dir = tempdir();
         let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
-        let id = import_layer(&repo, &layer_id, Some("name"), &mut layer.as_slice()).unwrap();
+        let (id, _stats) = import_layer(&repo, &layer_id, Some("name"), &mut layer.as_slice()).unwrap();
 
         let mut dump = String::new();
         let mut split_stream = repo.open_stream("refs/name", Some(&id), None).unwrap();

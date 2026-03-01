@@ -35,11 +35,11 @@ COMPOSEFS_TEST_IMAGE := "localhost/composefs-rs-test:latest"
 
 # Run integration tests (builds cfsctl first); pass extra args to the harness
 test-integration *ARGS: build
-    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests -- {{ ARGS }}
+    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests --bin cfsctl-integration-tests -- {{ ARGS }}
 
 # Run only the fast unprivileged integration tests (no root, no VM)
 integration-unprivileged: build
-    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests -- --skip privileged_
+    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests --bin cfsctl-integration-tests -- --skip privileged_
 
 # Build the test container image for VM-based integration tests
 integration-container-build:
@@ -49,7 +49,19 @@ integration-container-build:
 integration-container: build integration-container-build
     COMPOSEFS_TEST_IMAGE={{COMPOSEFS_TEST_IMAGE}} \
         CFSCTL_PATH=$(pwd)/target/debug/cfsctl \
-        cargo run -p integration-tests
+        cargo run -p integration-tests --bin cfsctl-integration-tests
+
+# Run all tests with all features enabled
+test-all:
+    cargo test --workspace --all-features
+
+# Build with containers-storage feature
+build-cstorage:
+    cargo build --workspace --features containers-storage
+
+# Run integration tests (requires podman and skopeo)
+integration-test: build-release
+    cargo run --release -p integration-tests --bin integration-tests
 
 # Clean build artifacts
 clean:

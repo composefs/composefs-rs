@@ -23,6 +23,9 @@ composefs-oci = { version = "0.3.0", path = "crates/composefs-oci", default-feat
 composefs-boot = { version = "0.3.0", path = "crates/composefs-boot", default-features = false }
 composefs-http = { version = "0.3.0", path = "crates/composefs-http", default-features = false }
 
+# JSON-RPC with FD passing for userns helper
+jsonrpc-fdpass = { git = "https://github.com/cgwalters/jsonrpc-fdpass", rev = "b30fa1d" }
+
 [profile.dev.package.sha2]
 # this is *really* slow otherwise
 opt-level = 3

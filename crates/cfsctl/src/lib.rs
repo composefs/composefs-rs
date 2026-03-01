@@ -1,19 +1,21 @@
 //! Library for `cfsctl` command line utility
 
-use std::{
-    ffi::OsString,
-    fs::create_dir_all,
-    io::IsTerminal,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{ffi::OsString, path::PathBuf};
+
+#[cfg(feature = "oci")]
+use std::{fs::create_dir_all, io::IsTerminal, path::Path};
+
+#[cfg(any(feature = "oci", feature = "http"))]
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+#[cfg(feature = "oci")]
 use comfy_table::{presets::UTF8_FULL, Table};
 
 use rustix::fs::CWD;
 
+#[cfg(feature = "oci")]
 use composefs_boot::{write_boot, BootOps};
 
 use composefs::{
@@ -294,6 +296,7 @@ where
     }
 }
 
+#[cfg(feature = "oci")]
 fn verity_opt<ObjectID>(opt: &Option<String>) -> Result<Option<ObjectID>>
 where
     ObjectID: FsVerityHashValue,
@@ -348,7 +351,7 @@ where
         #[cfg(feature = "oci")]
         Command::Oci { cmd: oci_cmd } => match oci_cmd {
             OciCommand::ImportLayer { name, digest } => {
-                let object_id = composefs_oci::import_layer(
+                let (object_id, _stats) = composefs_oci::import_layer(
                     &Arc::new(repo),
                     &digest,
                     name.as_deref(),
@@ -422,13 +425,45 @@ where
             OciCommand::Pull { ref image, name } => {
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
-                let result =
-                    composefs_oci::pull_image(&Arc::new(repo), image, Some(tag_name), None).await?;
+                let repo = Arc::new(repo);
 
-                println!("manifest {}", result.manifest_digest);
-                println!("config   {}", result.config_digest);
-                println!("verity   {}", result.manifest_verity.to_hex());
-                println!("tagged   {tag_name}");
+                // Check if this is a containers-storage import
+                #[cfg(feature = "containers-storage")]
+                let is_cstor = composefs_oci::cstor::parse_containers_storage_ref(image).is_some();
+                #[cfg(not(feature = "containers-storage"))]
+                let is_cstor = false;
+
+                if is_cstor {
+                    // Use unified pull which handles containers-storage routing
+                    let result = composefs_oci::pull(&repo, image, Some(tag_name), None).await?;
+
+                    println!("config {}", result.config_digest);
+                    println!("verity {}", result.config_verity.to_hex());
+                    println!("tagged {tag_name}");
+                    println!(
+                        "objects  {} copied, {} already present, {} bytes copied, {} bytes inlined",
+                        result.stats.objects_copied,
+                        result.stats.objects_already_present,
+                        result.stats.bytes_copied,
+                        result.stats.bytes_inlined,
+                    );
+                } else {
+                    // Use the normal skopeo-based pull which produces full manifest info
+                    let (result, stats) =
+                        composefs_oci::pull_image(&repo, image, Some(tag_name), None).await?;
+
+                    println!("manifest {}", result.manifest_digest);
+                    println!("config   {}", result.config_digest);
+                    println!("verity   {}", result.manifest_verity.to_hex());
+                    println!("tagged   {tag_name}");
+                    println!(
+                        "objects  {} copied, {} already present, {} bytes copied, {} bytes inlined",
+                        stats.objects_copied,
+                        stats.objects_already_present,
+                        stats.bytes_copied,
+                        stats.bytes_inlined,
+                    );
+                }
             }
             OciCommand::ListImages { json } => {
                 let images = composefs_oci::oci_image::list_images(&repo)?;
