@@ -23,7 +23,7 @@ use std::thread::available_parallelism;
 use anyhow::{Context, Result};
 use cap_std_ext::cap_std;
 use fn_error_context::context;
-use oci_spec::image::{Descriptor, ImageConfiguration, MediaType};
+use oci_spec::image::{Descriptor, MediaType};
 use ocidir::OciDir;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -97,7 +97,7 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
     // Import config and layers
     let config_descriptor = manifest.config();
     let layers = manifest.layers();
-    let (config_digest, config_verity, layer_verities, stats) =
+    let (config_digest, config_verity, layer_refs, stats) =
         import_config_and_layers(repo, &ocidir, layers, config_descriptor)
             .await
             .with_context(|| format!("Failed to import config {}", config_descriptor.digest()))?;
@@ -115,7 +115,8 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
         let config_key = format!("config:{}", config_descriptor.digest());
         splitstream.add_named_stream_ref(&config_key, &config_verity);
 
-        for (diff_id, verity) in &layer_verities {
+        // Add layer refs in config-defined diff_id order
+        for (diff_id, verity) in &layer_refs {
             splitstream.add_named_stream_ref(diff_id, verity);
         }
 
@@ -142,25 +143,52 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
 }
 
 /// Import config and all layers from an OCI layout.
+///
+/// Returns (config_digest, config_verity, layer_refs, stats).
+/// `layer_refs` is an ordered Vec of (diff_id, verity) pairs preserving the
+/// order from the config (or manifest for artifacts).
 async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     ocidir: &OciDir,
     manifest_layers: &[Descriptor],
     config_descriptor: &Descriptor,
-) -> Result<(String, ObjectID, HashMap<String, ObjectID>, ImportStats)> {
+) -> Result<(String, ObjectID, Vec<(String, ObjectID)>, ImportStats)> {
     let config_digest: &str = config_descriptor.digest().as_ref();
     let content_id = config_identifier(config_digest);
 
     if let Some(config_id) = repo.has_stream(&content_id)? {
         debug!("Already have container config {config_digest}");
 
-        let stream =
-            repo.open_stream(&content_id, Some(&config_id), Some(OCI_CONFIG_CONTENT_TYPE))?;
-        let layer_refs: HashMap<String, ObjectID> = stream
-            .into_named_refs()
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
+        let (data, named_refs) = crate::oci_image::read_external_splitstream(
+            repo,
+            &content_id,
+            Some(&config_id),
+            Some(OCI_CONFIG_CONTENT_TYPE),
+        )?;
+        let named_refs_map: HashMap<&str, ObjectID> = named_refs
+            .iter()
+            .map(|(k, v)| (k.as_ref(), v.clone()))
             .collect();
+
+        let diff_ids =
+            crate::extract_diff_ids(config_descriptor.media_type(), &data, manifest_layers)?;
+
+        let layer_refs: Vec<(String, ObjectID)> = diff_ids
+            .into_iter()
+            .map(|diff_id| {
+                let verity = named_refs_map
+                    .get(diff_id.as_str())
+                    .with_context(|| format!("missing layer verity for diff_id {diff_id}"))?;
+                Ok((diff_id, verity.clone()))
+            })
+            .collect::<Result<_>>()?;
+
+        anyhow::ensure!(
+            layer_refs.len() == manifest_layers.len(),
+            "expected {} layer refs but got {}",
+            manifest_layers.len(),
+            layer_refs.len()
+        );
 
         return Ok((
             config_digest.to_string(),
@@ -174,18 +202,10 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
     debug!("Reading config {config_digest}");
     let raw_config = read_blob_bytes(ocidir, config_descriptor).context("Reading config blob")?;
 
-    // Parse config to get diff_ids (if this is a container image)
-    let is_image_config = *config_descriptor.media_type() == MediaType::ImageConfig;
-    let diff_ids: Vec<String> = if is_image_config {
-        let config = ImageConfiguration::from_reader(&raw_config[..])?;
-        config.rootfs().diff_ids().to_vec()
-    } else {
-        // Artifact - use manifest layer digests
-        manifest_layers
-            .iter()
-            .map(|d| d.digest().to_string())
-            .collect()
-    };
+    // Parse config to get diff_ids (if this is a container image).
+    // For artifacts with non-standard config types, falls back to layer digests.
+    let diff_ids =
+        crate::extract_diff_ids(config_descriptor.media_type(), &raw_config, manifest_layers)?;
 
     // Sort layers by size for parallel fetching (largest first)
     let mut layers: Vec<_> = manifest_layers.iter().zip(&diff_ids).collect();
@@ -214,22 +234,36 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
         });
     }
 
-    // Collect results and sort by index
-    let mut results: Vec<_> = layer_tasks
-        .join_all()
-        .await
-        .into_iter()
-        .collect::<Result<_, _>>()?;
-    results.sort_by_key(|(idx, _, _, _)| *idx);
-
-    // Build config splitstream with layer refs
-    let mut splitstream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
-    let mut layer_refs = HashMap::new();
+    // Collect results into a map keyed by diff_id for ordered lookup
+    let mut verity_map = HashMap::new();
     let mut stats = ImportStats::default();
-    for (_, diff_id, verity, layer_stats) in results {
-        splitstream.add_named_stream_ref(&diff_id, &verity);
-        layer_refs.insert(diff_id, verity);
+    for result in layer_tasks.join_all().await {
+        let (_, diff_id, verity, layer_stats) = result?;
+        verity_map.insert(diff_id, verity);
         stats.merge(&layer_stats);
+    }
+
+    // Build ordered layer_refs from config-defined diff_id order
+    let layer_refs: Vec<(String, ObjectID)> = diff_ids
+        .into_iter()
+        .map(|diff_id| {
+            let verity = verity_map
+                .get(diff_id.as_str())
+                .with_context(|| format!("missing layer verity for diff_id {diff_id}"))?;
+            Ok((diff_id, verity.clone()))
+        })
+        .collect::<Result<_>>()?;
+
+    anyhow::ensure!(
+        layer_refs.len() == manifest_layers.len(),
+        "expected {} layer refs but got {}",
+        manifest_layers.len(),
+        layer_refs.len()
+    );
+
+    let mut splitstream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+    for (diff_id, verity) in &layer_refs {
+        splitstream.add_named_stream_ref(diff_id, verity);
     }
 
     splitstream.write_external(&raw_config)?;

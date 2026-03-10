@@ -26,7 +26,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{bail, ensure, Context, Result};
 use containers_image_proxy::ImageProxyConfig;
-use oci_spec::image::ImageConfiguration;
+use oci_spec::image::{Descriptor, ImageConfiguration, MediaType};
 use sha2::{Digest, Sha256};
 
 use composefs::{
@@ -199,6 +199,28 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     })
 }
 
+/// Extract ordered diff_ids from a config descriptor.
+///
+/// For standard container images (ImageConfig media type), parses the
+/// config JSON and returns `rootfs.diff_ids`. For artifacts with
+/// non-standard config types, falls back to using manifest layer
+/// digests as identifiers.
+pub(crate) fn extract_diff_ids(
+    media_type: &MediaType,
+    config_bytes: &[u8],
+    manifest_layers: &[Descriptor],
+) -> Result<Vec<String>> {
+    if *media_type == MediaType::ImageConfig {
+        let config = ImageConfiguration::from_reader(config_bytes)?;
+        Ok(config.rootfs().diff_ids().to_vec())
+    } else {
+        Ok(manifest_layers
+            .iter()
+            .map(|d| d.digest().to_string())
+            .collect())
+    }
+}
+
 fn hash(bytes: &[u8]) -> String {
     let mut context = Sha256::new();
     context.update(bytes);
@@ -259,8 +281,12 @@ pub fn write_config<ObjectID: FsVerityHashValue>(
     let json_bytes = json.as_bytes();
     let config_digest = hash(json_bytes);
     let mut stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
-    for (name, value) in &refs {
-        stream.add_named_stream_ref(name, value)
+    // Add refs in config-defined diff_id order for deterministic output
+    for diff_id in config.rootfs().diff_ids() {
+        let value = refs
+            .get(diff_id.as_str())
+            .with_context(|| format!("missing layer verity for diff_id {diff_id}"))?;
+        stream.add_named_stream_ref(diff_id, value);
     }
     stream.write_external(json_bytes)?;
     let id = repo.write_stream(stream, &config_identifier(&config_digest), None)?;
@@ -520,6 +546,75 @@ mod test {
             object_refs[0], expected_verity,
             "External object verity should match independently computed verity of config JSON"
         );
+    }
+
+    #[tokio::test]
+    async fn test_config_verity_deterministic() -> Result<()> {
+        use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+
+        let repo_dir = tempdir();
+        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+
+        // Create 3 distinct layers with different content
+        let mut layers = Vec::new();
+        for (name, size) in [("alpha", 1000), ("beta", 2000), ("gamma", 3000)] {
+            let mut builder = ::tar::Builder::new(vec![]);
+            append_data(&mut builder, name, size);
+            let layer = builder.into_inner().unwrap();
+
+            let mut context = Sha256::new();
+            context.update(&layer);
+            let diff_id = format!("sha256:{}", hex::encode(context.finalize()));
+
+            let (verity, _stats) = import_layer(&repo, &diff_id, None, &mut layer.as_slice())
+                .await
+                .unwrap();
+            layers.push((diff_id, verity));
+        }
+
+        let diff_ids: Vec<String> = layers.iter().map(|(d, _)| d.clone()).collect();
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(
+                RootFsBuilder::default()
+                    .typ("layers")
+                    .diff_ids(diff_ids.clone())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        // Build refs HashMaps with different insertion orders to exercise
+        // that write_config uses config-defined diff_id order, not HashMap order.
+        let refs1: HashMap<Box<str>, Sha256HashValue> = layers
+            .iter()
+            .map(|(d, v)| (d.as_str().into(), v.clone()))
+            .collect();
+        let refs2: HashMap<Box<str>, Sha256HashValue> = layers
+            .iter()
+            .rev()
+            .map(|(d, v)| (d.as_str().into(), v.clone()))
+            .collect();
+
+        let (_digest1, verity1) = write_config(&repo, &config, refs1)?;
+        let (_digest2, verity2) = write_config(&repo, &config, refs2)?;
+
+        // The verity must be identical regardless of HashMap iteration order
+        assert_eq!(
+            verity1, verity2,
+            "config verity must be deterministic across calls"
+        );
+
+        // Hardcoded expected value to catch any accidental changes
+        assert_eq!(
+            verity1.to_hex(),
+            "7752e739a60d1e697ac96545fc23d9a6e5f254625fd313a146722781cef0ffac",
+            "config verity changed unexpectedly"
+        );
+
+        Ok(())
     }
 
     #[test]
