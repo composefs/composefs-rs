@@ -431,6 +431,9 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 /// Returns `PullResult` containing both manifest and config digests/verities.
 /// If `reference` is provided, the manifest is also stored under that name.
 ///
+/// For `oci:` transport (local OCI layout directories), this uses a fast path
+/// that reads the layout directly without going through the skopeo proxy.
+///
 /// Note: For backward compatibility, use `.into_config()` on the result to get
 /// the (config_digest, config_verity) tuple that was previously returned.
 pub async fn pull_image<ObjectID: FsVerityHashValue>(
@@ -442,6 +445,15 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     let image_ref =
         ImageReference::try_from(imgref).context("Parsing image reference transport")?;
 
+    // Fast path: read local OCI layout directories directly without skopeo
+    if image_ref.transport == Transport::OciDir {
+        let (path_str, layout_tag) = crate::oci_layout::parse_oci_layout_ref(&image_ref.name);
+        let layout_path = std::path::Path::new(path_str);
+        return crate::oci_layout::import_oci_layout(repo, layout_path, layout_tag, reference)
+            .await;
+    }
+
+    // Standard path: use skopeo proxy for other transports
     let op = Arc::new(ImageOp::new(repo, &image_ref, img_proxy_config).await?);
     let (result, stats) = op
         .pull()
