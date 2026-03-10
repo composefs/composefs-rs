@@ -51,6 +51,7 @@ use sha2::{Digest, Sha256};
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
+use crate::layer::is_tar_media_type;
 use crate::skopeo::{OCI_BLOB_CONTENT_TYPE, OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE};
 
 /// Data and named refs from a splitstream with external object storage.
@@ -605,19 +606,6 @@ pub fn has_manifest<ObjectID: FsVerityHashValue>(
 /// Returns the content identifier for a manifest.
 pub fn manifest_identifier(digest: &str) -> String {
     format!("oci-manifest-{digest}")
-}
-
-/// Returns true if this is a tar-based layer media type.
-pub(crate) fn is_tar_media_type(media_type: &MediaType) -> bool {
-    matches!(
-        media_type,
-        MediaType::ImageLayer
-            | MediaType::ImageLayerGzip
-            | MediaType::ImageLayerZstd
-            | MediaType::ImageLayerNonDistributable
-            | MediaType::ImageLayerNonDistributableGzip
-            | MediaType::ImageLayerNonDistributableZstd
-    )
 }
 
 /// Returns the reference path for an OCI name.

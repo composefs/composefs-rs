@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod image;
+pub mod layer;
 pub mod oci_image;
 pub mod skopeo;
 pub mod tar;
@@ -363,6 +364,64 @@ mod test {
 /file4096 4096 100700 1 0 0 0 0.0 ba/bc284ee4ffe7f449377fbf6692715b43aec7bc39c094a95878904d34bac97e - babc284ee4ffe7f449377fbf6692715b43aec7bc39c094a95878904d34bac97e
 /file4097 4097 100700 1 0 0 0 0.0 09/3756e4ea9683329106d4a16982682ed182c14bf076463a9e7f97305cbac743 - 093756e4ea9683329106d4a16982682ed182c14bf076463a9e7f97305cbac743
 ");
+    }
+
+    #[tokio::test]
+    async fn test_layer_import_stats() {
+        let layer = example_layer();
+        let mut context = Sha256::new();
+        context.update(&layer);
+        let layer_id = format!("sha256:{}", hex::encode(context.finalize()));
+
+        let repo_dir = tempdir();
+        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+        let (_id, stats) = import_layer(&repo, &layer_id, Some("name"), &layer[..])
+            .await
+            .unwrap();
+
+        // The example layer has files of sizes 0, 4095, 4096, 4097.
+        // Files > INLINE_CONTENT_MAX (64 bytes) are stored as external objects.
+        // So 4095, 4096, and 4097 are all external → 3 objects copied.
+        assert_eq!(
+            stats.objects_copied, 3,
+            "three files above inline threshold should be external objects"
+        );
+        assert_eq!(stats.objects_already_present, 0);
+        assert!(
+            stats.bytes_copied > 0,
+            "bytes_copied should be nonzero for external objects"
+        );
+        assert!(
+            stats.bytes_inlined > 0,
+            "bytes_inlined should be nonzero (tar headers + small file)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_layer_import_deduplication_stats() {
+        let layer = example_layer();
+        let mut context = Sha256::new();
+        context.update(&layer);
+        let layer_id = format!("sha256:{}", hex::encode(context.finalize()));
+
+        let repo_dir = tempdir();
+        let repo = Arc::new(Repository::<Sha256HashValue>::open_path(CWD, &repo_dir).unwrap());
+
+        // First import
+        let (_id, stats1) = import_layer(&repo, &layer_id, None, &layer[..])
+            .await
+            .unwrap();
+        assert_eq!(stats1.objects_copied, 3);
+        assert_eq!(stats1.objects_already_present, 0);
+
+        // Re-import the same layer — the stream already exists so we get
+        // an early return with zero stats (idempotent).
+        let (_id, stats2) = import_layer(&repo, &layer_id, None, &layer[..])
+            .await
+            .unwrap();
+        assert_eq!(stats2.objects_copied, 0);
+        assert_eq!(stats2.objects_already_present, 0);
+        assert_eq!(stats2.bytes_copied, 0);
     }
 
     #[test]

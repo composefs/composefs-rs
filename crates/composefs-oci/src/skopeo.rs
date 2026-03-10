@@ -13,7 +13,6 @@ use std::{cmp::Reverse, process::Command, thread::available_parallelism};
 use std::{iter::zip, sync::Arc};
 
 use anyhow::{Context, Result};
-use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
 use containers_image_proxy::{
     ConvertedLayerInfo, ImageProxy, ImageProxyConfig, OpenedImage, Transport,
 };
@@ -21,22 +20,18 @@ use fn_error_context::context;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use oci_spec::image::{Descriptor, ImageConfiguration, MediaType};
 use rustix::process::geteuid;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
-    sync::Semaphore,
-    task::JoinSet,
-};
+use tokio::{io::AsyncReadExt, sync::Semaphore, task::JoinSet};
 
 use composefs::{
     fsverity::FsVerityHashValue,
     repository::{ObjectStoreMethod, Repository},
-    shared_internals::IO_BUF_CAPACITY,
 };
 
 use crate::{
-    config_identifier, layer_identifier,
-    oci_image::{is_tar_media_type, manifest_identifier, tag_image},
-    tar::split_async,
+    config_identifier,
+    layer::{decompress_async, import_tar_async, is_tar_media_type, store_blob_async},
+    layer_identifier,
+    oci_image::{manifest_identifier, tag_image},
     ContentAndVerity, ImportStats,
 };
 
@@ -196,40 +191,12 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             let media_type = descriptor.media_type();
             let (object_id, layer_stats) = if is_tar_media_type(media_type) {
                 // Tar layers: decompress and split into a splitstream
-                let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match media_type {
-                    MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => {
-                        Box::new(BufReader::with_capacity(IO_BUF_CAPACITY, progress))
-                    }
-                    MediaType::ImageLayerGzip | MediaType::ImageLayerNonDistributableGzip => {
-                        Box::new(BufReader::with_capacity(
-                            IO_BUF_CAPACITY,
-                            GzipDecoder::new(BufReader::new(progress)),
-                        ))
-                    }
-                    MediaType::ImageLayerZstd | MediaType::ImageLayerNonDistributableZstd => {
-                        Box::new(BufReader::with_capacity(
-                            IO_BUF_CAPACITY,
-                            ZstdDecoder::new(BufReader::new(progress)),
-                        ))
-                    }
-                    _ => unreachable!("is_tar_media_type returned true"),
-                };
-                split_async(reader, self.repo.clone(), TAR_LAYER_CONTENT_TYPE).await?
+                let reader = decompress_async(progress, media_type)?;
+                import_tar_async(self.repo.clone(), reader).await?
             } else {
-                // Non-tar layers (OCI artifacts like SBOMs, disk images,
-                // etc.): stream the raw bytes into a repository object and
-                // create a splitstream with a single external reference.
-                // This avoids buffering arbitrarily large blobs in memory
-                // and lets callers get an fd to the object directly via
-                // open_object().
-                let tmpfile = self.repo.create_object_tmpfile()?;
-                let mut writer = tokio::fs::File::from(std::fs::File::from(tmpfile));
-                let mut reader = progress;
-                let size = tokio::io::copy(&mut reader, &mut writer).await?;
-                writer.flush().await?;
-                let tmpfile = writer.into_std().await;
+                // Non-tar layers (OCI artifacts): stream raw bytes to object store
+                let (object_id, size, method) = store_blob_async(&self.repo, progress).await?;
                 driver.await?;
-                let (object_id, method) = self.repo.finalize_object_tmpfile(tmpfile, size)?;
 
                 let mut stats = ImportStats::default();
                 match method {
@@ -242,11 +209,10 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                     }
                 }
 
+                // Create splitstream with external reference and register it
                 let mut stream = self.repo.create_stream(OCI_BLOB_CONTENT_TYPE);
                 stream.add_external_size(size);
                 stream.write_reference(object_id)?;
-                // write_stream handles both object storage and stream
-                // registration, so we return directly.
                 let stream_id = self.repo.write_stream(stream, &content_id, None)?;
                 return Ok((stream_id, stats));
             };
