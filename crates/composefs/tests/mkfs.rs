@@ -12,7 +12,11 @@ use tempfile::NamedTempFile;
 
 use composefs::{
     dumpfile::write_dumpfile,
-    erofs::{debug::debug_img, writer::mkfs_erofs},
+    erofs::{
+        debug::debug_img,
+        format::FormatVersion,
+        writer::{mkfs_erofs, mkfs_erofs_versioned},
+    },
     fsverity::{FsVerityHashValue, Sha256HashValue},
     tree::{FileSystem, Inode, LeafContent, RegularFile, Stat},
 };
@@ -34,6 +38,14 @@ fn debug_fs(fs: FileSystem<impl FsVerityHashValue>) -> String {
     String::from_utf8(output).unwrap()
 }
 
+fn debug_fs_v1(mut fs: FileSystem<impl FsVerityHashValue>) -> String {
+    fs.add_overlay_whiteouts();
+    let image = mkfs_erofs_versioned(&fs, FormatVersion::V1);
+    let mut output = vec![];
+    debug_img(&mut output, &image).unwrap();
+    String::from_utf8(output).unwrap()
+}
+
 fn empty(_fs: &mut FileSystem<impl FsVerityHashValue>) {}
 
 #[test]
@@ -41,6 +53,13 @@ fn test_empty() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     empty(&mut fs);
     insta::assert_snapshot!(debug_fs(fs));
+}
+
+#[test]
+fn test_empty_v1() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    empty(&mut fs);
+    insta::assert_snapshot!(debug_fs_v1(fs));
 }
 
 fn add_leaf<ObjectID: FsVerityHashValue>(
@@ -94,6 +113,13 @@ fn test_simple() {
     insta::assert_snapshot!(debug_fs(fs));
 }
 
+#[test]
+fn test_simple_v1() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    simple(&mut fs);
+    insta::assert_snapshot!(debug_fs_v1(fs));
+}
+
 fn foreach_case(f: fn(&FileSystem<Sha256HashValue>)) {
     for case in [empty, simple] {
         let mut fs = FileSystem::new(default_stat());
@@ -105,11 +131,24 @@ fn foreach_case(f: fn(&FileSystem<Sha256HashValue>)) {
 #[test_with::executable(fsck.erofs)]
 fn test_fsck() {
     foreach_case(|fs| {
+        // V2 (default)
         let mut tmp = NamedTempFile::new().unwrap();
         tmp.write_all(&mkfs_erofs(fs)).unwrap();
         let mut fsck = Command::new("fsck.erofs").arg(tmp.path()).spawn().unwrap();
         assert!(fsck.wait().unwrap().success());
     });
+
+    // V1 — needs its own filesystem instances for add_overlay_whiteouts
+    for case in [empty, simple] {
+        let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+        case(&mut fs);
+        fs.add_overlay_whiteouts();
+        let image = mkfs_erofs_versioned(&fs, FormatVersion::V1);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&image).unwrap();
+        let mut fsck = Command::new("fsck.erofs").arg(tmp.path()).spawn().unwrap();
+        assert!(fsck.wait().unwrap().success());
+    }
 }
 
 fn dump_image(img: &[u8]) -> String {
@@ -148,22 +187,29 @@ fn test_erofs_digest_stability() {
         );
     }
 }
-
-#[should_panic]
 #[test_with::executable(mkcomposefs)]
 fn test_vs_mkcomposefs() {
-    foreach_case(|fs| {
-        let image = mkfs_erofs(fs);
+    for case in [empty, simple] {
+        // Build separate filesystems to avoid Rc clone issues with nlink
+        let mut fs_rust = FileSystem::new(default_stat());
+        case(&mut fs_rust);
+
+        let mut fs_c = FileSystem::new(default_stat());
+        case(&mut fs_c);
+
+        // Add whiteouts for V1 (mkcomposefs does this internally)
+        fs_rust.add_overlay_whiteouts();
+        let image = mkfs_erofs_versioned(&fs_rust, FormatVersion::V1);
 
         let mut mkcomposefs = Command::new("mkcomposefs")
-            .args(["--min-version=3", "--from-file", "-", "-"])
+            .args(["--from-file", "-", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
 
         let mut stdin = mkcomposefs.stdin.take().unwrap();
-        write_dumpfile(&mut stdin, fs).unwrap();
+        write_dumpfile(&mut stdin, &fs_c).unwrap();
         drop(stdin);
 
         let output = mkcomposefs.wait_with_output().unwrap();
@@ -175,6 +221,6 @@ fn test_vs_mkcomposefs() {
             let mkcomposefs_dump = dump_image(&mkcomposefs_image);
             assert_eq!(mkcomposefs_dump, dump);
         }
-        assert_eq!(image, mkcomposefs_image); // fallback if the dump is somehow the same
-    });
+        assert_eq!(image, mkcomposefs_image);
+    }
 }

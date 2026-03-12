@@ -1,0 +1,3490 @@
+---
+source: crates/composefs/tests/mkfs.rs
+expression: debug_fs_v1(fs)
+---
+00000000 ComposefsHeader
+      +0     magic: U32(3497550490)
+      +4     version: U32(1)
+
+00000020 Padding
+    +3e0     # 992 nul bytes
+
+00000400 Superblock
+      +0     magic: U32(3774210530)
+      +8     feature_compat: U32(6)
+      +c     blkszbits: 12
+      +e     root_nid: U16(36)
+     +10     inos: U64(264)
+     +24     blocks: U32(4)
+     +2c     xattr_blkaddr: U32(2)
+
+# Filename "/"
+# nid #36
+00000480 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +2     xattr_icount: U16(6)
+      +4     mode: 0040755 (directory)
+      +8     size: U32(4096)
+     +10     u: U32(3)
+      +6     nlink: U16(2)
+     +20     name_filter: U32(4293918719)
+     +2c     xattr: (4 14 1) trusted."overlay.opaque" = "y"
+
+# Filename "/00"
+# nid #38
+000004c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(1)
+      +6     nlink: U16(1)
+
+# Filename "/01"
+# nid #39
+000004e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(2)
+      +6     nlink: U16(1)
+
+# Filename "/02"
+# nid #40
+00000500 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(3)
+      +6     nlink: U16(1)
+
+# Filename "/03"
+# nid #41
+00000520 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(4)
+      +6     nlink: U16(1)
+
+# Filename "/04"
+# nid #42
+00000540 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(5)
+      +6     nlink: U16(1)
+
+# Filename "/05"
+# nid #43
+00000560 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(6)
+      +6     nlink: U16(1)
+
+# Filename "/06"
+# nid #44
+00000580 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(7)
+      +6     nlink: U16(1)
+
+# Filename "/07"
+# nid #45
+000005a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(8)
+      +6     nlink: U16(1)
+
+# Filename "/08"
+# nid #46
+000005c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(9)
+      +6     nlink: U16(1)
+
+# Filename "/09"
+# nid #47
+000005e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(10)
+      +6     nlink: U16(1)
+
+# Filename "/0a"
+# nid #48
+00000600 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(11)
+      +6     nlink: U16(1)
+
+# Filename "/0b"
+# nid #49
+00000620 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(12)
+      +6     nlink: U16(1)
+
+# Filename "/0c"
+# nid #50
+00000640 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(13)
+      +6     nlink: U16(1)
+
+# Filename "/0d"
+# nid #51
+00000660 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(14)
+      +6     nlink: U16(1)
+
+# Filename "/0e"
+# nid #52
+00000680 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(15)
+      +6     nlink: U16(1)
+
+# Filename "/0f"
+# nid #53
+000006a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(16)
+      +6     nlink: U16(1)
+
+# Filename "/10"
+# nid #54
+000006c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(17)
+      +6     nlink: U16(1)
+
+# Filename "/11"
+# nid #55
+000006e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(18)
+      +6     nlink: U16(1)
+
+# Filename "/12"
+# nid #56
+00000700 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(19)
+      +6     nlink: U16(1)
+
+# Filename "/13"
+# nid #57
+00000720 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(20)
+      +6     nlink: U16(1)
+
+# Filename "/14"
+# nid #58
+00000740 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(21)
+      +6     nlink: U16(1)
+
+# Filename "/15"
+# nid #59
+00000760 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(22)
+      +6     nlink: U16(1)
+
+# Filename "/16"
+# nid #60
+00000780 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(23)
+      +6     nlink: U16(1)
+
+# Filename "/17"
+# nid #61
+000007a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(24)
+      +6     nlink: U16(1)
+
+# Filename "/18"
+# nid #62
+000007c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(25)
+      +6     nlink: U16(1)
+
+# Filename "/19"
+# nid #63
+000007e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(26)
+      +6     nlink: U16(1)
+
+# Filename "/1a"
+# nid #64
+00000800 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(27)
+      +6     nlink: U16(1)
+
+# Filename "/1b"
+# nid #65
+00000820 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(28)
+      +6     nlink: U16(1)
+
+# Filename "/1c"
+# nid #66
+00000840 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(29)
+      +6     nlink: U16(1)
+
+# Filename "/1d"
+# nid #67
+00000860 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(30)
+      +6     nlink: U16(1)
+
+# Filename "/1e"
+# nid #68
+00000880 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(31)
+      +6     nlink: U16(1)
+
+# Filename "/1f"
+# nid #69
+000008a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(32)
+      +6     nlink: U16(1)
+
+# Filename "/20"
+# nid #70
+000008c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(33)
+      +6     nlink: U16(1)
+
+# Filename "/21"
+# nid #71
+000008e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(34)
+      +6     nlink: U16(1)
+
+# Filename "/22"
+# nid #72
+00000900 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(35)
+      +6     nlink: U16(1)
+
+# Filename "/23"
+# nid #73
+00000920 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(36)
+      +6     nlink: U16(1)
+
+# Filename "/24"
+# nid #74
+00000940 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(37)
+      +6     nlink: U16(1)
+
+# Filename "/25"
+# nid #75
+00000960 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(38)
+      +6     nlink: U16(1)
+
+# Filename "/26"
+# nid #76
+00000980 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(39)
+      +6     nlink: U16(1)
+
+# Filename "/27"
+# nid #77
+000009a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(40)
+      +6     nlink: U16(1)
+
+# Filename "/28"
+# nid #78
+000009c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(41)
+      +6     nlink: U16(1)
+
+# Filename "/29"
+# nid #79
+000009e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(42)
+      +6     nlink: U16(1)
+
+# Filename "/2a"
+# nid #80
+00000a00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(43)
+      +6     nlink: U16(1)
+
+# Filename "/2b"
+# nid #81
+00000a20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(44)
+      +6     nlink: U16(1)
+
+# Filename "/2c"
+# nid #82
+00000a40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(45)
+      +6     nlink: U16(1)
+
+# Filename "/2d"
+# nid #83
+00000a60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(46)
+      +6     nlink: U16(1)
+
+# Filename "/2e"
+# nid #84
+00000a80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(47)
+      +6     nlink: U16(1)
+
+# Filename "/2f"
+# nid #85
+00000aa0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(48)
+      +6     nlink: U16(1)
+
+# Filename "/30"
+# nid #86
+00000ac0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(49)
+      +6     nlink: U16(1)
+
+# Filename "/31"
+# nid #87
+00000ae0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(50)
+      +6     nlink: U16(1)
+
+# Filename "/32"
+# nid #88
+00000b00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(51)
+      +6     nlink: U16(1)
+
+# Filename "/33"
+# nid #89
+00000b20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(52)
+      +6     nlink: U16(1)
+
+# Filename "/34"
+# nid #90
+00000b40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(53)
+      +6     nlink: U16(1)
+
+# Filename "/35"
+# nid #91
+00000b60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(54)
+      +6     nlink: U16(1)
+
+# Filename "/36"
+# nid #92
+00000b80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(55)
+      +6     nlink: U16(1)
+
+# Filename "/37"
+# nid #93
+00000ba0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(56)
+      +6     nlink: U16(1)
+
+# Filename "/38"
+# nid #94
+00000bc0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(57)
+      +6     nlink: U16(1)
+
+# Filename "/39"
+# nid #95
+00000be0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(58)
+      +6     nlink: U16(1)
+
+# Filename "/3a"
+# nid #96
+00000c00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(59)
+      +6     nlink: U16(1)
+
+# Filename "/3b"
+# nid #97
+00000c20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(60)
+      +6     nlink: U16(1)
+
+# Filename "/3c"
+# nid #98
+00000c40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(61)
+      +6     nlink: U16(1)
+
+# Filename "/3d"
+# nid #99
+00000c60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(62)
+      +6     nlink: U16(1)
+
+# Filename "/3e"
+# nid #100
+00000c80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(63)
+      +6     nlink: U16(1)
+
+# Filename "/3f"
+# nid #101
+00000ca0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(64)
+      +6     nlink: U16(1)
+
+# Filename "/40"
+# nid #102
+00000cc0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(65)
+      +6     nlink: U16(1)
+
+# Filename "/41"
+# nid #103
+00000ce0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(66)
+      +6     nlink: U16(1)
+
+# Filename "/42"
+# nid #104
+00000d00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(67)
+      +6     nlink: U16(1)
+
+# Filename "/43"
+# nid #105
+00000d20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(68)
+      +6     nlink: U16(1)
+
+# Filename "/44"
+# nid #106
+00000d40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(69)
+      +6     nlink: U16(1)
+
+# Filename "/45"
+# nid #107
+00000d60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(70)
+      +6     nlink: U16(1)
+
+# Filename "/46"
+# nid #108
+00000d80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(71)
+      +6     nlink: U16(1)
+
+# Filename "/47"
+# nid #109
+00000da0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(72)
+      +6     nlink: U16(1)
+
+# Filename "/48"
+# nid #110
+00000dc0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(73)
+      +6     nlink: U16(1)
+
+# Filename "/49"
+# nid #111
+00000de0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(74)
+      +6     nlink: U16(1)
+
+# Filename "/4a"
+# nid #112
+00000e00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(75)
+      +6     nlink: U16(1)
+
+# Filename "/4b"
+# nid #113
+00000e20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(76)
+      +6     nlink: U16(1)
+
+# Filename "/4c"
+# nid #114
+00000e40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(77)
+      +6     nlink: U16(1)
+
+# Filename "/4d"
+# nid #115
+00000e60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(78)
+      +6     nlink: U16(1)
+
+# Filename "/4e"
+# nid #116
+00000e80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(79)
+      +6     nlink: U16(1)
+
+# Filename "/4f"
+# nid #117
+00000ea0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(80)
+      +6     nlink: U16(1)
+
+# Filename "/50"
+# nid #118
+00000ec0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(81)
+      +6     nlink: U16(1)
+
+# Filename "/51"
+# nid #119
+00000ee0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(82)
+      +6     nlink: U16(1)
+
+# Filename "/52"
+# nid #120
+00000f00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(83)
+      +6     nlink: U16(1)
+
+# Filename "/53"
+# nid #121
+00000f20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(84)
+      +6     nlink: U16(1)
+
+# Filename "/54"
+# nid #122
+00000f40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(85)
+      +6     nlink: U16(1)
+
+# Filename "/55"
+# nid #123
+00000f60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(86)
+      +6     nlink: U16(1)
+
+# Filename "/56"
+# nid #124
+00000f80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(87)
+      +6     nlink: U16(1)
+
+# Filename "/57"
+# nid #125
+00000fa0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(88)
+      +6     nlink: U16(1)
+
+# Filename "/58"
+# nid #126
+00000fc0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(89)
+      +6     nlink: U16(1)
+
+# Filename "/59"
+# nid #127
+00000fe0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(90)
+      +6     nlink: U16(1)
+
+# Filename "/5a"
+# nid #128
+00001000 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(91)
+      +6     nlink: U16(1)
+
+# Filename "/5b"
+# nid #129
+00001020 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(92)
+      +6     nlink: U16(1)
+
+# Filename "/5c"
+# nid #130
+00001040 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(93)
+      +6     nlink: U16(1)
+
+# Filename "/5d"
+# nid #131
+00001060 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(94)
+      +6     nlink: U16(1)
+
+# Filename "/5e"
+# nid #132
+00001080 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(95)
+      +6     nlink: U16(1)
+
+# Filename "/5f"
+# nid #133
+000010a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(96)
+      +6     nlink: U16(1)
+
+# Filename "/60"
+# nid #134
+000010c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(97)
+      +6     nlink: U16(1)
+
+# Filename "/61"
+# nid #135
+000010e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(98)
+      +6     nlink: U16(1)
+
+# Filename "/62"
+# nid #136
+00001100 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(99)
+      +6     nlink: U16(1)
+
+# Filename "/63"
+# nid #137
+00001120 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(100)
+      +6     nlink: U16(1)
+
+# Filename "/64"
+# nid #138
+00001140 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(101)
+      +6     nlink: U16(1)
+
+# Filename "/65"
+# nid #139
+00001160 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(102)
+      +6     nlink: U16(1)
+
+# Filename "/66"
+# nid #140
+00001180 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(103)
+      +6     nlink: U16(1)
+
+# Filename "/67"
+# nid #141
+000011a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(104)
+      +6     nlink: U16(1)
+
+# Filename "/68"
+# nid #142
+000011c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(105)
+      +6     nlink: U16(1)
+
+# Filename "/69"
+# nid #143
+000011e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(106)
+      +6     nlink: U16(1)
+
+# Filename "/6a"
+# nid #144
+00001200 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(107)
+      +6     nlink: U16(1)
+
+# Filename "/6b"
+# nid #145
+00001220 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(108)
+      +6     nlink: U16(1)
+
+# Filename "/6c"
+# nid #146
+00001240 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(109)
+      +6     nlink: U16(1)
+
+# Filename "/6d"
+# nid #147
+00001260 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(110)
+      +6     nlink: U16(1)
+
+# Filename "/6e"
+# nid #148
+00001280 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(111)
+      +6     nlink: U16(1)
+
+# Filename "/6f"
+# nid #149
+000012a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(112)
+      +6     nlink: U16(1)
+
+# Filename "/70"
+# nid #150
+000012c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(113)
+      +6     nlink: U16(1)
+
+# Filename "/71"
+# nid #151
+000012e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(114)
+      +6     nlink: U16(1)
+
+# Filename "/72"
+# nid #152
+00001300 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(115)
+      +6     nlink: U16(1)
+
+# Filename "/73"
+# nid #153
+00001320 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(116)
+      +6     nlink: U16(1)
+
+# Filename "/74"
+# nid #154
+00001340 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(117)
+      +6     nlink: U16(1)
+
+# Filename "/75"
+# nid #155
+00001360 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(118)
+      +6     nlink: U16(1)
+
+# Filename "/76"
+# nid #156
+00001380 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(119)
+      +6     nlink: U16(1)
+
+# Filename "/77"
+# nid #157
+000013a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(120)
+      +6     nlink: U16(1)
+
+# Filename "/78"
+# nid #158
+000013c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(121)
+      +6     nlink: U16(1)
+
+# Filename "/79"
+# nid #159
+000013e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(122)
+      +6     nlink: U16(1)
+
+# Filename "/7a"
+# nid #160
+00001400 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(123)
+      +6     nlink: U16(1)
+
+# Filename "/7b"
+# nid #161
+00001420 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(124)
+      +6     nlink: U16(1)
+
+# Filename "/7c"
+# nid #162
+00001440 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(125)
+      +6     nlink: U16(1)
+
+# Filename "/7d"
+# nid #163
+00001460 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(126)
+      +6     nlink: U16(1)
+
+# Filename "/7e"
+# nid #164
+00001480 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(127)
+      +6     nlink: U16(1)
+
+# Filename "/7f"
+# nid #165
+000014a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(128)
+      +6     nlink: U16(1)
+
+# Filename "/80"
+# nid #166
+000014c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(129)
+      +6     nlink: U16(1)
+
+# Filename "/81"
+# nid #167
+000014e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(130)
+      +6     nlink: U16(1)
+
+# Filename "/82"
+# nid #168
+00001500 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(131)
+      +6     nlink: U16(1)
+
+# Filename "/83"
+# nid #169
+00001520 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(132)
+      +6     nlink: U16(1)
+
+# Filename "/84"
+# nid #170
+00001540 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(133)
+      +6     nlink: U16(1)
+
+# Filename "/85"
+# nid #171
+00001560 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(134)
+      +6     nlink: U16(1)
+
+# Filename "/86"
+# nid #172
+00001580 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(135)
+      +6     nlink: U16(1)
+
+# Filename "/87"
+# nid #173
+000015a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(136)
+      +6     nlink: U16(1)
+
+# Filename "/88"
+# nid #174
+000015c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(137)
+      +6     nlink: U16(1)
+
+# Filename "/89"
+# nid #175
+000015e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(138)
+      +6     nlink: U16(1)
+
+# Filename "/8a"
+# nid #176
+00001600 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(139)
+      +6     nlink: U16(1)
+
+# Filename "/8b"
+# nid #177
+00001620 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(140)
+      +6     nlink: U16(1)
+
+# Filename "/8c"
+# nid #178
+00001640 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(141)
+      +6     nlink: U16(1)
+
+# Filename "/8d"
+# nid #179
+00001660 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(142)
+      +6     nlink: U16(1)
+
+# Filename "/8e"
+# nid #180
+00001680 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(143)
+      +6     nlink: U16(1)
+
+# Filename "/8f"
+# nid #181
+000016a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(144)
+      +6     nlink: U16(1)
+
+# Filename "/90"
+# nid #182
+000016c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(145)
+      +6     nlink: U16(1)
+
+# Filename "/91"
+# nid #183
+000016e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(146)
+      +6     nlink: U16(1)
+
+# Filename "/92"
+# nid #184
+00001700 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(147)
+      +6     nlink: U16(1)
+
+# Filename "/93"
+# nid #185
+00001720 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(148)
+      +6     nlink: U16(1)
+
+# Filename "/94"
+# nid #186
+00001740 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(149)
+      +6     nlink: U16(1)
+
+# Filename "/95"
+# nid #187
+00001760 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(150)
+      +6     nlink: U16(1)
+
+# Filename "/96"
+# nid #188
+00001780 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(151)
+      +6     nlink: U16(1)
+
+# Filename "/97"
+# nid #189
+000017a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(152)
+      +6     nlink: U16(1)
+
+# Filename "/98"
+# nid #190
+000017c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(153)
+      +6     nlink: U16(1)
+
+# Filename "/99"
+# nid #191
+000017e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(154)
+      +6     nlink: U16(1)
+
+# Filename "/9a"
+# nid #192
+00001800 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(155)
+      +6     nlink: U16(1)
+
+# Filename "/9b"
+# nid #193
+00001820 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(156)
+      +6     nlink: U16(1)
+
+# Filename "/9c"
+# nid #194
+00001840 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(157)
+      +6     nlink: U16(1)
+
+# Filename "/9d"
+# nid #195
+00001860 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(158)
+      +6     nlink: U16(1)
+
+# Filename "/9e"
+# nid #196
+00001880 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(159)
+      +6     nlink: U16(1)
+
+# Filename "/9f"
+# nid #197
+000018a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(160)
+      +6     nlink: U16(1)
+
+# Filename "/a0"
+# nid #198
+000018c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(161)
+      +6     nlink: U16(1)
+
+# Filename "/a1"
+# nid #199
+000018e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(162)
+      +6     nlink: U16(1)
+
+# Filename "/a2"
+# nid #200
+00001900 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(163)
+      +6     nlink: U16(1)
+
+# Filename "/a3"
+# nid #201
+00001920 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(164)
+      +6     nlink: U16(1)
+
+# Filename "/a4"
+# nid #202
+00001940 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(165)
+      +6     nlink: U16(1)
+
+# Filename "/a5"
+# nid #203
+00001960 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(166)
+      +6     nlink: U16(1)
+
+# Filename "/a6"
+# nid #204
+00001980 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(167)
+      +6     nlink: U16(1)
+
+# Filename "/a7"
+# nid #205
+000019a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(168)
+      +6     nlink: U16(1)
+
+# Filename "/a8"
+# nid #206
+000019c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(169)
+      +6     nlink: U16(1)
+
+# Filename "/a9"
+# nid #207
+000019e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(170)
+      +6     nlink: U16(1)
+
+# Filename "/aa"
+# nid #208
+00001a00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(171)
+      +6     nlink: U16(1)
+
+# Filename "/ab"
+# nid #209
+00001a20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(172)
+      +6     nlink: U16(1)
+
+# Filename "/ac"
+# nid #210
+00001a40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(173)
+      +6     nlink: U16(1)
+
+# Filename "/ad"
+# nid #211
+00001a60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(174)
+      +6     nlink: U16(1)
+
+# Filename "/ae"
+# nid #212
+00001a80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(175)
+      +6     nlink: U16(1)
+
+# Filename "/af"
+# nid #213
+00001aa0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(176)
+      +6     nlink: U16(1)
+
+# Filename "/b0"
+# nid #214
+00001ac0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(177)
+      +6     nlink: U16(1)
+
+# Filename "/b1"
+# nid #215
+00001ae0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(178)
+      +6     nlink: U16(1)
+
+# Filename "/b2"
+# nid #216
+00001b00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(179)
+      +6     nlink: U16(1)
+
+# Filename "/b3"
+# nid #217
+00001b20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(180)
+      +6     nlink: U16(1)
+
+# Filename "/b4"
+# nid #218
+00001b40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(181)
+      +6     nlink: U16(1)
+
+# Filename "/b5"
+# nid #219
+00001b60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(182)
+      +6     nlink: U16(1)
+
+# Filename "/b6"
+# nid #220
+00001b80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(183)
+      +6     nlink: U16(1)
+
+# Filename "/b7"
+# nid #221
+00001ba0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(184)
+      +6     nlink: U16(1)
+
+# Filename "/b8"
+# nid #222
+00001bc0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(185)
+      +6     nlink: U16(1)
+
+# Filename "/b9"
+# nid #223
+00001be0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(186)
+      +6     nlink: U16(1)
+
+# Filename "/ba"
+# nid #224
+00001c00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(187)
+      +6     nlink: U16(1)
+
+# Filename "/bb"
+# nid #225
+00001c20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(188)
+      +6     nlink: U16(1)
+
+# Filename "/bc"
+# nid #226
+00001c40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(189)
+      +6     nlink: U16(1)
+
+# Filename "/bd"
+# nid #227
+00001c60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(190)
+      +6     nlink: U16(1)
+
+# Filename "/be"
+# nid #228
+00001c80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(191)
+      +6     nlink: U16(1)
+
+# Filename "/bf"
+# nid #229
+00001ca0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(192)
+      +6     nlink: U16(1)
+
+# Filename "/blkdev"
+# nid #230
+00001cc0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0060000 (blockdev)
+     +10     u: U32(123)
+     +14     ino: U32(193)
+      +6     nlink: U16(1)
+
+# Filename "/c0"
+# nid #231
+00001ce0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(194)
+      +6     nlink: U16(1)
+
+# Filename "/c1"
+# nid #232
+00001d00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(195)
+      +6     nlink: U16(1)
+
+# Filename "/c2"
+# nid #233
+00001d20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(196)
+      +6     nlink: U16(1)
+
+# Filename "/c3"
+# nid #234
+00001d40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(197)
+      +6     nlink: U16(1)
+
+# Filename "/c4"
+# nid #235
+00001d60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(198)
+      +6     nlink: U16(1)
+
+# Filename "/c5"
+# nid #236
+00001d80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(199)
+      +6     nlink: U16(1)
+
+# Filename "/c6"
+# nid #237
+00001da0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(200)
+      +6     nlink: U16(1)
+
+# Filename "/c7"
+# nid #238
+00001dc0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(201)
+      +6     nlink: U16(1)
+
+# Filename "/c8"
+# nid #239
+00001de0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(202)
+      +6     nlink: U16(1)
+
+# Filename "/c9"
+# nid #240
+00001e00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(203)
+      +6     nlink: U16(1)
+
+# Filename "/ca"
+# nid #241
+00001e20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(204)
+      +6     nlink: U16(1)
+
+# Filename "/cb"
+# nid #242
+00001e40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(205)
+      +6     nlink: U16(1)
+
+# Filename "/cc"
+# nid #243
+00001e60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(206)
+      +6     nlink: U16(1)
+
+# Filename "/cd"
+# nid #244
+00001e80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(207)
+      +6     nlink: U16(1)
+
+# Filename "/ce"
+# nid #245
+00001ea0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(208)
+      +6     nlink: U16(1)
+
+# Filename "/cf"
+# nid #246
+00001ec0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(209)
+      +6     nlink: U16(1)
+
+# Filename "/chrdev"
+# nid #247
+00001ee0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020000 (chardev)
+     +10     u: U32(123)
+     +14     ino: U32(210)
+      +6     nlink: U16(1)
+
+# Filename "/d0"
+# nid #248
+00001f00 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(211)
+      +6     nlink: U16(1)
+
+# Filename "/d1"
+# nid #249
+00001f20 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(212)
+      +6     nlink: U16(1)
+
+# Filename "/d2"
+# nid #250
+00001f40 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(213)
+      +6     nlink: U16(1)
+
+# Filename "/d3"
+# nid #251
+00001f60 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(214)
+      +6     nlink: U16(1)
+
+# Filename "/d4"
+# nid #252
+00001f80 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(215)
+      +6     nlink: U16(1)
+
+# Filename "/d5"
+# nid #253
+00001fa0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(216)
+      +6     nlink: U16(1)
+
+# Filename "/d6"
+# nid #254
+00001fc0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(217)
+      +6     nlink: U16(1)
+
+# Filename "/d7"
+# nid #255
+00001fe0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(218)
+      +6     nlink: U16(1)
+
+# Filename "/d8"
+# nid #256
+00002000 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(219)
+      +6     nlink: U16(1)
+
+# Filename "/d9"
+# nid #257
+00002020 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(220)
+      +6     nlink: U16(1)
+
+# Filename "/da"
+# nid #258
+00002040 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(221)
+      +6     nlink: U16(1)
+
+# Filename "/db"
+# nid #259
+00002060 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(222)
+      +6     nlink: U16(1)
+
+# Filename "/dc"
+# nid #260
+00002080 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(223)
+      +6     nlink: U16(1)
+
+# Filename "/dd"
+# nid #261
+000020a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(224)
+      +6     nlink: U16(1)
+
+# Filename "/de"
+# nid #262
+000020c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(225)
+      +6     nlink: U16(1)
+
+# Filename "/df"
+# nid #263
+000020e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(226)
+      +6     nlink: U16(1)
+
+# Filename "/e0"
+# nid #264
+00002100 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(227)
+      +6     nlink: U16(1)
+
+# Filename "/e1"
+# nid #265
+00002120 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(228)
+      +6     nlink: U16(1)
+
+# Filename "/e2"
+# nid #266
+00002140 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(229)
+      +6     nlink: U16(1)
+
+# Filename "/e3"
+# nid #267
+00002160 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(230)
+      +6     nlink: U16(1)
+
+# Filename "/e4"
+# nid #268
+00002180 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(231)
+      +6     nlink: U16(1)
+
+# Filename "/e5"
+# nid #269
+000021a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(232)
+      +6     nlink: U16(1)
+
+# Filename "/e6"
+# nid #270
+000021c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(233)
+      +6     nlink: U16(1)
+
+# Filename "/e7"
+# nid #271
+000021e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(234)
+      +6     nlink: U16(1)
+
+# Filename "/e8"
+# nid #272
+00002200 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(235)
+      +6     nlink: U16(1)
+
+# Filename "/e9"
+# nid #273
+00002220 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(236)
+      +6     nlink: U16(1)
+
+# Filename "/ea"
+# nid #274
+00002240 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(237)
+      +6     nlink: U16(1)
+
+# Filename "/eb"
+# nid #275
+00002260 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(238)
+      +6     nlink: U16(1)
+
+# Filename "/ec"
+# nid #276
+00002280 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(239)
+      +6     nlink: U16(1)
+
+# Filename "/ed"
+# nid #277
+000022a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(240)
+      +6     nlink: U16(1)
+
+# Filename "/ee"
+# nid #278
+000022c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(241)
+      +6     nlink: U16(1)
+
+# Filename "/ef"
+# nid #279
+000022e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(242)
+      +6     nlink: U16(1)
+
+# Filename "/f0"
+# nid #280
+00002300 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(243)
+      +6     nlink: U16(1)
+
+# Filename "/f1"
+# nid #281
+00002320 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(244)
+      +6     nlink: U16(1)
+
+# Filename "/f2"
+# nid #282
+00002340 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(245)
+      +6     nlink: U16(1)
+
+# Filename "/f3"
+# nid #283
+00002360 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(246)
+      +6     nlink: U16(1)
+
+# Filename "/f4"
+# nid #284
+00002380 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(247)
+      +6     nlink: U16(1)
+
+# Filename "/f5"
+# nid #285
+000023a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(248)
+      +6     nlink: U16(1)
+
+# Filename "/f6"
+# nid #286
+000023c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(249)
+      +6     nlink: U16(1)
+
+# Filename "/f7"
+# nid #287
+000023e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(250)
+      +6     nlink: U16(1)
+
+# Filename "/f8"
+# nid #288
+00002400 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(251)
+      +6     nlink: U16(1)
+
+# Filename "/f9"
+# nid #289
+00002420 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(252)
+      +6     nlink: U16(1)
+
+# Filename "/fa"
+# nid #290
+00002440 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(253)
+      +6     nlink: U16(1)
+
+# Filename "/fb"
+# nid #291
+00002460 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(254)
+      +6     nlink: U16(1)
+
+# Filename "/fc"
+# nid #292
+00002480 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(255)
+      +6     nlink: U16(1)
+
+# Filename "/fd"
+# nid #293
+000024a0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(256)
+      +6     nlink: U16(1)
+
+# Filename "/fe"
+# nid #294
+000024c0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(257)
+      +6     nlink: U16(1)
+
+# Filename "/ff"
+# nid #295
+000024e0 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0020644 (chardev)
+     +14     ino: U32(258)
+      +6     nlink: U16(1)
+
+# Filename "/fifo"
+# nid #296
+00002500 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0010000 (fifo)
+     +14     ino: U32(259)
+      +6     nlink: U16(1)
+
+# Filename "/regular-external"
+# nid #297
+00002520 CompactInodeHeader
+      +0     format: 8 = Compact | Ok(ChunkBased)
+      +2     xattr_icount: U16(37)
+      +4     mode: 0100000 (regular file)
+      +8     size: U32(1234)
+     +14     ino: U32(260)
+      +6     nlink: U16(1)
+     +20     name_filter: U32(2147352575)
+     +2c     xattr: (4 16 36) trusted."overlay.metacopy" = "\0$\0\u{1}ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+     +64     xattr: (4 16 66) trusted."overlay.redirect" = "/5a/5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+     +b0                                       ff ff ff ff  |            ....|
+
+# Filename "/regular-inline"
+# nid #303
+000025e0 CompactInodeHeader
+      +0     format: 4 = Compact | Ok(FlatInline)
+      +4     mode: 0100000 (regular file)
+      +8     size: U32(4)
+     +14     ino: U32(261)
+      +6     nlink: U16(1)
+     +20     inline: "hihi"
+
+00002604 Padding
+     +1c     # 28 nul bytes
+
+# Filename "/socket"
+# nid #305
+00002620 CompactInodeHeader
+      +0     format: 0 = Compact | Ok(FlatPlain)
+      +4     mode: 0140000 (socket)
+     +14     ino: U32(262)
+      +6     nlink: U16(1)
+
+# Filename "/symlink"
+# nid #306
+00002640 CompactInodeHeader
+      +0     format: 4 = Compact | Ok(FlatInline)
+      +4     mode: 0120000 (symlink)
+      +8     size: U32(7)
+     +14     ino: U32(263)
+      +6     nlink: U16(1)
+     +20     inline: "/target"
+
+00002667 Padding
+    +999     # 2457 nul bytes
+
+# Filename "/"
+# block #3
+00003000 Directory block
+      +0     inode_offset: U64(36)
+      +8     name_offset: U16(3180)
+      +a     file_type: Directory
+    +c6c     # name: "."
+
+      +c     inode_offset: U64(36)
+     +14     name_offset: U16(3181)
+     +16     file_type: Directory
+    +c6d     # name: ".."
+
+     +18     inode_offset: U64(38)
+     +20     name_offset: U16(3183)
+     +22     file_type: CharacterDevice
+    +c6f     # name: "00"
+
+     +24     inode_offset: U64(39)
+     +2c     name_offset: U16(3185)
+     +2e     file_type: CharacterDevice
+    +c71     # name: "01"
+
+     +30     inode_offset: U64(40)
+     +38     name_offset: U16(3187)
+     +3a     file_type: CharacterDevice
+    +c73     # name: "02"
+
+     +3c     inode_offset: U64(41)
+     +44     name_offset: U16(3189)
+     +46     file_type: CharacterDevice
+    +c75     # name: "03"
+
+     +48     inode_offset: U64(42)
+     +50     name_offset: U16(3191)
+     +52     file_type: CharacterDevice
+    +c77     # name: "04"
+
+     +54     inode_offset: U64(43)
+     +5c     name_offset: U16(3193)
+     +5e     file_type: CharacterDevice
+    +c79     # name: "05"
+
+     +60     inode_offset: U64(44)
+     +68     name_offset: U16(3195)
+     +6a     file_type: CharacterDevice
+    +c7b     # name: "06"
+
+     +6c     inode_offset: U64(45)
+     +74     name_offset: U16(3197)
+     +76     file_type: CharacterDevice
+    +c7d     # name: "07"
+
+     +78     inode_offset: U64(46)
+     +80     name_offset: U16(3199)
+     +82     file_type: CharacterDevice
+    +c7f     # name: "08"
+
+     +84     inode_offset: U64(47)
+     +8c     name_offset: U16(3201)
+     +8e     file_type: CharacterDevice
+    +c81     # name: "09"
+
+     +90     inode_offset: U64(48)
+     +98     name_offset: U16(3203)
+     +9a     file_type: CharacterDevice
+    +c83     # name: "0a"
+
+     +9c     inode_offset: U64(49)
+     +a4     name_offset: U16(3205)
+     +a6     file_type: CharacterDevice
+    +c85     # name: "0b"
+
+     +a8     inode_offset: U64(50)
+     +b0     name_offset: U16(3207)
+     +b2     file_type: CharacterDevice
+    +c87     # name: "0c"
+
+     +b4     inode_offset: U64(51)
+     +bc     name_offset: U16(3209)
+     +be     file_type: CharacterDevice
+    +c89     # name: "0d"
+
+     +c0     inode_offset: U64(52)
+     +c8     name_offset: U16(3211)
+     +ca     file_type: CharacterDevice
+    +c8b     # name: "0e"
+
+     +cc     inode_offset: U64(53)
+     +d4     name_offset: U16(3213)
+     +d6     file_type: CharacterDevice
+    +c8d     # name: "0f"
+
+     +d8     inode_offset: U64(54)
+     +e0     name_offset: U16(3215)
+     +e2     file_type: CharacterDevice
+    +c8f     # name: "10"
+
+     +e4     inode_offset: U64(55)
+     +ec     name_offset: U16(3217)
+     +ee     file_type: CharacterDevice
+    +c91     # name: "11"
+
+     +f0     inode_offset: U64(56)
+     +f8     name_offset: U16(3219)
+     +fa     file_type: CharacterDevice
+    +c93     # name: "12"
+
+     +fc     inode_offset: U64(57)
+    +104     name_offset: U16(3221)
+    +106     file_type: CharacterDevice
+    +c95     # name: "13"
+
+    +108     inode_offset: U64(58)
+    +110     name_offset: U16(3223)
+    +112     file_type: CharacterDevice
+    +c97     # name: "14"
+
+    +114     inode_offset: U64(59)
+    +11c     name_offset: U16(3225)
+    +11e     file_type: CharacterDevice
+    +c99     # name: "15"
+
+    +120     inode_offset: U64(60)
+    +128     name_offset: U16(3227)
+    +12a     file_type: CharacterDevice
+    +c9b     # name: "16"
+
+    +12c     inode_offset: U64(61)
+    +134     name_offset: U16(3229)
+    +136     file_type: CharacterDevice
+    +c9d     # name: "17"
+
+    +138     inode_offset: U64(62)
+    +140     name_offset: U16(3231)
+    +142     file_type: CharacterDevice
+    +c9f     # name: "18"
+
+    +144     inode_offset: U64(63)
+    +14c     name_offset: U16(3233)
+    +14e     file_type: CharacterDevice
+    +ca1     # name: "19"
+
+    +150     inode_offset: U64(64)
+    +158     name_offset: U16(3235)
+    +15a     file_type: CharacterDevice
+    +ca3     # name: "1a"
+
+    +15c     inode_offset: U64(65)
+    +164     name_offset: U16(3237)
+    +166     file_type: CharacterDevice
+    +ca5     # name: "1b"
+
+    +168     inode_offset: U64(66)
+    +170     name_offset: U16(3239)
+    +172     file_type: CharacterDevice
+    +ca7     # name: "1c"
+
+    +174     inode_offset: U64(67)
+    +17c     name_offset: U16(3241)
+    +17e     file_type: CharacterDevice
+    +ca9     # name: "1d"
+
+    +180     inode_offset: U64(68)
+    +188     name_offset: U16(3243)
+    +18a     file_type: CharacterDevice
+    +cab     # name: "1e"
+
+    +18c     inode_offset: U64(69)
+    +194     name_offset: U16(3245)
+    +196     file_type: CharacterDevice
+    +cad     # name: "1f"
+
+    +198     inode_offset: U64(70)
+    +1a0     name_offset: U16(3247)
+    +1a2     file_type: CharacterDevice
+    +caf     # name: "20"
+
+    +1a4     inode_offset: U64(71)
+    +1ac     name_offset: U16(3249)
+    +1ae     file_type: CharacterDevice
+    +cb1     # name: "21"
+
+    +1b0     inode_offset: U64(72)
+    +1b8     name_offset: U16(3251)
+    +1ba     file_type: CharacterDevice
+    +cb3     # name: "22"
+
+    +1bc     inode_offset: U64(73)
+    +1c4     name_offset: U16(3253)
+    +1c6     file_type: CharacterDevice
+    +cb5     # name: "23"
+
+    +1c8     inode_offset: U64(74)
+    +1d0     name_offset: U16(3255)
+    +1d2     file_type: CharacterDevice
+    +cb7     # name: "24"
+
+    +1d4     inode_offset: U64(75)
+    +1dc     name_offset: U16(3257)
+    +1de     file_type: CharacterDevice
+    +cb9     # name: "25"
+
+    +1e0     inode_offset: U64(76)
+    +1e8     name_offset: U16(3259)
+    +1ea     file_type: CharacterDevice
+    +cbb     # name: "26"
+
+    +1ec     inode_offset: U64(77)
+    +1f4     name_offset: U16(3261)
+    +1f6     file_type: CharacterDevice
+    +cbd     # name: "27"
+
+    +1f8     inode_offset: U64(78)
+    +200     name_offset: U16(3263)
+    +202     file_type: CharacterDevice
+    +cbf     # name: "28"
+
+    +204     inode_offset: U64(79)
+    +20c     name_offset: U16(3265)
+    +20e     file_type: CharacterDevice
+    +cc1     # name: "29"
+
+    +210     inode_offset: U64(80)
+    +218     name_offset: U16(3267)
+    +21a     file_type: CharacterDevice
+    +cc3     # name: "2a"
+
+    +21c     inode_offset: U64(81)
+    +224     name_offset: U16(3269)
+    +226     file_type: CharacterDevice
+    +cc5     # name: "2b"
+
+    +228     inode_offset: U64(82)
+    +230     name_offset: U16(3271)
+    +232     file_type: CharacterDevice
+    +cc7     # name: "2c"
+
+    +234     inode_offset: U64(83)
+    +23c     name_offset: U16(3273)
+    +23e     file_type: CharacterDevice
+    +cc9     # name: "2d"
+
+    +240     inode_offset: U64(84)
+    +248     name_offset: U16(3275)
+    +24a     file_type: CharacterDevice
+    +ccb     # name: "2e"
+
+    +24c     inode_offset: U64(85)
+    +254     name_offset: U16(3277)
+    +256     file_type: CharacterDevice
+    +ccd     # name: "2f"
+
+    +258     inode_offset: U64(86)
+    +260     name_offset: U16(3279)
+    +262     file_type: CharacterDevice
+    +ccf     # name: "30"
+
+    +264     inode_offset: U64(87)
+    +26c     name_offset: U16(3281)
+    +26e     file_type: CharacterDevice
+    +cd1     # name: "31"
+
+    +270     inode_offset: U64(88)
+    +278     name_offset: U16(3283)
+    +27a     file_type: CharacterDevice
+    +cd3     # name: "32"
+
+    +27c     inode_offset: U64(89)
+    +284     name_offset: U16(3285)
+    +286     file_type: CharacterDevice
+    +cd5     # name: "33"
+
+    +288     inode_offset: U64(90)
+    +290     name_offset: U16(3287)
+    +292     file_type: CharacterDevice
+    +cd7     # name: "34"
+
+    +294     inode_offset: U64(91)
+    +29c     name_offset: U16(3289)
+    +29e     file_type: CharacterDevice
+    +cd9     # name: "35"
+
+    +2a0     inode_offset: U64(92)
+    +2a8     name_offset: U16(3291)
+    +2aa     file_type: CharacterDevice
+    +cdb     # name: "36"
+
+    +2ac     inode_offset: U64(93)
+    +2b4     name_offset: U16(3293)
+    +2b6     file_type: CharacterDevice
+    +cdd     # name: "37"
+
+    +2b8     inode_offset: U64(94)
+    +2c0     name_offset: U16(3295)
+    +2c2     file_type: CharacterDevice
+    +cdf     # name: "38"
+
+    +2c4     inode_offset: U64(95)
+    +2cc     name_offset: U16(3297)
+    +2ce     file_type: CharacterDevice
+    +ce1     # name: "39"
+
+    +2d0     inode_offset: U64(96)
+    +2d8     name_offset: U16(3299)
+    +2da     file_type: CharacterDevice
+    +ce3     # name: "3a"
+
+    +2dc     inode_offset: U64(97)
+    +2e4     name_offset: U16(3301)
+    +2e6     file_type: CharacterDevice
+    +ce5     # name: "3b"
+
+    +2e8     inode_offset: U64(98)
+    +2f0     name_offset: U16(3303)
+    +2f2     file_type: CharacterDevice
+    +ce7     # name: "3c"
+
+    +2f4     inode_offset: U64(99)
+    +2fc     name_offset: U16(3305)
+    +2fe     file_type: CharacterDevice
+    +ce9     # name: "3d"
+
+    +300     inode_offset: U64(100)
+    +308     name_offset: U16(3307)
+    +30a     file_type: CharacterDevice
+    +ceb     # name: "3e"
+
+    +30c     inode_offset: U64(101)
+    +314     name_offset: U16(3309)
+    +316     file_type: CharacterDevice
+    +ced     # name: "3f"
+
+    +318     inode_offset: U64(102)
+    +320     name_offset: U16(3311)
+    +322     file_type: CharacterDevice
+    +cef     # name: "40"
+
+    +324     inode_offset: U64(103)
+    +32c     name_offset: U16(3313)
+    +32e     file_type: CharacterDevice
+    +cf1     # name: "41"
+
+    +330     inode_offset: U64(104)
+    +338     name_offset: U16(3315)
+    +33a     file_type: CharacterDevice
+    +cf3     # name: "42"
+
+    +33c     inode_offset: U64(105)
+    +344     name_offset: U16(3317)
+    +346     file_type: CharacterDevice
+    +cf5     # name: "43"
+
+    +348     inode_offset: U64(106)
+    +350     name_offset: U16(3319)
+    +352     file_type: CharacterDevice
+    +cf7     # name: "44"
+
+    +354     inode_offset: U64(107)
+    +35c     name_offset: U16(3321)
+    +35e     file_type: CharacterDevice
+    +cf9     # name: "45"
+
+    +360     inode_offset: U64(108)
+    +368     name_offset: U16(3323)
+    +36a     file_type: CharacterDevice
+    +cfb     # name: "46"
+
+    +36c     inode_offset: U64(109)
+    +374     name_offset: U16(3325)
+    +376     file_type: CharacterDevice
+    +cfd     # name: "47"
+
+    +378     inode_offset: U64(110)
+    +380     name_offset: U16(3327)
+    +382     file_type: CharacterDevice
+    +cff     # name: "48"
+
+    +384     inode_offset: U64(111)
+    +38c     name_offset: U16(3329)
+    +38e     file_type: CharacterDevice
+    +d01     # name: "49"
+
+    +390     inode_offset: U64(112)
+    +398     name_offset: U16(3331)
+    +39a     file_type: CharacterDevice
+    +d03     # name: "4a"
+
+    +39c     inode_offset: U64(113)
+    +3a4     name_offset: U16(3333)
+    +3a6     file_type: CharacterDevice
+    +d05     # name: "4b"
+
+    +3a8     inode_offset: U64(114)
+    +3b0     name_offset: U16(3335)
+    +3b2     file_type: CharacterDevice
+    +d07     # name: "4c"
+
+    +3b4     inode_offset: U64(115)
+    +3bc     name_offset: U16(3337)
+    +3be     file_type: CharacterDevice
+    +d09     # name: "4d"
+
+    +3c0     inode_offset: U64(116)
+    +3c8     name_offset: U16(3339)
+    +3ca     file_type: CharacterDevice
+    +d0b     # name: "4e"
+
+    +3cc     inode_offset: U64(117)
+    +3d4     name_offset: U16(3341)
+    +3d6     file_type: CharacterDevice
+    +d0d     # name: "4f"
+
+    +3d8     inode_offset: U64(118)
+    +3e0     name_offset: U16(3343)
+    +3e2     file_type: CharacterDevice
+    +d0f     # name: "50"
+
+    +3e4     inode_offset: U64(119)
+    +3ec     name_offset: U16(3345)
+    +3ee     file_type: CharacterDevice
+    +d11     # name: "51"
+
+    +3f0     inode_offset: U64(120)
+    +3f8     name_offset: U16(3347)
+    +3fa     file_type: CharacterDevice
+    +d13     # name: "52"
+
+    +3fc     inode_offset: U64(121)
+    +404     name_offset: U16(3349)
+    +406     file_type: CharacterDevice
+    +d15     # name: "53"
+
+    +408     inode_offset: U64(122)
+    +410     name_offset: U16(3351)
+    +412     file_type: CharacterDevice
+    +d17     # name: "54"
+
+    +414     inode_offset: U64(123)
+    +41c     name_offset: U16(3353)
+    +41e     file_type: CharacterDevice
+    +d19     # name: "55"
+
+    +420     inode_offset: U64(124)
+    +428     name_offset: U16(3355)
+    +42a     file_type: CharacterDevice
+    +d1b     # name: "56"
+
+    +42c     inode_offset: U64(125)
+    +434     name_offset: U16(3357)
+    +436     file_type: CharacterDevice
+    +d1d     # name: "57"
+
+    +438     inode_offset: U64(126)
+    +440     name_offset: U16(3359)
+    +442     file_type: CharacterDevice
+    +d1f     # name: "58"
+
+    +444     inode_offset: U64(127)
+    +44c     name_offset: U16(3361)
+    +44e     file_type: CharacterDevice
+    +d21     # name: "59"
+
+    +450     inode_offset: U64(128)
+    +458     name_offset: U16(3363)
+    +45a     file_type: CharacterDevice
+    +d23     # name: "5a"
+
+    +45c     inode_offset: U64(129)
+    +464     name_offset: U16(3365)
+    +466     file_type: CharacterDevice
+    +d25     # name: "5b"
+
+    +468     inode_offset: U64(130)
+    +470     name_offset: U16(3367)
+    +472     file_type: CharacterDevice
+    +d27     # name: "5c"
+
+    +474     inode_offset: U64(131)
+    +47c     name_offset: U16(3369)
+    +47e     file_type: CharacterDevice
+    +d29     # name: "5d"
+
+    +480     inode_offset: U64(132)
+    +488     name_offset: U16(3371)
+    +48a     file_type: CharacterDevice
+    +d2b     # name: "5e"
+
+    +48c     inode_offset: U64(133)
+    +494     name_offset: U16(3373)
+    +496     file_type: CharacterDevice
+    +d2d     # name: "5f"
+
+    +498     inode_offset: U64(134)
+    +4a0     name_offset: U16(3375)
+    +4a2     file_type: CharacterDevice
+    +d2f     # name: "60"
+
+    +4a4     inode_offset: U64(135)
+    +4ac     name_offset: U16(3377)
+    +4ae     file_type: CharacterDevice
+    +d31     # name: "61"
+
+    +4b0     inode_offset: U64(136)
+    +4b8     name_offset: U16(3379)
+    +4ba     file_type: CharacterDevice
+    +d33     # name: "62"
+
+    +4bc     inode_offset: U64(137)
+    +4c4     name_offset: U16(3381)
+    +4c6     file_type: CharacterDevice
+    +d35     # name: "63"
+
+    +4c8     inode_offset: U64(138)
+    +4d0     name_offset: U16(3383)
+    +4d2     file_type: CharacterDevice
+    +d37     # name: "64"
+
+    +4d4     inode_offset: U64(139)
+    +4dc     name_offset: U16(3385)
+    +4de     file_type: CharacterDevice
+    +d39     # name: "65"
+
+    +4e0     inode_offset: U64(140)
+    +4e8     name_offset: U16(3387)
+    +4ea     file_type: CharacterDevice
+    +d3b     # name: "66"
+
+    +4ec     inode_offset: U64(141)
+    +4f4     name_offset: U16(3389)
+    +4f6     file_type: CharacterDevice
+    +d3d     # name: "67"
+
+    +4f8     inode_offset: U64(142)
+    +500     name_offset: U16(3391)
+    +502     file_type: CharacterDevice
+    +d3f     # name: "68"
+
+    +504     inode_offset: U64(143)
+    +50c     name_offset: U16(3393)
+    +50e     file_type: CharacterDevice
+    +d41     # name: "69"
+
+    +510     inode_offset: U64(144)
+    +518     name_offset: U16(3395)
+    +51a     file_type: CharacterDevice
+    +d43     # name: "6a"
+
+    +51c     inode_offset: U64(145)
+    +524     name_offset: U16(3397)
+    +526     file_type: CharacterDevice
+    +d45     # name: "6b"
+
+    +528     inode_offset: U64(146)
+    +530     name_offset: U16(3399)
+    +532     file_type: CharacterDevice
+    +d47     # name: "6c"
+
+    +534     inode_offset: U64(147)
+    +53c     name_offset: U16(3401)
+    +53e     file_type: CharacterDevice
+    +d49     # name: "6d"
+
+    +540     inode_offset: U64(148)
+    +548     name_offset: U16(3403)
+    +54a     file_type: CharacterDevice
+    +d4b     # name: "6e"
+
+    +54c     inode_offset: U64(149)
+    +554     name_offset: U16(3405)
+    +556     file_type: CharacterDevice
+    +d4d     # name: "6f"
+
+    +558     inode_offset: U64(150)
+    +560     name_offset: U16(3407)
+    +562     file_type: CharacterDevice
+    +d4f     # name: "70"
+
+    +564     inode_offset: U64(151)
+    +56c     name_offset: U16(3409)
+    +56e     file_type: CharacterDevice
+    +d51     # name: "71"
+
+    +570     inode_offset: U64(152)
+    +578     name_offset: U16(3411)
+    +57a     file_type: CharacterDevice
+    +d53     # name: "72"
+
+    +57c     inode_offset: U64(153)
+    +584     name_offset: U16(3413)
+    +586     file_type: CharacterDevice
+    +d55     # name: "73"
+
+    +588     inode_offset: U64(154)
+    +590     name_offset: U16(3415)
+    +592     file_type: CharacterDevice
+    +d57     # name: "74"
+
+    +594     inode_offset: U64(155)
+    +59c     name_offset: U16(3417)
+    +59e     file_type: CharacterDevice
+    +d59     # name: "75"
+
+    +5a0     inode_offset: U64(156)
+    +5a8     name_offset: U16(3419)
+    +5aa     file_type: CharacterDevice
+    +d5b     # name: "76"
+
+    +5ac     inode_offset: U64(157)
+    +5b4     name_offset: U16(3421)
+    +5b6     file_type: CharacterDevice
+    +d5d     # name: "77"
+
+    +5b8     inode_offset: U64(158)
+    +5c0     name_offset: U16(3423)
+    +5c2     file_type: CharacterDevice
+    +d5f     # name: "78"
+
+    +5c4     inode_offset: U64(159)
+    +5cc     name_offset: U16(3425)
+    +5ce     file_type: CharacterDevice
+    +d61     # name: "79"
+
+    +5d0     inode_offset: U64(160)
+    +5d8     name_offset: U16(3427)
+    +5da     file_type: CharacterDevice
+    +d63     # name: "7a"
+
+    +5dc     inode_offset: U64(161)
+    +5e4     name_offset: U16(3429)
+    +5e6     file_type: CharacterDevice
+    +d65     # name: "7b"
+
+    +5e8     inode_offset: U64(162)
+    +5f0     name_offset: U16(3431)
+    +5f2     file_type: CharacterDevice
+    +d67     # name: "7c"
+
+    +5f4     inode_offset: U64(163)
+    +5fc     name_offset: U16(3433)
+    +5fe     file_type: CharacterDevice
+    +d69     # name: "7d"
+
+    +600     inode_offset: U64(164)
+    +608     name_offset: U16(3435)
+    +60a     file_type: CharacterDevice
+    +d6b     # name: "7e"
+
+    +60c     inode_offset: U64(165)
+    +614     name_offset: U16(3437)
+    +616     file_type: CharacterDevice
+    +d6d     # name: "7f"
+
+    +618     inode_offset: U64(166)
+    +620     name_offset: U16(3439)
+    +622     file_type: CharacterDevice
+    +d6f     # name: "80"
+
+    +624     inode_offset: U64(167)
+    +62c     name_offset: U16(3441)
+    +62e     file_type: CharacterDevice
+    +d71     # name: "81"
+
+    +630     inode_offset: U64(168)
+    +638     name_offset: U16(3443)
+    +63a     file_type: CharacterDevice
+    +d73     # name: "82"
+
+    +63c     inode_offset: U64(169)
+    +644     name_offset: U16(3445)
+    +646     file_type: CharacterDevice
+    +d75     # name: "83"
+
+    +648     inode_offset: U64(170)
+    +650     name_offset: U16(3447)
+    +652     file_type: CharacterDevice
+    +d77     # name: "84"
+
+    +654     inode_offset: U64(171)
+    +65c     name_offset: U16(3449)
+    +65e     file_type: CharacterDevice
+    +d79     # name: "85"
+
+    +660     inode_offset: U64(172)
+    +668     name_offset: U16(3451)
+    +66a     file_type: CharacterDevice
+    +d7b     # name: "86"
+
+    +66c     inode_offset: U64(173)
+    +674     name_offset: U16(3453)
+    +676     file_type: CharacterDevice
+    +d7d     # name: "87"
+
+    +678     inode_offset: U64(174)
+    +680     name_offset: U16(3455)
+    +682     file_type: CharacterDevice
+    +d7f     # name: "88"
+
+    +684     inode_offset: U64(175)
+    +68c     name_offset: U16(3457)
+    +68e     file_type: CharacterDevice
+    +d81     # name: "89"
+
+    +690     inode_offset: U64(176)
+    +698     name_offset: U16(3459)
+    +69a     file_type: CharacterDevice
+    +d83     # name: "8a"
+
+    +69c     inode_offset: U64(177)
+    +6a4     name_offset: U16(3461)
+    +6a6     file_type: CharacterDevice
+    +d85     # name: "8b"
+
+    +6a8     inode_offset: U64(178)
+    +6b0     name_offset: U16(3463)
+    +6b2     file_type: CharacterDevice
+    +d87     # name: "8c"
+
+    +6b4     inode_offset: U64(179)
+    +6bc     name_offset: U16(3465)
+    +6be     file_type: CharacterDevice
+    +d89     # name: "8d"
+
+    +6c0     inode_offset: U64(180)
+    +6c8     name_offset: U16(3467)
+    +6ca     file_type: CharacterDevice
+    +d8b     # name: "8e"
+
+    +6cc     inode_offset: U64(181)
+    +6d4     name_offset: U16(3469)
+    +6d6     file_type: CharacterDevice
+    +d8d     # name: "8f"
+
+    +6d8     inode_offset: U64(182)
+    +6e0     name_offset: U16(3471)
+    +6e2     file_type: CharacterDevice
+    +d8f     # name: "90"
+
+    +6e4     inode_offset: U64(183)
+    +6ec     name_offset: U16(3473)
+    +6ee     file_type: CharacterDevice
+    +d91     # name: "91"
+
+    +6f0     inode_offset: U64(184)
+    +6f8     name_offset: U16(3475)
+    +6fa     file_type: CharacterDevice
+    +d93     # name: "92"
+
+    +6fc     inode_offset: U64(185)
+    +704     name_offset: U16(3477)
+    +706     file_type: CharacterDevice
+    +d95     # name: "93"
+
+    +708     inode_offset: U64(186)
+    +710     name_offset: U16(3479)
+    +712     file_type: CharacterDevice
+    +d97     # name: "94"
+
+    +714     inode_offset: U64(187)
+    +71c     name_offset: U16(3481)
+    +71e     file_type: CharacterDevice
+    +d99     # name: "95"
+
+    +720     inode_offset: U64(188)
+    +728     name_offset: U16(3483)
+    +72a     file_type: CharacterDevice
+    +d9b     # name: "96"
+
+    +72c     inode_offset: U64(189)
+    +734     name_offset: U16(3485)
+    +736     file_type: CharacterDevice
+    +d9d     # name: "97"
+
+    +738     inode_offset: U64(190)
+    +740     name_offset: U16(3487)
+    +742     file_type: CharacterDevice
+    +d9f     # name: "98"
+
+    +744     inode_offset: U64(191)
+    +74c     name_offset: U16(3489)
+    +74e     file_type: CharacterDevice
+    +da1     # name: "99"
+
+    +750     inode_offset: U64(192)
+    +758     name_offset: U16(3491)
+    +75a     file_type: CharacterDevice
+    +da3     # name: "9a"
+
+    +75c     inode_offset: U64(193)
+    +764     name_offset: U16(3493)
+    +766     file_type: CharacterDevice
+    +da5     # name: "9b"
+
+    +768     inode_offset: U64(194)
+    +770     name_offset: U16(3495)
+    +772     file_type: CharacterDevice
+    +da7     # name: "9c"
+
+    +774     inode_offset: U64(195)
+    +77c     name_offset: U16(3497)
+    +77e     file_type: CharacterDevice
+    +da9     # name: "9d"
+
+    +780     inode_offset: U64(196)
+    +788     name_offset: U16(3499)
+    +78a     file_type: CharacterDevice
+    +dab     # name: "9e"
+
+    +78c     inode_offset: U64(197)
+    +794     name_offset: U16(3501)
+    +796     file_type: CharacterDevice
+    +dad     # name: "9f"
+
+    +798     inode_offset: U64(198)
+    +7a0     name_offset: U16(3503)
+    +7a2     file_type: CharacterDevice
+    +daf     # name: "a0"
+
+    +7a4     inode_offset: U64(199)
+    +7ac     name_offset: U16(3505)
+    +7ae     file_type: CharacterDevice
+    +db1     # name: "a1"
+
+    +7b0     inode_offset: U64(200)
+    +7b8     name_offset: U16(3507)
+    +7ba     file_type: CharacterDevice
+    +db3     # name: "a2"
+
+    +7bc     inode_offset: U64(201)
+    +7c4     name_offset: U16(3509)
+    +7c6     file_type: CharacterDevice
+    +db5     # name: "a3"
+
+    +7c8     inode_offset: U64(202)
+    +7d0     name_offset: U16(3511)
+    +7d2     file_type: CharacterDevice
+    +db7     # name: "a4"
+
+    +7d4     inode_offset: U64(203)
+    +7dc     name_offset: U16(3513)
+    +7de     file_type: CharacterDevice
+    +db9     # name: "a5"
+
+    +7e0     inode_offset: U64(204)
+    +7e8     name_offset: U16(3515)
+    +7ea     file_type: CharacterDevice
+    +dbb     # name: "a6"
+
+    +7ec     inode_offset: U64(205)
+    +7f4     name_offset: U16(3517)
+    +7f6     file_type: CharacterDevice
+    +dbd     # name: "a7"
+
+    +7f8     inode_offset: U64(206)
+    +800     name_offset: U16(3519)
+    +802     file_type: CharacterDevice
+    +dbf     # name: "a8"
+
+    +804     inode_offset: U64(207)
+    +80c     name_offset: U16(3521)
+    +80e     file_type: CharacterDevice
+    +dc1     # name: "a9"
+
+    +810     inode_offset: U64(208)
+    +818     name_offset: U16(3523)
+    +81a     file_type: CharacterDevice
+    +dc3     # name: "aa"
+
+    +81c     inode_offset: U64(209)
+    +824     name_offset: U16(3525)
+    +826     file_type: CharacterDevice
+    +dc5     # name: "ab"
+
+    +828     inode_offset: U64(210)
+    +830     name_offset: U16(3527)
+    +832     file_type: CharacterDevice
+    +dc7     # name: "ac"
+
+    +834     inode_offset: U64(211)
+    +83c     name_offset: U16(3529)
+    +83e     file_type: CharacterDevice
+    +dc9     # name: "ad"
+
+    +840     inode_offset: U64(212)
+    +848     name_offset: U16(3531)
+    +84a     file_type: CharacterDevice
+    +dcb     # name: "ae"
+
+    +84c     inode_offset: U64(213)
+    +854     name_offset: U16(3533)
+    +856     file_type: CharacterDevice
+    +dcd     # name: "af"
+
+    +858     inode_offset: U64(214)
+    +860     name_offset: U16(3535)
+    +862     file_type: CharacterDevice
+    +dcf     # name: "b0"
+
+    +864     inode_offset: U64(215)
+    +86c     name_offset: U16(3537)
+    +86e     file_type: CharacterDevice
+    +dd1     # name: "b1"
+
+    +870     inode_offset: U64(216)
+    +878     name_offset: U16(3539)
+    +87a     file_type: CharacterDevice
+    +dd3     # name: "b2"
+
+    +87c     inode_offset: U64(217)
+    +884     name_offset: U16(3541)
+    +886     file_type: CharacterDevice
+    +dd5     # name: "b3"
+
+    +888     inode_offset: U64(218)
+    +890     name_offset: U16(3543)
+    +892     file_type: CharacterDevice
+    +dd7     # name: "b4"
+
+    +894     inode_offset: U64(219)
+    +89c     name_offset: U16(3545)
+    +89e     file_type: CharacterDevice
+    +dd9     # name: "b5"
+
+    +8a0     inode_offset: U64(220)
+    +8a8     name_offset: U16(3547)
+    +8aa     file_type: CharacterDevice
+    +ddb     # name: "b6"
+
+    +8ac     inode_offset: U64(221)
+    +8b4     name_offset: U16(3549)
+    +8b6     file_type: CharacterDevice
+    +ddd     # name: "b7"
+
+    +8b8     inode_offset: U64(222)
+    +8c0     name_offset: U16(3551)
+    +8c2     file_type: CharacterDevice
+    +ddf     # name: "b8"
+
+    +8c4     inode_offset: U64(223)
+    +8cc     name_offset: U16(3553)
+    +8ce     file_type: CharacterDevice
+    +de1     # name: "b9"
+
+    +8d0     inode_offset: U64(224)
+    +8d8     name_offset: U16(3555)
+    +8da     file_type: CharacterDevice
+    +de3     # name: "ba"
+
+    +8dc     inode_offset: U64(225)
+    +8e4     name_offset: U16(3557)
+    +8e6     file_type: CharacterDevice
+    +de5     # name: "bb"
+
+    +8e8     inode_offset: U64(226)
+    +8f0     name_offset: U16(3559)
+    +8f2     file_type: CharacterDevice
+    +de7     # name: "bc"
+
+    +8f4     inode_offset: U64(227)
+    +8fc     name_offset: U16(3561)
+    +8fe     file_type: CharacterDevice
+    +de9     # name: "bd"
+
+    +900     inode_offset: U64(228)
+    +908     name_offset: U16(3563)
+    +90a     file_type: CharacterDevice
+    +deb     # name: "be"
+
+    +90c     inode_offset: U64(229)
+    +914     name_offset: U16(3565)
+    +916     file_type: CharacterDevice
+    +ded     # name: "bf"
+
+    +918     inode_offset: U64(230)
+    +920     name_offset: U16(3567)
+    +922     file_type: BlockDevice
+    +def     # name: "blkdev"
+
+    +924     inode_offset: U64(231)
+    +92c     name_offset: U16(3573)
+    +92e     file_type: CharacterDevice
+    +df5     # name: "c0"
+
+    +930     inode_offset: U64(232)
+    +938     name_offset: U16(3575)
+    +93a     file_type: CharacterDevice
+    +df7     # name: "c1"
+
+    +93c     inode_offset: U64(233)
+    +944     name_offset: U16(3577)
+    +946     file_type: CharacterDevice
+    +df9     # name: "c2"
+
+    +948     inode_offset: U64(234)
+    +950     name_offset: U16(3579)
+    +952     file_type: CharacterDevice
+    +dfb     # name: "c3"
+
+    +954     inode_offset: U64(235)
+    +95c     name_offset: U16(3581)
+    +95e     file_type: CharacterDevice
+    +dfd     # name: "c4"
+
+    +960     inode_offset: U64(236)
+    +968     name_offset: U16(3583)
+    +96a     file_type: CharacterDevice
+    +dff     # name: "c5"
+
+    +96c     inode_offset: U64(237)
+    +974     name_offset: U16(3585)
+    +976     file_type: CharacterDevice
+    +e01     # name: "c6"
+
+    +978     inode_offset: U64(238)
+    +980     name_offset: U16(3587)
+    +982     file_type: CharacterDevice
+    +e03     # name: "c7"
+
+    +984     inode_offset: U64(239)
+    +98c     name_offset: U16(3589)
+    +98e     file_type: CharacterDevice
+    +e05     # name: "c8"
+
+    +990     inode_offset: U64(240)
+    +998     name_offset: U16(3591)
+    +99a     file_type: CharacterDevice
+    +e07     # name: "c9"
+
+    +99c     inode_offset: U64(241)
+    +9a4     name_offset: U16(3593)
+    +9a6     file_type: CharacterDevice
+    +e09     # name: "ca"
+
+    +9a8     inode_offset: U64(242)
+    +9b0     name_offset: U16(3595)
+    +9b2     file_type: CharacterDevice
+    +e0b     # name: "cb"
+
+    +9b4     inode_offset: U64(243)
+    +9bc     name_offset: U16(3597)
+    +9be     file_type: CharacterDevice
+    +e0d     # name: "cc"
+
+    +9c0     inode_offset: U64(244)
+    +9c8     name_offset: U16(3599)
+    +9ca     file_type: CharacterDevice
+    +e0f     # name: "cd"
+
+    +9cc     inode_offset: U64(245)
+    +9d4     name_offset: U16(3601)
+    +9d6     file_type: CharacterDevice
+    +e11     # name: "ce"
+
+    +9d8     inode_offset: U64(246)
+    +9e0     name_offset: U16(3603)
+    +9e2     file_type: CharacterDevice
+    +e13     # name: "cf"
+
+    +9e4     inode_offset: U64(247)
+    +9ec     name_offset: U16(3605)
+    +9ee     file_type: CharacterDevice
+    +e15     # name: "chrdev"
+
+    +9f0     inode_offset: U64(248)
+    +9f8     name_offset: U16(3611)
+    +9fa     file_type: CharacterDevice
+    +e1b     # name: "d0"
+
+    +9fc     inode_offset: U64(249)
+    +a04     name_offset: U16(3613)
+    +a06     file_type: CharacterDevice
+    +e1d     # name: "d1"
+
+    +a08     inode_offset: U64(250)
+    +a10     name_offset: U16(3615)
+    +a12     file_type: CharacterDevice
+    +e1f     # name: "d2"
+
+    +a14     inode_offset: U64(251)
+    +a1c     name_offset: U16(3617)
+    +a1e     file_type: CharacterDevice
+    +e21     # name: "d3"
+
+    +a20     inode_offset: U64(252)
+    +a28     name_offset: U16(3619)
+    +a2a     file_type: CharacterDevice
+    +e23     # name: "d4"
+
+    +a2c     inode_offset: U64(253)
+    +a34     name_offset: U16(3621)
+    +a36     file_type: CharacterDevice
+    +e25     # name: "d5"
+
+    +a38     inode_offset: U64(254)
+    +a40     name_offset: U16(3623)
+    +a42     file_type: CharacterDevice
+    +e27     # name: "d6"
+
+    +a44     inode_offset: U64(255)
+    +a4c     name_offset: U16(3625)
+    +a4e     file_type: CharacterDevice
+    +e29     # name: "d7"
+
+    +a50     inode_offset: U64(256)
+    +a58     name_offset: U16(3627)
+    +a5a     file_type: CharacterDevice
+    +e2b     # name: "d8"
+
+    +a5c     inode_offset: U64(257)
+    +a64     name_offset: U16(3629)
+    +a66     file_type: CharacterDevice
+    +e2d     # name: "d9"
+
+    +a68     inode_offset: U64(258)
+    +a70     name_offset: U16(3631)
+    +a72     file_type: CharacterDevice
+    +e2f     # name: "da"
+
+    +a74     inode_offset: U64(259)
+    +a7c     name_offset: U16(3633)
+    +a7e     file_type: CharacterDevice
+    +e31     # name: "db"
+
+    +a80     inode_offset: U64(260)
+    +a88     name_offset: U16(3635)
+    +a8a     file_type: CharacterDevice
+    +e33     # name: "dc"
+
+    +a8c     inode_offset: U64(261)
+    +a94     name_offset: U16(3637)
+    +a96     file_type: CharacterDevice
+    +e35     # name: "dd"
+
+    +a98     inode_offset: U64(262)
+    +aa0     name_offset: U16(3639)
+    +aa2     file_type: CharacterDevice
+    +e37     # name: "de"
+
+    +aa4     inode_offset: U64(263)
+    +aac     name_offset: U16(3641)
+    +aae     file_type: CharacterDevice
+    +e39     # name: "df"
+
+    +ab0     inode_offset: U64(264)
+    +ab8     name_offset: U16(3643)
+    +aba     file_type: CharacterDevice
+    +e3b     # name: "e0"
+
+    +abc     inode_offset: U64(265)
+    +ac4     name_offset: U16(3645)
+    +ac6     file_type: CharacterDevice
+    +e3d     # name: "e1"
+
+    +ac8     inode_offset: U64(266)
+    +ad0     name_offset: U16(3647)
+    +ad2     file_type: CharacterDevice
+    +e3f     # name: "e2"
+
+    +ad4     inode_offset: U64(267)
+    +adc     name_offset: U16(3649)
+    +ade     file_type: CharacterDevice
+    +e41     # name: "e3"
+
+    +ae0     inode_offset: U64(268)
+    +ae8     name_offset: U16(3651)
+    +aea     file_type: CharacterDevice
+    +e43     # name: "e4"
+
+    +aec     inode_offset: U64(269)
+    +af4     name_offset: U16(3653)
+    +af6     file_type: CharacterDevice
+    +e45     # name: "e5"
+
+    +af8     inode_offset: U64(270)
+    +b00     name_offset: U16(3655)
+    +b02     file_type: CharacterDevice
+    +e47     # name: "e6"
+
+    +b04     inode_offset: U64(271)
+    +b0c     name_offset: U16(3657)
+    +b0e     file_type: CharacterDevice
+    +e49     # name: "e7"
+
+    +b10     inode_offset: U64(272)
+    +b18     name_offset: U16(3659)
+    +b1a     file_type: CharacterDevice
+    +e4b     # name: "e8"
+
+    +b1c     inode_offset: U64(273)
+    +b24     name_offset: U16(3661)
+    +b26     file_type: CharacterDevice
+    +e4d     # name: "e9"
+
+    +b28     inode_offset: U64(274)
+    +b30     name_offset: U16(3663)
+    +b32     file_type: CharacterDevice
+    +e4f     # name: "ea"
+
+    +b34     inode_offset: U64(275)
+    +b3c     name_offset: U16(3665)
+    +b3e     file_type: CharacterDevice
+    +e51     # name: "eb"
+
+    +b40     inode_offset: U64(276)
+    +b48     name_offset: U16(3667)
+    +b4a     file_type: CharacterDevice
+    +e53     # name: "ec"
+
+    +b4c     inode_offset: U64(277)
+    +b54     name_offset: U16(3669)
+    +b56     file_type: CharacterDevice
+    +e55     # name: "ed"
+
+    +b58     inode_offset: U64(278)
+    +b60     name_offset: U16(3671)
+    +b62     file_type: CharacterDevice
+    +e57     # name: "ee"
+
+    +b64     inode_offset: U64(279)
+    +b6c     name_offset: U16(3673)
+    +b6e     file_type: CharacterDevice
+    +e59     # name: "ef"
+
+    +b70     inode_offset: U64(280)
+    +b78     name_offset: U16(3675)
+    +b7a     file_type: CharacterDevice
+    +e5b     # name: "f0"
+
+    +b7c     inode_offset: U64(281)
+    +b84     name_offset: U16(3677)
+    +b86     file_type: CharacterDevice
+    +e5d     # name: "f1"
+
+    +b88     inode_offset: U64(282)
+    +b90     name_offset: U16(3679)
+    +b92     file_type: CharacterDevice
+    +e5f     # name: "f2"
+
+    +b94     inode_offset: U64(283)
+    +b9c     name_offset: U16(3681)
+    +b9e     file_type: CharacterDevice
+    +e61     # name: "f3"
+
+    +ba0     inode_offset: U64(284)
+    +ba8     name_offset: U16(3683)
+    +baa     file_type: CharacterDevice
+    +e63     # name: "f4"
+
+    +bac     inode_offset: U64(285)
+    +bb4     name_offset: U16(3685)
+    +bb6     file_type: CharacterDevice
+    +e65     # name: "f5"
+
+    +bb8     inode_offset: U64(286)
+    +bc0     name_offset: U16(3687)
+    +bc2     file_type: CharacterDevice
+    +e67     # name: "f6"
+
+    +bc4     inode_offset: U64(287)
+    +bcc     name_offset: U16(3689)
+    +bce     file_type: CharacterDevice
+    +e69     # name: "f7"
+
+    +bd0     inode_offset: U64(288)
+    +bd8     name_offset: U16(3691)
+    +bda     file_type: CharacterDevice
+    +e6b     # name: "f8"
+
+    +bdc     inode_offset: U64(289)
+    +be4     name_offset: U16(3693)
+    +be6     file_type: CharacterDevice
+    +e6d     # name: "f9"
+
+    +be8     inode_offset: U64(290)
+    +bf0     name_offset: U16(3695)
+    +bf2     file_type: CharacterDevice
+    +e6f     # name: "fa"
+
+    +bf4     inode_offset: U64(291)
+    +bfc     name_offset: U16(3697)
+    +bfe     file_type: CharacterDevice
+    +e71     # name: "fb"
+
+    +c00     inode_offset: U64(292)
+    +c08     name_offset: U16(3699)
+    +c0a     file_type: CharacterDevice
+    +e73     # name: "fc"
+
+    +c0c     inode_offset: U64(293)
+    +c14     name_offset: U16(3701)
+    +c16     file_type: CharacterDevice
+    +e75     # name: "fd"
+
+    +c18     inode_offset: U64(294)
+    +c20     name_offset: U16(3703)
+    +c22     file_type: CharacterDevice
+    +e77     # name: "fe"
+
+    +c24     inode_offset: U64(295)
+    +c2c     name_offset: U16(3705)
+    +c2e     file_type: CharacterDevice
+    +e79     # name: "ff"
+
+    +c30     inode_offset: U64(296)
+    +c38     name_offset: U16(3707)
+    +c3a     file_type: Fifo
+    +e7b     # name: "fifo"
+
+    +c3c     inode_offset: U64(297)
+    +c44     name_offset: U16(3711)
+    +c46     file_type: RegularFile
+    +e7f     # name: "regular-external"
+
+    +c48     inode_offset: U64(303)
+    +c50     name_offset: U16(3727)
+    +c52     file_type: RegularFile
+    +e8f     # name: "regular-inline"
+
+    +c54     inode_offset: U64(305)
+    +c5c     name_offset: U16(3741)
+    +c5e     file_type: Socket
+    +e9d     # name: "socket"
+
+    +c60     inode_offset: U64(306)
+    +c68     name_offset: U16(3747)
+    +c6a     file_type: Symlink
+    +ea3     # name: "symlink"
+
+Space statistics (total size 16384B):
+  compact inode = 8651B, 52.80%
+  directory block = 4096B, 25.00%
+  header = 32B, 0.20%
+  superblock = 128B, 0.78%
+  padding compact inode -> compact inode = 28B, 0.17%
+  padding compact inode -> directory block = 2457B, 15.00%
+  padding header -> superblock = 992B, 6.05%

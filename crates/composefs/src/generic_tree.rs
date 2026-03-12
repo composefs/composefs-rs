@@ -100,7 +100,7 @@ pub struct Leaf<T> {
 }
 
 /// A directory node containing named entries.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Directory<T> {
     /// Metadata for this directory.
     pub stat: Stat,
@@ -109,7 +109,7 @@ pub struct Directory<T> {
 }
 
 /// A filesystem inode representing either a directory or a leaf node.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Inode<T> {
     /// A directory inode.
     Directory(Box<Directory<T>>),
@@ -496,6 +496,15 @@ impl<T> Directory<T> {
         self.entries.clear();
     }
 
+    /// Retains only top-level entries whose names satisfy the predicate.
+    /// This is used for filtering dump output to specific entries.
+    pub fn retain_top_level(&mut self, mut f: impl FnMut(&str) -> bool) {
+        self.entries.retain(|name, _| {
+            // Convert OsStr to str for comparison; non-UTF8 names never match
+            name.to_str().is_some_and(&mut f)
+        });
+    }
+
     /// Recursively finds the newest modification time in this directory tree.
     ///
     /// Returns the maximum modification time among this directory's metadata
@@ -583,6 +592,54 @@ pub struct FileSystem<T> {
 }
 
 impl<T> FileSystem<T> {
+    /// Add 256 overlay whiteout stub entries to the root directory.
+    ///
+    /// This is required for Format 1.0 compatibility with the C mkcomposefs.
+    /// Each whiteout is a character device named "00" through "ff" with rdev=0.
+    /// They inherit uid/gid/mtime from the root directory but have empty xattrs.
+    ///
+    /// These entries allow overlay filesystems to efficiently represent
+    /// deleted files using device stubs that match the naming convention.
+    pub fn add_overlay_whiteouts(&mut self) {
+        use std::ffi::OsString;
+
+        // Copy root's stat for the whiteout entries (inherit uid/gid/mtime)
+        // Mode is set to 0o644 (rw-r--r--) as per C mkcomposefs
+        let whiteout_stat = Stat {
+            st_mode: 0o644,
+            st_uid: self.root.stat.st_uid,
+            st_gid: self.root.stat.st_gid,
+            st_mtim_sec: self.root.stat.st_mtim_sec,
+
+            xattrs: self.root.stat.xattrs.clone(),
+        };
+
+        for i in 0..=255u8 {
+            let name = OsString::from(format!("{:02x}", i));
+
+            // Skip if entry already exists
+            if self.root.entries.contains_key(name.as_os_str()) {
+                continue;
+            }
+
+            let leaf_id = self.push_leaf(whiteout_stat.clone(), LeafContent::CharacterDevice(0));
+            self.root
+                .entries
+                .insert(name.into_boxed_os_str(), Inode::leaf(leaf_id));
+        }
+    }
+
+    /// Add trusted.overlay.opaque="y" xattr to root directory.
+    ///
+    /// This is required for Format 1.0 when whiteout entries are present,
+    /// marking the directory as opaque for the overlay filesystem.
+    pub fn set_overlay_opaque(&mut self) {
+        self.root.stat.xattrs.insert(
+            Box::from(std::ffi::OsStr::new("trusted.overlay.opaque")),
+            Box::from(*b"y"),
+        );
+    }
+
     /// Creates a new filesystem with a root directory having the given metadata.
     pub fn new(root_stat: Stat) -> Self {
         Self {
@@ -1781,5 +1838,96 @@ mod tests {
 
         assert_eq!(fs.root.stat.st_mtim_sec, 200);
         assert_eq!(fs.leaves[0].stat.st_mtim_sec, 400);
+    }
+
+    #[test]
+    fn test_add_overlay_whiteouts() {
+        let root_stat = Stat {
+            st_mode: 0o755,
+            st_uid: 1000,
+            st_gid: 2000,
+            st_mtim_sec: 12345,
+            xattrs: BTreeMap::from([(
+                Box::from(OsStr::new("security.selinux")),
+                Box::from(b"system_u:object_r:root_t:s0".as_slice()),
+            )]),
+        };
+        let mut fs = FileSystem::<FileContents>::new(root_stat);
+
+        // Add a pre-existing entry that should not be overwritten
+        let pre_id = fs.push_leaf(
+            stat_with_mtime(99999),
+            LeafContent::Regular(FileContents {}),
+        );
+        fs.root.insert(OsStr::new("00"), Inode::leaf(pre_id));
+
+        fs.add_overlay_whiteouts();
+
+        // Should have 256 whiteout entries (255 new + 1 pre-existing)
+        assert_eq!(fs.root.entries.len(), 256);
+
+        // The pre-existing "00" should still have its original mtime
+        if let Some(Inode::Leaf(id, _)) = fs.root.entries.get(OsStr::new("00")) {
+            assert_eq!(fs.leaf(*id).stat.st_mtim_sec, 99999);
+        } else {
+            panic!("Expected '00' to remain a leaf");
+        }
+
+        // Check a newly created whiteout entry
+        if let Some(Inode::Leaf(id, _)) = fs.root.entries.get(OsStr::new("ff")) {
+            let leaf = fs.leaf(*id);
+            // Should be a character device with rdev=0
+            assert!(matches!(leaf.content, LeafContent::CharacterDevice(0)));
+            // Should have mode 0o644
+            assert_eq!(leaf.stat.st_mode, 0o644);
+            // Should inherit uid/gid/mtime from root
+            assert_eq!(leaf.stat.st_uid, 1000);
+            assert_eq!(leaf.stat.st_gid, 2000);
+            assert_eq!(leaf.stat.st_mtim_sec, 12345);
+            // Should inherit xattrs from root (e.g. SELinux label) — matching
+            // C mkcomposefs behaviour where whiteout entries copy root metadata.
+            assert_eq!(
+                leaf.stat
+                    .xattrs
+                    .get(OsStr::new("security.selinux"))
+                    .map(|v| v.as_ref()),
+                Some(b"system_u:object_r:root_t:s0".as_slice())
+            );
+        } else {
+            panic!("Expected 'ff' to be a leaf");
+        }
+
+        // Check some middle entries exist
+        assert!(fs.root.entries.contains_key(OsStr::new("7f")));
+        assert!(fs.root.entries.contains_key(OsStr::new("a0")));
+    }
+
+    #[test]
+    fn test_set_overlay_opaque() {
+        let mut fs = FileSystem::<FileContents>::new(default_stat());
+
+        fs.set_overlay_opaque();
+
+        let opaque = fs
+            .root
+            .stat
+            .xattrs
+            .get(OsStr::new("trusted.overlay.opaque"));
+        assert!(opaque.is_some());
+        assert_eq!(opaque.unwrap().as_ref(), b"y");
+    }
+
+    #[test]
+    fn test_add_overlay_whiteouts_empty_fs() {
+        let mut fs = FileSystem::<FileContents>::new(default_stat());
+
+        fs.add_overlay_whiteouts();
+
+        // Should have exactly 256 entries
+        assert_eq!(fs.root.entries.len(), 256);
+
+        // Check first and last entries
+        assert!(fs.root.entries.contains_key(OsStr::new("00")));
+        assert!(fs.root.entries.contains_key(OsStr::new("ff")));
     }
 }

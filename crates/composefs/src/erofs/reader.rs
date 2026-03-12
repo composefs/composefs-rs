@@ -1083,10 +1083,9 @@ fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tr
             inode.header.mode.0.get() as u32 & 0o7777,
             inode.header.uid.get() as u32,
             inode.header.gid.get() as u32,
-            // Compact inodes don't store mtime; the writer uses build_time
-            // but for round-trip purposes, 0 matches what was written for
-            // compact headers (the writer always uses ExtendedInodeHeader)
-            0i64,
+            // Compact inodes don't store mtime; use superblock build_time
+            // (the writer sets build_time = min mtime across all inodes)
+            img.sb.build_time.get() as i64,
         ),
         InodeType::Extended(inode) => (
             inode.header.mode.0.get() as u32 & 0o7777,
@@ -2510,11 +2509,12 @@ mod tests {
 
     mod proptest_tests {
         use super::*;
+        use crate::erofs::{format::FormatVersion, writer::mkfs_erofs_versioned};
         use crate::fsverity::Sha512HashValue;
-        use crate::test::proptest_strategies::{build_filesystem, filesystem_spec};
+        use crate::test::proptest_strategies::{FsSpec, build_filesystem, filesystem_spec};
         use proptest::prelude::*;
 
-        /// Round-trip a FileSystem through erofs and compare dumpfile output.
+        /// Round-trip a FileSystem through V2 erofs and compare dumpfile output.
         fn round_trip_filesystem<ObjectID: FsVerityHashValue>(
             fs_orig: &tree::FileSystem<ObjectID>,
         ) {
@@ -2533,6 +2533,50 @@ mod tests {
             );
         }
 
+        /// Round-trip a FileSystem through V1 erofs and compare dumpfile output.
+        ///
+        /// V1 uses compact inodes (when mtime matches the minimum), BFS ordering,
+        /// and includes overlay whiteout character device entries in the root.
+        /// The writer also adds `trusted.overlay.opaque` to the root, but the
+        /// reader strips it (as an internal overlay xattr), so the expected
+        /// filesystem should not include it.
+        fn round_trip_filesystem_v1<ObjectID: FsVerityHashValue>(spec: FsSpec) {
+            // Build two separate filesystems from the same spec so we avoid
+            // Rc::strong_count issues from sharing leaf Rcs.
+            let mut fs_write = build_filesystem::<ObjectID>(spec.clone());
+            let mut fs_expected = build_filesystem::<ObjectID>(spec);
+
+            // Add overlay whiteouts to both (the caller is responsible for this
+            // before calling mkfs_erofs_versioned with V1).
+            fs_write.add_overlay_whiteouts();
+            fs_expected.add_overlay_whiteouts();
+
+            // The writer internally adds trusted.overlay.opaque=y to root,
+            // but the reader strips all trusted.overlay.* xattrs that aren't
+            // escaped user xattrs. So the expected filesystem should NOT have it.
+
+            // Generate the V1 image from the write filesystem.
+            let image = mkfs_erofs_versioned(&fs_write, FormatVersion::V1);
+
+            // Read back from the image.
+            let fs_rt = erofs_to_filesystem::<ObjectID>(&image).unwrap();
+
+            // Compare via dumpfile serialization.
+            let mut expected_output = Vec::new();
+            write_dumpfile(&mut expected_output, &fs_expected).unwrap();
+
+            let mut rt_output = Vec::new();
+            write_dumpfile(&mut rt_output, &fs_rt).unwrap();
+
+            if expected_output != rt_output {
+                let expected_str = String::from_utf8_lossy(&expected_output);
+                let rt_str = String::from_utf8_lossy(&rt_output);
+                panic!(
+                    "V1 round-trip mismatch:\n--- expected ---\n{expected_str}\n--- got ---\n{rt_str}"
+                );
+            }
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -2546,6 +2590,16 @@ mod tests {
             fn test_erofs_round_trip_sha512(spec in filesystem_spec()) {
                 let fs = build_filesystem::<Sha512HashValue>(spec);
                 round_trip_filesystem(&fs);
+            }
+
+            #[test]
+            fn test_erofs_round_trip_v1_sha256(spec in filesystem_spec()) {
+                round_trip_filesystem_v1::<Sha256HashValue>(spec);
+            }
+
+            #[test]
+            fn test_erofs_round_trip_v1_sha512(spec in filesystem_spec()) {
+                round_trip_filesystem_v1::<Sha512HashValue>(spec);
             }
         }
     }
