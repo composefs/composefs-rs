@@ -574,6 +574,7 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     write_semaphore: OnceCell<Arc<Semaphore>>,
     insecure: bool,
     metadata: RepoMetadata,
+    privileged: bool,
     _data: std::marker::PhantomData<ObjectID>,
 }
 
@@ -583,6 +584,7 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for Repository<ObjectID> {
             .field("repository", &self.repository)
             .field("objects", &self.objects)
             .field("insecure", &self.insecure)
+            .field("privileged", &self.privileged)
             .finish_non_exhaustive()
     }
 }
@@ -968,6 +970,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             write_semaphore: OnceCell::new(),
             insecure: !has_verity,
             metadata,
+            privileged: true,
             _data: std::marker::PhantomData,
         })
     }
@@ -1553,6 +1556,25 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(())
     }
 
+    /// Sets whether this repository operates in privileged mode.
+    ///
+    /// In privileged mode (default), kernel EROFS mounting and the `.fs-verity`
+    /// keyring are available. In unprivileged mode, callers should use FUSE
+    /// mounting with userspace verification instead.
+    ///
+    /// This is orthogonal to `insecure`: `insecure` controls whether fsverity
+    /// is available on the filesystem, while `privileged` controls whether
+    /// kernel mounting capabilities are available.
+    pub fn set_privileged(&mut self, privileged: bool) -> &mut Self {
+        self.privileged = privileged;
+        self
+    }
+
+    /// Returns whether this repository is in privileged mode.
+    pub fn is_privileged(&self) -> bool {
+        self.privileged
+    }
+
     /// Creates a SplitStreamWriter for writing a split stream.
     /// You should write the data to the returned object and then pass it to .store_stream() to
     /// store the result.
@@ -1910,6 +1932,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// be attached via e.g. `move_mount`.
     #[context("Mounting image '{name}'")]
     pub fn mount(&self, name: &str) -> Result<OwnedFd> {
+        ensure!(
+            self.privileged,
+            "kernel mounting requires privileged mode; use FUSE mounting for unprivileged operation"
+        );
+
         let (image, enable_verity) = self.open_image(name)?;
 
         composefs_fsmount(
@@ -4596,5 +4623,28 @@ mod tests {
 
         // Verify Debug impl works
         assert_eq!(format!("{:?}", ObjectStoreMethod::Hardlinked), "Hardlinked");
+    }
+
+    #[test]
+    fn test_privileged_flag() {
+        let tmp = tempdir();
+        let (mut repo, _) = Repository::<Sha512HashValue>::init_path(
+            CWD,
+            tmp.path(),
+            crate::fsverity::Algorithm::SHA512,
+            false,
+        )
+        .unwrap();
+
+        // Default is privileged
+        assert!(repo.is_privileged());
+
+        // Can disable
+        repo.set_privileged(false);
+        assert!(!repo.is_privileged());
+
+        // Can re-enable
+        repo.set_privileged(true);
+        assert!(repo.is_privileged());
     }
 }

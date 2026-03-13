@@ -4,10 +4,7 @@
 //! creating and mounting filesystem images, handling OCI containers, and performing
 //! repository maintenance operations like garbage collection.
 
-use cfsctl::App;
-
 use anyhow::Result;
-use clap::Parser;
 
 fn main() -> Result<()> {
     // If we were spawned as a userns helper process, handle that and exit.
@@ -24,7 +21,5 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     env_logger::init();
-
-    let args = App::parse();
-    cfsctl::run_app(args).await
+    cfsctl::run_from_args().await
 }

@@ -25,6 +25,7 @@
 #![deny(unsafe_code)]
 
 pub mod fsverity;
+pub mod keyring;
 
 #[cfg(feature = "loop-device")]
 pub mod loop_device;

@@ -21,6 +21,26 @@ pub(super) fn fs_ioc_enable_verity<H: FsVerityHashValue>(
     composefs_ioctls::fsverity::fs_ioc_enable_verity(fd.as_fd(), H::ALGORITHM.kernel_id(), 4096)
 }
 
+/// Enable fsverity on the target file, optionally with a PKCS#7 signature.
+///
+/// If `signature` is provided, the kernel will verify it against the `.fs-verity`
+/// keyring before enabling verity. The signature must be a DER-encoded PKCS#7
+/// detached signature over the `fsverity_formatted_digest` of this file.
+///
+/// All constraints of `fs_ioc_enable_verity` apply: the file descriptor must be
+/// `O_RDONLY` with no outstanding writable file descriptors or mappings.
+pub(super) fn fs_ioc_enable_verity_with_sig<H: FsVerityHashValue>(
+    fd: impl AsFd,
+    signature: Option<&[u8]>,
+) -> Result<(), EnableVerityError> {
+    composefs_ioctls::fsverity::fs_ioc_enable_verity_with_sig(
+        fd.as_fd(),
+        H::ALGORITHM.kernel_id(),
+        4096,
+        signature,
+    )
+}
+
 /// Measure the fsverity digest of the provided file descriptor.
 ///
 /// Returns the digest as the appropriate FsVerityHashValue type.

@@ -43,6 +43,17 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
         compute_verity(&mkfs_erofs(self))
     }
 
+    /// Generate the EROFS image and compute its fs-verity digest.
+    ///
+    /// Returns the raw EROFS image bytes alongside the fs-verity digest.
+    /// Unlike `compute_image_id()` which discards the bytes, this preserves
+    /// them for inclusion in composefs artifacts.
+    pub fn generate_erofs_image(&self) -> (Box<[u8]>, ObjectID) {
+        let erofs_bytes = mkfs_erofs(self);
+        let digest = compute_verity(&erofs_bytes);
+        (erofs_bytes, digest)
+    }
+
     /// Prints this filesystem in dumpfile format to stdout.
     ///
     /// Serializes the entire filesystem tree to stdout in composefs dumpfile

@@ -4,7 +4,9 @@
 //! digest computation, kernel ioctl interfaces for enabling and measuring
 //! verity, and hash value types for SHA-256 and SHA-512.
 
+pub mod algorithm;
 mod digest;
+pub mod formatted_digest;
 mod hashvalue;
 mod ioctl;
 
@@ -77,6 +79,36 @@ pub fn compute_verity<H: FsVerityHashValue>(data: &[u8]) -> H {
 /// currently hardcoded to 4096.  Salt is not supported.
 pub fn enable_verity_raw<H: FsVerityHashValue>(fd: impl AsFd) -> Result<(), EnableVerityError> {
     ioctl::fs_ioc_enable_verity::<H>(fd)
+}
+
+/// Enable fs-verity on the given file, optionally with a PKCS#7 signature.
+///
+/// Like `enable_verity_raw`, but accepts an optional DER-encoded PKCS#7 detached
+/// signature over the [`formatted_digest::format_fsverity_digest`] structure. If
+/// provided, the kernel will verify it against the `.fs-verity` keyring before
+/// enabling verity.
+///
+/// # Trust Models
+///
+/// composefs supports two complementary signature trust models:
+///
+/// 1. **Application-level (OCI signature artifacts)**: PKCS#7 signatures are stored
+///    in OCI artifacts alongside the image. Verification is done in userspace by the
+///    composefs tooling. This is the primary model for container image signing.
+///
+/// 2. **Kernel-level (`.fs-verity` keyring)**: The kernel itself verifies PKCS#7
+///    signatures during `FS_IOC_ENABLE_VERITY`. This requires loading a CA certificate
+///    into the kernel's `.fs-verity` keyring (typically by root). When enabled, the
+///    kernel rejects enabling verity on any file without a valid signature. This
+///    function supports this model via the `signature` parameter.
+///
+/// Most deployments use model 1 (application-level). Model 2 is for high-security
+/// environments where kernel-enforced signatures are required.
+pub fn enable_verity_raw_with_sig<H: FsVerityHashValue>(
+    fd: impl AsFd,
+    signature: Option<&[u8]>,
+) -> Result<(), EnableVerityError> {
+    ioctl::fs_ioc_enable_verity_with_sig::<H>(fd, signature)
 }
 
 /// Enable fs-verity on the given file, retrying if file is opened for writing.
@@ -256,6 +288,9 @@ pub fn ensure_verity_equal(
         })
     }
 }
+
+// Re-export keyring from composefs-ioctls where the unsafe code lives
+pub use composefs_ioctls::keyring::{KeyringError, inject_fsverity_cert};
 
 #[cfg(test)]
 mod tests {

@@ -15,7 +15,7 @@ case "${ID}" in
         ;;
     debian|ubuntu)
         pkg_install \
-            openssl e2fsprogs bubblewrap openssh-server \
+            openssl e2fsprogs bubblewrap openssh-server fsverity-utils \
             podman skopeo
 
         # OSTree symlink targets — /root, /home, /srv, etc. are symlinks

@@ -498,6 +498,12 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
         }
     }
 
+    // TODO: When pulling from an OCI layout that contains referrer/signature
+    // artifacts (composefs signature artifacts), import them too. Currently
+    // only the image manifest, config, and layers are pulled, which breaks
+    // the signature round-trip: export with `--signatures` -> re-import ->
+    // verify fails because no artifacts exist in the new repo.
+
     Ok((result, stats))
 }
 
