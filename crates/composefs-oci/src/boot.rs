@@ -12,6 +12,9 @@ use composefs::repository::Repository;
 
 use crate::OciDigest;
 
+/// The name used for the bootable image reference in the config.
+pub const BOOT_IMAGE_REF_NAME: &str = "cfs-oci-for-bootable";
+
 /// Generate a bootable EROFS image from a pulled OCI manifest (idempotent).
 #[cfg(feature = "boot")]
 pub fn generate_boot_image<ObjectID: FsVerityHashValue>(

@@ -59,7 +59,7 @@ pub const BOOT_IMAGE_REF_KEY: &str = "composefs.image.boot";
 // Re-export key types for convenience
 #[cfg(feature = "boot")]
 pub use boot::generate_boot_image;
-pub use boot::{boot_image, remove_boot_image};
+pub use boot::{BOOT_IMAGE_REF_NAME, boot_image, remove_boot_image};
 pub use oci_image::{
     ImageInfo, LayerInfo, OCI_REF_PREFIX, OciFsckError, OciFsckResult, OciImage, SplitstreamInfo,
     add_referrer, layer_dumpfile, layer_info, layer_tar, list_images, list_referrers, list_refs,
