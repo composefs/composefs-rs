@@ -56,11 +56,20 @@ pub async fn fetch_and_import_referrers<ObjectID: FsVerityHashValue>(
     let client = Client::new(ClientConfig::default());
 
     // Fetch the referrers index, filtering by our artifact type.
-    // The registry filters by artifactType server-side per the OCI spec.
-    let index = client
+    // Try the OCI Referrers API first, then fall back to the tag scheme.
+    // Some registries (e.g. GHCR) don't properly support the referrers API
+    // but store referrers under a tag named "sha256-<hex>" per the OCI 1.1
+    // referrers tag scheme fallback.
+    let index = match client
         .pull_referrers(&digest_ref, Some(EROFS_ALONGSIDE_ARTIFACT_TYPE))
         .await
-        .context("fetching referrers from registry")?;
+    {
+        Ok(idx) => idx,
+        Err(api_err) => {
+            log::debug!("Referrers API failed ({api_err:#}), trying tag scheme fallback");
+            fetch_referrers_by_tag(&client, &reference, manifest_digest).await?
+        }
+    };
 
     if index.manifests.is_empty() {
         return Ok(0);
@@ -153,6 +162,43 @@ pub async fn fetch_and_import_referrers<ObjectID: FsVerityHashValue>(
     }
 
     Ok(imported)
+}
+
+/// Fetch referrers using the OCI 1.1 tag scheme fallback.
+///
+/// When a registry doesn't support the Referrers API (e.g. GHCR returns 303/404),
+/// referrer artifacts are stored under a tag named `sha256-<hex>` in the same
+/// repository. The tagged manifest is an OCI Image Index listing all referrers.
+async fn fetch_referrers_by_tag(
+    client: &Client,
+    reference: &Reference,
+    manifest_digest: &str,
+) -> Result<oci_client::manifest::OciImageIndex> {
+    // Convert "sha256:abcdef..." to tag "sha256-abcdef..."
+    let tag = manifest_digest.replace(':', "-");
+    let tag_ref = Reference::with_tag(
+        reference.registry().to_string(),
+        reference.repository().to_string(),
+        tag.clone(),
+    );
+
+    let (raw_bytes, _digest) = client
+        .pull_manifest_raw(
+            &tag_ref,
+            &RegistryAuth::Anonymous,
+            &["application/vnd.oci.image.index.v1+json"],
+        )
+        .await
+        .with_context(|| format!("fetching referrers via tag scheme (tag '{tag}')"))?;
+
+    let index: oci_client::manifest::OciImageIndex =
+        serde_json::from_slice(&raw_bytes).context("parsing referrers tag index")?;
+
+    log::info!(
+        "Found {} referrer(s) via tag scheme fallback",
+        index.manifests.len()
+    );
+    Ok(index)
 }
 
 /// Fetch a blob by digest from the registry.
