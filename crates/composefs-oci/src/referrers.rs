@@ -30,17 +30,23 @@ use crate::signature::EROFS_ALONGSIDE_ARTIFACT_TYPE;
 /// that reference the pulled image's manifest digest.
 ///
 /// `registry_ref` is the image reference as used for pulling, e.g.
-/// `"docker://docker.io/myorg/myimage:latest"` or `"docker.io/myorg/myimage:latest"`.
-/// Transport prefixes like `docker://` are stripped automatically.
+/// `"docker://docker.io/myorg/myimage:latest"`. Transport prefixes are
+/// stripped automatically.
 ///
-/// `manifest_digest` is the sha256 digest of the pulled image's manifest,
-/// e.g. `"sha256:abc123..."`.
+/// `registry_manifest_digest` is the manifest digest as known by the
+/// registry — used to query the Referrers API and tag scheme fallback.
+///
+/// `local_subject_digest` is the manifest digest as stored in the local
+/// composefs repo (which may differ from the registry digest due to
+/// config rewriting for EROFS refs). Used to register the referrer
+/// relationship locally via `add_referrer`.
 ///
 /// Returns the number of referrer artifacts imported.
 pub async fn fetch_and_import_referrers<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     registry_ref: &str,
-    manifest_digest: &str,
+    registry_manifest_digest: &str,
+    local_subject_digest: &str,
 ) -> Result<usize> {
     // Strip transport prefixes that skopeo uses but oci-client doesn't understand
     let clean_ref = strip_transport_prefix(registry_ref);
@@ -49,9 +55,9 @@ pub async fn fetch_and_import_referrers<ObjectID: FsVerityHashValue>(
     let reference = Reference::from_str(clean_ref)
         .with_context(|| format!("parsing image reference '{clean_ref}' for referrer lookup"))?;
 
-    // Create a reference with the manifest digest for the referrers API.
-    // The referrers API needs the digest, not the tag.
-    let digest_ref = reference.clone_with_digest(manifest_digest.to_string());
+    // Create a reference with the registry manifest digest for the referrers API.
+    // The referrers API needs the registry-side digest, not the local one.
+    let digest_ref = reference.clone_with_digest(registry_manifest_digest.to_string());
 
     let client = Client::new(ClientConfig::default());
 
@@ -67,7 +73,7 @@ pub async fn fetch_and_import_referrers<ObjectID: FsVerityHashValue>(
         Ok(idx) => idx,
         Err(api_err) => {
             log::debug!("Referrers API failed ({api_err:#}), trying tag scheme fallback");
-            fetch_referrers_by_tag(&client, &reference, manifest_digest).await?
+            fetch_referrers_by_tag(&client, &reference, registry_manifest_digest).await?
         }
     };
 
@@ -154,8 +160,9 @@ pub async fn fetch_and_import_referrers<ObjectID: FsVerityHashValue>(
         manifest_stream.write_external(&raw_manifest_bytes)?;
         repo.write_stream(manifest_stream, &manifest_content_id, None)?;
 
-        // Register in the referrer index
-        oci_image::add_referrer(repo, manifest_digest, artifact_digest)?;
+        // Register in the referrer index using the LOCAL manifest digest
+        // (which may differ from the registry digest due to config rewriting)
+        oci_image::add_referrer(repo, local_subject_digest, artifact_digest)?;
 
         log::info!("Imported referrer artifact {artifact_digest}");
         imported += 1;

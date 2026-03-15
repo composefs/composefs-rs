@@ -512,10 +512,22 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     {
         // Only attempt for registry transports (not local sources)
         if matches!(op.transport, Transport::Registry) {
+            // The local manifest digest may differ from the registry digest
+            // because ensure_oci_composefs_erofs rewrites the config+manifest.
+            // We need the registry digest for the referrers API query, and
+            // the local digest for registering the referrer relationship.
+            let local_digest = if let Some(name) = reference {
+                crate::oci_image::resolve_ref(repo, name)
+                    .map(|(d, _)| d)
+                    .unwrap_or_else(|_| result.manifest_digest.clone())
+            } else {
+                result.manifest_digest.clone()
+            };
             match crate::referrers::fetch_and_import_referrers(
                 repo,
                 imgref,
                 &result.manifest_digest,
+                &local_digest,
             )
             .await
             {
