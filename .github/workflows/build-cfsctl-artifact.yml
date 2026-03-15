@@ -27,7 +27,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build cfsctl (release)
-        run: cargo build --release -p cfsctl --features composefs/pre-6.15,composefs-oci/oci-client
+        run: cargo build --release -p cfsctl --features composefs/rhel9,composefs-oci/oci-client
 
       - name: Install oras CLI
         run: |
