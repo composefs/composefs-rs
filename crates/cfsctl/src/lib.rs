@@ -1630,6 +1630,7 @@ where
                     &repo,
                     manifest_digest,
                     oci_layout_path,
+                    None,
                 )
                 .context("exporting signatures to OCI layout")?;
 

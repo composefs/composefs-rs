@@ -38,6 +38,7 @@
 //! This module handles both transparently. Use `is_container_image()` to check.
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
@@ -1779,13 +1780,21 @@ pub fn export_image_to_oci_layout<ObjectID: FsVerityHashValue>(
         .build()
         .context("building platform")?;
 
-    ocidir
+    let new_manifest_desc = ocidir
         .insert_manifest(new_manifest, tag, platform)
         .context("inserting manifest into OCI layout")?;
 
-    // 5. Optionally export referrers
+    // 5. Optionally export referrers, rewriting subject.digest to match
+    //    the new manifest digest (which differs from the original because
+    //    layers are reconstituted as uncompressed tars).
     if include_referrers {
-        export_referrers_to_oci_layout(repo, image.manifest_digest(), oci_layout_path)?;
+        let new_digest = new_manifest_desc.digest().to_string();
+        export_referrers_to_oci_layout(
+            repo,
+            image.manifest_digest(),
+            oci_layout_path,
+            Some(&new_digest),
+        )?;
     }
 
     Ok(())
@@ -1798,6 +1807,7 @@ pub fn export_image_to_oci_layout<ObjectID: FsVerityHashValue>(
 /// 1. Lists all referrers for the given subject manifest digest
 /// 2. For each referrer artifact:
 ///    - Writes config, layer, and manifest blobs via `ocidir::OciDir`
+///    - Optionally rewrites the `subject.digest` field in the artifact manifest
 ///    - Updates the index.json with artifact_type and annotations for
 ///      OCI Referrers API discoverability
 ///
@@ -1808,8 +1818,11 @@ pub fn export_image_to_oci_layout<ObjectID: FsVerityHashValue>(
 /// # Arguments
 ///
 /// * `repo` - The composefs repository
-/// * `subject_digest` - The manifest digest of the subject image (sha256:...)
+/// * `subject_digest` - The manifest digest of the subject image in the repo (sha256:...)
 /// * `oci_layout_path` - Path to the OCI layout directory
+/// * `rewrite_subject_digest` - If `Some`, rewrite the artifact's `subject.digest` to this
+///   value. This is needed when the exported image manifest has a different digest than the
+///   original (e.g., because layers were reconstituted as uncompressed tars).
 ///
 /// # Returns
 ///
@@ -1818,6 +1831,7 @@ pub fn export_referrers_to_oci_layout<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     subject_digest: &OciDigest,
     oci_layout_path: &std::path::Path,
+    rewrite_subject_digest: Option<&str>,
 ) -> Result<usize> {
     use oci_spec::image::ImageIndexBuilder;
     use std::io::Write;
@@ -1881,8 +1895,32 @@ pub fn export_referrers_to_oci_layout<ObjectID: FsVerityHashValue>(
             layer_blob.complete().context("completing layer blob")?;
         }
 
+        // Optionally rewrite subject.digest to match the exported image manifest
+        let manifest_json = if let Some(new_digest) = rewrite_subject_digest {
+            let mut rewritten = manifest.clone();
+            if let Some(ref old_subject) = rewritten.subject().clone() {
+                use oci_spec::image::DescriptorBuilder;
+                let mut new_subject_builder = DescriptorBuilder::default()
+                    .media_type(old_subject.media_type().clone())
+                    .digest(
+                        oci_spec::image::Digest::from_str(new_digest)
+                            .context("parsing new subject digest")?,
+                    )
+                    .size(old_subject.size());
+                if let Some(annotations) = old_subject.annotations() {
+                    new_subject_builder = new_subject_builder.annotations(annotations.clone());
+                }
+                let new_subject = new_subject_builder
+                    .build()
+                    .context("building rewritten subject descriptor")?;
+                rewritten.set_subject(Some(new_subject));
+            }
+            rewritten.to_string()?
+        } else {
+            manifest.to_string()?
+        };
+
         // Write the manifest blob
-        let manifest_json = manifest.to_string()?;
         let mut manifest_blob = ocidir.create_blob().context("creating manifest blob")?;
         manifest_blob
             .write_all(manifest_json.as_bytes())
