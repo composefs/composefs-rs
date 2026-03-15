@@ -565,6 +565,8 @@ pub struct ImageInfo {
     pub manifest_digest: OciDigest,
     /// Whether this is a container image (vs artifact)
     pub is_container: bool,
+    /// Whether this image has been sealed (has composefs fsverity label)
+    pub sealed: bool,
     /// Architecture (empty for artifacts)
     pub architecture: String,
     /// OS (empty for artifacts)
@@ -591,6 +593,7 @@ pub fn list_images<ObjectID: FsVerityHashValue>(
                     name,
                     manifest_digest: digest,
                     is_container: img.is_container_image(),
+                    sealed: img.is_sealed(),
                     architecture: img.architecture(),
                     os: img.os(),
                     created: img.created().map(String::from),

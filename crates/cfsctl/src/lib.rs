@@ -303,6 +303,12 @@ enum OciCommand {
         /// Mount the bootable variant instead of the regular EROFS image
         #[arg(long)]
         bootable: bool,
+        /// Require a valid signature artifact for the image before mounting
+        #[clap(long)]
+        require_signature: bool,
+        /// Path to PEM-encoded trusted certificate for signature verification
+        #[clap(long)]
+        trust_cert: Option<PathBuf>,
     },
     /// Compute the composefs image ID of a stored OCI image's rootfs
     ///
@@ -1036,7 +1042,13 @@ where
                 ref image,
                 ref mountpoint,
                 bootable,
+                require_signature,
+                ref trust_cert,
             } => {
+                if require_signature && trust_cert.is_none() {
+                    anyhow::bail!("--require-signature requires --trust-cert");
+                }
+
                 let img = if image.starts_with("sha256:") {
                     let digest: composefs_oci::OciDigest =
                         image.parse().context("Parsing manifest digest")?;
@@ -1044,6 +1056,17 @@ where
                 } else {
                     composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
                 };
+
+                if require_signature {
+                    let cert_path = trust_cert.as_ref().unwrap();
+                    let cert_pem = std::fs::read(cert_path)
+                        .with_context(|| format!("failed to read certificate: {cert_path:?}"))?;
+                    let verified_count = verify_image_signatures(&repo, image, &cert_pem)?;
+                    println!(
+                        "Signature verification passed ({verified_count} signatures verified)"
+                    );
+                }
+
                 let erofs_id = if bootable {
                     match img.boot_image_ref() {
                         Some(id) => id,
