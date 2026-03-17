@@ -38,14 +38,6 @@ fn debug_fs(fs: FileSystem<impl FsVerityHashValue>) -> String {
     String::from_utf8(output).unwrap()
 }
 
-fn debug_fs_v1(mut fs: FileSystem<impl FsVerityHashValue>) -> String {
-    fs.add_overlay_whiteouts();
-    let image = mkfs_erofs_versioned(&fs, FormatVersion::V1);
-    let mut output = vec![];
-    debug_img(&mut output, &image).unwrap();
-    String::from_utf8(output).unwrap()
-}
-
 fn empty(_fs: &mut FileSystem<impl FsVerityHashValue>) {}
 
 #[test]
@@ -53,13 +45,6 @@ fn test_empty() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     empty(&mut fs);
     insta::assert_snapshot!(debug_fs(fs));
-}
-
-#[test]
-fn test_empty_v1() {
-    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
-    empty(&mut fs);
-    insta::assert_snapshot!(debug_fs_v1(fs));
 }
 
 fn add_leaf<ObjectID: FsVerityHashValue>(
@@ -111,13 +96,6 @@ fn test_simple() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     simple(&mut fs);
     insta::assert_snapshot!(debug_fs(fs));
-}
-
-#[test]
-fn test_simple_v1() {
-    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
-    simple(&mut fs);
-    insta::assert_snapshot!(debug_fs_v1(fs));
 }
 
 fn foreach_case(f: fn(&FileSystem<Sha256HashValue>)) {
@@ -187,6 +165,38 @@ fn test_erofs_digest_stability() {
         );
     }
 }
+
+#[test]
+fn test_erofs_v1_digest_stability() {
+    // Same as test_erofs_digest_stability but for V1 (C-compatible) format.
+    // V1 output must be byte-stable since it needs to match C mkcomposefs.
+    let cases: &[(&str, fn(&mut FileSystem<Sha256HashValue>), &str)] = &[
+        (
+            "empty_v1",
+            empty,
+            "8f589e8f57ecb88823736b0d857ddca1e1068a23e264fad164b28f7038eb3682",
+        ),
+        (
+            "simple_v1",
+            simple,
+            "9f3f5620ee0c54708516467d0d58741e7963047c7106b245d94c298259d0fa01",
+        ),
+    ];
+
+    for (name, case, expected_digest) in cases {
+        let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+        case(&mut fs);
+        fs.add_overlay_whiteouts();
+        let image = mkfs_erofs_versioned(&fs, FormatVersion::V1);
+        let digest = composefs::fsverity::compute_verity::<Sha256HashValue>(&image);
+        let hex = digest.to_hex();
+        assert_eq!(
+            &hex, expected_digest,
+            "{name}: V1 EROFS digest changed — if this is intentional, update the pinned value"
+        );
+    }
+}
+
 #[test_with::executable(mkcomposefs)]
 fn test_vs_mkcomposefs() {
     for case in [empty, simple] {

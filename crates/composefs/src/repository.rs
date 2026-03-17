@@ -4793,6 +4793,45 @@ mod tests {
         Ok(())
     }
 
+    /// Helper to create a V1 (C-compatible) EROFS image and write it to the repo.
+    fn commit_v1_image(
+        repo: &Repository<Sha512HashValue>,
+        obj_id: &Sha512HashValue,
+        obj_size: u64,
+    ) -> Result<Sha512HashValue> {
+        use crate::erofs::format::FormatVersion;
+        use crate::erofs::writer::mkfs_erofs_versioned;
+
+        let mut fs = make_test_fs(obj_id, obj_size);
+        fs.add_overlay_whiteouts();
+        let image_data = mkfs_erofs_versioned(&fs, FormatVersion::V1);
+        repo.write_image(None, &image_data)
+    }
+
+    #[tokio::test]
+    async fn test_fsck_validates_v1_erofs_image() -> Result<()> {
+        // V1 images (C-compatible format) should pass fsck just like V2.
+        // This catches regressions where fsck or the reader doesn't handle
+        // compact inodes, BFS ordering, or the whiteout table.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj_size: u64 = 32 * 1024;
+        let obj = generate_test_data(obj_size, 0xBB);
+        let obj_id = repo.ensure_object(&obj)?;
+
+        commit_v1_image(&repo, &obj_id, obj_size)?;
+        repo.sync()?;
+
+        let result = repo.fsck().await?;
+        assert!(
+            result.is_ok(),
+            "V1 (C-compatible) erofs image should pass fsck: {result}"
+        );
+        assert!(result.images_checked > 0, "should have checked the image");
+        Ok(())
+    }
+
     // ---- Fsck metadata validation tests ----
 
     #[tokio::test]
@@ -5105,5 +5144,44 @@ mod tests {
         let (_repo, upgraded) =
             Repository::<Sha256HashValue>::open_upgrade(CWD, &repo_path).unwrap();
         assert!(!upgraded);
+    }
+
+    #[tokio::test]
+    async fn test_fsck_v1_image_detects_missing_object() -> Result<()> {
+        // Same as test_fsck_validates_erofs_image_objects but with a V1 image,
+        // ensuring fsck correctly parses V1 images to find object references.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj_size: u64 = 32 * 1024;
+        let obj = generate_test_data(obj_size, 0xBC);
+        let obj_id = repo.ensure_object(&obj)?;
+
+        commit_v1_image(&repo, &obj_id, obj_size)?;
+        repo.sync()?;
+
+        // Sanity: passes before we break it
+        let result = repo.fsck().await?;
+        assert!(
+            result.is_ok(),
+            "healthy V1 image should pass fsck: {result}"
+        );
+
+        // Delete the referenced object
+        let hex = obj_id.to_hex();
+        let (prefix, rest) = hex.split_at(2);
+        let dir = open_test_repo_dir(&tmp);
+        dir.remove_file(format!("objects/{prefix}/{rest}"))?;
+
+        let result = repo.fsck().await?;
+        assert!(
+            !result.is_ok(),
+            "fsck should detect missing object in V1 erofs image: {result}"
+        );
+        assert!(
+            result.missing_objects > 0,
+            "should report missing objects: {result}"
+        );
+        Ok(())
     }
 }
