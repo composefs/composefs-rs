@@ -17,10 +17,10 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, little_endian::U32};
 use super::{
     composefs::OverlayMetacopy,
     format::{
-        self, BLOCK_BITS, COMPOSEFS_MAGIC, CompactInodeHeader, ComposefsHeader, DataLayout,
-        DirectoryEntryHeader, ExtendedInodeHeader, InodeXAttrHeader, MAGIC_V1, ModeField, S_IFBLK,
-        S_IFCHR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, Superblock, VERSION, XATTR_PREFIXES,
-        XAttrHeader,
+        self, BLOCK_BITS, COMPOSEFS_MAGIC, COMPOSEFS_VERSION, COMPOSEFS_VERSION_V1,
+        CompactInodeHeader, ComposefsHeader, DataLayout, DirectoryEntryHeader, ExtendedInodeHeader,
+        InodeXAttrHeader, MAGIC_V1, ModeField, S_IFBLK, S_IFCHR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
+        S_IFSOCK, Superblock, VERSION, XATTR_PREFIXES, XAttrHeader,
     },
 };
 use crate::MAX_INLINE_CONTENT;
@@ -494,8 +494,16 @@ impl<'img> Image<'img> {
                 self.header.version.get(),
             )));
         }
-        // Note: we don't enforce composefs_version here because C mkcomposefs
-        // writes version 0 while the Rust writer uses version 2.  Both are valid.
+        // Reject unknown composefs versions.  V1 (composefs_version=0) is the
+        // original C format; V2 (composefs_version=2) is the Rust-native format.
+        let cv = self.header.composefs_version.get();
+        if cv != COMPOSEFS_VERSION.get() && cv != COMPOSEFS_VERSION_V1.get() {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "unknown composefs_version {cv} (expected {} or {})",
+                COMPOSEFS_VERSION_V1.get(),
+                COMPOSEFS_VERSION.get(),
+            )));
+        }
 
         // Validate EROFS superblock magic
         if self.sb.magic != MAGIC_V1 {
