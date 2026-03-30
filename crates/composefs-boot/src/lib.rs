@@ -18,6 +18,7 @@ pub mod write_boot;
 use std::ffi::OsStr;
 
 use anyhow::Result;
+use rustix::fd::AsFd;
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository, tree::FileSystem};
 
@@ -41,6 +42,19 @@ use crate::bootloader::{get_boot_resources, BootEntry};
 /// here we can just ignore it.
 const REQUIRED_TOPLEVEL_TO_EMPTY_DIRS: &[&str] = &["boot", "sysroot"];
 
+/// Empty the required top-level directories and set their mtime to match /usr.
+fn empty_toplevel_dirs<ObjectID: FsVerityHashValue>(fs: &mut FileSystem<ObjectID>) -> Result<()> {
+    let usr_mtime = fs.root.get_directory(OsStr::new("usr"))?.stat.st_mtim_sec;
+
+    for d in REQUIRED_TOPLEVEL_TO_EMPTY_DIRS {
+        let d = fs.root.get_directory_mut(d.as_ref())?;
+        d.stat.st_mtim_sec = usr_mtime;
+        d.clear();
+    }
+
+    Ok(())
+}
+
 /// Trait for transforming filesystem images for boot scenarios.
 ///
 /// This trait provides functionality to prepare composefs filesystem images for booting by
@@ -62,6 +76,22 @@ pub trait BootOps<ObjectID: FsVerityHashValue> {
         &mut self,
         repo: &Repository<ObjectID>,
     ) -> Result<Vec<BootEntry<ObjectID>>>;
+
+    /// Apply boot filesystem transformations using an on-disk directory for file content.
+    ///
+    /// This applies the same filesystem transformations as [`BootOps::transform_for_boot`]
+    /// (emptying /boot and /sysroot, SELinux relabeling) but reads SELinux policy files
+    /// directly from the on-disk filesystem via a directory fd rather than from the
+    /// composefs repository.
+    ///
+    /// This does not extract boot entries (Type 1 BLS entries, UKIs, etc.) since those
+    /// are only needed for writing to the boot partition, not for computing the composefs
+    /// digest.
+    ///
+    /// # Arguments
+    ///
+    /// * `rootfs` - A directory fd pointing to the root of the on-disk filesystem
+    fn transform_for_boot_from_dir(&mut self, rootfs: impl AsFd) -> Result<()>;
 }
 
 impl<ObjectID: FsVerityHashValue> BootOps<ObjectID> for FileSystem<ObjectID> {
@@ -70,19 +100,15 @@ impl<ObjectID: FsVerityHashValue> BootOps<ObjectID> for FileSystem<ObjectID> {
         repo: &Repository<ObjectID>,
     ) -> Result<Vec<BootEntry<ObjectID>>> {
         let boot_entries = get_boot_resources(self, repo)?;
-
-        // Get /usr's mtime to use as the canonical mtime for emptied directories.
-        // This matches how we handle the root directory in copy_root_metadata_from_usr().
-        let usr_mtime = self.root.get_directory(OsStr::new("usr"))?.stat.st_mtim_sec;
-
-        for d in REQUIRED_TOPLEVEL_TO_EMPTY_DIRS {
-            let d = self.root.get_directory_mut(d.as_ref())?;
-            d.stat.st_mtim_sec = usr_mtime;
-            d.clear();
-        }
-
+        empty_toplevel_dirs(self)?;
         selabel::selabel(self, repo)?;
 
         Ok(boot_entries)
+    }
+
+    fn transform_for_boot_from_dir(&mut self, rootfs: impl AsFd) -> Result<()> {
+        empty_toplevel_dirs(self)?;
+        selabel::selabel_from_dir(self, rootfs)?;
+        Ok(())
     }
 }
