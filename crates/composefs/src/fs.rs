@@ -162,8 +162,8 @@ pub fn write_to_path<ObjectID: FsVerityHashValue>(
 
 /// Helper for reading filesystem trees from disk into composefs representation.
 ///
-/// Tracks hardlinks via inode numbers and handles integration with repositories
-/// for storing large file content.
+/// Tracks hardlinks via inode numbers and optionally stores large file objects
+/// in a repository.
 #[derive(Debug)]
 pub struct FilesystemReader<'repo, ObjectID: FsVerityHashValue> {
     repo: Option<&'repo Repository<ObjectID>>,
@@ -295,8 +295,7 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
     /// Reads a directory from disk into composefs representation.
     ///
     /// Recursively reads directory contents, tracking hardlinks and optionally
-    /// reading the directory's own metadata. Large files are stored in the repository
-    /// if one was provided.
+    /// storing large file objects in the repository.
     #[context("Reading directory {}", name.to_string_lossy())]
     fn read_directory(&mut self, dirfd: impl AsFd, name: &OsStr) -> Result<Directory<ObjectID>> {
         let fd = openat(
@@ -341,9 +340,12 @@ impl<ObjectID: FsVerityHashValue> FilesystemReader<'_, ObjectID> {
     }
 }
 
-/// Load a filesystem tree from the given path. A repository may
-/// be provided; if it is, then all files found in the filesystem
-/// are copied in.
+/// Load a filesystem tree from the given path.
+///
+/// If a repository is provided, all files found in the filesystem are
+/// stored in it. If `None`, fsverity digests are computed in memory
+/// without writing to disk — suitable for computing image IDs and
+/// dumpfiles without requiring O_TMPFILE support.
 #[context("Reading filesystem from {}", path.display())]
 pub fn read_filesystem<ObjectID: FsVerityHashValue>(
     dirfd: impl AsFd,
@@ -373,7 +375,7 @@ pub fn read_filesystem<ObjectID: FsVerityHashValue>(
 /// use composefs::fs::{read_filesystem_filtered, CONTAINER_XATTR_ALLOWLIST};
 ///
 /// // Filter to only allow security.capability
-/// let fs = read_filesystem_filtered(dirfd, path, repo, |name| {
+/// let fs = read_filesystem_filtered(dirfd, path, None, |name| {
 ///     name.as_encoded_bytes() == b"security.capability"
 /// })?;
 /// ```

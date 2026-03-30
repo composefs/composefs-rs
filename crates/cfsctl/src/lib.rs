@@ -36,7 +36,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "oci")]
 use comfy_table::{presets::UTF8_FULL, Table};
 
-use rustix::fs::CWD;
+use rustix::fs::{Mode, OFlags, CWD};
 use serde::Serialize;
 
 #[cfg(feature = "oci")]
@@ -94,6 +94,11 @@ pub struct App {
     /// boot entry.
     #[clap(long)]
     insecure: bool,
+
+    /// Don't open a repository. Only valid for commands that don't need one
+    /// (compute-id, create-dumpfile).
+    #[clap(long)]
+    pub no_repo: bool,
 
     #[clap(subcommand)]
     cmd: Command,
@@ -316,14 +321,15 @@ enum Command {
         /// optional reference name for the image, use as 'ref/<name>' elsewhere
         image_name: Option<String>,
     },
-    /// Read rootfs located at a path, add all files to the repo, then compute the composefs image object id of the rootfs.
-    /// Note that this does not create or commit the composefs image itself.
+    /// Read rootfs located at a path and compute the composefs image object id of the rootfs.
+    /// Note that this does not create or commit the composefs image itself, and does not
+    /// store any file objects in the repository.
     ComputeId {
         #[clap(flatten)]
         fs_opts: FsReadOptions,
     },
-    /// Read rootfs located at a path, add all files to the repo, then dump full content of the rootfs to a composefs dumpfile
-    /// and write to stdout.
+    /// Read rootfs located at a path and dump full content of the rootfs to a composefs dumpfile,
+    /// writing to stdout. Does not store any file objects in the repository.
     CreateDumpfile {
         #[clap(flatten)]
         fs_opts: FsReadOptions,
@@ -374,6 +380,13 @@ where
     let args = App::parse_from(
         std::iter::once(OsString::from("cfsctl")).chain(args.into_iter().map(Into::into)),
     );
+
+    if args.no_repo {
+        return match args.hash {
+            HashType::Sha256 => run_cmd_without_repo::<Sha256HashValue>(args),
+            HashType::Sha512 => run_cmd_without_repo::<Sha512HashValue>(args),
+        };
+    }
 
     match args.hash {
         HashType::Sha256 => run_cmd_with_repo(open_repo::<Sha256HashValue>(&args)?, args).await,
@@ -433,15 +446,25 @@ fn load_filesystem_from_oci_image<ObjectID: FsVerityHashValue>(
 
 fn load_filesystem_from_ondisk_fs<ObjectID: FsVerityHashValue>(
     fs_opts: &FsReadOptions,
-    repo: &Repository<ObjectID>,
+    repo: Option<&Repository<ObjectID>>,
 ) -> Result<FileSystem<RegularFile<ObjectID>>> {
     let mut fs = if fs_opts.no_propagate_usr_to_root {
-        composefs::fs::read_filesystem(CWD, &fs_opts.path, Some(repo))?
+        composefs::fs::read_filesystem(CWD, &fs_opts.path, repo)?
     } else {
-        composefs::fs::read_container_root(CWD, &fs_opts.path, Some(repo))?
+        composefs::fs::read_container_root(CWD, &fs_opts.path, repo)?
     };
     if fs_opts.bootable {
-        fs.transform_for_boot(repo)?;
+        if let Some(repo) = repo {
+            fs.transform_for_boot(repo)?;
+        } else {
+            let rootfd = rustix::fs::openat(
+                CWD,
+                &fs_opts.path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            fs.transform_for_boot_from_dir(rootfd)?;
+        }
     }
     Ok(fs)
 }
@@ -500,6 +523,25 @@ fn dump_file_impl(
         println!("{}", out_str);
     }
 
+    Ok(())
+}
+
+/// Run commands that don't require a repository.
+pub fn run_cmd_without_repo<ObjectID: FsVerityHashValue>(args: App) -> Result<()> {
+    match args.cmd {
+        Command::ComputeId { fs_opts } => {
+            let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None)?;
+            let id = fs.compute_image_id();
+            println!("{}", id.to_hex());
+        }
+        Command::CreateDumpfile { fs_opts } => {
+            let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None)?;
+            fs.print_dumpfile()?;
+        }
+        _ => {
+            anyhow::bail!("--no-repo is only supported for compute-id and create-dumpfile");
+        }
+    }
     Ok(())
 }
 
@@ -758,7 +800,7 @@ where
             }
         },
         Command::ComputeId { fs_opts } => {
-            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
+            let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None)?;
             let id = fs.compute_image_id();
             println!("{}", id.to_hex());
         }
@@ -766,12 +808,12 @@ where
             fs_opts,
             ref image_name,
         } => {
-            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
+            let fs = load_filesystem_from_ondisk_fs(&fs_opts, Some(&repo))?;
             let id = fs.commit_image(&repo, image_name.as_deref())?;
             println!("{}", id.to_id());
         }
         Command::CreateDumpfile { fs_opts } => {
-            let fs = load_filesystem_from_ondisk_fs(&fs_opts, &repo)?;
+            let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None)?;
             fs.print_dumpfile()?;
         }
         Command::Mount { name, mountpoint } => {
