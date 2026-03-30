@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     fs::File,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Cursor, Read},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
@@ -17,6 +17,11 @@ use std::{
 use anyhow::{bail, ensure, Context, Result};
 use fn_error_context::context;
 use regex_automata::{hybrid::dfa, util::syntax, Anchored, Input};
+use rustix::{
+    fd::AsFd,
+    fs::{openat, Mode, OFlags},
+    io::Errno,
+};
 
 use composefs::{
     fsverity::FsVerityHashValue,
@@ -123,40 +128,63 @@ struct Policy {
 }
 
 /// Open a file in the composefs store, handling inline vs external files.
-pub fn openat<'a, H: FsVerityHashValue>(
-    dir: &'a Directory<H>,
+pub fn open_file<H: FsVerityHashValue>(
+    dir: &Directory<H>,
     filename: impl AsRef<OsStr>,
     repo: &Repository<H>,
-) -> Result<Option<Box<dyn Read + 'a>>> {
+) -> Result<Option<Box<dyn Read>>> {
     match dir.get_file_opt(filename.as_ref())? {
         Some(file) => match file {
-            RegularFile::Inline(data) => Ok(Some(Box::new(&**data))),
+            RegularFile::Inline(data) => Ok(Some(Box::new(Cursor::new(data.clone())))),
             RegularFile::External(id, ..) => Ok(Some(Box::new(File::from(repo.open_object(id)?)))),
         },
         None => Ok(None),
     }
 }
 
+/// Open a file from an on-disk directory, returning None if it doesn't exist.
+fn open_file_from_dir(
+    dirfd: impl AsFd,
+    filename: impl AsRef<OsStr>,
+) -> Result<Option<Box<dyn Read>>> {
+    match openat(
+        dirfd,
+        filename.as_ref(),
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => Ok(Some(Box::new(File::from(fd)))),
+        Err(Errno::NOENT) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl Policy {
+    /// Build a SELinux policy from file_contexts files opened via a callback.
+    ///
+    /// The callback takes a filename (e.g. "file_contexts", "file_contexts.subs")
+    /// and returns an optional reader for that file.
     #[context("Building SELinux policy")]
-    pub fn build<H: FsVerityHashValue>(dir: &Directory<H>, repo: &Repository<H>) -> Result<Self> {
+    fn build_from(mut open: impl FnMut(&str) -> Result<Option<Box<dyn Read>>>) -> Result<Self> {
         let mut aliases = HashMap::new();
         let mut regexps = vec![];
         let mut contexts = vec![];
 
         for suffix in ["", ".local", ".homedirs"] {
-            if let Some(file) = openat(dir, format!("file_contexts{suffix}"), repo)? {
+            let name = format!("file_contexts{suffix}");
+            if let Some(file) = open(&name)? {
                 process_spec_file(file, &mut regexps, &mut contexts)
-                    .with_context(|| format!("SELinux spec file file_contexts{suffix}"))?;
+                    .with_context(|| format!("SELinux spec file {name}"))?;
             } else if suffix.is_empty() {
                 bail!("SELinux policy is missing mandatory file_contexts file");
             }
         }
 
         for suffix in [".subs", ".subs_dist"] {
-            if let Some(file) = openat(dir, format!("file_contexts{suffix}"), repo)? {
+            let name = format!("file_contexts{suffix}");
+            if let Some(file) = open(&name)? {
                 process_subs_file(file, &mut aliases)
-                    .with_context(|| format!("SELinux subs file file_contexts{suffix}"))?;
+                    .with_context(|| format!("SELinux subs file {name}"))?;
             }
         }
 
@@ -273,6 +301,39 @@ fn strip_selinux_labels<H: FsVerityHashValue>(fs: &FileSystem<H>) {
     });
 }
 
+/// Build a Policy from a file-open callback, or return None if /etc/selinux/config
+/// is missing or doesn't specify a policy type.
+fn build_policy(
+    mut open_config: impl FnMut(&str) -> Result<Option<Box<dyn Read>>>,
+    mut open_policy_file: impl FnMut(&str, &str) -> Result<Option<Box<dyn Read>>>,
+) -> Result<Option<Policy>> {
+    let Some(etc_selinux_config) = open_config("config")? else {
+        return Ok(None);
+    };
+
+    let Some(policy_name) = parse_config(etc_selinux_config)? else {
+        return Ok(None);
+    };
+
+    let policy = Policy::build_from(|filename| open_policy_file(&policy_name, filename))?;
+    Ok(Some(policy))
+}
+
+/// Apply a pre-built policy to the filesystem tree, or strip labels if no policy.
+fn apply_policy<H: FsVerityHashValue>(fs: &mut FileSystem<H>, policy: Option<Policy>) -> bool {
+    match policy {
+        Some(mut policy) => {
+            let mut path = PathBuf::from("/");
+            relabel_dir(&fs.root, &mut path, &mut policy);
+            true
+        }
+        None => {
+            strip_selinux_labels(fs);
+            false
+        }
+    }
+}
+
 /// Applies SELinux security contexts to all files in a filesystem tree.
 ///
 /// Reads the SELinux policy from /etc/selinux/config and corresponding policy files,
@@ -293,28 +354,74 @@ fn strip_selinux_labels<H: FsVerityHashValue>(fs: &FileSystem<H>) {
 /// or `Ok(false)` if no policy was found and existing labels were stripped.
 #[context("Applying SELinux labels to filesystem")]
 pub fn selabel<H: FsVerityHashValue>(fs: &mut FileSystem<H>, repo: &Repository<H>) -> Result<bool> {
-    // if /etc/selinux/config doesn't exist then strip any existing labels
-    let Some(etc_selinux) = fs.root.get_directory_opt("etc/selinux".as_ref())? else {
-        strip_selinux_labels(fs);
-        return Ok(false);
+    // Build the policy while only borrowing fs.root immutably.
+    let policy = {
+        let Some(etc_selinux) = fs.root.get_directory_opt("etc/selinux".as_ref())? else {
+            strip_selinux_labels(fs);
+            return Ok(false);
+        };
+
+        build_policy(
+            |filename| open_file(etc_selinux, filename, repo),
+            |policy_name, filename| {
+                let dir = etc_selinux
+                    .get_directory(policy_name.as_ref())?
+                    .get_directory("contexts/files".as_ref())?;
+                open_file(dir, filename, repo)
+            },
+        )?
     };
 
-    let Some(etc_selinux_config) = openat(etc_selinux, "config", repo)? else {
-        strip_selinux_labels(fs);
-        return Ok(false);
+    // Now we can mutably borrow fs for relabeling.
+    Ok(apply_policy(fs, policy))
+}
+
+/// Applies SELinux security contexts by reading policy files from an on-disk directory.
+///
+/// This is an alternative to [`selabel`] that reads SELinux policy files directly from
+/// a mounted filesystem via a directory file descriptor, rather than from a composefs
+/// repository. This avoids the need to store file objects in the repository just to
+/// compute SELinux labels.
+///
+/// The directory fd should point to the root of the filesystem being labeled
+/// (the same filesystem that was read into the `FileSystem` tree).
+///
+/// # Arguments
+///
+/// * `fs` - The filesystem tree to label
+/// * `rootfs` - A directory fd pointing to the root of the on-disk filesystem
+///
+/// # Returns
+///
+/// Returns `Ok(true)` if SELinux labeling was performed (policy was found),
+/// or `Ok(false)` if no policy was found and existing labels were stripped.
+#[context("Applying SELinux labels to filesystem from directory")]
+pub fn selabel_from_dir(
+    fs: &mut FileSystem<impl FsVerityHashValue>,
+    rootfs: impl AsFd,
+) -> Result<bool> {
+    // Open /etc/selinux as a directory fd, treating NOENT as "no policy"
+    let etc_selinux = match openat(
+        &rootfs,
+        "etc/selinux",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => {
+            strip_selinux_labels(fs);
+            return Ok(false);
+        }
+        Err(e) => return Err(e.into()),
     };
 
-    let Some(policy) = parse_config(etc_selinux_config)? else {
-        strip_selinux_labels(fs);
-        return Ok(false);
-    };
+    let policy = build_policy(
+        |filename| open_file_from_dir(&etc_selinux, filename),
+        |policy_name, filename| {
+            let path = format!("{policy_name}/contexts/files/{filename}");
+            open_file_from_dir(&etc_selinux, path)
+        },
+    )?;
 
-    let dir = etc_selinux
-        .get_directory(policy.as_ref())?
-        .get_directory("contexts/files".as_ref())?;
-
-    let mut policy = Policy::build(dir, repo)?;
-    let mut path = PathBuf::from("/");
-    relabel_dir(&fs.root, &mut path, &mut policy);
-    Ok(true)
+    Ok(apply_policy(fs, policy))
 }
