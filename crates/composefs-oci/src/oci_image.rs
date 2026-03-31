@@ -3294,6 +3294,8 @@ mod test {
 
         let mut layer_verities = HashMap::new();
         layer_verities.insert(blob_digest.clone().into_boxed_str(), blob_verity);
+        let layer_verities_vec: Vec<_> =
+            layer_verities.iter().map(|(k, v)| (k.as_ref(), v.clone())).collect();
 
         let manifest_json = manifest.to_string().unwrap();
         let manifest_digest = hash(manifest_json.as_bytes());
@@ -3303,7 +3305,7 @@ mod test {
             &manifest,
             &manifest_digest,
             &config_verity,
-            &layer_verities,
+            &layer_verities_vec,
             Some("artifact-fsck:v1"),
         )
         .unwrap();
@@ -3361,7 +3363,7 @@ mod test {
             .unwrap();
 
         // Deliberately pass empty layer_verities — no layer refs in manifest
-        let layer_verities: HashMap<Box<str>, Sha256HashValue> = HashMap::new();
+        let layer_verities: Vec<(&str, Sha256HashValue)> = Vec::new();
 
         let manifest_json = manifest.to_string().unwrap();
         let manifest_digest = hash(manifest_json.as_bytes());
@@ -3513,6 +3515,8 @@ mod test {
 
         let mut layer_verities = HashMap::new();
         layer_verities.insert(layer_digest.into_boxed_str(), layer_verity);
+        let layer_verities_vec: Vec<_> =
+            layer_verities.iter().map(|(k, v)| (k.as_ref(), v.clone())).collect();
         let manifest_json = manifest.to_string().unwrap();
         let manifest_digest = hash(manifest_json.as_bytes());
 
@@ -3521,7 +3525,7 @@ mod test {
             &manifest,
             &manifest_digest,
             &config_verity,
-            &layer_verities,
+            &layer_verities_vec,
             Some("missing-layer-ref:v1"),
         )
         .unwrap();
