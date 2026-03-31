@@ -13,30 +13,25 @@ use std::{cmp::Reverse, process::Command, thread::available_parallelism};
 use std::{iter::zip, sync::Arc};
 
 use anyhow::{Context, Result};
-use async_compression::tokio::bufread::{GzipDecoder, ZstdDecoder};
 use containers_image_proxy::{
-    ConvertedLayerInfo, ImageProxy, ImageProxyConfig, OpenedImage, Transport,
+    ConvertedLayerInfo, ImageProxy, ImageProxyConfig, ImageReference, OpenedImage, Transport,
 };
 use fn_error_context::context;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use oci_spec::image::{Descriptor, ImageConfiguration, MediaType};
+use oci_spec::image::Descriptor;
 use rustix::process::geteuid;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
-    sync::Semaphore,
-    task::JoinSet,
-};
+use tokio::{io::AsyncReadExt, sync::Semaphore, task::JoinSet};
 
 use composefs::{
     fsverity::FsVerityHashValue,
     repository::{ObjectStoreMethod, Repository},
-    shared_internals::IO_BUF_CAPACITY,
 };
 
 use crate::{
-    config_identifier, layer_identifier,
-    oci_image::{is_tar_media_type, manifest_identifier, tag_image},
-    tar::split_async,
+    config_identifier,
+    layer::{decompress_async, import_tar_async, is_tar_media_type, store_blob_async},
+    layer_identifier,
+    oci_image::{manifest_identifier, tag_image},
     ContentAndVerity, ImportStats,
 };
 
@@ -87,11 +82,10 @@ struct ImageOp<ObjectID: FsVerityHashValue> {
 impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
     async fn new(
         repo: &Arc<Repository<ObjectID>>,
-        imgref: &str,
+        image_ref: &ImageReference,
         img_proxy_config: Option<ImageProxyConfig>,
     ) -> Result<Self> {
-        // Detect transport from image reference
-        let transport = Transport::try_from(imgref).context("Failed to get image transport")?;
+        let transport = image_ref.transport;
 
         // See https://github.com/containers/skopeo/issues/2563
         let skopeo_cmd = if transport == Transport::ContainerStorage && !geteuid().is_root() {
@@ -103,10 +97,22 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         };
 
         // See https://github.com/containers/skopeo/issues/2750
-        let imgref = if let Some(hash) = imgref.strip_prefix("containers-storage:sha256:") {
-            &format!("containers-storage:{hash}") // yay temporary lifetime extension!
+        // ImageReference.name for containers-storage: is already without the
+        // transport prefix (e.g. "sha256:abc" not "containers-storage:sha256:abc").
+        // Skopeo expects "abc" without the "sha256:" prefix for digest references.
+        let fixup_ref;
+        let image_ref = if transport == Transport::ContainerStorage {
+            if let Some(hash) = image_ref.name.strip_prefix("sha256:") {
+                fixup_ref = ImageReference {
+                    transport,
+                    name: hash.to_string(),
+                };
+                &fixup_ref
+            } else {
+                image_ref
+            }
         } else {
-            imgref
+            image_ref
         };
 
         let config = match img_proxy_config {
@@ -130,7 +136,10 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         let proxy = containers_image_proxy::ImageProxy::new_with_config(config)
             .await
             .context("Creating ImageProxy")?;
-        let img = proxy.open_image(imgref).await.context("Opening image")?;
+        let img = proxy
+            .open_image_ref(image_ref)
+            .await
+            .context("Opening image")?;
         let progress = MultiProgress::new();
         Ok(ImageOp {
             repo: Arc::clone(repo),
@@ -196,40 +205,12 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             let media_type = descriptor.media_type();
             let (object_id, layer_stats) = if is_tar_media_type(media_type) {
                 // Tar layers: decompress and split into a splitstream
-                let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match media_type {
-                    MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => {
-                        Box::new(BufReader::with_capacity(IO_BUF_CAPACITY, progress))
-                    }
-                    MediaType::ImageLayerGzip | MediaType::ImageLayerNonDistributableGzip => {
-                        Box::new(BufReader::with_capacity(
-                            IO_BUF_CAPACITY,
-                            GzipDecoder::new(BufReader::new(progress)),
-                        ))
-                    }
-                    MediaType::ImageLayerZstd | MediaType::ImageLayerNonDistributableZstd => {
-                        Box::new(BufReader::with_capacity(
-                            IO_BUF_CAPACITY,
-                            ZstdDecoder::new(BufReader::new(progress)),
-                        ))
-                    }
-                    _ => unreachable!("is_tar_media_type returned true"),
-                };
-                split_async(reader, self.repo.clone(), TAR_LAYER_CONTENT_TYPE).await?
+                let reader = decompress_async(progress, media_type)?;
+                import_tar_async(self.repo.clone(), reader).await?
             } else {
-                // Non-tar layers (OCI artifacts like SBOMs, disk images,
-                // etc.): stream the raw bytes into a repository object and
-                // create a splitstream with a single external reference.
-                // This avoids buffering arbitrarily large blobs in memory
-                // and lets callers get an fd to the object directly via
-                // open_object().
-                let tmpfile = self.repo.create_object_tmpfile()?;
-                let mut writer = tokio::fs::File::from(std::fs::File::from(tmpfile));
-                let mut reader = progress;
-                let size = tokio::io::copy(&mut reader, &mut writer).await?;
-                writer.flush().await?;
-                let tmpfile = writer.into_std().await;
+                // Non-tar layers (OCI artifacts): stream raw bytes to object store
+                let (object_id, size, method) = store_blob_async(&self.repo, progress).await?;
                 driver.await?;
-                let (object_id, method) = self.repo.finalize_object_tmpfile(tmpfile, size)?;
 
                 let mut stats = ImportStats::default();
                 match method {
@@ -242,11 +223,10 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                     }
                 }
 
+                // Create splitstream with external reference and register it
                 let mut stream = self.repo.create_stream(OCI_BLOB_CONTENT_TYPE);
                 stream.add_external_size(size);
                 stream.write_reference(object_id)?;
-                // write_stream handles both object storage and stream
-                // registration, so we return directly.
                 let stream_id = self.repo.write_stream(stream, &content_id, None)?;
                 return Ok((stream_id, stats));
             };
@@ -265,36 +245,53 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
     }
 
     /// Ensure config is present and return layer verities along with config info.
+    ///
+    /// Returns (config_digest, config_verity, layer_refs, stats).
+    /// `layer_refs` is an ordered Vec of (diff_id, verity) pairs preserving the
+    /// order from the config (or manifest for artifacts).
     async fn ensure_config_with_layers(
         self: &Arc<Self>,
         manifest_layers: &[Descriptor],
         descriptor: &Descriptor,
-    ) -> Result<(
-        String,
-        ObjectID,
-        // FIXME change this string to be Digest - actually we may want to go stronger and have a
-        // struct DiffID(Digest) newtype
-        std::collections::HashMap<String, ObjectID>,
-        ImportStats,
-    )> {
+    ) -> Result<(String, ObjectID, Vec<(String, ObjectID)>, ImportStats)> {
         let config_digest: &str = descriptor.digest().as_ref();
         let content_id = config_identifier(config_digest);
 
         if let Some(config_id) = self.repo.has_stream(&content_id)? {
-            // We already got this config - need to read the layer refs from it
+            // We already got this config - need to read the layer refs and diff_ids from it
             self.progress
                 .println(format!("Already have container config {config_digest}"))?;
 
-            let stream = self.repo.open_stream(
+            let (data, named_refs) = crate::oci_image::read_external_splitstream(
+                &self.repo,
                 &content_id,
                 Some(&config_id),
                 Some(OCI_CONFIG_CONTENT_TYPE),
             )?;
-            let layer_refs: std::collections::HashMap<String, ObjectID> = stream
-                .into_named_refs()
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
+            let named_refs_map: std::collections::HashMap<&str, ObjectID> = named_refs
+                .iter()
+                .map(|(k, v)| (k.as_ref(), v.clone()))
                 .collect();
+
+            let diff_ids =
+                crate::extract_diff_ids(descriptor.media_type(), &data, manifest_layers)?;
+
+            let layer_refs: Vec<(String, ObjectID)> = diff_ids
+                .into_iter()
+                .map(|diff_id| {
+                    let verity = named_refs_map
+                        .get(diff_id.as_str())
+                        .with_context(|| format!("missing layer verity for diff_id {diff_id}"))?;
+                    Ok((diff_id, verity.clone()))
+                })
+                .collect::<Result<_>>()?;
+
+            anyhow::ensure!(
+                layer_refs.len() == manifest_layers.len(),
+                "expected {} layer refs but got {}",
+                manifest_layers.len(),
+                layer_refs.len()
+            );
 
             Ok((
                 config_digest.to_string(),
@@ -322,16 +319,8 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             // custom media type — not a standard image config. In that case
             // there are no diff_ids, so we use the manifest layer digests.
             // [1]: https://github.com/opencontainers/image-spec/blob/main/artifacts-guidance.md
-            let is_image_config = *descriptor.media_type() == MediaType::ImageConfig;
-            let diff_ids: Vec<String> = if is_image_config {
-                let config = ImageConfiguration::from_reader(&raw_config[..])?;
-                config.rootfs().diff_ids().to_vec()
-            } else {
-                manifest_layers
-                    .iter()
-                    .map(|d| d.digest().to_string())
-                    .collect()
-            };
+            let diff_ids =
+                crate::extract_diff_ids(descriptor.media_type(), &raw_config, manifest_layers)?;
 
             // Sort layers by size for parallel fetching
             let mut layers: Vec<_> = zip(manifest_layers, &diff_ids).collect();
@@ -370,21 +359,36 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 });
             }
 
-            // Collect results and sort by index for deterministic ordering
-            let mut results: Vec<_> = layer_tasks
-                .join_all()
-                .await
+            // Collect results into a map keyed by diff_id for ordered lookup
+            let mut verity_map = std::collections::HashMap::new();
+            let mut stats = ImportStats::default();
+            for result in layer_tasks.join_all().await {
+                let (_, diff_id, verity, layer_stats) = result?;
+                verity_map.insert(diff_id, verity);
+                stats.merge(&layer_stats);
+            }
+
+            // Build ordered layer_refs from config-defined diff_id order
+            let layer_refs: Vec<(String, ObjectID)> = diff_ids
                 .into_iter()
-                .collect::<Result<_, _>>()?;
-            results.sort_by_key(|(idx, _, _, _)| *idx);
+                .map(|diff_id| {
+                    let verity = verity_map
+                        .get(diff_id.as_str())
+                        .with_context(|| format!("missing layer verity for diff_id {diff_id}"))?;
+                    Ok((diff_id, verity.clone()))
+                })
+                .collect::<Result<_>>()?;
+
+            anyhow::ensure!(
+                layer_refs.len() == manifest_layers.len(),
+                "expected {} layer refs but got {}",
+                manifest_layers.len(),
+                layer_refs.len()
+            );
 
             let mut splitstream = self.repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
-            let mut layer_refs = std::collections::HashMap::new();
-            let mut stats = ImportStats::default();
-            for (_, diff_id, verity, layer_stats) in results {
-                splitstream.add_named_stream_ref(&diff_id, &verity);
-                layer_refs.insert(diff_id, verity);
-                stats.merge(&layer_stats);
+            for (diff_id, verity) in &layer_refs {
+                splitstream.add_named_stream_ref(diff_id, verity);
             }
 
             // Store config as external object for independent fsverity
@@ -405,7 +409,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         let manifest = oci_spec::image::ImageManifest::from_reader(raw_manifest.as_slice())?;
         let config_descriptor = manifest.config();
         let layers = manifest.layers();
-        let (config_digest, config_verity, layer_verities, stats) = self
+        let (config_digest, config_verity, layer_refs, stats) = self
             .ensure_config_with_layers(layers, config_descriptor)
             .await
             .with_context(|| format!("Failed to pull config {config_descriptor:?}"))?;
@@ -424,7 +428,8 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             let config_key = format!("config:{}", config_descriptor.digest());
             splitstream.add_named_stream_ref(&config_key, &config_verity);
 
-            for (diff_id, verity) in &layer_verities {
+            // Add layer refs in config-defined diff_id order
+            for (diff_id, verity) in &layer_refs {
                 splitstream.add_named_stream_ref(diff_id, verity);
             }
 
@@ -451,6 +456,9 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 /// Returns `PullResult` containing both manifest and config digests/verities.
 /// If `reference` is provided, the manifest is also stored under that name.
 ///
+/// For `oci:` transport (local OCI layout directories), this uses a fast path
+/// that reads the layout directly without going through the skopeo proxy.
+///
 /// Note: For backward compatibility, use `.into_config()` on the result to get
 /// the (config_digest, config_verity) tuple that was previously returned.
 pub async fn pull_image<ObjectID: FsVerityHashValue>(
@@ -459,7 +467,19 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
-    let op = Arc::new(ImageOp::new(repo, imgref, img_proxy_config).await?);
+    let image_ref =
+        ImageReference::try_from(imgref).context("Parsing image reference transport")?;
+
+    // Fast path: read local OCI layout directories directly without skopeo
+    if image_ref.transport == Transport::OciDir {
+        let (path_str, layout_tag) = crate::oci_layout::parse_oci_layout_ref(&image_ref.name);
+        let layout_path = std::path::Path::new(path_str);
+        return crate::oci_layout::import_oci_layout(repo, layout_path, layout_tag, reference)
+            .await;
+    }
+
+    // Standard path: use skopeo proxy for other transports
+    let op = Arc::new(ImageOp::new(repo, &image_ref, img_proxy_config).await?);
     let (result, stats) = op
         .pull()
         .await
