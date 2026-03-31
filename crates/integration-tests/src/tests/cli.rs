@@ -771,6 +771,96 @@ fn test_oci_fsck_single_image() -> Result<()> {
 }
 integration_test!(test_oci_fsck_single_image);
 
+fn test_compute_id_no_repo() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    let output = cmd!(
+        sh,
+        "{cfsctl} --no-repo compute-id --no-propagate-usr-to-root {rootfs}"
+    )
+    .read()?;
+    assert!(
+        !output.trim().is_empty(),
+        "expected image ID output, got nothing"
+    );
+    // Should be a valid hex digest
+    assert!(
+        output.trim().chars().all(|c| c.is_ascii_hexdigit()),
+        "expected hex digest, got: {output}"
+    );
+    Ok(())
+}
+integration_test!(test_compute_id_no_repo);
+
+fn test_compute_id_no_repo_matches_repo() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+
+    let id_no_repo = cmd!(
+        sh,
+        "{cfsctl} --no-repo compute-id --no-propagate-usr-to-root {rootfs}"
+    )
+    .read()?;
+    let id_with_repo = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} compute-id --no-propagate-usr-to-root {rootfs}"
+    )
+    .read()?;
+    assert_eq!(
+        id_no_repo.trim(),
+        id_with_repo.trim(),
+        "--no-repo and --repo should produce the same digest"
+    );
+    Ok(())
+}
+integration_test!(test_compute_id_no_repo_matches_repo);
+
+fn test_create_dumpfile_no_repo() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    let output = cmd!(
+        sh,
+        "{cfsctl} --no-repo create-dumpfile --no-propagate-usr-to-root {rootfs}"
+    )
+    .read()?;
+    assert!(
+        output.contains("/usr/bin/hello"),
+        "expected dumpfile to contain /usr/bin/hello, got: {output}"
+    );
+    assert!(
+        output.contains("/etc/hostname"),
+        "expected dumpfile to contain /etc/hostname, got: {output}"
+    );
+    Ok(())
+}
+integration_test!(test_create_dumpfile_no_repo);
+
+fn test_no_repo_rejects_create_image() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --no-repo create-image --no-propagate-usr-to-root {rootfs}"
+    )
+    .run()
+    .expect_err("create-image should fail with --no-repo");
+    Ok(())
+}
+integration_test!(test_no_repo_rejects_create_image);
+
 fn test_fsck_detects_broken_image_ref() -> Result<()> {
     use cap_std_ext::cap_std;
 
