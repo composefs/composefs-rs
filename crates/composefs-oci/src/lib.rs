@@ -67,27 +67,49 @@ pub use skopeo::pull_image;
 /// Statistics from an image import operation.
 #[derive(Debug, Clone, Default)]
 pub struct ImportStats {
-    /// Number of objects stored via copy.
+    /// Number of layers in the image.
+    pub layers: u64,
+    /// Number of layers that were already present (skipped).
+    pub layers_already_present: u64,
+    /// Number of objects stored via regular copy.
     pub objects_copied: u64,
+    /// Number of objects stored via reflink (zero-copy).
+    pub objects_reflinked: u64,
     /// Number of objects that already existed (deduplicated).
     pub objects_already_present: u64,
-    /// Total bytes stored as new objects.
+    /// Total bytes stored via regular copy.
     pub bytes_copied: u64,
+    /// Total bytes stored via reflink.
+    pub bytes_reflinked: u64,
     /// Total bytes inlined in splitstreams (small files + headers).
     pub bytes_inlined: u64,
 }
 
 impl ImportStats {
+    /// Total number of new objects stored (copied + reflinked).
+    pub fn new_objects(&self) -> u64 {
+        self.objects_copied + self.objects_reflinked
+    }
+
     /// Total number of objects processed (new + already present).
     pub fn total_objects(&self) -> u64 {
-        self.objects_copied + self.objects_already_present
+        self.new_objects() + self.objects_already_present
+    }
+
+    /// Total bytes stored as new objects (copied + reflinked).
+    pub fn new_bytes(&self) -> u64 {
+        self.bytes_copied + self.bytes_reflinked
     }
 
     /// Merge another `ImportStats` into this one.
     pub fn merge(&mut self, other: &ImportStats) {
+        self.layers += other.layers;
+        self.layers_already_present += other.layers_already_present;
         self.objects_copied += other.objects_copied;
+        self.objects_reflinked += other.objects_reflinked;
         self.objects_already_present += other.objects_already_present;
         self.bytes_copied += other.bytes_copied;
+        self.bytes_reflinked += other.bytes_reflinked;
         self.bytes_inlined += other.bytes_inlined;
     }
 
@@ -103,6 +125,10 @@ impl ImportStats {
                     stats.objects_copied += 1;
                     stats.bytes_copied += size;
                 }
+                ObjectStoreMethod::Reflinked => {
+                    stats.objects_reflinked += 1;
+                    stats.bytes_reflinked += size;
+                }
                 ObjectStoreMethod::AlreadyPresent => {
                     stats.objects_already_present += 1;
                 }
@@ -114,14 +140,27 @@ impl ImportStats {
 
 impl std::fmt::Display for ImportStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} new + {} already present objects; {} stored, {} inlined",
-            self.objects_copied,
-            self.objects_already_present,
-            indicatif::HumanBytes(self.bytes_copied),
-            indicatif::HumanBytes(self.bytes_inlined),
-        )
+        if self.objects_reflinked > 0 {
+            write!(
+                f,
+                "{} reflinked + {} copied + {} already present objects; {} reflinked, {} copied, {} inlined",
+                self.objects_reflinked,
+                self.objects_copied,
+                self.objects_already_present,
+                indicatif::HumanBytes(self.bytes_reflinked),
+                indicatif::HumanBytes(self.bytes_copied),
+                indicatif::HumanBytes(self.bytes_inlined),
+            )
+        } else {
+            write!(
+                f,
+                "{} new + {} already present objects; {} stored, {} inlined",
+                self.objects_copied,
+                self.objects_already_present,
+                indicatif::HumanBytes(self.bytes_copied),
+                indicatif::HumanBytes(self.bytes_inlined),
+            )
+        }
     }
 }
 
@@ -1072,16 +1111,39 @@ mod test {
 
     #[test]
     fn test_import_stats_display() {
+        // Copy-only stats (no reflinks)
         let stats = ImportStats {
             objects_copied: 42,
             objects_already_present: 100,
             bytes_copied: 1_500_000,
             bytes_inlined: 800,
+            ..Default::default()
         };
         assert_eq!(
             stats.to_string(),
             "42 new + 100 already present objects; 1.43 MiB stored, 800 B inlined"
         );
+        assert_eq!(stats.total_objects(), 142);
+        assert_eq!(stats.new_objects(), 42);
+        assert_eq!(stats.new_bytes(), 1_500_000);
+
+        // Stats with reflinks
+        let reflink_stats = ImportStats {
+            objects_reflinked: 30,
+            objects_copied: 12,
+            objects_already_present: 100,
+            bytes_reflinked: 1_000_000,
+            bytes_copied: 500_000,
+            bytes_inlined: 800,
+            ..Default::default()
+        };
+        assert_eq!(
+            reflink_stats.to_string(),
+            "30 reflinked + 12 copied + 100 already present objects; 976.56 KiB reflinked, 488.28 KiB copied, 800 B inlined"
+        );
+        assert_eq!(reflink_stats.total_objects(), 142);
+        assert_eq!(reflink_stats.new_objects(), 42);
+        assert_eq!(reflink_stats.new_bytes(), 1_500_000);
 
         let empty = ImportStats::default();
         assert_eq!(
@@ -1089,6 +1151,5 @@ mod test {
             "0 new + 0 already present objects; 0 B stored, 0 B inlined"
         );
         assert_eq!(empty.total_objects(), 0);
-        assert_eq!(stats.total_objects(), 142);
     }
 }

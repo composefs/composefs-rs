@@ -238,6 +238,10 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                         stats.objects_copied += 1;
                         stats.bytes_copied += size;
                     }
+                    ObjectStoreMethod::Reflinked => {
+                        stats.objects_reflinked += 1;
+                        stats.bytes_reflinked += size;
+                    }
                     ObjectStoreMethod::AlreadyPresent => {
                         stats.objects_already_present += 1;
                     }
