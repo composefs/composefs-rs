@@ -8,9 +8,13 @@
 //! - Pulling container images from registries using skopeo
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
+//! - Importing from containers-storage with zero-copy reflinks (optional feature)
+
 #![forbid(unsafe_code)]
 
 pub mod boot;
+#[cfg(feature = "containers-storage")]
+pub mod cstor;
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
@@ -175,7 +179,8 @@ pub struct PullResult<ObjectID> {
     pub stats: ImportStats,
 }
 
-type ContentAndVerity<ObjectID> = (OciDigest, ObjectID);
+/// A tuple of (content digest, fs-verity ObjectID).
+pub type ContentAndVerity<ObjectID> = (OciDigest, ObjectID);
 
 /// Parsed OCI config and its associated references.
 pub struct OpenConfig<ObjectID> {
@@ -199,11 +204,11 @@ impl<ObjectID: std::fmt::Debug> std::fmt::Debug for OpenConfig<ObjectID> {
     }
 }
 
-fn layer_identifier(diff_id: &OciDigest) -> String {
+pub(crate) fn layer_identifier(diff_id: &OciDigest) -> String {
     format!("oci-layer-{diff_id}")
 }
 
-fn config_identifier(config: &OciDigest) -> String {
+pub(crate) fn config_identifier(config: &OciDigest) -> String {
     format!("oci-config-{config}")
 }
 
@@ -262,12 +267,27 @@ pub fn ls_layer<ObjectID: FsVerityHashValue>(
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
+///
+/// When the `containers-storage` feature is enabled and the image reference
+/// starts with `containers-storage:`, this uses the native cstor import path
+/// which supports zero-copy reflinks. Otherwise, it uses skopeo.
 pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<PullResult<ObjectID>> {
+    #[cfg(feature = "containers-storage")]
+    if let Some(image_id) = cstor::parse_containers_storage_ref(imgref) {
+        let ((config_digest, config_verity), stats) =
+            cstor::import_from_containers_storage(repo, image_id, reference).await?;
+        return Ok(PullResult {
+            config_digest,
+            config_verity,
+            stats,
+        });
+    }
+
     let (config_digest, config_verity, stats) =
         skopeo::pull(repo, imgref, reference, img_proxy_config).await?;
     Ok(crate::PullResult {

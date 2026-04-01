@@ -55,7 +55,7 @@ _test_image := if base_image =~ "debian" { "localhost/composefs-rs-test-debian:l
 
 # Run unprivileged integration tests against the cfsctl binary (no root, no VM)
 test-integration: build
-    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests -- --skip privileged_
+    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests --bin cfsctl-integration-tests -- --skip privileged_
 
 # Build the test container image for VM-based integration tests
 _integration-container-build:
@@ -65,7 +65,7 @@ _integration-container-build:
 test-integration-vm: build _integration-container-build
     COMPOSEFS_TEST_IMAGE={{_test_image}} \
         CFSCTL_PATH=$(pwd)/target/debug/cfsctl \
-        cargo run -p integration-tests
+        cargo run -p integration-tests --bin cfsctl-integration-tests
 
 # Run everything: checks + full integration tests including VM
 ci: check test-integration-vm
