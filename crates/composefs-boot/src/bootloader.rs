@@ -524,12 +524,10 @@ initrd /{id}/initramfs.img
 
 /// Represents any type of boot entry found in the filesystem.
 ///
-/// This enum unifies the three types of boot entries that can be discovered:
-/// Type 1 BLS entries, Type 2 UKIs, and traditional vmlinuz/initramfs pairs.
+/// This enum unifies the different types of boot entries that can be discovered:
+/// Type 2 UKIs and traditional vmlinuz/initramfs pairs.
 #[derive(Debug)]
 pub enum BootEntry<ObjectID: FsVerityHashValue> {
-    /// Boot Loader Specification Type 1 entry
-    Type1(Type1Entry<ObjectID>),
     /// Boot Loader Specification Type 2 entry (UKI)
     Type2(Type2Entry<ObjectID>),
     /// Traditional vmlinuz from /usr/lib/modules
@@ -538,27 +536,21 @@ pub enum BootEntry<ObjectID: FsVerityHashValue> {
 
 /// Extracts all boot resources from a filesystem image.
 ///
-/// Scans the filesystem for all types of boot entries: Type 1 BLS entries in
-/// /boot/loader/entries, Type 2 UKIs in /boot/EFI/Linux, and traditional vmlinuz
-/// files in /usr/lib/modules.
+/// Scans the filesystem for all types of boot entries: Type 2 UKIs in
+/// /boot/EFI/Linux and traditional vmlinuz files in /usr/lib/modules.
 ///
 /// # Arguments
 ///
 /// * `image` - The filesystem to scan
-/// * `repo` - The composefs repository
 ///
 /// # Returns
 ///
 /// A vector containing all boot entries found in the filesystem
 pub fn get_boot_resources<ObjectID: FsVerityHashValue>(
     image: &FileSystem<ObjectID>,
-    repo: &Repository<ObjectID>,
 ) -> Result<Vec<BootEntry<ObjectID>>> {
     let mut entries = vec![];
 
-    for e in Type1Entry::load_all(&image.root, repo)? {
-        entries.push(BootEntry::Type1(e));
-    }
     for e in Type2Entry::load_all(&image.root)? {
         entries.push(BootEntry::Type2(e));
     }

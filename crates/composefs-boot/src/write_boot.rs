@@ -140,20 +140,6 @@ pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
     cmdline_extra: &[&str],
 ) -> Result<()> {
     match entry {
-        BootEntry::Type1(mut t1) => {
-            if let Some(name) = entry_id {
-                t1.relocate(boot_subdir, name);
-            }
-            write_t1_simple(
-                t1,
-                boot_partition,
-                boot_subdir,
-                root_id,
-                insecure,
-                cmdline_extra,
-                repo,
-            )?;
-        }
         BootEntry::Type2(mut t2) => {
             if let Some(name) = entry_id {
                 t2.rename(name);

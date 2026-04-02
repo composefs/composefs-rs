@@ -69,7 +69,7 @@ impl<ObjectID: FsVerityHashValue> BootOps<ObjectID> for FileSystem<ObjectID> {
         &mut self,
         repo: &Repository<ObjectID>,
     ) -> Result<Vec<BootEntry<ObjectID>>> {
-        let boot_entries = get_boot_resources(self, repo)?;
+        let boot_entries = get_boot_resources(self)?;
 
         // Get /usr's mtime to use as the canonical mtime for emptied directories.
         // This matches how we handle the root directory in copy_root_metadata_from_usr().
