@@ -529,6 +529,8 @@ pub(crate) fn write_repo_metadata(
 pub enum ObjectStoreMethod {
     /// Object was stored via reflink (zero-copy, FICLONE ioctl).
     Reflinked,
+    /// Object was stored via hardlink (zero-copy, source file linked directly).
+    Hardlinked,
     /// Object was stored via regular file copy (reflink not supported).
     Copied,
     /// Object already existed in the repository (deduplicated).
@@ -1085,11 +1087,15 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         tokio::task::spawn_blocking(move || self_.finalize_object_tmpfile(tmpfile_fd.into(), size))
     }
 
-    /// Ensure an object exists by reflinking from a source file.
+    /// Ensure an object exists by reflinking or hardlinking from a source file.
     ///
-    /// This method attempts to use FICLONE (reflink) to copy the source file
-    /// to the objects directory without duplicating data on disk. If reflinks
-    /// are not supported, it falls back to a regular copy.
+    /// The fallback chain is: reflink → hardlink → copy.
+    ///
+    /// - **Reflink** (FICLONE): zero-copy clone on btrfs/XFS. Uses a tmpfile.
+    /// - **Hardlink**: enables fs-verity on the source file in-place, then
+    ///   hardlinks it directly into the objects directory. This avoids all data
+    ///   copying on filesystems like ext4 that don't support reflinks.
+    /// - **Copy**: regular data copy into a tmpfile as last resort.
     ///
     /// This is particularly useful for importing from containers-storage where
     /// we already have the file on disk and want to avoid copying data.
@@ -1103,22 +1109,50 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         src: &std::fs::File,
         size: u64,
     ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        self.ensure_object_from_file_inner(src, size, true)
+    }
+
+    /// Like [`ensure_object_from_file`](Self::ensure_object_from_file) but
+    /// errors if neither reflink nor hardlink succeeds, instead of falling back
+    /// to a regular copy.
+    ///
+    /// Intended for bootc's unified storage path where the composefs repo and
+    /// containers-storage are always on the same filesystem, so zero-copy
+    /// should always be possible.
+    pub fn ensure_object_from_file_zerocopy(
+        &self,
+        src: &std::fs::File,
+        size: u64,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        self.ensure_object_from_file_inner(src, size, false)
+    }
+
+    /// Inner implementation for [`ensure_object_from_file`](Self::ensure_object_from_file) and
+    /// [`ensure_object_from_file_zerocopy`](Self::ensure_object_from_file_zerocopy).
+    ///
+    /// When `allow_copy` is false, the copy fallback returns an error instead.
+    fn ensure_object_from_file_inner(
+        &self,
+        src: &std::fs::File,
+        size: u64,
+        allow_copy: bool,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
         use rustix::fs::{fstat, ioctl_ficlone};
 
-        // Create tmpfile in objects directory
         let objects_dir = self.objects_dir()?;
+
+        // Try reflink first: create a tmpfile and clone the source into it.
         let tmpfile_fd = openat(
             objects_dir,
             ".",
             OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o644),
         )?;
+        let tmpfile = File::from(tmpfile_fd);
 
-        // Try reflink first
-        let mut tmpfile = File::from(tmpfile_fd);
-        let used_reflink = match ioctl_ficlone(&tmpfile, src) {
+        match ioctl_ficlone(&tmpfile, src) {
             Ok(()) => {
-                // Reflink succeeded - verify size matches
+                // Reflink succeeded — verify size matches
                 let stat = fstat(&tmpfile)?;
                 anyhow::ensure!(
                     stat.st_size as u64 == size,
@@ -1126,33 +1160,126 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     size,
                     stat.st_size
                 );
-                true
+
+                let (object_id, method) = self.finalize_object_tmpfile(tmpfile, size)?;
+                let method = match method {
+                    ObjectStoreMethod::Copied => ObjectStoreMethod::Reflinked,
+                    other => other,
+                };
+                return Ok((object_id, method));
             }
             Err(Errno::OPNOTSUPP | Errno::XDEV) => {
-                // Reflink not supported or cross-device, fall back to copy
-                use std::io::{Seek, SeekFrom};
-                let mut src_clone = src.try_clone()?;
-                src_clone.seek(SeekFrom::Start(0))?;
-                std::io::copy(&mut src_clone, &mut tmpfile)?;
-                false
+                // Reflink not supported or cross-device — drop the tmpfile and
+                // try hardlink next.
+                drop(tmpfile);
             }
             Err(e) => {
-                // Other errors (EACCES, ENOSPC, etc.) should be propagated
                 return Err(e).context("Reflinking source file to objects directory")?;
+            }
+        }
+
+        // Try hardlink: enable verity on the source in-place, then link it
+        // directly into objects/. This avoids all data copying.
+        match self.try_hardlink_object(src, size) {
+            Ok(result) => return Ok(result),
+            Err(_) if allow_copy => {
+                // Hardlink failed, fall through to copy
+            }
+            Err(e) => {
+                return Err(e).context(
+                    "reflink and hardlink both failed; copy fallback is disabled (zerocopy mode)",
+                );
+            }
+        }
+
+        // Final fallback: copy data into a new tmpfile.
+        let tmpfile_fd = openat(
+            objects_dir,
+            ".",
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )?;
+        let mut tmpfile = File::from(tmpfile_fd);
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut src_clone = src.try_clone()?;
+            src_clone.seek(SeekFrom::Start(0))?;
+            std::io::copy(&mut src_clone, &mut tmpfile)?;
+        }
+
+        let (object_id, method) = self.finalize_object_tmpfile(tmpfile, size)?;
+        Ok((object_id, method))
+    }
+
+    /// Try to hardlink a source file directly into the objects directory.
+    ///
+    /// Enables fs-verity on the source file in-place, measures the digest to
+    /// determine the object ID, then hardlinks the source into `objects/<hash>`.
+    ///
+    /// Returns an error if verity cannot be enabled, the digest cannot be
+    /// measured, or the hardlink fails (e.g. cross-device).
+    fn try_hardlink_object(
+        &self,
+        src: &std::fs::File,
+        size: u64,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        use crate::fsverity::enable_verity_with_retry;
+
+        let objects_dir = self.objects_dir()?;
+
+        // Enable fs-verity on the source file in-place.
+        // This is safe because the caller (bootc/containers-storage) owns the
+        // source files and they are immutable image data.
+        // AlreadyEnabled is fine — the file was already verity-protected.
+        let verity_enabled = match enable_verity_with_retry::<ObjectID>(src) {
+            Ok(()) => true,
+            Err(EnableVerityError::AlreadyEnabled) => true,
+            Err(EnableVerityError::FilesystemNotSupported) if self.insecure => false,
+            Err(e) => {
+                return Err(e).context("enabling verity on source file for hardlink")?;
             }
         };
 
-        // Finalize the tmpfile (enable verity, link into objects/)
-        let (object_id, method) = self.finalize_object_tmpfile(tmpfile, size)?;
-
-        // Refine: finalize only knows Copied vs AlreadyPresent,
-        // but we know whether reflink was used for the initial copy.
-        let method = match method {
-            ObjectStoreMethod::Copied if used_reflink => ObjectStoreMethod::Reflinked,
-            other => other,
+        // Get the object ID from the verity digest (kernel-measured or userspace-computed)
+        let id: ObjectID = if verity_enabled {
+            measure_verity(src).context("measuring verity digest on source file")?
+        } else {
+            // Insecure mode on a filesystem without verity: compute digest in userspace
+            let mut reader = std::io::BufReader::new(
+                src.try_clone()
+                    .context("cloning fd for digest computation")?,
+            );
+            Self::compute_verity_digest(&mut reader)
+                .context("computing verity digest in insecure mode")?
         };
 
-        Ok((object_id, method))
+        // Check if object already exists (dedup)
+        let path = id.to_object_pathname();
+        match statat(objects_dir, &path, AtFlags::empty()) {
+            Ok(stat) if stat.st_size as u64 == size => {
+                return Ok((id, ObjectStoreMethod::AlreadyPresent));
+            }
+            _ => {}
+        }
+
+        // Ensure parent directory exists (e.g. objects/4e/)
+        let parent_dir = id.to_object_dir();
+        let _ = mkdirat(objects_dir, &parent_dir, Mode::from_raw_mode(0o755));
+
+        // Hardlink the source file directly into objects/<hash>.
+        // Use /proc/self/fd/<N> as the source path with AT_SYMLINK_FOLLOW
+        // to avoid requiring CAP_DAC_READ_SEARCH (which AT_EMPTY_PATH needs).
+        match linkat(
+            CWD,
+            proc_self_fd(src),
+            objects_dir,
+            &path,
+            AtFlags::SYMLINK_FOLLOW,
+        ) {
+            Ok(()) => Ok((id, ObjectStoreMethod::Hardlinked)),
+            Err(Errno::EXIST) => Ok((id, ObjectStoreMethod::AlreadyPresent)),
+            Err(e) => Err(e).context("hardlinking source file into objects directory")?,
+        }
     }
 
     /// Finalize a tmpfile as an object.
@@ -4445,5 +4572,29 @@ mod tests {
             meta.check_compatible::<Sha512HashValue>().unwrap(),
             FeatureCheck::ReadWrite
         );
+    }
+
+    #[test]
+    fn test_object_store_method_variants() {
+        // Verify all variants exist and are distinct
+        let methods = [
+            ObjectStoreMethod::Reflinked,
+            ObjectStoreMethod::Hardlinked,
+            ObjectStoreMethod::Copied,
+            ObjectStoreMethod::AlreadyPresent,
+        ];
+
+        for (i, a) in methods.iter().enumerate() {
+            for (j, b) in methods.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+
+        // Verify Debug impl works
+        assert_eq!(format!("{:?}", ObjectStoreMethod::Hardlinked), "Hardlinked");
     }
 }

@@ -64,7 +64,8 @@ fn privileged_test_cstor_vs_skopeo_equivalence() -> Result<()> {
         // Import via containers-storage (reflink path)
         let cstor_image_ref = format!("containers-storage:{}", test_image);
         println!("Importing via containers-storage: {}", cstor_image_ref);
-        let cstor_result = composefs_oci::pull(&cstor_repo, &cstor_image_ref, None, None).await?;
+        let cstor_result =
+            composefs_oci::pull(&cstor_repo, &cstor_image_ref, None, None, false).await?;
 
         // Import via skopeo (tar streaming path) - copy to OCI directory first
         let oci_dir = TempDir::new()?;
@@ -162,11 +163,11 @@ fn privileged_test_cstor_idempotent_import() -> Result<()> {
 
         // First import
         println!("First import via containers-storage...");
-        let first_result = composefs_oci::pull(&repo, &cstor_image_ref, None, None).await?;
+        let first_result = composefs_oci::pull(&repo, &cstor_image_ref, None, None, false).await?;
 
         // Second import of the same image
         println!("Second import via containers-storage (should use cache)...");
-        let second_result = composefs_oci::pull(&repo, &cstor_image_ref, None, None).await?;
+        let second_result = composefs_oci::pull(&repo, &cstor_image_ref, None, None, false).await?;
 
         // Verify idempotency: both imports should produce identical results
         assert_eq!(
@@ -255,7 +256,7 @@ fn privileged_test_cstor_import_with_reference() -> Result<()> {
         // Import with a reference name
         println!("Importing with reference: {}", reference_name);
         let result =
-            composefs_oci::pull(&repo, &cstor_image_ref, Some(reference_name), None).await?;
+            composefs_oci::pull(&repo, &cstor_image_ref, Some(reference_name), None, false).await?;
 
         println!("Import complete. Config digest: {}", result.config_digest);
 

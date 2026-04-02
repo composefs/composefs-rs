@@ -33,7 +33,7 @@
 //! use composefs_oci::cstor::import_from_containers_storage;
 //!
 //! let repo = Arc::new(Repository::open_user()?);
-//! let (result, stats) = import_from_containers_storage(&repo, "sha256:abc123...", None).await?;
+//! let (result, stats) = import_from_containers_storage(&repo, "sha256:abc123...", None, false).await?;
 //! println!("Imported config: {}", result.0);
 //! println!("Stats: {:?}", stats);
 //! ```
@@ -78,6 +78,7 @@ const ZERO_PADDING: [u8; 512] = [0u8; 512];
 /// * `repo` - The composefs repository to import into
 /// * `image_id` - The image ID (sha256 digest or name) to import
 /// * `reference` - Optional reference name to assign to the imported config
+/// * `zerocopy` - If true, error instead of falling back to copy (reflink or hardlink required)
 ///
 /// # Returns
 /// A tuple of ((config_digest, config_verity_id), import_stats).
@@ -85,6 +86,7 @@ pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     image_id: &str,
     reference: Option<&str>,
+    zerocopy: bool,
 ) -> Result<(ContentAndVerity<ObjectID>, ImportStats)> {
     // Check if we can access files directly or need a proxy
     if can_bypass_file_permissions() {
@@ -94,13 +96,13 @@ pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
         let reference = reference.map(|s| s.to_owned());
 
         tokio::task::spawn_blocking(move || {
-            import_from_containers_storage_direct(&repo, &image_id, reference.as_deref())
+            import_from_containers_storage_direct(&repo, &image_id, reference.as_deref(), zerocopy)
         })
         .await
         .context("spawn_blocking failed")?
     } else {
         // Need proxy for rootless access
-        import_from_containers_storage_proxied(repo, image_id, reference).await
+        import_from_containers_storage_proxied(repo, image_id, reference, zerocopy).await
     }
 }
 
@@ -112,6 +114,7 @@ fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     image_id: &str,
     reference: Option<&str>,
+    zerocopy: bool,
 ) -> Result<(ContentAndVerity<ObjectID>, ImportStats)> {
     let mut stats = ImportStats::default();
 
@@ -179,7 +182,8 @@ fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
                 .iter()
                 .find_map(|s| Layer::open(s, storage_layer_id).ok().map(|l| (s, l)))
                 .with_context(|| format!("Failed to open layer {}", storage_layer_id))?;
-            let (verity, layer_stats) = import_layer_direct(repo, layer_store, &layer, diff_id)?;
+            let (verity, layer_stats) =
+                import_layer_direct(repo, layer_store, &layer, diff_id, zerocopy)?;
             stats.merge(&layer_stats);
             verity
         };
@@ -204,7 +208,7 @@ fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
         existing
     } else {
         progress.println(format!("Creating config splitstream {config_digest}"));
-        let mut writer = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut writer = repo.create_stream(OCI_CONFIG_CONTENT_TYPE)?;
 
         // Add layer references — the key is the diff_id as a string slice
         for (diff_id, verity) in &layer_refs {
@@ -230,6 +234,7 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     image_id: &str,
     reference: Option<&str>,
+    zerocopy: bool,
 ) -> Result<(ContentAndVerity<ObjectID>, ImportStats)> {
     let mut stats = ImportStats::default();
 
@@ -301,6 +306,7 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
                 &storage_path,
                 storage_layer_id,
                 diff_id_str,
+                zerocopy,
             )
             .await?;
             stats.merge(&layer_stats);
@@ -334,7 +340,7 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
         existing
     } else {
         progress.println(format!("Creating config splitstream {config_digest}"));
-        let mut writer = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut writer = repo.create_stream(OCI_CONFIG_CONTENT_TYPE)?;
 
         // Add layer references — the key is the diff_id as a string slice
         for (diff_id, verity) in &layer_refs {
@@ -361,13 +367,14 @@ fn import_layer_direct<ObjectID: FsVerityHashValue>(
     storage: &Storage,
     layer: &Layer,
     diff_id: &OciDigest,
+    zerocopy: bool,
 ) -> Result<(ObjectID, ImportStats)> {
     let mut stats = ImportStats::default();
 
     let mut stream = TarSplitFdStream::new(storage, layer)
         .with_context(|| format!("Failed to create tar-split stream for layer {}", layer.id()))?;
 
-    let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
+    let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE)?;
     let content_id = layer_identifier(diff_id);
 
     // Track padding from previous file - tar-split bundles padding with the NEXT
@@ -385,7 +392,7 @@ fn import_layer_direct<ObjectID: FsVerityHashValue>(
                 prev_file_padding = 0;
             }
             TarSplitItem::FileContent { fd, size, name } => {
-                process_file_content(repo, &mut writer, &mut stats, fd, size, &name)?;
+                process_file_content(repo, &mut writer, &mut stats, fd, size, &name, zerocopy)?;
 
                 // Write padding inline immediately after file content
                 let padding_size = (size as usize).next_multiple_of(512) - size as usize;
@@ -410,10 +417,11 @@ async fn import_layer_proxied<ObjectID: FsVerityHashValue>(
     storage_path: &str,
     layer_id: &str,
     diff_id: &str,
+    zerocopy: bool,
 ) -> Result<(ObjectID, ImportStats)> {
     let mut stats = ImportStats::default();
 
-    let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE);
+    let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE)?;
     let diff_id_digest: OciDigest = diff_id.parse().context("parsing diff_id")?;
     let content_id = layer_identifier(&diff_id_digest);
 
@@ -442,7 +450,7 @@ async fn import_layer_proxied<ObjectID: FsVerityHashValue>(
                 prev_file_padding = 0;
             }
             ProxiedTarSplitItem::FileContent { fd, size, name } => {
-                process_file_content(repo, &mut writer, &mut stats, fd, size, &name)?;
+                process_file_content(repo, &mut writer, &mut stats, fd, size, &name, zerocopy)?;
 
                 // Write padding inline immediately after file content
                 let padding_size = (size as usize).next_multiple_of(512) - size as usize;
@@ -468,20 +476,28 @@ fn process_file_content<ObjectID: FsVerityHashValue>(
     fd: OwnedFd,
     size: u64,
     name: &str,
+    zerocopy: bool,
 ) -> Result<()> {
     // Convert fd to File for operations
     let file = std::fs::File::from(fd);
 
     if size as usize > INLINE_CONTENT_MAX_V0 {
-        // Large file: use reflink to store as external object
-        let (object_id, method) = repo
-            .ensure_object_from_file(&file, size)
-            .with_context(|| format!("Failed to store object for {}", name))?;
+        // Large file: store as external object
+        let (object_id, method) = if zerocopy {
+            repo.ensure_object_from_file_zerocopy(&file, size)
+        } else {
+            repo.ensure_object_from_file(&file, size)
+        }
+        .with_context(|| format!("Failed to store object for {}", name))?;
 
         match method {
             ObjectStoreMethod::Reflinked => {
                 stats.objects_reflinked += 1;
                 stats.bytes_reflinked += size;
+            }
+            ObjectStoreMethod::Hardlinked => {
+                stats.objects_hardlinked += 1;
+                stats.bytes_hardlinked += size;
             }
             ObjectStoreMethod::Copied => {
                 stats.objects_copied += 1;

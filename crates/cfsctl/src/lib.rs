@@ -874,7 +874,7 @@ where
                     }
                     // Use unified pull which handles containers-storage routing
                     let result =
-                        composefs_oci::pull(&repo_arc, image, Some(tag_name), None).await?;
+                        composefs_oci::pull(&repo_arc, image, Some(tag_name), None, false).await?;
 
                     println!("config   {}", result.config_digest);
                     println!("verity   {}", result.config_verity.to_hex());
