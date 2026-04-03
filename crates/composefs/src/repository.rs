@@ -100,8 +100,8 @@ use fn_error_context::context;
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, flock, linkat, mkdirat, openat,
-        readlinkat, statat, syncfs, unlinkat,
+        Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, accessat, flock, linkat,
+        mkdirat, openat, readlinkat, statat, syncfs, unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -1049,6 +1049,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// enable fs-verity, and link the file into the objects directory.
     #[context("Creating object tmpfile")]
     pub fn create_object_tmpfile(&self) -> Result<OwnedFd> {
+        self.ensure_writable()?;
         let objects_dir = self
             .objects_dir()
             .context("Getting objects directory for tmpfile creation")?;
@@ -1101,6 +1102,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         file: File,
         size: u64,
     ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        self.ensure_writable()?;
         let ro_fd =
             reopen_tmpfile_ro(file).context("Re-opening tmpfile as read-only for verity")?;
 
@@ -1287,6 +1289,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// done with everything, call `Repository::sync()`.
     #[context("Ensuring object exists in repository")]
     pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
+        self.ensure_writable()?;
         let id: ObjectID = compute_verity(data);
         self.store_object_with_id(data, &id)?;
         Ok(id)
@@ -1339,11 +1342,29 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(())
     }
 
+    /// Check that the repository directory is writable.
+    ///
+    /// This is a fast pre-flight check (using `faccessat(2)`) that
+    /// catches read-only mounts and permission issues before starting
+    /// expensive network or I/O work.
+    pub fn ensure_writable(&self) -> Result<()> {
+        accessat(&self.repository, ".", Access::WRITE_OK, AtFlags::empty())
+            .context("Repository is not writable")?;
+        Ok(())
+    }
+
     /// Creates a SplitStreamWriter for writing a split stream.
     /// You should write the data to the returned object and then pass it to .store_stream() to
     /// store the result.
-    pub fn create_stream(self: &Arc<Self>, content_type: u64) -> SplitStreamWriter<ObjectID> {
-        SplitStreamWriter::new(self, content_type)
+    ///
+    /// The writable check is performed here so that callers cannot obtain
+    /// a writer without first verifying the repository is writable.
+    pub fn create_stream(
+        self: &Arc<Self>,
+        content_type: u64,
+    ) -> Result<SplitStreamWriter<ObjectID>> {
+        self.ensure_writable()?;
+        Ok(SplitStreamWriter::new(self, content_type))
     }
 
     fn format_object_path(id: &ObjectID) -> String {
@@ -1393,6 +1414,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
+        self.ensure_writable()?;
         let object_id = writer.done().context("Finalizing split stream writer")?;
 
         // Right now we have:
@@ -1434,6 +1456,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<()> {
+        self.ensure_writable()?;
         self.sync_async().await?;
 
         let stream_path = Self::format_stream_path(content_identifier);
@@ -1460,6 +1483,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
+        self.ensure_writable()?;
         let object_id = writer
             .done_async()
             .await
@@ -1504,6 +1528,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// (e.g., `myapp/layer1`), and intermediate directories are created automatically.
     #[context("Naming stream '{content_identifier}' as '{name}'")]
     pub fn name_stream(&self, content_identifier: &str, name: &str) -> Result<()> {
+        self.ensure_writable()?;
         let stream_path = Self::format_stream_path(content_identifier);
         let reference_path = format!("streams/refs/{name}");
         self.symlink(&reference_path, &stream_path)?;
@@ -1532,12 +1557,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         callback: impl FnOnce(&mut SplitStreamWriter<ObjectID>) -> Result<T>,
         reference: Option<&str>,
     ) -> Result<(ObjectID, T)> {
+        self.ensure_writable()?;
         let stream_path = Self::format_stream_path(content_identifier);
 
         let (object_id, extra) = match self.has_stream(content_identifier)? {
             Some(id) => (id, T::default()),
             None => {
-                let mut writer = self.create_stream(content_type);
+                let mut writer = self.create_stream(content_type)?;
                 let extra = callback(&mut writer).context("Writing stream content via callback")?;
                 let id = self.write_stream(writer, content_identifier, reference)?;
                 (id, extra)
@@ -1616,6 +1642,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// This function is not safe for untrusted users.
     #[context("Writing image to repository")]
     pub fn write_image(&self, name: Option<&str>, data: &[u8]) -> Result<ObjectID> {
+        self.ensure_writable()?;
         let object_id = self.ensure_object(data)?;
 
         let object_path = Self::format_object_path(&object_id);
@@ -1640,6 +1667,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// This function is not safe for untrusted users.
     #[context("Importing image '{name}' from reader")]
     pub fn import_image<R: Read>(&self, name: &str, image: &mut R) -> Result<ObjectID> {
+        self.ensure_writable()?;
         let mut data = vec![];
         image
             .read_to_end(&mut data)
@@ -2058,6 +2086,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// An exclusive lock is held for the duration of this operation.
     #[context("Running garbage collection")]
     pub fn gc(&self, additional_roots: &[&str]) -> Result<GcResult> {
+        self.ensure_writable()?;
         flock(&self.repository, FlockOperation::LockExclusive)
             .context("Acquiring exclusive lock for GC")?;
         self.gc_impl(additional_roots, false)
@@ -2869,7 +2898,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
 
@@ -2911,7 +2940,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
 
@@ -2959,7 +2988,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", Some("ref-name"))?;
 
@@ -3011,12 +3040,12 @@ mod tests {
         let obj3_id: Sha512HashValue = compute_verity(&obj3);
         let obj4_id: Sha512HashValue = compute_verity(&obj4);
 
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj2)?;
         writer1.write_external(&obj3)?;
         let _stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.write_external(&obj2)?;
         writer2.write_external(&obj4)?;
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
@@ -3077,11 +3106,11 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj2)?;
         let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.add_named_stream_ref("test-stream1", &stream1_id);
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
 
@@ -3143,11 +3172,11 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj2)?;
         let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.add_named_stream_ref("different-table-name-for-test-stream1", &stream1_id);
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
 
@@ -3213,24 +3242,24 @@ mod tests {
         let obj3_id: Sha512HashValue = compute_verity(&obj3);
         let obj4_id: Sha512HashValue = compute_verity(&obj4);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let stream1_id = repo.write_stream(writer, "test-stream1", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj3)?;
         let stream2_id = repo.write_stream(writer, "test-stream2", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj4)?;
         let stream3_id = repo.write_stream(writer, "test-stream3", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.add_named_stream_ref("test-stream1", &stream1_id);
         writer.add_named_stream_ref("test-stream2", &stream2_id);
         let _ref_stream1_id = repo.write_stream(writer, "ref-stream1", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.add_named_stream_ref("test-stream1", &stream1_id);
         writer.add_named_stream_ref("test-stream3", &stream3_id);
         let _ref_stream2_id = repo.write_stream(writer, "ref-stream2", None)?;
@@ -3611,7 +3640,7 @@ mod tests {
         let _obj1_id = repo.ensure_object(&obj1)?;
         let _obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;
@@ -3676,7 +3705,7 @@ mod tests {
         let obj = generate_test_data(64 * 1024, 0xEA);
         let _obj_verity: Sha512HashValue = compute_verity(&obj);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;
@@ -3710,7 +3739,7 @@ mod tests {
         // Create a stream with an external reference to the object.
         // write_external calls ensure_object internally, so the object
         // will exist.
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;
@@ -3979,12 +4008,12 @@ mod tests {
         let obj = generate_test_data(64 * 1024, 0xEA);
 
         // Create stream1 that references obj
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj)?;
         let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
         // Create stream2 with a named ref to stream1
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.add_named_stream_ref("test-stream1", &stream1_id);
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
         repo.sync()?;
@@ -4026,7 +4055,7 @@ mod tests {
 
         let obj = generate_test_data(64 * 1024, 0xEA);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         // write_stream with reference creates a ref symlink
         let _stream_id = repo.write_stream(writer, "test-stream", Some("my-ref"))?;
@@ -4049,7 +4078,7 @@ mod tests {
 
         let obj = generate_test_data(64 * 1024, 0xEA);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;

@@ -387,7 +387,7 @@ pub fn write_config_raw<ObjectID: FsVerityHashValue>(
     boot_image: Option<&ObjectID>,
 ) -> Result<ContentAndVerity<ObjectID>> {
     let config_digest = hash_sha256(config_json);
-    let mut stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+    let mut stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE)?;
     for (name, value) in &refs {
         stream.add_named_stream_ref(name, value)
     }
