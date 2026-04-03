@@ -89,7 +89,10 @@ async fn stream_large_file<ObjectID: FsVerityHashValue>(
     if from_buf > 0 && tx.send(buf.split_to(from_buf).freeze()).await.is_err() {
         // The receiver dropped — await the handle to get the real error.
         drop(tx);
-        return handle.await?.map(|_| ()).context("Object write task failed");
+        return handle
+            .await?
+            .map(|_| ())
+            .context("Object write task failed");
     }
 
     // SAFETY: from_buf = min(_, actual_size) so from_buf <= actual_size
@@ -108,7 +111,10 @@ async fn stream_large_file<ObjectID: FsVerityHashValue>(
             // from tar_stream, so continuing to parse would misinterpret
             // file content as tar headers.
             drop(tx);
-            return handle.await?.map(|_| ()).context("Object write task failed");
+            return handle
+                .await?
+                .map(|_| ())
+                .context("Object write task failed");
         }
         // SAFETY: chunk_size = min(remaining, _) so chunk_size <= remaining
         remaining = remaining.checked_sub(chunk_size).unwrap();

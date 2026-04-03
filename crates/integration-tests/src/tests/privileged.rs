@@ -375,3 +375,55 @@ fn privileged_init_insecure_skips_verity() -> Result<()> {
     Ok(())
 }
 integration_test!(privileged_init_insecure_skips_verity);
+
+/// Verify that `oci pull` into a read-only bind-mounted repository fails
+/// immediately with a clear "not writable" error instead of a confusing
+/// tar header error.
+fn privileged_pull_readonly_repo() -> Result<()> {
+    if require_privileged("privileged_pull_readonly_repo")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+
+    cmd!(sh, "{cfsctl} --repo {repo} init").run()?;
+
+    // Bind-mount the repo read-only over itself
+    cmd!(sh, "mount --bind {repo} {repo}").run()?;
+    cmd!(sh, "mount -o remount,ro,bind {repo}").run()?;
+
+    // Use a bogus oci: reference — the writable check fires before any
+    // image processing so the source doesn't matter.
+    let output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} oci pull oci:/nonexistent ignored"
+    )
+    .ignore_status()
+    .output()?;
+
+    // Clean up the bind mount before asserting
+    cmd!(sh, "umount {repo}").run()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}{stderr}");
+
+    ensure!(
+        !output.status.success(),
+        "pull into read-only repo should fail"
+    );
+    ensure!(
+        combined.contains("not writable") || combined.contains("Read-only file system"),
+        "expected writable or EROFS error, got: {combined}"
+    );
+    ensure!(
+        !combined.contains("header error") && !combined.contains("invalid octal"),
+        "should NOT produce misleading tar header errors, got: {combined}"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_pull_readonly_repo);
