@@ -20,6 +20,8 @@ thiserror = { version = "2.0.0", default-features = false }
 zerocopy = { version = "0.8.0", default-features = false, features = ["derive"] }
 
 [dev-dependencies]
+composefs = { workspace = true, features = ["test"] }
+indoc = "2"
 similar-asserts = "1.7.0"
 
 [lints]
