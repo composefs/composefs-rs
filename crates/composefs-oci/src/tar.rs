@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use bytes::{Bytes, BytesMut};
 use rustix::fs::makedev;
 use tar_core::{
@@ -87,7 +87,12 @@ async fn stream_large_file<ObjectID: FsVerityHashValue>(
     // Drain any leftover bytes in our buffer that belong to content (zero-copy)
     let from_buf = std::cmp::min(buf.len(), actual_size);
     if from_buf > 0 && tx.send(buf.split_to(from_buf).freeze()).await.is_err() {
-        bail!("object write task failed");
+        // The receiver dropped — await the handle to get the real error.
+        drop(tx);
+        return handle
+            .await?
+            .map(|_| ())
+            .context("Object write task failed");
     }
 
     // SAFETY: from_buf = min(_, actual_size) so from_buf <= actual_size
@@ -101,7 +106,15 @@ async fn stream_large_file<ObjectID: FsVerityHashValue>(
         }
         let chunk_size = std::cmp::min(remaining, buf.len());
         if tx.send(buf.split_to(chunk_size).freeze()).await.is_err() {
-            break;
+            // The receiver dropped — await the handle to get the real error.
+            // Don't just `break`: we haven't consumed the remaining content
+            // from tar_stream, so continuing to parse would misinterpret
+            // file content as tar headers.
+            drop(tx);
+            return handle
+                .await?
+                .map(|_| ())
+                .context("Object write task failed");
         }
         // SAFETY: chunk_size = min(remaining, _) so chunk_size <= remaining
         remaining = remaining.checked_sub(chunk_size).unwrap();
