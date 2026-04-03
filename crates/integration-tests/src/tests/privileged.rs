@@ -15,7 +15,7 @@ use xshell::{Shell, cmd};
 
 use crate::{cfsctl, integration_test};
 
-/// Ensure we're running as root, or re-exec this test inside a VM.
+/// Ensure we're running in a privileged environment, or re-exec this test inside a VM.
 ///
 /// If already root (e.g. inside a bcvk VM), returns `Ok(None)` and the
 /// test proceeds normally.
@@ -26,7 +26,10 @@ use crate::{cfsctl, integration_test};
 /// the test already ran in the VM.
 ///
 /// If not root and no test image is configured, returns an error.
-fn require_privileged(test_name: &str) -> Result<Option<()>> {
+///
+/// This is also used by cstor tests which need user namespace support
+/// (via `podman unshare`) that may not be available on GHA runners.
+pub fn require_privileged(test_name: &str) -> Result<Option<()>> {
     if rustix::process::getuid().is_root() {
         return Ok(None);
     }
@@ -40,6 +43,58 @@ fn require_privileged(test_name: &str) -> Result<Option<()>> {
         anyhow::anyhow!(
             "not root and COMPOSEFS_TEST_IMAGE not set; \
              run `just test-integration-vm` to build the image and run all tests"
+        )
+    })?;
+
+    let sh = Shell::new()?;
+    let bcvk = std::env::var("BCVK_PATH").unwrap_or_else(|_| "bcvk".into());
+    cmd!(
+        sh,
+        "{bcvk} ephemeral run-ssh {image} -- cfsctl-integration-tests --exact {test_name}"
+    )
+    .run()?;
+    Ok(Some(()))
+}
+
+/// Check if user namespaces work (needed for podman unshare).
+fn userns_works() -> bool {
+    std::process::Command::new("podman")
+        .args(["unshare", "true"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Ensure user namespace support is available, or re-exec this test inside a VM.
+///
+/// Unlike `require_privileged`, this doesn't require root — it just needs
+/// working user namespaces (for `podman unshare`). If user namespaces work,
+/// the test proceeds normally. Otherwise, it dispatches to a VM.
+///
+/// Returns `Ok(None)` if the test should proceed, `Ok(Some(()))` if it was
+/// dispatched to a VM and the caller should return immediately.
+pub fn require_userns(test_name: &str) -> Result<Option<()>> {
+    // If we're root (e.g. in VM), userns works
+    if rustix::process::getuid().is_root() {
+        return Ok(None);
+    }
+
+    // Check if userns works on this host
+    if userns_works() {
+        return Ok(None);
+    }
+
+    // userns doesn't work — delegate to a VM
+    if std::env::var_os("COMPOSEFS_IN_VM").is_some() {
+        bail!("COMPOSEFS_IN_VM is set but userns doesn't work — VM setup is broken");
+    }
+
+    let image = std::env::var("COMPOSEFS_TEST_IMAGE").map_err(|_| {
+        anyhow::anyhow!(
+            "user namespaces not available and COMPOSEFS_TEST_IMAGE not set; \
+             run `just build-test-image` or use `just test-integration-vm`"
         )
     })?;
 
@@ -375,3 +430,55 @@ fn privileged_init_insecure_skips_verity() -> Result<()> {
     Ok(())
 }
 integration_test!(privileged_init_insecure_skips_verity);
+
+/// Verify that `oci pull` into a read-only bind-mounted repository fails
+/// immediately with a clear "not writable" error instead of a confusing
+/// tar header error.
+fn privileged_pull_readonly_repo() -> Result<()> {
+    if require_privileged("privileged_pull_readonly_repo")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+
+    cmd!(sh, "{cfsctl} --repo {repo} init").run()?;
+
+    // Bind-mount the repo read-only over itself
+    cmd!(sh, "mount --bind {repo} {repo}").run()?;
+    cmd!(sh, "mount -o remount,ro,bind {repo}").run()?;
+
+    // Use a bogus oci: reference — the writable check fires before any
+    // image processing so the source doesn't matter.
+    let output = cmd!(
+        sh,
+        "{cfsctl} --repo {repo} oci pull oci:/nonexistent ignored"
+    )
+    .ignore_status()
+    .output()?;
+
+    // Clean up the bind mount before asserting
+    cmd!(sh, "umount {repo}").run()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}{stderr}");
+
+    ensure!(
+        !output.status.success(),
+        "pull into read-only repo should fail"
+    );
+    ensure!(
+        combined.contains("not writable") || combined.contains("Read-only file system"),
+        "expected writable or EROFS error, got: {combined}"
+    );
+    ensure!(
+        !combined.contains("header error") && !combined.contains("invalid octal"),
+        "should NOT produce misleading tar header errors, got: {combined}"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_pull_readonly_repo);

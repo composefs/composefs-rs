@@ -859,25 +859,43 @@ where
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
                 let repo_arc = Arc::new(repo);
-                let (result, stats) =
-                    composefs_oci::pull_image(&repo_arc, image, Some(tag_name), None).await?;
 
-                println!("manifest {}", result.manifest_digest);
-                println!("config   {}", result.config_digest);
-                println!("verity   {}", result.manifest_verity.to_hex());
-                println!("tagged   {tag_name}");
-                println!(
-                    "objects  {} copied, {} already present, {} bytes copied, {} bytes inlined",
-                    stats.objects_copied,
-                    stats.objects_already_present,
-                    stats.bytes_copied,
-                    stats.bytes_inlined,
-                );
+                // Check if this is a containers-storage import
+                #[cfg(feature = "containers-storage")]
+                let is_cstor = composefs_oci::cstor::parse_containers_storage_ref(image).is_some();
+                #[cfg(not(feature = "containers-storage"))]
+                let is_cstor = false;
 
-                if bootable {
-                    let image_verity =
-                        composefs_oci::generate_boot_image(&repo_arc, &result.manifest_digest)?;
-                    println!("Boot image: {}", image_verity.to_hex());
+                if is_cstor {
+                    if bootable {
+                        anyhow::bail!(
+                            "--bootable is not yet supported for containers-storage imports"
+                        );
+                    }
+                    // Use unified pull which handles containers-storage routing
+                    let result =
+                        composefs_oci::pull(&repo_arc, image, Some(tag_name), None, false).await?;
+
+                    println!("config   {}", result.config_digest);
+                    println!("verity   {}", result.config_verity.to_hex());
+                    println!("tagged   {tag_name}");
+                    println!("objects  {}", result.stats);
+                } else {
+                    // Use the normal skopeo-based pull which produces full manifest info
+                    let (result, stats) =
+                        composefs_oci::pull_image(&repo_arc, image, Some(tag_name), None).await?;
+
+                    println!("manifest {}", result.manifest_digest);
+                    println!("config   {}", result.config_digest);
+                    println!("verity   {}", result.manifest_verity.to_hex());
+                    println!("tagged   {tag_name}");
+                    println!("objects  {}", stats);
+
+                    if bootable {
+                        let image_verity =
+                            composefs_oci::generate_boot_image(&repo_arc, &result.manifest_digest)?;
+                        println!("Boot image: {}", image_verity.to_hex());
+                    }
                 }
             }
             OciCommand::ListImages { json } => {

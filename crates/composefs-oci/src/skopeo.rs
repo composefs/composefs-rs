@@ -238,12 +238,20 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                         stats.objects_copied += 1;
                         stats.bytes_copied += size;
                     }
+                    ObjectStoreMethod::Reflinked => {
+                        stats.objects_reflinked += 1;
+                        stats.bytes_reflinked += size;
+                    }
+                    ObjectStoreMethod::Hardlinked => {
+                        stats.objects_hardlinked += 1;
+                        stats.bytes_hardlinked += size;
+                    }
                     ObjectStoreMethod::AlreadyPresent => {
                         stats.objects_already_present += 1;
                     }
                 }
 
-                let mut stream = self.repo.create_stream(OCI_BLOB_CONTENT_TYPE);
+                let mut stream = self.repo.create_stream(OCI_BLOB_CONTENT_TYPE)?;
                 stream.add_external_size(size);
                 stream.write_reference(object_id)?;
                 // write_stream handles both object storage and stream
@@ -379,7 +387,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 .collect::<Result<_, _>>()?;
             results.sort_by_key(|(idx, _, _, _)| *idx);
 
-            let mut splitstream = self.repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+            let mut splitstream = self.repo.create_stream(OCI_CONFIG_CONTENT_TYPE)?;
             let mut layer_refs = std::collections::HashMap::new();
             let mut stats = ImportStats::default();
             for (_, diff_id, verity, layer_stats) in results {
@@ -425,7 +433,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             self.progress
                 .println(format!("Storing manifest {manifest_digest}"))?;
 
-            let mut splitstream = self.repo.create_stream(OCI_MANIFEST_CONTENT_TYPE);
+            let mut splitstream = self.repo.create_stream(OCI_MANIFEST_CONTENT_TYPE)?;
 
             let config_key = format!("config:{}", config_descriptor.digest());
             splitstream.add_named_stream_ref(&config_key, &config_verity);
@@ -465,6 +473,9 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
+    // Fail fast if the repository is read-only, before starting any
+    // network or image-proxy work.
+    repo.ensure_writable()?;
     let op = Arc::new(ImageOp::new(repo, imgref, img_proxy_config).await?);
     let (result, stats) = op
         .pull()

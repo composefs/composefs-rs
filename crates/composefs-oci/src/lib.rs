@@ -8,9 +8,13 @@
 //! - Pulling container images from registries using skopeo
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
+//! - Importing from containers-storage with zero-copy reflinks (optional feature)
+
 #![forbid(unsafe_code)]
 
 pub mod boot;
+#[cfg(feature = "containers-storage")]
+pub mod cstor;
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
@@ -67,27 +71,55 @@ pub use skopeo::pull_image;
 /// Statistics from an image import operation.
 #[derive(Debug, Clone, Default)]
 pub struct ImportStats {
-    /// Number of objects stored via copy.
+    /// Number of layers in the image.
+    pub layers: u64,
+    /// Number of layers that were already present (skipped).
+    pub layers_already_present: u64,
+    /// Number of objects stored via regular copy.
     pub objects_copied: u64,
+    /// Number of objects stored via reflink (zero-copy).
+    pub objects_reflinked: u64,
+    /// Number of objects stored via hardlink (zero-copy).
+    pub objects_hardlinked: u64,
     /// Number of objects that already existed (deduplicated).
     pub objects_already_present: u64,
-    /// Total bytes stored as new objects.
+    /// Total bytes stored via regular copy.
     pub bytes_copied: u64,
+    /// Total bytes stored via reflink.
+    pub bytes_reflinked: u64,
+    /// Total bytes stored via hardlink.
+    pub bytes_hardlinked: u64,
     /// Total bytes inlined in splitstreams (small files + headers).
     pub bytes_inlined: u64,
 }
 
 impl ImportStats {
+    /// Total number of new objects stored (copied + reflinked + hardlinked).
+    pub fn new_objects(&self) -> u64 {
+        self.objects_copied + self.objects_reflinked + self.objects_hardlinked
+    }
+
     /// Total number of objects processed (new + already present).
     pub fn total_objects(&self) -> u64 {
-        self.objects_copied + self.objects_already_present
+        self.new_objects() + self.objects_already_present
+    }
+
+    /// Total bytes stored as new objects (copied + reflinked + hardlinked).
+    pub fn new_bytes(&self) -> u64 {
+        self.bytes_copied + self.bytes_reflinked + self.bytes_hardlinked
     }
 
     /// Merge another `ImportStats` into this one.
     pub fn merge(&mut self, other: &ImportStats) {
+        self.layers += other.layers;
+        self.layers_already_present += other.layers_already_present;
         self.objects_copied += other.objects_copied;
+        self.objects_reflinked += other.objects_reflinked;
+        self.objects_hardlinked += other.objects_hardlinked;
         self.objects_already_present += other.objects_already_present;
         self.bytes_copied += other.bytes_copied;
+        self.bytes_reflinked += other.bytes_reflinked;
+        self.bytes_hardlinked += other.bytes_hardlinked;
         self.bytes_inlined += other.bytes_inlined;
     }
 
@@ -103,6 +135,14 @@ impl ImportStats {
                     stats.objects_copied += 1;
                     stats.bytes_copied += size;
                 }
+                ObjectStoreMethod::Reflinked => {
+                    stats.objects_reflinked += 1;
+                    stats.bytes_reflinked += size;
+                }
+                ObjectStoreMethod::Hardlinked => {
+                    stats.objects_hardlinked += 1;
+                    stats.bytes_hardlinked += size;
+                }
                 ObjectStoreMethod::AlreadyPresent => {
                     stats.objects_already_present += 1;
                 }
@@ -114,14 +154,52 @@ impl ImportStats {
 
 impl std::fmt::Display for ImportStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} new + {} already present objects; {} stored, {} inlined",
-            self.objects_copied,
-            self.objects_already_present,
-            indicatif::HumanBytes(self.bytes_copied),
-            indicatif::HumanBytes(self.bytes_inlined),
-        )
+        let has_zerocopy = self.objects_reflinked > 0 || self.objects_hardlinked > 0;
+        if has_zerocopy {
+            // Show detailed breakdown when zero-copy methods were used
+            let mut parts = Vec::new();
+            if self.objects_reflinked > 0 {
+                parts.push(format!("{} reflinked", self.objects_reflinked));
+            }
+            if self.objects_hardlinked > 0 {
+                parts.push(format!("{} hardlinked", self.objects_hardlinked));
+            }
+            parts.push(format!("{} copied", self.objects_copied));
+            parts.push(format!("{} already present", self.objects_already_present));
+            write!(f, "{} objects; ", parts.join(" + "))?;
+
+            let mut byte_parts = Vec::new();
+            if self.objects_reflinked > 0 {
+                byte_parts.push(format!(
+                    "{} reflinked",
+                    indicatif::HumanBytes(self.bytes_reflinked)
+                ));
+            }
+            if self.objects_hardlinked > 0 {
+                byte_parts.push(format!(
+                    "{} hardlinked",
+                    indicatif::HumanBytes(self.bytes_hardlinked)
+                ));
+            }
+            byte_parts.push(format!(
+                "{} copied",
+                indicatif::HumanBytes(self.bytes_copied)
+            ));
+            byte_parts.push(format!(
+                "{} inlined",
+                indicatif::HumanBytes(self.bytes_inlined)
+            ));
+            write!(f, "{}", byte_parts.join(", "))
+        } else {
+            write!(
+                f,
+                "{} new + {} already present objects; {} stored, {} inlined",
+                self.objects_copied,
+                self.objects_already_present,
+                indicatif::HumanBytes(self.bytes_copied),
+                indicatif::HumanBytes(self.bytes_inlined),
+            )
+        }
     }
 }
 
@@ -136,7 +214,8 @@ pub struct PullResult<ObjectID> {
     pub stats: ImportStats,
 }
 
-type ContentAndVerity<ObjectID> = (OciDigest, ObjectID);
+/// A tuple of (content digest, fs-verity ObjectID).
+pub type ContentAndVerity<ObjectID> = (OciDigest, ObjectID);
 
 /// Parsed OCI config and its associated references.
 pub struct OpenConfig<ObjectID> {
@@ -160,11 +239,11 @@ impl<ObjectID: std::fmt::Debug> std::fmt::Debug for OpenConfig<ObjectID> {
     }
 }
 
-fn layer_identifier(diff_id: &OciDigest) -> String {
+pub(crate) fn layer_identifier(diff_id: &OciDigest) -> String {
     format!("oci-layer-{diff_id}")
 }
 
-fn config_identifier(config: &OciDigest) -> String {
+pub(crate) fn config_identifier(config: &OciDigest) -> String {
     format!("oci-config-{config}")
 }
 
@@ -223,12 +302,37 @@ pub fn ls_layer<ObjectID: FsVerityHashValue>(
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
+///
+/// When the `containers-storage` feature is enabled and the image reference
+/// starts with `containers-storage:`, this uses the native cstor import path
+/// which supports zero-copy reflinks/hardlinks. Otherwise, it uses skopeo.
+///
+/// The `zerocopy` parameter controls whether the cstor import path is allowed
+/// to fall back to copying file data. When `true`, only reflink or hardlink
+/// is permitted — a copy fallback will error. This is intended for bootc's
+/// unified storage path where containers-storage and the composefs repo are
+/// always on the same filesystem. Ignored for the skopeo path.
 pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
+    zerocopy: bool,
 ) -> Result<PullResult<ObjectID>> {
+    #[cfg(feature = "containers-storage")]
+    if let Some(image_id) = cstor::parse_containers_storage_ref(imgref) {
+        let ((config_digest, config_verity), stats) =
+            cstor::import_from_containers_storage(repo, image_id, reference, zerocopy).await?;
+        return Ok(PullResult {
+            config_digest,
+            config_verity,
+            stats,
+        });
+    }
+
+    // Suppress unused variable warning when containers-storage feature is disabled
+    let _ = zerocopy;
+
     let (config_digest, config_verity, stats) =
         skopeo::pull(repo, imgref, reference, img_proxy_config).await?;
     Ok(crate::PullResult {
@@ -387,7 +491,7 @@ pub fn write_config_raw<ObjectID: FsVerityHashValue>(
     boot_image: Option<&ObjectID>,
 ) -> Result<ContentAndVerity<ObjectID>> {
     let config_digest = hash_sha256(config_json);
-    let mut stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+    let mut stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE)?;
     for (name, value) in &refs {
         stream.add_named_stream_ref(name, value)
     }
@@ -1072,16 +1176,77 @@ mod test {
 
     #[test]
     fn test_import_stats_display() {
+        // Copy-only stats (no reflinks)
         let stats = ImportStats {
             objects_copied: 42,
             objects_already_present: 100,
             bytes_copied: 1_500_000,
             bytes_inlined: 800,
+            ..Default::default()
         };
         assert_eq!(
             stats.to_string(),
             "42 new + 100 already present objects; 1.43 MiB stored, 800 B inlined"
         );
+        assert_eq!(stats.total_objects(), 142);
+        assert_eq!(stats.new_objects(), 42);
+        assert_eq!(stats.new_bytes(), 1_500_000);
+
+        // Stats with reflinks
+        let reflink_stats = ImportStats {
+            objects_reflinked: 30,
+            objects_copied: 12,
+            objects_already_present: 100,
+            bytes_reflinked: 1_000_000,
+            bytes_copied: 500_000,
+            bytes_inlined: 800,
+            ..Default::default()
+        };
+        assert_eq!(
+            reflink_stats.to_string(),
+            "30 reflinked + 12 copied + 100 already present objects; 976.56 KiB reflinked, 488.28 KiB copied, 800 B inlined"
+        );
+        assert_eq!(reflink_stats.total_objects(), 142);
+        assert_eq!(reflink_stats.new_objects(), 42);
+        assert_eq!(reflink_stats.new_bytes(), 1_500_000);
+
+        // Stats with hardlinks only
+        let hardlink_stats = ImportStats {
+            objects_hardlinked: 20,
+            objects_copied: 5,
+            objects_already_present: 50,
+            bytes_hardlinked: 800_000,
+            bytes_copied: 200_000,
+            bytes_inlined: 400,
+            ..Default::default()
+        };
+        assert_eq!(
+            hardlink_stats.to_string(),
+            "20 hardlinked + 5 copied + 50 already present objects; 781.25 KiB hardlinked, 195.31 KiB copied, 400 B inlined"
+        );
+        assert_eq!(hardlink_stats.total_objects(), 75);
+        assert_eq!(hardlink_stats.new_objects(), 25);
+        assert_eq!(hardlink_stats.new_bytes(), 1_000_000);
+
+        // Stats with both reflinks and hardlinks
+        let mixed_stats = ImportStats {
+            objects_reflinked: 10,
+            objects_hardlinked: 15,
+            objects_copied: 5,
+            objects_already_present: 70,
+            bytes_reflinked: 500_000,
+            bytes_hardlinked: 750_000,
+            bytes_copied: 250_000,
+            bytes_inlined: 600,
+            ..Default::default()
+        };
+        assert_eq!(
+            mixed_stats.to_string(),
+            "10 reflinked + 15 hardlinked + 5 copied + 70 already present objects; 488.28 KiB reflinked, 732.42 KiB hardlinked, 244.14 KiB copied, 600 B inlined"
+        );
+        assert_eq!(mixed_stats.total_objects(), 100);
+        assert_eq!(mixed_stats.new_objects(), 30);
+        assert_eq!(mixed_stats.new_bytes(), 1_500_000);
 
         let empty = ImportStats::default();
         assert_eq!(
@@ -1089,6 +1254,5 @@ mod test {
             "0 new + 0 already present objects; 0 B stored, 0 B inlined"
         );
         assert_eq!(empty.total_objects(), 0);
-        assert_eq!(stats.total_objects(), 142);
     }
 }

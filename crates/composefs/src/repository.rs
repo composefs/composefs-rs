@@ -100,8 +100,8 @@ use fn_error_context::context;
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, flock, linkat, mkdirat, openat,
-        readlinkat, statat, syncfs, unlinkat,
+        Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, accessat, flock, linkat,
+        mkdirat, openat, readlinkat, statat, syncfs, unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -522,11 +522,16 @@ pub(crate) fn write_repo_metadata(
 
 /// How an object was stored in the repository.
 ///
-/// Returned by [`Repository::ensure_object_from_file_with_stats`] to indicate
-/// whether the operation used a regular copy or found an existing object.
+/// Returned by [`Repository::ensure_object_from_file`] to indicate
+/// whether the operation used zero-copy reflinks, a regular copy, or found
+/// an existing object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectStoreMethod {
-    /// Object was stored via regular file copy.
+    /// Object was stored via reflink (zero-copy, FICLONE ioctl).
+    Reflinked,
+    /// Object was stored via hardlink (zero-copy, source file linked directly).
+    Hardlinked,
+    /// Object was stored via regular file copy (reflink not supported).
     Copied,
     /// Object already existed in the repository (deduplicated).
     AlreadyPresent,
@@ -1049,6 +1054,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// enable fs-verity, and link the file into the objects directory.
     #[context("Creating object tmpfile")]
     pub fn create_object_tmpfile(&self) -> Result<OwnedFd> {
+        self.ensure_writable()?;
         let objects_dir = self
             .objects_dir()
             .context("Getting objects directory for tmpfile creation")?;
@@ -1081,6 +1087,201 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         tokio::task::spawn_blocking(move || self_.finalize_object_tmpfile(tmpfile_fd.into(), size))
     }
 
+    /// Ensure an object exists by reflinking or hardlinking from a source file.
+    ///
+    /// The fallback chain is: reflink → hardlink → copy.
+    ///
+    /// - **Reflink** (FICLONE): zero-copy clone on btrfs/XFS. Uses a tmpfile.
+    /// - **Hardlink**: enables fs-verity on the source file in-place, then
+    ///   hardlinks it directly into the objects directory. This avoids all data
+    ///   copying on filesystems like ext4 that don't support reflinks.
+    /// - **Copy**: regular data copy into a tmpfile as last resort.
+    ///
+    /// This is particularly useful for importing from containers-storage where
+    /// we already have the file on disk and want to avoid copying data.
+    ///
+    /// # Arguments
+    /// * `src` - An open file descriptor to read from
+    /// * `size` - The size of the source file in bytes
+    ///
+    pub fn ensure_object_from_file(
+        &self,
+        src: &std::fs::File,
+        size: u64,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        self.ensure_object_from_file_inner(src, size, true)
+    }
+
+    /// Like [`ensure_object_from_file`](Self::ensure_object_from_file) but
+    /// errors if neither reflink nor hardlink succeeds, instead of falling back
+    /// to a regular copy.
+    ///
+    /// Intended for bootc's unified storage path where the composefs repo and
+    /// containers-storage are always on the same filesystem, so zero-copy
+    /// should always be possible.
+    pub fn ensure_object_from_file_zerocopy(
+        &self,
+        src: &std::fs::File,
+        size: u64,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        self.ensure_object_from_file_inner(src, size, false)
+    }
+
+    /// Inner implementation for [`ensure_object_from_file`](Self::ensure_object_from_file) and
+    /// [`ensure_object_from_file_zerocopy`](Self::ensure_object_from_file_zerocopy).
+    ///
+    /// When `allow_copy` is false, the copy fallback returns an error instead.
+    fn ensure_object_from_file_inner(
+        &self,
+        src: &std::fs::File,
+        size: u64,
+        allow_copy: bool,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        use rustix::fs::{fstat, ioctl_ficlone};
+
+        let objects_dir = self.objects_dir()?;
+
+        // Try reflink first: create a tmpfile and clone the source into it.
+        let tmpfile_fd = openat(
+            objects_dir,
+            ".",
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )?;
+        let tmpfile = File::from(tmpfile_fd);
+
+        match ioctl_ficlone(&tmpfile, src) {
+            Ok(()) => {
+                // Reflink succeeded — verify size matches
+                let stat = fstat(&tmpfile)?;
+                anyhow::ensure!(
+                    stat.st_size as u64 == size,
+                    "Reflink size mismatch: expected {}, got {}",
+                    size,
+                    stat.st_size
+                );
+
+                let (object_id, method) = self.finalize_object_tmpfile(tmpfile, size)?;
+                let method = match method {
+                    ObjectStoreMethod::Copied => ObjectStoreMethod::Reflinked,
+                    other => other,
+                };
+                return Ok((object_id, method));
+            }
+            Err(Errno::OPNOTSUPP | Errno::XDEV) => {
+                // Reflink not supported or cross-device — drop the tmpfile and
+                // try hardlink next.
+                drop(tmpfile);
+            }
+            Err(e) => {
+                return Err(e).context("Reflinking source file to objects directory")?;
+            }
+        }
+
+        // Try hardlink: enable verity on the source in-place, then link it
+        // directly into objects/. This avoids all data copying.
+        match self.try_hardlink_object(src, size) {
+            Ok(result) => return Ok(result),
+            Err(_) if allow_copy => {
+                // Hardlink failed, fall through to copy
+            }
+            Err(e) => {
+                return Err(e).context(
+                    "reflink and hardlink both failed; copy fallback is disabled (zerocopy mode)",
+                );
+            }
+        }
+
+        // Final fallback: copy data into a new tmpfile.
+        let tmpfile_fd = openat(
+            objects_dir,
+            ".",
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )?;
+        let mut tmpfile = File::from(tmpfile_fd);
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut src_clone = src.try_clone()?;
+            src_clone.seek(SeekFrom::Start(0))?;
+            std::io::copy(&mut src_clone, &mut tmpfile)?;
+        }
+
+        let (object_id, method) = self.finalize_object_tmpfile(tmpfile, size)?;
+        Ok((object_id, method))
+    }
+
+    /// Try to hardlink a source file directly into the objects directory.
+    ///
+    /// Enables fs-verity on the source file in-place, measures the digest to
+    /// determine the object ID, then hardlinks the source into `objects/<hash>`.
+    ///
+    /// Returns an error if verity cannot be enabled, the digest cannot be
+    /// measured, or the hardlink fails (e.g. cross-device).
+    fn try_hardlink_object(
+        &self,
+        src: &std::fs::File,
+        size: u64,
+    ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        use crate::fsverity::enable_verity_with_retry;
+
+        let objects_dir = self.objects_dir()?;
+
+        // Enable fs-verity on the source file in-place.
+        // This is safe because the caller (bootc/containers-storage) owns the
+        // source files and they are immutable image data.
+        // AlreadyEnabled is fine — the file was already verity-protected.
+        let verity_enabled = match enable_verity_with_retry::<ObjectID>(src) {
+            Ok(()) => true,
+            Err(EnableVerityError::AlreadyEnabled) => true,
+            Err(EnableVerityError::FilesystemNotSupported) if self.insecure => false,
+            Err(e) => {
+                return Err(e).context("enabling verity on source file for hardlink")?;
+            }
+        };
+
+        // Get the object ID from the verity digest (kernel-measured or userspace-computed)
+        let id: ObjectID = if verity_enabled {
+            measure_verity(src).context("measuring verity digest on source file")?
+        } else {
+            // Insecure mode on a filesystem without verity: compute digest in userspace
+            let mut reader = std::io::BufReader::new(
+                src.try_clone()
+                    .context("cloning fd for digest computation")?,
+            );
+            Self::compute_verity_digest(&mut reader)
+                .context("computing verity digest in insecure mode")?
+        };
+
+        // Check if object already exists (dedup)
+        let path = id.to_object_pathname();
+        match statat(objects_dir, &path, AtFlags::empty()) {
+            Ok(stat) if stat.st_size as u64 == size => {
+                return Ok((id, ObjectStoreMethod::AlreadyPresent));
+            }
+            _ => {}
+        }
+
+        // Ensure parent directory exists (e.g. objects/4e/)
+        let parent_dir = id.to_object_dir();
+        let _ = mkdirat(objects_dir, &parent_dir, Mode::from_raw_mode(0o755));
+
+        // Hardlink the source file directly into objects/<hash>.
+        // Use /proc/self/fd/<N> as the source path with AT_SYMLINK_FOLLOW
+        // to avoid requiring CAP_DAC_READ_SEARCH (which AT_EMPTY_PATH needs).
+        match linkat(
+            CWD,
+            proc_self_fd(src),
+            objects_dir,
+            &path,
+            AtFlags::SYMLINK_FOLLOW,
+        ) {
+            Ok(()) => Ok((id, ObjectStoreMethod::Hardlinked)),
+            Err(Errno::EXIST) => Ok((id, ObjectStoreMethod::AlreadyPresent)),
+            Err(e) => Err(e).context("hardlinking source file into objects directory")?,
+        }
+    }
+
     /// Finalize a tmpfile as an object.
     ///
     /// This method should be called from a blocking context (e.g., `spawn_blocking`)
@@ -1101,6 +1302,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         file: File,
         size: u64,
     ) -> Result<(ObjectID, ObjectStoreMethod)> {
+        self.ensure_writable()?;
         let ro_fd =
             reopen_tmpfile_ro(file).context("Re-opening tmpfile as read-only for verity")?;
 
@@ -1287,6 +1489,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// done with everything, call `Repository::sync()`.
     #[context("Ensuring object exists in repository")]
     pub fn ensure_object(&self, data: &[u8]) -> Result<ObjectID> {
+        self.ensure_writable()?;
         let id: ObjectID = compute_verity(data);
         self.store_object_with_id(data, &id)?;
         Ok(id)
@@ -1339,11 +1542,29 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(())
     }
 
+    /// Check that the repository directory is writable.
+    ///
+    /// This is a fast pre-flight check (using `faccessat(2)`) that
+    /// catches read-only mounts and permission issues before starting
+    /// expensive network or I/O work.
+    pub fn ensure_writable(&self) -> Result<()> {
+        accessat(&self.repository, ".", Access::WRITE_OK, AtFlags::empty())
+            .context("Repository is not writable")?;
+        Ok(())
+    }
+
     /// Creates a SplitStreamWriter for writing a split stream.
     /// You should write the data to the returned object and then pass it to .store_stream() to
     /// store the result.
-    pub fn create_stream(self: &Arc<Self>, content_type: u64) -> SplitStreamWriter<ObjectID> {
-        SplitStreamWriter::new(self, content_type)
+    ///
+    /// The writable check is performed here so that callers cannot obtain
+    /// a writer without first verifying the repository is writable.
+    pub fn create_stream(
+        self: &Arc<Self>,
+        content_type: u64,
+    ) -> Result<SplitStreamWriter<ObjectID>> {
+        self.ensure_writable()?;
+        Ok(SplitStreamWriter::new(self, content_type))
     }
 
     fn format_object_path(id: &ObjectID) -> String {
@@ -1393,6 +1614,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
+        self.ensure_writable()?;
         let object_id = writer.done().context("Finalizing split stream writer")?;
 
         // Right now we have:
@@ -1434,6 +1656,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<()> {
+        self.ensure_writable()?;
         self.sync_async().await?;
 
         let stream_path = Self::format_stream_path(content_identifier);
@@ -1460,6 +1683,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         content_identifier: &str,
         reference: Option<&str>,
     ) -> Result<ObjectID> {
+        self.ensure_writable()?;
         let object_id = writer
             .done_async()
             .await
@@ -1504,6 +1728,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// (e.g., `myapp/layer1`), and intermediate directories are created automatically.
     #[context("Naming stream '{content_identifier}' as '{name}'")]
     pub fn name_stream(&self, content_identifier: &str, name: &str) -> Result<()> {
+        self.ensure_writable()?;
         let stream_path = Self::format_stream_path(content_identifier);
         let reference_path = format!("streams/refs/{name}");
         self.symlink(&reference_path, &stream_path)?;
@@ -1532,12 +1757,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         callback: impl FnOnce(&mut SplitStreamWriter<ObjectID>) -> Result<T>,
         reference: Option<&str>,
     ) -> Result<(ObjectID, T)> {
+        self.ensure_writable()?;
         let stream_path = Self::format_stream_path(content_identifier);
 
         let (object_id, extra) = match self.has_stream(content_identifier)? {
             Some(id) => (id, T::default()),
             None => {
-                let mut writer = self.create_stream(content_type);
+                let mut writer = self.create_stream(content_type)?;
                 let extra = callback(&mut writer).context("Writing stream content via callback")?;
                 let id = self.write_stream(writer, content_identifier, reference)?;
                 (id, extra)
@@ -1616,6 +1842,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// This function is not safe for untrusted users.
     #[context("Writing image to repository")]
     pub fn write_image(&self, name: Option<&str>, data: &[u8]) -> Result<ObjectID> {
+        self.ensure_writable()?;
         let object_id = self.ensure_object(data)?;
 
         let object_path = Self::format_object_path(&object_id);
@@ -1640,6 +1867,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// This function is not safe for untrusted users.
     #[context("Importing image '{name}' from reader")]
     pub fn import_image<R: Read>(&self, name: &str, image: &mut R) -> Result<ObjectID> {
+        self.ensure_writable()?;
         let mut data = vec![];
         image
             .read_to_end(&mut data)
@@ -2058,6 +2286,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// An exclusive lock is held for the duration of this operation.
     #[context("Running garbage collection")]
     pub fn gc(&self, additional_roots: &[&str]) -> Result<GcResult> {
+        self.ensure_writable()?;
         flock(&self.repository, FlockOperation::LockExclusive)
             .context("Acquiring exclusive lock for GC")?;
         self.gc_impl(additional_roots, false)
@@ -2869,7 +3098,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
 
@@ -2911,7 +3140,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
 
@@ -2959,7 +3188,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", Some("ref-name"))?;
 
@@ -3011,12 +3240,12 @@ mod tests {
         let obj3_id: Sha512HashValue = compute_verity(&obj3);
         let obj4_id: Sha512HashValue = compute_verity(&obj4);
 
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj2)?;
         writer1.write_external(&obj3)?;
         let _stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.write_external(&obj2)?;
         writer2.write_external(&obj4)?;
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
@@ -3077,11 +3306,11 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj2)?;
         let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.add_named_stream_ref("test-stream1", &stream1_id);
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
 
@@ -3143,11 +3372,11 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj2)?;
         let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.add_named_stream_ref("different-table-name-for-test-stream1", &stream1_id);
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
 
@@ -3213,24 +3442,24 @@ mod tests {
         let obj3_id: Sha512HashValue = compute_verity(&obj3);
         let obj4_id: Sha512HashValue = compute_verity(&obj4);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let stream1_id = repo.write_stream(writer, "test-stream1", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj3)?;
         let stream2_id = repo.write_stream(writer, "test-stream2", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj4)?;
         let stream3_id = repo.write_stream(writer, "test-stream3", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.add_named_stream_ref("test-stream1", &stream1_id);
         writer.add_named_stream_ref("test-stream2", &stream2_id);
         let _ref_stream1_id = repo.write_stream(writer, "ref-stream1", None)?;
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.add_named_stream_ref("test-stream1", &stream1_id);
         writer.add_named_stream_ref("test-stream3", &stream3_id);
         let _ref_stream2_id = repo.write_stream(writer, "ref-stream2", None)?;
@@ -3578,6 +3807,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_ensure_object_from_file() -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let test_data = generate_test_data(64 * 1024, 0xBE);
+        let mut temp_file = crate::test::tempfile();
+        temp_file.write_all(&test_data)?;
+        temp_file.seek(SeekFrom::Start(0))?;
+
+        // First store should return Copied or Reflinked (depending on fs)
+        let (object_id, method) =
+            repo.ensure_object_from_file(&temp_file, test_data.len() as u64)?;
+        assert_ne!(method, ObjectStoreMethod::AlreadyPresent);
+        assert!(test_object_exists(&tmp, &object_id)?);
+
+        // Read back and verify contents match
+        let stored_data = repo.read_object(&object_id)?;
+        assert_eq!(stored_data, test_data);
+
+        // Second store of same data should return AlreadyPresent
+        temp_file.seek(SeekFrom::Start(0))?;
+        let (object_id_2, method_2) =
+            repo.ensure_object_from_file(&temp_file, test_data.len() as u64)?;
+        assert_eq!(object_id, object_id_2);
+        assert_eq!(method_2, ObjectStoreMethod::AlreadyPresent);
+
+        Ok(())
+    }
+
     // ==================== Fsck Tests ====================
 
     #[tokio::test]
@@ -3611,7 +3872,7 @@ mod tests {
         let _obj1_id = repo.ensure_object(&obj1)?;
         let _obj2_id: Sha512HashValue = compute_verity(&obj2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj2)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;
@@ -3676,7 +3937,7 @@ mod tests {
         let obj = generate_test_data(64 * 1024, 0xEA);
         let _obj_verity: Sha512HashValue = compute_verity(&obj);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;
@@ -3710,7 +3971,7 @@ mod tests {
         // Create a stream with an external reference to the object.
         // write_external calls ensure_object internally, so the object
         // will exist.
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;
@@ -3979,12 +4240,12 @@ mod tests {
         let obj = generate_test_data(64 * 1024, 0xEA);
 
         // Create stream1 that references obj
-        let mut writer1 = repo.create_stream(0);
+        let mut writer1 = repo.create_stream(0)?;
         writer1.write_external(&obj)?;
         let stream1_id = repo.write_stream(writer1, "test-stream1", None)?;
 
         // Create stream2 with a named ref to stream1
-        let mut writer2 = repo.create_stream(0);
+        let mut writer2 = repo.create_stream(0)?;
         writer2.add_named_stream_ref("test-stream1", &stream1_id);
         let _stream2_id = repo.write_stream(writer2, "test-stream2", None)?;
         repo.sync()?;
@@ -4026,7 +4287,7 @@ mod tests {
 
         let obj = generate_test_data(64 * 1024, 0xEA);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         // write_stream with reference creates a ref symlink
         let _stream_id = repo.write_stream(writer, "test-stream", Some("my-ref"))?;
@@ -4049,7 +4310,7 @@ mod tests {
 
         let obj = generate_test_data(64 * 1024, 0xEA);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&obj)?;
         let _stream_id = repo.write_stream(writer, "test-stream", None)?;
         repo.sync()?;
@@ -4311,5 +4572,29 @@ mod tests {
             meta.check_compatible::<Sha512HashValue>().unwrap(),
             FeatureCheck::ReadWrite
         );
+    }
+
+    #[test]
+    fn test_object_store_method_variants() {
+        // Verify all variants exist and are distinct
+        let methods = [
+            ObjectStoreMethod::Reflinked,
+            ObjectStoreMethod::Hardlinked,
+            ObjectStoreMethod::Copied,
+            ObjectStoreMethod::AlreadyPresent,
+        ];
+
+        for (i, a) in methods.iter().enumerate() {
+            for (j, b) in methods.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+
+        // Verify Debug impl works
+        assert_eq!(format!("{:?}", ObjectStoreMethod::Hardlinked), "Hardlinked");
     }
 }

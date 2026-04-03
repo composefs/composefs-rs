@@ -627,7 +627,7 @@ pub fn write_manifest<ObjectID: FsVerityHashValue>(
         "Manifest digest mismatch: expected {manifest_digest}, got {computed}"
     );
 
-    let mut stream = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE);
+    let mut stream = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE)?;
 
     let config_key = format!("config:{}", manifest.config().digest());
     stream.add_named_stream_ref(&config_key, config_verity);
@@ -667,7 +667,7 @@ pub(crate) fn rewrite_manifest<ObjectID: FsVerityHashValue>(
         manifest.config().digest().to_string()
     };
 
-    let mut stream = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE);
+    let mut stream = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE)?;
 
     let config_key = format!("config:{config_digest}");
     stream.add_named_stream_ref(&config_key, config_verity);
@@ -781,7 +781,7 @@ pub fn write_blob<ObjectID: FsVerityHashValue>(
         return Ok((digest, verity));
     }
 
-    let mut stream = repo.create_stream(OCI_BLOB_CONTENT_TYPE);
+    let mut stream = repo.create_stream(OCI_BLOB_CONTENT_TYPE)?;
     stream.write_external(data)?;
     let verity = repo.write_stream(stream, &content_id, None)?;
 
@@ -1626,7 +1626,9 @@ mod test {
         let layer_data = format!("fake-layer-{arch}").into_bytes();
         let layer_digest = hash_sha256(&layer_data);
 
-        let mut layer_stream = repo.create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE);
+        let mut layer_stream = repo
+            .create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE)
+            .unwrap();
         layer_stream.write_external(&layer_data).unwrap();
         let layer_verity = repo
             .write_stream(layer_stream, &crate::layer_identifier(&layer_digest), None)
@@ -1651,7 +1653,7 @@ mod test {
         let config_json = config.to_string().unwrap();
         let config_digest = hash_sha256(config_json.as_bytes());
 
-        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
         config_stream.add_named_stream_ref(layer_digest.as_ref(), &layer_verity);
         config_stream
             .write_external(config_json.as_bytes())
@@ -1927,7 +1929,7 @@ mod test {
         let empty_config = b"{}";
         let config_digest = hash_sha256(empty_config);
 
-        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
         config_stream.write_external(empty_config).unwrap();
         let config_verity = repo
             .write_stream(
@@ -2021,7 +2023,9 @@ mod test {
         // Store the raw layer as an object with external ref splitstream
         let blob_object_id = repo.ensure_object(sbom_data).unwrap();
         let layer_content_id = crate::layer_identifier(&layer_digest);
-        let mut layer_stream = repo.create_stream(crate::skopeo::OCI_BLOB_CONTENT_TYPE);
+        let mut layer_stream = repo
+            .create_stream(crate::skopeo::OCI_BLOB_CONTENT_TYPE)
+            .unwrap();
         layer_stream.add_external_size(sbom_data.len() as u64);
         layer_stream
             .write_reference(blob_object_id.clone())
@@ -2041,7 +2045,7 @@ mod test {
         // Store the config — for artifacts we still write it as a config
         // splitstream, but it contains no diff_ids-derived named refs.
         // Instead, the layer refs come from the manifest layer digests.
-        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
         config_stream.write_external(empty_config).unwrap();
         let config_verity = repo
             .write_stream(
@@ -2150,7 +2154,9 @@ mod test {
         let object_id = repo.ensure_object(sbom_data).unwrap();
 
         let content_id = crate::layer_identifier(&diff_id);
-        let mut stream = repo.create_stream(crate::skopeo::OCI_BLOB_CONTENT_TYPE);
+        let mut stream = repo
+            .create_stream(crate::skopeo::OCI_BLOB_CONTENT_TYPE)
+            .unwrap();
         stream.add_external_size(sbom_data.len() as u64);
         stream.write_reference(object_id.clone()).unwrap();
         let stream_verity = repo.write_stream(stream, &content_id, None).unwrap();
@@ -2192,7 +2198,9 @@ mod test {
         let blob_object_id = repo.ensure_object(sbom_data).unwrap();
 
         let layer_content_id = crate::layer_identifier(&diff_id);
-        let mut layer_stream = repo.create_stream(crate::skopeo::OCI_BLOB_CONTENT_TYPE);
+        let mut layer_stream = repo
+            .create_stream(crate::skopeo::OCI_BLOB_CONTENT_TYPE)
+            .unwrap();
         layer_stream.add_external_size(sbom_data.len() as u64);
         layer_stream
             .write_reference(blob_object_id.clone())
@@ -2203,7 +2211,7 @@ mod test {
 
         let config_bytes = b"{}";
         let config_digest = hash_sha256(config_bytes);
-        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
         config_stream.write_external(config_bytes).unwrap();
         let config_verity = repo
             .write_stream(
@@ -2617,7 +2625,9 @@ mod test {
         let shared_layer_data = b"shared-base-layer-content";
         let shared_layer_digest = hash_sha256(shared_layer_data);
 
-        let mut shared_layer_stream = repo.create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE);
+        let mut shared_layer_stream = repo
+            .create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE)
+            .unwrap();
         shared_layer_stream
             .write_external(shared_layer_data)
             .unwrap();
@@ -2655,7 +2665,7 @@ mod test {
             let config_json = config.to_string().unwrap();
             let config_digest = hash_sha256(config_json.as_bytes());
 
-            let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+            let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
             config_stream.add_named_stream_ref(shared_layer_digest.as_ref(), &shared_layer_verity);
             config_stream
                 .write_external(config_json.as_bytes())
@@ -2818,7 +2828,7 @@ mod test {
 
         let empty_config = b"{}";
         let config_digest = hash_sha256(empty_config);
-        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
         config_stream.write_external(empty_config).unwrap();
         let config_verity = repo
             .write_stream(
@@ -2899,7 +2909,7 @@ mod test {
         let empty_config = b"{}";
         let config_digest = hash_sha256(empty_config);
 
-        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
         config_stream.write_external(empty_config).unwrap();
         let config_verity = repo
             .write_stream(
@@ -3381,7 +3391,9 @@ mod test {
         let layer_data = b"fake-layer-data";
         let layer_digest = hash_sha256(layer_data);
 
-        let mut layer_stream = repo.create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE);
+        let mut layer_stream = repo
+            .create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE)
+            .unwrap();
         layer_stream.write_external(layer_data).unwrap();
         let layer_verity = repo
             .write_stream(layer_stream, &crate::layer_identifier(&layer_digest), None)
@@ -3404,7 +3416,7 @@ mod test {
         let config_digest = hash_sha256(config_json.as_bytes());
 
         // Store config normally
-        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
         config_stream.add_named_stream_ref(layer_digest.as_ref(), &layer_verity);
         config_stream
             .write_external(config_json.as_bytes())
@@ -3442,7 +3454,7 @@ mod test {
 
         // Store manifest WITHOUT config named ref — this is the bug we test
         let manifest_id = manifest_identifier(&manifest_digest);
-        let mut manifest_stream = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE);
+        let mut manifest_stream = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE).unwrap();
         // Deliberately omit: manifest_stream.add_named_stream_ref(...)
         manifest_stream
             .write_external(manifest_json.as_bytes())
@@ -3486,7 +3498,7 @@ mod test {
 
         let empty_config = b"{}";
         let config_digest = hash_sha256(empty_config);
-        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
         config_stream.write_external(empty_config).unwrap();
         let config_verity = repo
             .write_stream(
@@ -3554,7 +3566,7 @@ mod test {
 
         let empty_config = b"{}";
         let config_digest = hash_sha256(empty_config);
-        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
         config_stream.write_external(empty_config).unwrap();
         let config_verity = repo
             .write_stream(
@@ -3680,7 +3692,9 @@ mod test {
         let layer_data = b"layer-for-missing-ref-test";
         let layer_digest = hash_sha256(layer_data);
 
-        let mut layer_stream = repo.create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE);
+        let mut layer_stream = repo
+            .create_stream(crate::skopeo::TAR_LAYER_CONTENT_TYPE)
+            .unwrap();
         layer_stream.write_external(layer_data).unwrap();
         let layer_verity = repo
             .write_stream(layer_stream, &crate::layer_identifier(&layer_digest), None)
@@ -3703,7 +3717,7 @@ mod test {
         let config_digest = hash_sha256(config_json.as_bytes());
 
         // Store config WITHOUT the layer named ref — this is the bug
-        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+        let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
         // Deliberately omit: config_stream.add_named_stream_ref(&layer_digest, &layer_verity);
         config_stream
             .write_external(config_json.as_bytes())

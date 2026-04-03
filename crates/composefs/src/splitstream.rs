@@ -937,7 +937,7 @@ mod tests {
     use super::*;
     use crate::fsverity::{Sha256HashValue, compute_verity};
     use crate::test::tempdir;
-    use rustix::fs::{CWD, Mode, mkdirat};
+    use rustix::fs::CWD;
     use std::io::Cursor;
     use std::path::Path;
 
@@ -1014,7 +1014,7 @@ mod tests {
         let inline1 = generate_test_data(32, 0xAB);
         let inline2 = generate_test_data(48, 0xCD);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_inline(&inline1);
         writer.write_inline(&inline2);
         let stream_id = repo.write_stream(writer, "test-inline", None)?;
@@ -1041,7 +1041,7 @@ mod tests {
         // Compute expected fs-verity digest for this content
         let expected_digest: Sha256HashValue = compute_verity(&large_content);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&large_content)?;
         let stream_id = repo.write_stream(writer, "test-external", None)?;
 
@@ -1081,7 +1081,7 @@ mod tests {
         // Compute expected digest for the external content
         let expected_digest: Sha256HashValue = compute_verity(&file_content);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_inline(&header);
         writer.write_external(&file_content)?;
         writer.write_inline(&trailer);
@@ -1126,7 +1126,7 @@ mod tests {
         let expected_digest2: Sha256HashValue = compute_verity(&file2);
         let expected_digest3: Sha256HashValue = compute_verity(&file3);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&file1)?;
         writer.write_inline(&separator);
         writer.write_external(&file2)?;
@@ -1175,7 +1175,7 @@ mod tests {
         let repeated_digest: Sha256HashValue = compute_verity(&repeated_chunk);
         let unique_digest: Sha256HashValue = compute_verity(&unique_chunk);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_external(&repeated_chunk)?;
         writer.write_external(&unique_chunk)?;
         writer.write_external(&repeated_chunk)?; // duplicate
@@ -1224,7 +1224,7 @@ mod tests {
         let expected_digest1: Sha256HashValue = compute_verity(&chunk1);
         let expected_digest2: Sha256HashValue = compute_verity(&chunk2);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_inline(&inline_data);
         writer.write_external(&chunk1)?;
         writer.write_external(&chunk2)?;
@@ -1263,7 +1263,7 @@ mod tests {
             // Compute expected digest
             let expected_digest: Sha256HashValue = compute_verity(&data);
 
-            let mut writer = repo.create_stream(0);
+            let mut writer = repo.create_stream(0)?;
             writer.write_external(&data)?;
             let stream_id = repo.write_stream(writer, "test-boundary", None)?;
 
@@ -1301,7 +1301,7 @@ mod tests {
         let repo = create_test_repo(&tmp.path().join("repo"))?;
         let content_type = 0xDEADBEEF_u64;
 
-        let mut writer = repo.create_stream(content_type);
+        let mut writer = repo.create_stream(content_type)?;
         writer.write_inline(b"test data");
         let stream_id = repo.write_stream(writer, "test-ctype", None)?;
 
@@ -1319,7 +1319,7 @@ mod tests {
         let inline_data = generate_test_data(100, 0x01);
         let external_data = generate_test_data(1000, 0x02);
 
-        let mut writer = repo.create_stream(0);
+        let mut writer = repo.create_stream(0)?;
         writer.write_inline(&inline_data);
         writer.write_external(&external_data)?;
         let stream_id = repo.write_stream(writer, "test-size", None)?;
