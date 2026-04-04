@@ -238,12 +238,20 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                         stats.objects_copied += 1;
                         stats.bytes_copied += size;
                     }
+                    ObjectStoreMethod::Reflinked => {
+                        stats.objects_reflinked += 1;
+                        stats.bytes_reflinked += size;
+                    }
+                    ObjectStoreMethod::Hardlinked => {
+                        stats.objects_hardlinked += 1;
+                        stats.bytes_hardlinked += size;
+                    }
                     ObjectStoreMethod::AlreadyPresent => {
                         stats.objects_already_present += 1;
                     }
                 }
 
-                let mut stream = self.repo.create_stream(OCI_BLOB_CONTENT_TYPE);
+                let mut stream = self.repo.create_stream(OCI_BLOB_CONTENT_TYPE)?;
                 stream.add_external_size(size);
                 stream.write_reference(object_id)?;
                 // write_stream handles both object storage and stream
@@ -379,7 +387,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 .collect::<Result<_, _>>()?;
             results.sort_by_key(|(idx, _, _, _)| *idx);
 
-            let mut splitstream = self.repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+            let mut splitstream = self.repo.create_stream(OCI_CONFIG_CONTENT_TYPE)?;
             let mut layer_refs = std::collections::HashMap::new();
             let mut stats = ImportStats::default();
             for (_, diff_id, verity, layer_stats) in results {
@@ -425,7 +433,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             self.progress
                 .println(format!("Storing manifest {manifest_digest}"))?;
 
-            let mut splitstream = self.repo.create_stream(OCI_MANIFEST_CONTENT_TYPE);
+            let mut splitstream = self.repo.create_stream(OCI_MANIFEST_CONTENT_TYPE)?;
 
             let config_key = format!("config:{}", config_descriptor.digest());
             splitstream.add_named_stream_ref(&config_key, &config_verity);
@@ -465,6 +473,9 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
+    // Fail fast if the repository is read-only, before starting any
+    // network or image-proxy work.
+    repo.ensure_writable()?;
     let op = Arc::new(ImageOp::new(repo, imgref, img_proxy_config).await?);
     let (result, stats) = op
         .pull()
@@ -484,6 +495,52 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
         // Not a container image (artifact) — tag the manifest directly
         if let Some(name) = reference {
             tag_image(repo, &result.manifest_digest, name)?;
+        }
+    }
+
+    // TODO: When pulling from an OCI layout that contains referrer/signature
+    // artifacts (composefs signature artifacts), import them too. Currently
+    // only the image manifest, config, and layers are pulled, which breaks
+    // the signature round-trip: export with `--signatures` -> re-import ->
+    // verify fails because no artifacts exist in the new repo.
+
+    // Supplement the skopeo-based pull by fetching referrer artifacts
+    // (composefs signature artifacts) directly from the registry via
+    // oci-client. Skopeo doesn't support the OCI Referrers API, so
+    // without this, --require-signature always fails after pulling.
+    #[cfg(feature = "oci-client")]
+    {
+        // Only attempt for registry transports (not local sources)
+        if matches!(op.transport, Transport::Registry) {
+            // The local manifest digest may differ from the registry digest
+            // because ensure_oci_composefs_erofs rewrites the config+manifest.
+            // We need the registry digest for the referrers API query, and
+            // the local digest for registering the referrer relationship.
+            let local_digest = if let Some(name) = reference {
+                crate::oci_image::resolve_ref(repo, name)
+                    .map(|(d, _)| d)
+                    .unwrap_or_else(|_| result.manifest_digest.clone())
+            } else {
+                result.manifest_digest.clone()
+            };
+            match crate::referrers::fetch_and_import_referrers(
+                repo,
+                imgref,
+                &result.manifest_digest,
+                &local_digest,
+            )
+            .await
+            {
+                Ok(count) => {
+                    if count > 0 {
+                        log::info!("Imported {count} referrer artifact(s) from registry");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to fetch referrer artifacts: {e:#}");
+                    // Non-fatal: the image is still usable without signatures
+                }
+            }
         }
     }
 

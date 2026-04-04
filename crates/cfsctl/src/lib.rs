@@ -102,6 +102,9 @@ pub struct App {
     #[clap(long)]
     require_verity: bool,
 
+    // TODO: Add a `--verbose` flag to control debug output. Currently,
+    // errors like "Layer has incorrect checksum" give no context about
+    // which layer failed or what the expected vs actual digests were.
     #[clap(subcommand)]
     cmd: Command,
 }
@@ -189,6 +192,11 @@ struct OCIConfigOptions {
     config_verity: Option<String>,
 }
 
+// TODO: Inconsistent argument naming across OCI subcommands. Some use
+// `image: String` (Seal, Sign, Verify, Push), some `name: String` (Mount,
+// LsLayer), and others use `config_name` via OCIConfigOptions (Dump,
+// CreateImage). They also differ in whether they accept tag names,
+// manifest digests, or both. Standardize on a consistent convention.
 #[cfg(feature = "oci")]
 #[derive(Debug, Subcommand)]
 enum OciCommand {
@@ -224,6 +232,12 @@ enum OciCommand {
         /// Also generate a bootable EROFS image from the pulled OCI image
         #[arg(long)]
         bootable: bool,
+        /// Require a valid signature artifact for the pulled image
+        #[clap(long)]
+        require_signature: bool,
+        /// Path to PEM-encoded trusted certificate for signature verification
+        #[clap(long)]
+        trust_cert: Option<PathBuf>,
     },
     /// List all tagged OCI images in the repository
     #[clap(name = "images")]
@@ -289,6 +303,12 @@ enum OciCommand {
         /// Mount the bootable variant instead of the regular EROFS image
         #[arg(long)]
         bootable: bool,
+        /// Require a valid signature artifact for the image before mounting
+        #[clap(long)]
+        require_signature: bool,
+        /// Path to PEM-encoded trusted certificate for signature verification
+        #[clap(long)]
+        trust_cert: Option<PathBuf>,
     },
     /// Compute the composefs image ID of a stored OCI image's rootfs
     ///
@@ -298,6 +318,12 @@ enum OciCommand {
     ComputeId {
         #[clap(flatten)]
         config_opts: OCIConfigFilesystemOptions,
+    },
+    /// Seal a stored OCI image by creating a cloned manifest with embedded verity digest (a.k.a. composefs image object ID)
+    /// in the repo, then prints the stream and verity digest of the new sealed manifest
+    Seal {
+        /// Image reference (tag name or manifest digest)
+        image: String,
     },
 
     /// Create the composefs image of the rootfs of a stored OCI image, perform bootable transformation, commit it to the repo,
@@ -328,6 +354,52 @@ enum OciCommand {
         /// Output results as JSON (always exits 0 unless the check itself fails)
         #[clap(long)]
         json: bool,
+    },
+    /// Create a composefs PKCS#7 signature artifact for an image
+    Sign {
+        /// Image reference (tag name)
+        image: String,
+        /// Path to PEM-encoded signing certificate
+        #[clap(long)]
+        cert: PathBuf,
+        /// Path to PEM-encoded private key
+        #[clap(long)]
+        key: PathBuf,
+    },
+    /// Verify composefs signature artifacts for an image
+    Verify {
+        /// Image reference (tag name)
+        image: String,
+        /// Path to PEM-encoded trusted certificate for verification
+        #[clap(long)]
+        cert: Option<PathBuf>,
+    },
+    /// Export an OCI image to an OCI layout directory
+    Push {
+        /// Image reference (tag name)
+        image: String,
+        /// Destination OCI layout path (optionally prefixed with oci:)
+        destination: String,
+        /// Also export signature/composefs artifacts
+        #[clap(long)]
+        signatures: bool,
+    },
+    /// Export signature artifacts for an image to an OCI layout directory
+    ExportSignatures {
+        /// Image reference (tag name)
+        image: String,
+        /// Path to the OCI layout directory (must already exist)
+        oci_layout_path: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyringCommand {
+    /// Add a CA certificate to the kernel's .fs-verity keyring.
+    /// Requires CAP_SYS_ADMIN (root).
+    AddCert {
+        /// Path to a PEM-encoded X.509 certificate file
+        cert: PathBuf,
     },
 }
 
@@ -451,8 +523,33 @@ enum Command {
         #[clap(long)]
         json: bool,
     },
+    /// Commands for managing the kernel keyring (requires root)
+    Keyring {
+        #[clap(subcommand)]
+        cmd: KeyringCommand,
+    },
     #[cfg(feature = "http")]
     Fetch { url: String, name: String },
+}
+
+fn run_keyring_cmd(cmd: &KeyringCommand) -> Result<()> {
+    match cmd {
+        // TODO: Check for CAP_SYS_ADMIN before attempting to inject
+        // the certificate. Currently the kernel returns an opaque error.
+        // A clear "keyring add-cert requires root privileges" message
+        // would be much more helpful.
+        KeyringCommand::AddCert { cert } => {
+            let cert_pem = std::fs::read(cert).context("failed to read certificate file")?;
+            composefs::fsverity::inject_fsverity_cert(&cert_pem)?;
+            println!("Certificate added to .fs-verity keyring");
+        }
+    }
+    Ok(())
+}
+
+/// Run the CLI using `std::env::args()`, as if invoked from the command line.
+pub async fn run_from_args() -> Result<()> {
+    run_app(App::parse()).await
 }
 
 /// Acts as a proxy for the `cfsctl` CLI by executing the CLI logic programmatically
@@ -468,7 +565,6 @@ where
     let args = App::parse_from(
         std::iter::once(OsString::from("cfsctl")).chain(args.into_iter().map(Into::into)),
     );
-
     run_app(args).await
 }
 
@@ -550,8 +646,13 @@ fn resolve_hash_type(repo_path: &Path, cli_hash: Option<HashType>) -> Result<Has
     Ok(detected)
 }
 
-/// Top-level dispatch: handle init specially, otherwise open repo and run.
+/// Top-level dispatch: handle init and keyring specially, otherwise open repo and run.
 pub async fn run_app(args: App) -> Result<()> {
+    // Handle commands that don't need a repository first
+    if let Command::Keyring { ref cmd } = args.cmd {
+        return run_keyring_cmd(cmd);
+    }
+
     // Init is handled before opening a repo since it creates one
     if let Command::Init {
         ref algorithm,
@@ -774,6 +875,126 @@ fn dump_file_impl(
     Ok(())
 }
 
+/// Verify that a valid composefs signature artifact exists for the given image tag.
+///
+/// Looks up the image's referrer artifacts, parses any composefs signature
+/// artifacts, recomputes the expected per-layer and merged EROFS digests, and
+/// verifies the PKCS#7 signatures against the trusted certificate.
+#[cfg(feature = "oci")]
+fn verify_image_signatures<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    tag_name: &str,
+    cert_pem: &[u8],
+) -> Result<usize> {
+    let verifier = composefs_oci::signing::FsVeritySignatureVerifier::from_pem(cert_pem)?;
+
+    let img = composefs_oci::OciImage::open_ref(repo, tag_name)?;
+    let manifest_digest = img.manifest_digest();
+    let config_digest = img.config_digest();
+
+    let referrers = composefs_oci::oci_image::list_referrers(repo, manifest_digest)?;
+
+    if referrers.is_empty() {
+        anyhow::bail!(
+            "no signature artifacts found for {tag_name}; \
+             cannot satisfy --require-signature"
+        );
+    }
+
+    let per_layer_digests = composefs_oci::compute_per_layer_digests(repo, config_digest, None)?;
+    let merged_digest: ObjectID = composefs_oci::compute_merged_digest(repo, config_digest, None)?;
+    let merged_hex = merged_digest.to_hex();
+    let algorithm = ObjectID::ALGORITHM;
+
+    let mut found_composefs = false;
+    let mut verified_count = 0usize;
+
+    'artifacts: for (artifact_digest, artifact_verity) in &referrers {
+        let artifact_image =
+            composefs_oci::OciImage::open(repo, artifact_digest, Some(artifact_verity))
+                .with_context(|| format!("opening referrer {artifact_digest}"))?;
+
+        match artifact_image.manifest().artifact_type() {
+            Some(oci_spec::image::MediaType::Other(t))
+                if t == composefs_oci::signature::ARTIFACT_TYPE => {}
+            _ => continue,
+        }
+
+        found_composefs = true;
+        let parsed = composefs_oci::signature::parse_signature_artifact(artifact_image.manifest())
+            .with_context(|| format!("parsing artifact {artifact_digest}"))?;
+
+        let layer_descriptors = artifact_image.layer_descriptors();
+        let mut layer_idx = 0usize;
+        let sig_layer_offset = parsed.erofs_entries.len();
+        let mut this_artifact_count = 0usize;
+
+        for (entry_idx, entry) in parsed.signature_entries.iter().enumerate() {
+            let expected_hex = match entry.sig_type {
+                composefs_oci::signature::SignatureType::Layer => {
+                    let expected = per_layer_digests.get(layer_idx).map(|d| d.to_hex());
+                    layer_idx += 1;
+                    expected
+                }
+                composefs_oci::signature::SignatureType::Merged => Some(merged_hex.clone()),
+                _ => continue,
+            };
+
+            let Some(expected) = expected_hex else {
+                continue 'artifacts; // wrong shape, try next artifact
+            };
+
+            if expected != entry.digest {
+                continue 'artifacts; // digest mismatch, try next artifact
+            }
+
+            let layer_desc = layer_descriptors
+                .get(sig_layer_offset + entry_idx)
+                .context("layer descriptor out of bounds")?;
+            let blob_digest = layer_desc.digest();
+
+            if layer_desc.size() == 0 {
+                continue 'artifacts;
+            }
+
+            let blob_verity = artifact_image
+                .layer_verity(blob_digest.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("verity not found for {blob_digest}"))?;
+            let signature_blob =
+                composefs_oci::oci_image::open_blob(repo, blob_digest, Some(blob_verity))?;
+
+            let digest_bytes = hex::decode(&entry.digest).context("invalid hex digest")?;
+
+            if verifier
+                .verify_raw(&signature_blob, algorithm.kernel_id(), &digest_bytes)
+                .is_err()
+            {
+                continue 'artifacts; // not signed with our cert, try next
+            }
+            this_artifact_count += 1;
+        }
+
+        // This artifact fully verified
+        verified_count += this_artifact_count;
+    }
+
+    if !found_composefs {
+        anyhow::bail!(
+            "no composefs signature artifacts found for {tag_name}; \
+             cannot satisfy --require-signature"
+        );
+    }
+
+    if verified_count == 0 {
+        anyhow::bail!(
+            "no signature artifacts verified with the given certificate for {tag_name}; \
+             cannot satisfy --require-signature"
+        );
+    }
+
+    Ok(verified_count)
+}
+
 /// Run with cmd
 pub async fn run_cmd_with_repo<ObjectID>(repo: Repository<ObjectID>, args: App) -> Result<()>
 where
@@ -821,7 +1042,13 @@ where
                 ref image,
                 ref mountpoint,
                 bootable,
+                require_signature,
+                ref trust_cert,
             } => {
+                if require_signature && trust_cert.is_none() {
+                    anyhow::bail!("--require-signature requires --trust-cert");
+                }
+
                 let img = if image.starts_with("sha256:") {
                     let digest: composefs_oci::OciDigest =
                         image.parse().context("Parsing manifest digest")?;
@@ -829,6 +1056,17 @@ where
                 } else {
                     composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
                 };
+
+                if require_signature {
+                    let cert_path = trust_cert.as_ref().unwrap();
+                    let cert_pem = std::fs::read(cert_path)
+                        .with_context(|| format!("failed to read certificate: {cert_path:?}"))?;
+                    let verified_count = verify_image_signatures(&repo, image, &cert_pem)?;
+                    println!(
+                        "Signature verification passed ({verified_count} signatures verified)"
+                    );
+                }
+
                 let erofs_id = if bootable {
                     match img.boot_image_ref() {
                         Some(id) => id,
@@ -855,29 +1093,63 @@ where
                 ref image,
                 name,
                 bootable,
+                require_signature,
+                ref trust_cert,
             } => {
+                if require_signature && trust_cert.is_none() {
+                    anyhow::bail!("--require-signature requires --trust-cert");
+                }
+
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
                 let repo_arc = Arc::new(repo);
-                let (result, stats) =
-                    composefs_oci::pull_image(&repo_arc, image, Some(tag_name), None).await?;
 
-                println!("manifest {}", result.manifest_digest);
-                println!("config   {}", result.config_digest);
-                println!("verity   {}", result.manifest_verity.to_hex());
-                println!("tagged   {tag_name}");
-                println!(
-                    "objects  {} copied, {} already present, {} bytes copied, {} bytes inlined",
-                    stats.objects_copied,
-                    stats.objects_already_present,
-                    stats.bytes_copied,
-                    stats.bytes_inlined,
-                );
+                // Check if this is a containers-storage import
+                #[cfg(feature = "containers-storage")]
+                let is_cstor = composefs_oci::cstor::parse_containers_storage_ref(image).is_some();
+                #[cfg(not(feature = "containers-storage"))]
+                let is_cstor = false;
 
-                if bootable {
-                    let image_verity =
-                        composefs_oci::generate_boot_image(&repo_arc, &result.manifest_digest)?;
-                    println!("Boot image: {}", image_verity.to_hex());
+                if is_cstor {
+                    if bootable {
+                        anyhow::bail!(
+                            "--bootable is not yet supported for containers-storage imports"
+                        );
+                    }
+                    // Use unified pull which handles containers-storage routing
+                    let result =
+                        composefs_oci::pull(&repo_arc, image, Some(tag_name), None, false).await?;
+
+                    println!("config   {}", result.config_digest);
+                    println!("verity   {}", result.config_verity.to_hex());
+                    println!("tagged   {tag_name}");
+                    println!("objects  {}", result.stats);
+                } else {
+                    // Use the normal skopeo-based pull which produces full manifest info
+                    let (result, stats) =
+                        composefs_oci::pull_image(&repo_arc, image, Some(tag_name), None).await?;
+
+                    println!("manifest {}", result.manifest_digest);
+                    println!("config   {}", result.config_digest);
+                    println!("verity   {}", result.manifest_verity.to_hex());
+                    println!("tagged   {tag_name}");
+                    println!("objects  {}", stats);
+
+                    if bootable {
+                        let image_verity =
+                            composefs_oci::generate_boot_image(&repo_arc, &result.manifest_digest)?;
+                        println!("Boot image: {}", image_verity.to_hex());
+                    }
+                }
+
+                if require_signature {
+                    let cert_path = trust_cert.as_ref().unwrap();
+                    let cert_pem = std::fs::read(cert_path)
+                        .with_context(|| format!("failed to read certificate: {cert_path:?}"))?;
+                    let verified_count = verify_image_signatures(&repo_arc, tag_name, &cert_pem)?;
+                    println!(
+                        "Signature verification passed ({verified_count} signatures verified)"
+                    );
                 }
             }
             OciCommand::ListImages { json } => {
@@ -939,6 +1211,10 @@ where
                     println!("{}", serde_json::to_string_pretty(&output)?);
                 }
             }
+            // TODO: This only accepts a raw manifest digest (sha256:...),
+            // not a tag name. If a user provides a tag name as the source,
+            // tag_image creates a broken symlink. Consider resolving tag
+            // names to digests here, like Seal/Sign/Verify do.
             OciCommand::Tag {
                 ref manifest_digest,
                 ref name,
@@ -972,7 +1248,11 @@ where
                     composefs_oci::layer_tar(&repo, layer, &mut out)?;
                 }
             }
-
+            OciCommand::Seal { ref image } => {
+                let repo = Arc::new(repo);
+                let manifest_digest = composefs_oci::seal_image(&repo, image)?;
+                println!("Sealed {image} -> {manifest_digest}");
+            }
             OciCommand::PrepareBoot {
                 config_opts:
                     OCIConfigOptions {
@@ -1040,6 +1320,327 @@ where
                     if !result.is_ok() {
                         anyhow::bail!("OCI integrity check failed");
                     }
+                }
+            }
+            OciCommand::Sign {
+                ref image,
+                ref cert,
+                ref key,
+            } => {
+                let repo = Arc::new(repo);
+                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
+
+                anyhow::ensure!(
+                    img.is_container_image(),
+                    "can only sign container images, not artifacts"
+                );
+
+                // TODO: Warn if the image hasn't been sealed yet. Signing an
+                // unsealed image creates a valid signature, but the image can't
+                // be mounted (mount requires a sealed config). This is almost
+                // certainly a user mistake.
+
+                let config_digest = img.config_digest();
+
+                let algorithm = match ObjectID::ALGORITHM.kernel_id() {
+                    1 => composefs::fsverity::algorithm::SHA256_12,
+                    2 => composefs::fsverity::algorithm::SHA512_12,
+                    other => anyhow::bail!("unsupported hash algorithm {other}"),
+                };
+
+                let per_layer_images =
+                    composefs_oci::generate_per_layer_images(&repo, config_digest, None)?;
+
+                let (merged_erofs, merged_digest) =
+                    composefs_oci::generate_merged_image(&repo, config_digest, None)?;
+
+                let cert_pem = std::fs::read(cert).context("failed to read certificate file")?;
+                let key_pem = std::fs::read(key).context("failed to read private key file")?;
+                let signing_key =
+                    composefs_oci::signing::FsVeritySigningKey::from_pem(&cert_pem, &key_pem)?;
+
+                let subject = oci_spec::image::DescriptorBuilder::default()
+                    .media_type(oci_spec::image::MediaType::ImageManifest)
+                    .digest(img.manifest_digest().clone())
+                    .size(img.manifest().to_string()?.len() as u64)
+                    .build()
+                    .context("building subject descriptor")?;
+
+                let mut builder =
+                    composefs_oci::signature::SignatureArtifactBuilder::new(algorithm, subject);
+
+                // Add EROFS layers first (per erofs-alongside spec)
+                let erofs_data_and_digests: Vec<(Vec<u8>, String)> = per_layer_images
+                    .iter()
+                    .map(|(data, digest)| (data.to_vec(), digest.to_hex()))
+                    .collect();
+                builder.add_erofs_layers(&erofs_data_and_digests)?;
+
+                builder.add_erofs_entry(composefs_oci::signature::ErofsEntry {
+                    erofs_type: composefs_oci::signature::ErofsEntryType::Merged,
+                    digest: merged_digest.to_hex(),
+                    data: Some(merged_erofs.to_vec()),
+                })?;
+
+                // Then add signature entries
+                for (_, digest) in &per_layer_images {
+                    let sig = signing_key.sign(digest)?;
+                    builder.add_entry(composefs_oci::signature::SignatureEntry {
+                        sig_type: composefs_oci::signature::SignatureType::Layer,
+                        digest: digest.to_hex(),
+                        signature: Some(sig),
+                    })?;
+                }
+
+                let merged_sig = signing_key.sign(&merged_digest)?;
+                builder.add_entry(composefs_oci::signature::SignatureEntry {
+                    sig_type: composefs_oci::signature::SignatureType::Merged,
+                    digest: merged_digest.to_hex(),
+                    signature: Some(merged_sig),
+                })?;
+
+                let artifact = builder.build()?;
+                let (artifact_digest, _) =
+                    composefs_oci::signature::store_signature_artifact(&repo, artifact)?;
+
+                println!("{artifact_digest}");
+            }
+            OciCommand::Verify {
+                ref image,
+                ref cert,
+            } => {
+                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
+                let manifest_digest = img.manifest_digest();
+
+                let referrers = composefs_oci::oci_image::list_referrers(&repo, manifest_digest)?;
+
+                if referrers.is_empty() {
+                    anyhow::bail!("no signature artifacts found for {image}");
+                }
+
+                let verifier = match cert {
+                    Some(cert_path) => {
+                        let cert_pem = std::fs::read(cert_path).with_context(|| {
+                            format!("failed to read certificate: {cert_path:?}")
+                        })?;
+                        Some(composefs_oci::signing::FsVeritySignatureVerifier::from_pem(
+                            &cert_pem,
+                        )?)
+                    }
+                    None => None,
+                };
+
+                let config_digest = img.config_digest();
+                let per_layer_digests =
+                    composefs_oci::compute_per_layer_digests(&repo, config_digest, None)?;
+                let merged_digest: ObjectID =
+                    composefs_oci::compute_merged_digest(&repo, config_digest, None)?;
+                let merged_hex = merged_digest.to_hex();
+                let algorithm = ObjectID::ALGORITHM.kernel_id();
+
+                let mut digest_ok_all = true;
+                let mut found_composefs = false;
+                let mut verified_count = 0usize;
+
+                for (artifact_digest, artifact_verity) in &referrers {
+                    let artifact_image = composefs_oci::OciImage::open(
+                        &repo,
+                        artifact_digest,
+                        Some(artifact_verity),
+                    )
+                    .with_context(|| format!("opening referrer {artifact_digest}"))?;
+
+                    match artifact_image.manifest().artifact_type() {
+                        Some(oci_spec::image::MediaType::Other(t))
+                            if t == composefs_oci::signature::ARTIFACT_TYPE => {}
+                        _ => continue,
+                    }
+
+                    found_composefs = true;
+                    let parsed = composefs_oci::signature::parse_signature_artifact(
+                        artifact_image.manifest(),
+                    )
+                    .with_context(|| format!("parsing artifact {artifact_digest}"))?;
+
+                    println!("Signature artifact (algorithm: {})", parsed.algorithm);
+
+                    let layer_descriptors = artifact_image.layer_descriptors();
+                    let mut layer_idx = 0usize;
+                    let sig_layer_offset = parsed.erofs_entries.len();
+                    // Track whether this particular artifact verified with
+                    // the given cert (relevant for multi-signer scenarios).
+                    let mut artifact_verified = true;
+
+                    for (entry_idx, entry) in parsed.signature_entries.iter().enumerate() {
+                        let (label, expected_hex) = match entry.sig_type {
+                            composefs_oci::signature::SignatureType::Layer => {
+                                let lbl = format!("  layer[{layer_idx}]:");
+                                let expected = per_layer_digests.get(layer_idx).map(|d| d.to_hex());
+                                layer_idx += 1;
+                                (lbl, expected)
+                            }
+                            composefs_oci::signature::SignatureType::Merged => {
+                                ("  merged:  ".to_string(), Some(merged_hex.clone()))
+                            }
+                            other => {
+                                println!("  {other}: skipped");
+                                continue;
+                            }
+                        };
+
+                        let digest_matches = match &expected_hex {
+                            Some(expected) => *expected == entry.digest,
+                            None => {
+                                println!("{label} no expected digest - SKIP");
+                                digest_ok_all = false;
+                                continue;
+                            }
+                        };
+
+                        if !digest_matches {
+                            println!("{label} digest MISMATCH");
+                            digest_ok_all = false;
+                            continue;
+                        }
+
+                        if let Some(ref verifier) = verifier {
+                            let layer_desc = layer_descriptors
+                                .get(sig_layer_offset + entry_idx)
+                                .context("layer descriptor out of bounds")?;
+                            let blob_digest = layer_desc.digest();
+
+                            if layer_desc.size() == 0 {
+                                println!("{label} digest matches but no signature blob");
+                                artifact_verified = false;
+                                continue;
+                            }
+
+                            let blob_verity = artifact_image
+                                .layer_verity(blob_digest.as_ref())
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("verity not found for {blob_digest}")
+                                })?;
+                            let signature_blob = composefs_oci::oci_image::open_blob(
+                                &repo,
+                                blob_digest,
+                                Some(blob_verity),
+                            )?;
+
+                            let digest_bytes =
+                                hex::decode(&entry.digest).context("invalid hex digest")?;
+
+                            match verifier.verify_raw(&signature_blob, algorithm, &digest_bytes) {
+                                Ok(()) => {
+                                    println!("{label} signature verified");
+                                    verified_count += 1;
+                                }
+                                Err(e) => {
+                                    println!("{label} not verified by this cert: {e}");
+                                    artifact_verified = false;
+                                }
+                            }
+                        } else {
+                            println!("{label} digest matches");
+                        }
+                    }
+
+                    if verifier.is_some() && !artifact_verified {
+                        println!("  (artifact not signed by given cert, skipping)");
+                    }
+                }
+
+                if !found_composefs {
+                    anyhow::bail!("no composefs signature artifacts found for {image}");
+                }
+
+                if verifier.is_some() {
+                    if verified_count == 0 {
+                        anyhow::bail!("no signature artifacts verified with the given certificate");
+                    }
+                    println!("\nVerification passed ({verified_count} signatures verified)");
+                } else {
+                    if !digest_ok_all {
+                        std::process::exit(1);
+                    }
+                    println!(
+                        "\nDigest check passed. NOTE: no certificate provided, signatures were NOT cryptographically verified."
+                    );
+                    println!(
+                        "To verify signatures, use: cfsctl oci verify {image} --cert <certificate.pem>"
+                    );
+                }
+            }
+            OciCommand::Push {
+                ref image,
+                ref destination,
+                signatures,
+            } => {
+                // Parse destination: strip "oci:" prefix, handle "oci:/path:tag" syntax
+                let dest = destination.strip_prefix("oci:").unwrap_or(destination);
+
+                // Parse optional tag from path — only split on the last colon if
+                // it isn't part of an absolute path (i.e. not position 0 like "/tmp/foo")
+                let (path_str, dest_tag) = if let Some(colon_pos) = dest.rfind(':') {
+                    // Don't split on the colon right after a drive letter or at position 0
+                    if colon_pos > 0
+                        && !dest[..colon_pos].ends_with('/')
+                        && !dest[colon_pos + 1..].contains('/')
+                    {
+                        (&dest[..colon_pos], Some(&dest[colon_pos + 1..]))
+                    } else {
+                        (dest, None)
+                    }
+                } else {
+                    (dest, None)
+                };
+
+                let oci_layout_path = std::path::Path::new(path_str);
+                std::fs::create_dir_all(oci_layout_path).with_context(|| {
+                    format!(
+                        "creating destination directory: {}",
+                        oci_layout_path.display()
+                    )
+                })?;
+
+                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
+                let tag = dest_tag.or(Some(image));
+
+                composefs_oci::export_image_to_oci_layout(
+                    &repo,
+                    &img,
+                    oci_layout_path,
+                    tag,
+                    signatures,
+                )
+                .context("exporting image to OCI layout")?;
+
+                println!("Exported {} to {}", image, oci_layout_path.display());
+                if let Some(t) = tag {
+                    println!("Tagged as {t}");
+                }
+            }
+            OciCommand::ExportSignatures {
+                ref image,
+                ref oci_layout_path,
+            } => {
+                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
+                let manifest_digest = img.manifest_digest();
+
+                let count = composefs_oci::export_referrers_to_oci_layout(
+                    &repo,
+                    manifest_digest,
+                    oci_layout_path,
+                    None,
+                )
+                .context("exporting signatures to OCI layout")?;
+
+                if count == 0 {
+                    println!("No signature artifacts found for {image}");
+                } else {
+                    println!(
+                        "Exported {count} signature artifact(s) to {}",
+                        oci_layout_path.display()
+                    );
                 }
             }
         },
@@ -1121,6 +1722,9 @@ where
                     anyhow::bail!("repository integrity check failed");
                 }
             }
+        }
+        Command::Keyring { .. } => {
+            unreachable!("keyring commands are handled before opening a repository")
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {

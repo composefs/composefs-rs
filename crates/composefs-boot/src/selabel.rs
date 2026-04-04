@@ -318,3 +318,418 @@ pub fn selabel<H: FsVerityHashValue>(fs: &mut FileSystem<H>, repo: &Repository<H
     relabel_dir(&fs.root, &mut path, &mut policy);
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use composefs::dumpfile::dumpfile_to_filesystem;
+    use composefs::fsverity::Sha256HashValue;
+    use composefs::test::TestRepo;
+    use indoc::indoc;
+
+    /// Get the SELinux label from a Stat's xattrs, if any.
+    fn selinux_label(stat: &Stat) -> Option<String> {
+        stat.xattrs
+            .borrow()
+            .get(OsStr::new(XATTR_SECURITY_SELINUX))
+            .map(|v| String::from_utf8_lossy(v).into())
+    }
+
+    /// Look up a path in the filesystem and return its SELinux label.
+    ///
+    /// Panics if the path doesn't exist.  Returns `None` if the node
+    /// has no `security.selinux` xattr.
+    fn get_label(fs: &FileSystem<Sha256HashValue>, path: &str) -> Option<String> {
+        if path == "/" {
+            return selinux_label(&fs.root.stat);
+        }
+        let p = Path::new(path);
+        let parent = p.parent().unwrap();
+        let name = p.file_name().unwrap();
+        let dir = if parent == Path::new("/") {
+            &fs.root
+        } else {
+            fs.root.get_directory(parent.as_os_str()).unwrap()
+        };
+        match dir
+            .lookup(name)
+            .unwrap_or_else(|| panic!("{path} not found"))
+        {
+            Inode::Directory(d) => selinux_label(&d.stat),
+            Inode::Leaf(l) => selinux_label(&l.stat),
+        }
+    }
+
+    /// Build a filesystem with an embedded SELinux policy from the given
+    /// raw file_contexts content, then merge in additional entries from a
+    /// dumpfile string.
+    ///
+    /// `file_contexts` and values in `extra_policy_files` are raw bytes
+    /// (real tabs, newlines, etc.).
+    ///
+    /// `extra_policy_files` can supply additional policy files like
+    /// `file_contexts.local` or `file_contexts.subs`.
+    fn build_fs_with_selinux(
+        file_contexts: &[u8],
+        extra_policy_files: &[(&str, &[u8])],
+        fs_entries: &str,
+    ) -> FileSystem<Sha256HashValue> {
+        use composefs::dumpfile::write_dumpfile;
+
+        // Build a tree containing the SELinux policy files, serialize it
+        // via the dumpfile writer so escaping is handled correctly, then
+        // append the caller's additional entries and parse the whole thing.
+        let selinux_config = b"SELINUX=enforcing\nSELINUXTYPE=targeted\n";
+
+        let inline = |data: &[u8]| {
+            Inode::Leaf(std::rc::Rc::new(Leaf {
+                stat: Stat {
+                    st_mode: 0o100644,
+                    st_uid: 0,
+                    st_gid: 0,
+                    st_mtim_sec: 0,
+                    xattrs: Default::default(),
+                },
+                content: LeafContent::Regular(RegularFile::Inline(
+                    data.to_vec().into_boxed_slice(),
+                )),
+            }))
+        };
+
+        let dir_stat = || Stat {
+            st_mode: 0o40755,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 0,
+            xattrs: Default::default(),
+        };
+
+        let mut fs = FileSystem::<Sha256HashValue>::new(dir_stat());
+
+        // Create the directory tree
+        for path in [
+            "etc",
+            "etc/selinux",
+            "etc/selinux/targeted",
+            "etc/selinux/targeted/contexts",
+            "etc/selinux/targeted/contexts/files",
+        ] {
+            let (dir, name) = fs.root.split_mut(path.as_ref()).unwrap();
+            dir.insert(name, Inode::Directory(Box::new(Directory::new(dir_stat()))));
+        }
+        fs.root
+            .get_directory_mut("etc/selinux".as_ref())
+            .unwrap()
+            .insert(OsStr::new("config"), inline(selinux_config));
+
+        // Insert file_contexts and extra policy files
+        let files_dir = fs
+            .root
+            .get_directory_mut("etc/selinux/targeted/contexts/files".as_ref())
+            .unwrap();
+        files_dir.insert(OsStr::new("file_contexts"), inline(file_contexts));
+        for (name, content) in extra_policy_files {
+            files_dir.insert(OsStr::new(name), inline(content));
+        }
+
+        // Serialize via the proper dumpfile writer, append extra entries, re-parse
+        let mut buf = Vec::new();
+        write_dumpfile(&mut buf, &fs).unwrap();
+        let mut dumpfile = String::from_utf8(buf).unwrap();
+        dumpfile.push_str(fs_entries);
+        dumpfile_to_filesystem(&dumpfile).unwrap()
+    }
+
+    /// Verify that selabel() applies the correct SELinux contexts from
+    /// an in-memory filesystem's embedded policy files.
+    #[test]
+    fn selabel_applies_correct_labels() {
+        let file_contexts = indoc! {b"
+            /\t\tsystem_u:object_r:root_t:s0
+            /usr\t\tsystem_u:object_r:usr_t:s0
+            /usr/bin(/.*)?\t\tsystem_u:object_r:bin_t:s0
+            /etc(/.*)?\t\tsystem_u:object_r:etc_t:s0
+        "};
+
+        let fs_entries = "\
+/boot 0 40755 2 0 0 0 0.0 - - -
+/etc/hostname 9 100644 1 0 0 0 0.0 - testhost\\n -
+/sysroot 0 40755 2 0 0 0 0.0 - - -
+/usr 0 40755 2 0 0 0 1000.0 - - -
+/usr/bin 0 40755 2 0 0 0 1000.0 - - -
+/usr/bin/hello 21 100755 1 0 0 0 0.0 - #!/bin/sh\\necho\\x20hello\\n -
+";
+        let mut fs = build_fs_with_selinux(file_contexts, &[], fs_entries);
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(selabel(&mut fs, &test_repo.repo).unwrap());
+
+        assert_eq!(get_label(&fs, "/").unwrap(), "system_u:object_r:root_t:s0");
+        assert_eq!(
+            get_label(&fs, "/usr").unwrap(),
+            "system_u:object_r:usr_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/usr/bin").unwrap(),
+            "system_u:object_r:bin_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/usr/bin/hello").unwrap(),
+            "system_u:object_r:bin_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/etc").unwrap(),
+            "system_u:object_r:etc_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/etc/hostname").unwrap(),
+            "system_u:object_r:etc_t:s0"
+        );
+    }
+
+    /// Verify that selabel() strips pre-existing labels when no policy is found.
+    #[test]
+    fn selabel_strips_when_no_policy() {
+        let dumpfile = "\
+/ 0 40755 2 0 0 0 0.0 - - -
+/file 1 100644 1 0 0 0 0.0 - x - security.selinux=old_label
+";
+        let mut fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(!selabel(&mut fs, &test_repo.repo).unwrap());
+        assert!(get_label(&fs, "/").is_none());
+        assert!(get_label(&fs, "/file").is_none());
+    }
+
+    /// Verify that type-specific file_contexts rules (e.g. `-d`, `--`, `-l`)
+    /// label different inode types independently.
+    #[test]
+    fn selabel_type_specific_labels() {
+        // /var/log directories get var_log_dir_t, regular files get
+        // var_log_t, and symlinks get var_log_link_t.
+        let file_contexts = indoc! {b"
+            /var(/.*)?		system_u:object_r:var_t:s0
+            /var/log(/.*)? -d system_u:object_r:var_log_dir_t:s0
+            /var/log(/.*)? -- system_u:object_r:var_log_t:s0
+            /var/log(/.*)? -l system_u:object_r:var_log_link_t:s0
+        "};
+
+        let fs_entries = "\
+/var 0 40755 2 0 0 0 0.0 - - -
+/var/log 0 40755 2 0 0 0 0.0 - - -
+/var/log/messages 10 100644 1 0 0 0 0.0 - 0123456789 -
+/var/log/current 4 120777 1 0 0 0 0.0 /var/log/messages - -
+";
+        let mut fs = build_fs_with_selinux(file_contexts, &[], fs_entries);
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(selabel(&mut fs, &test_repo.repo).unwrap());
+
+        assert_eq!(
+            get_label(&fs, "/var").unwrap(),
+            "system_u:object_r:var_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/var/log").unwrap(),
+            "system_u:object_r:var_log_dir_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/var/log/messages").unwrap(),
+            "system_u:object_r:var_log_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/var/log/current").unwrap(),
+            "system_u:object_r:var_log_link_t:s0"
+        );
+    }
+
+    /// Verify that file_contexts.subs aliases redirect labeling lookups.
+    #[test]
+    fn selabel_subs_aliases() {
+        let file_contexts = indoc! {b"
+            /home(/.*)?		system_u:object_r:home_t:s0
+        "};
+        let subs_content = b"/srv/home /home\n";
+
+        let fs_entries = "\
+/home 0 40755 2 0 0 0 0.0 - - -
+/home/user.txt 5 100644 1 0 0 0 0.0 - hello -
+/srv 0 40755 2 0 0 0 0.0 - - -
+/srv/home 0 40755 2 0 0 0 0.0 - - -
+/srv/home/data.txt 5 100644 1 0 0 0 0.0 - world -
+";
+        let mut fs = build_fs_with_selinux(
+            file_contexts,
+            &[("file_contexts.subs", subs_content)],
+            fs_entries,
+        );
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(selabel(&mut fs, &test_repo.repo).unwrap());
+
+        assert_eq!(
+            get_label(&fs, "/home").unwrap(),
+            "system_u:object_r:home_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/home/user.txt").unwrap(),
+            "system_u:object_r:home_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/srv/home").unwrap(),
+            "system_u:object_r:home_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/srv/home/data.txt").unwrap(),
+            "system_u:object_r:home_t:s0"
+        );
+    }
+
+    /// Verify that <<none>> in file_contexts suppresses labeling.
+    #[test]
+    fn selabel_none_context() {
+        let file_contexts = indoc! {b"
+            /tmp(/.*)?		system_u:object_r:tmp_t:s0
+            /tmp/private(/.*)?		<<none>>
+        "};
+
+        let fs_entries = "\
+/tmp 0 40755 2 0 0 0 0.0 - - -
+/tmp/scratch.txt 5 100644 1 0 0 0 0.0 - hello -
+/tmp/private 0 40755 2 0 0 0 0.0 - - -
+/tmp/private/secret.txt 6 100644 1 0 0 0 0.0 - secret -
+";
+        let mut fs = build_fs_with_selinux(file_contexts, &[], fs_entries);
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(selabel(&mut fs, &test_repo.repo).unwrap());
+
+        assert_eq!(
+            get_label(&fs, "/tmp").unwrap(),
+            "system_u:object_r:tmp_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/tmp/scratch.txt").unwrap(),
+            "system_u:object_r:tmp_t:s0"
+        );
+        assert!(get_label(&fs, "/tmp/private").is_none());
+        assert!(get_label(&fs, "/tmp/private/secret.txt").is_none());
+    }
+
+    /// Verify that file_contexts.local overrides are processed.
+    #[test]
+    fn selabel_local_overrides() {
+        let file_contexts = indoc! {b"
+            /opt(/.*)?		system_u:object_r:opt_t:s0
+        "};
+        let local_content = indoc! {b"
+            /opt/custom(/.*)?		system_u:object_r:custom_t:s0
+        "};
+
+        let fs_entries = "\
+/opt 0 40755 2 0 0 0 0.0 - - -
+/opt/readme.txt 7 100644 1 0 0 0 0.0 - default -
+/opt/custom 0 40755 2 0 0 0 0.0 - - -
+/opt/custom/app 3 100755 1 0 0 0 0.0 - app -
+";
+        let mut fs = build_fs_with_selinux(
+            file_contexts,
+            &[("file_contexts.local", local_content)],
+            fs_entries,
+        );
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(selabel(&mut fs, &test_repo.repo).unwrap());
+
+        assert_eq!(
+            get_label(&fs, "/opt").unwrap(),
+            "system_u:object_r:opt_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/opt/readme.txt").unwrap(),
+            "system_u:object_r:opt_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/opt/custom").unwrap(),
+            "system_u:object_r:custom_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/opt/custom/app").unwrap(),
+            "system_u:object_r:custom_t:s0"
+        );
+    }
+
+    /// Verify labeling of device nodes and FIFOs with type-specific rules.
+    #[test]
+    fn selabel_device_and_fifo_labels() {
+        let file_contexts = indoc! {b"
+            /dev(/.*)?		system_u:object_r:device_t:s0
+            /dev(/.*)? -b system_u:object_r:fixed_disk_device_t:s0
+            /dev(/.*)? -c system_u:object_r:tty_device_t:s0
+            /dev(/.*)? -p system_u:object_r:fifo_t:s0
+        "};
+
+        let fs_entries = "\
+/dev 0 40755 2 0 0 0 0.0 - - -
+/dev/sda 0 60660 1 0 0 2049 0.0 - - -
+/dev/tty0 0 20666 1 0 0 1024 0.0 - - -
+/dev/initctl 0 10644 1 0 0 0 0.0 - - -
+";
+        let mut fs = build_fs_with_selinux(file_contexts, &[], fs_entries);
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(selabel(&mut fs, &test_repo.repo).unwrap());
+
+        assert_eq!(
+            get_label(&fs, "/dev").unwrap(),
+            "system_u:object_r:device_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/dev/sda").unwrap(),
+            "system_u:object_r:fixed_disk_device_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/dev/tty0").unwrap(),
+            "system_u:object_r:tty_device_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/dev/initctl").unwrap(),
+            "system_u:object_r:fifo_t:s0"
+        );
+    }
+
+    /// Verify that selabel() overwrites pre-existing labels with the policy's
+    /// labels, rather than accumulating or skipping them.
+    #[test]
+    fn selabel_replaces_stale_labels() {
+        let file_contexts = indoc! {b"
+            /(/.*)?		system_u:object_r:default_t:s0
+            /usr(/.*)?		system_u:object_r:usr_t:s0
+        "};
+
+        let fs_entries = "\
+/usr 0 40755 2 0 0 0 0.0 - - - security.selinux=unconfined_u:object_r:container_file_t:s0:c0,c1
+/usr/lib 0 40755 2 0 0 0 0.0 - - - security.selinux=unconfined_u:object_r:container_file_t:s0:c0,c1
+/usr/lib/readme.txt 5 100644 1 0 0 0 0.0 - hello - security.selinux=unconfined_u:object_r:container_file_t:s0:c0,c1
+";
+        let mut fs = build_fs_with_selinux(file_contexts, &[], fs_entries);
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(selabel(&mut fs, &test_repo.repo).unwrap());
+
+        assert_eq!(
+            get_label(&fs, "/usr").unwrap(),
+            "system_u:object_r:usr_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/usr/lib").unwrap(),
+            "system_u:object_r:usr_t:s0"
+        );
+        assert_eq!(
+            get_label(&fs, "/usr/lib/readme.txt").unwrap(),
+            "system_u:object_r:usr_t:s0"
+        );
+    }
+}

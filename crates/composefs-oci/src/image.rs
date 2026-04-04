@@ -88,6 +88,118 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
     Ok(())
 }
 
+/// Compute per-layer composefs digests for an OCI image.
+///
+/// For each layer, builds a single-layer filesystem and computes its EROFS fsverity digest.
+/// These digests can be stored in a composefs signature artifact.
+///
+/// Per-layer digests are computed without `transform_for_oci()` since individual layers
+/// typically don't have the `/usr` directory needed for the OCI root metadata transform.
+///
+/// The final merged digest (the digest of the complete flattened filesystem with
+/// `transform_for_oci()` applied) can be obtained from `seal()` or `create_filesystem()`.
+///
+/// **Security note**: When `config_verity` is `None`, layer content is not verified against
+/// the config's diff_ids. Callers MUST provide a trusted `config_verity` when computing
+/// digests that will be used in signature artifacts. Without verity, a compromised repository
+/// could cause digests to be computed over substituted layer content.
+#[context("Computing per-layer digests")]
+pub fn compute_per_layer_digests<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_name: &OciDigest,
+    config_verity: Option<&ObjectID>,
+) -> Result<Vec<ObjectID>> {
+    let oc = crate::open_config(repo, config_name, config_verity)?;
+
+    let mut layer_digests = Vec::with_capacity(oc.config.rootfs().diff_ids().len());
+
+    for diff_id in oc.config.rootfs().diff_ids() {
+        let layer_verity = oc
+            .layer_refs
+            .get(diff_id.as_str())
+            .context("OCI config splitstream missing named ref to layer")?;
+
+        let mut single_fs = FileSystem::new(Stat::uninitialized());
+        let mut layer_stream =
+            repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
+        while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
+            process_entry(&mut single_fs, entry)?;
+        }
+        layer_digests.push(single_fs.compute_image_id());
+    }
+
+    Ok(layer_digests)
+}
+
+/// Computes the composefs merged digest (image ID) for an OCI container.
+///
+/// This is the fs-verity digest of the merged filesystem created from all layers.
+/// This digest is deterministic for a given OCI image and is used in signature
+/// artifacts as the "merged" entry.
+///
+/// If `config_verity` is given, it is used for fast lookup. Otherwise, the config
+/// and layers will be hashed to verify their content.
+#[context("Computing merged digest")]
+pub fn compute_merged_digest<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_name: &OciDigest,
+    config_verity: Option<&ObjectID>,
+) -> Result<ObjectID> {
+    let fs = create_filesystem(repo, config_name, config_verity)?;
+    Ok(fs.compute_image_id())
+}
+
+/// Compute per-layer EROFS images and their fs-verity digests.
+///
+/// Returns one `(erofs_bytes, digest)` pair per OCI layer, in manifest order.
+/// This is the same as `compute_per_layer_digests` but preserves the raw EROFS
+/// bytes for inclusion in composefs artifacts.
+///
+/// **Security note**: When `config_verity` is `None`, layer content is not verified against
+/// the config's diff_ids. Callers MUST provide a trusted `config_verity` when generating
+/// images that will be used in signature artifacts.
+#[context("Generating per-layer EROFS images")]
+pub fn generate_per_layer_images<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_name: &OciDigest,
+    config_verity: Option<&ObjectID>,
+) -> Result<Vec<(Box<[u8]>, ObjectID)>> {
+    let oc = crate::open_config(repo, config_name, config_verity)?;
+
+    let mut results = Vec::with_capacity(oc.config.rootfs().diff_ids().len());
+
+    for diff_id in oc.config.rootfs().diff_ids() {
+        let layer_verity = oc
+            .layer_refs
+            .get(diff_id.as_str())
+            .context("OCI config splitstream missing named ref to layer")?;
+
+        let mut single_fs = FileSystem::new(Stat::uninitialized());
+        let mut layer_stream =
+            repo.open_stream("", Some(layer_verity), Some(TAR_LAYER_CONTENT_TYPE))?;
+        while let Some(entry) = crate::tar::get_entry(&mut layer_stream)? {
+            process_entry(&mut single_fs, entry)?;
+        }
+        results.push(single_fs.generate_erofs_image());
+    }
+
+    Ok(results)
+}
+
+/// Generate the merged EROFS image and its fs-verity digest.
+///
+/// This is the same as `compute_merged_digest` but preserves the raw EROFS
+/// bytes for inclusion in composefs artifacts.
+#[context("Generating merged EROFS image")]
+pub fn generate_merged_image<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    config_name: &OciDigest,
+    config_verity: Option<&ObjectID>,
+) -> Result<(Box<[u8]>, ObjectID)> {
+    let fs = create_filesystem(repo, config_name, config_verity)?;
+    Ok(fs.generate_erofs_image())
+}
+
 /// Creates a filesystem from the given OCI container.  No special transformations are performed to
 /// make the filesystem bootable.
 ///
@@ -152,7 +264,12 @@ mod test {
         fsverity::Sha256HashValue,
         tree::{LeafContent, RegularFile, Stat},
     };
-    use std::{cell::RefCell, collections::BTreeMap, io::BufRead, path::PathBuf};
+    use std::{
+        cell::RefCell,
+        collections::BTreeMap,
+        io::BufRead,
+        path::{Path, PathBuf},
+    };
 
     use super::*;
 
@@ -354,7 +471,7 @@ mod test {
         let by_path = |p: &str| -> &TarEntry<Sha256HashValue> {
             entries
                 .iter()
-                .find(|e| e.path == PathBuf::from(p))
+                .find(|e| e.path == Path::new(p))
                 .unwrap_or_else(|| panic!("missing entry for {p}"))
         };
 
@@ -487,7 +604,7 @@ mod test {
         // Find the *last* /bin entry, which should be the symlink.
         let bin_entries: Vec<_> = entries
             .iter()
-            .filter(|e| e.path == PathBuf::from("/bin"))
+            .filter(|e| e.path == Path::new("/bin"))
             .collect();
         assert!(
             bin_entries.len() >= 2,
@@ -516,6 +633,117 @@ mod test {
         );
 
         Ok(())
+    }
+
+    /// Helper to import a baseimage layer and create an OCI config for it.
+    /// Returns (config_digest, config_verity, diff_id).
+    fn import_baseimage_with_config(
+        repo: &std::sync::Arc<Repository<Sha256HashValue>>,
+    ) -> (OciDigest, Sha256HashValue, String) {
+        use oci_spec::image::{ImageConfigurationBuilder, RootFsBuilder};
+
+        let (layer_data, diff_id) = build_baseimage();
+        let diff_id_digest: OciDigest = diff_id.parse().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (layer_verity, _stats) = rt
+            .block_on(crate::import_layer(
+                repo,
+                &diff_id_digest,
+                None,
+                &mut layer_data.as_slice(),
+            ))
+            .unwrap();
+
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(vec![diff_id.clone()])
+            .build()
+            .unwrap();
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .build()
+            .unwrap();
+
+        let mut refs = std::collections::HashMap::new();
+        refs.insert(Box::from(diff_id.as_str()), layer_verity);
+
+        let (config_digest, config_verity) =
+            crate::write_config(repo, &config, refs, None, None).unwrap();
+        (config_digest, config_verity, diff_id)
+    }
+
+    #[test]
+    fn test_compute_per_layer_digests() {
+        use composefs::{repository::Repository, test::tempdir};
+        use rustix::fs::CWD;
+        use std::sync::Arc;
+
+        let repo_dir = tempdir();
+        let (repo, _) = Repository::<Sha256HashValue>::init_path(
+            CWD,
+            &repo_dir,
+            composefs::fsverity::Algorithm::SHA256,
+            false,
+        )
+        .unwrap();
+        let repo = Arc::new(repo);
+
+        let (config_digest, config_verity, _diff_id) = import_baseimage_with_config(&repo);
+
+        // Compute per-layer digests (with verity)
+        let digests =
+            compute_per_layer_digests(&repo, &config_digest, Some(&config_verity)).unwrap();
+        assert_eq!(digests.len(), 1, "expected exactly 1 per-layer digest");
+
+        // Determinism: calling again should produce the same result
+        let digests2 =
+            compute_per_layer_digests(&repo, &config_digest, Some(&config_verity)).unwrap();
+        assert_eq!(
+            digests, digests2,
+            "per-layer digests should be deterministic"
+        );
+
+        // Also works without verity (slower path that verifies content hashes)
+        let digests3 = compute_per_layer_digests(&repo, &config_digest, None).unwrap();
+        assert_eq!(
+            digests, digests3,
+            "verity and non-verity paths should agree"
+        );
+    }
+
+    #[test]
+    fn test_per_layer_digest_differs_from_merged() {
+        use composefs::{repository::Repository, test::tempdir};
+        use rustix::fs::CWD;
+        use std::sync::Arc;
+
+        let repo_dir = tempdir();
+        let (repo, _) = Repository::<Sha256HashValue>::init_path(
+            CWD,
+            &repo_dir,
+            composefs::fsverity::Algorithm::SHA256,
+            false,
+        )
+        .unwrap();
+        let repo = Arc::new(repo);
+
+        let (config_digest, config_verity, _diff_id) = import_baseimage_with_config(&repo);
+
+        let per_layer =
+            compute_per_layer_digests(&repo, &config_digest, Some(&config_verity)).unwrap();
+        assert_eq!(per_layer.len(), 1);
+
+        let merged_fs = create_filesystem(&repo, &config_digest, Some(&config_verity)).unwrap();
+        let merged_digest = merged_fs.compute_image_id();
+
+        // The merged filesystem applies transform_for_oci() which copies /usr metadata
+        // to the root, so the digests should differ.
+        assert_ne!(
+            per_layer[0], merged_digest,
+            "per-layer and merged digests should differ because of transform_for_oci"
+        );
     }
 
     #[test]

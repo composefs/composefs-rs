@@ -198,7 +198,7 @@ async fn create_multi_layer_image(
     let config_json = config.to_string().unwrap();
     let config_digest = hash(config_json.as_bytes());
 
-    let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE);
+    let mut config_stream = repo.create_stream(OCI_CONFIG_CONTENT_TYPE).unwrap();
     for (digest, verity) in &layer_verities_map {
         config_stream.add_named_stream_ref(digest, verity);
     }

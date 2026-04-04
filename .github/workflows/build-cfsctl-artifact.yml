@@ -1,0 +1,51 @@
+name: Build cfsctl OCI artifact
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cfsctl (release)
+        run: cargo build --release -p cfsctl --features composefs/rhel9,composefs-oci/oci-client
+
+      - name: Install oras CLI
+        run: |
+          curl -sLO https://github.com/oras-project/oras/releases/download/v1.3.1/oras_1.3.1_linux_amd64.tar.gz
+          tar xzf oras_1.3.1_linux_amd64.tar.gz -C /usr/local/bin oras
+          oras version
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push OCI artifact
+        working-directory: target/release
+        run: |
+          set -eux
+          oras push ghcr.io/${GITHUB_REPOSITORY}/cfsctl:${GITHUB_REF_NAME} \
+            --artifact-type application/vnd.composefs.cfsctl.v1 \
+            cfsctl:application/octet-stream
+          SHA_SHORT=$(echo "${GITHUB_SHA}" | head -c 12)
+          oras push "ghcr.io/${GITHUB_REPOSITORY}/cfsctl:${SHA_SHORT}" \
+            --artifact-type application/vnd.composefs.cfsctl.v1 \
+            cfsctl:application/octet-stream

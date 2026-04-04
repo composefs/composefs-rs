@@ -9,7 +9,7 @@ use anyhow::Result;
 use rustix::path::Arg;
 use xshell::{Shell, cmd};
 
-use crate::{cfsctl, create_test_rootfs, integration_test};
+use crate::{cfsctl, create_oci_layout, create_test_rootfs, integration_test};
 
 // Pinned composefs image ID for the deterministic OCI layout built by
 // create_oci_layout() (single layer with usr/ dir + hello.txt, mtime=1234567890).
@@ -209,76 +209,6 @@ fn test_oci_images_json_empty_repo() -> Result<()> {
 }
 integration_test!(test_oci_images_json_empty_repo);
 
-/// Creates a minimal OCI image layout directory for testing using the ocidir crate.
-///
-/// Returns the path to the OCI layout directory.
-fn create_oci_layout(parent: &std::path::Path) -> Result<std::path::PathBuf> {
-    use cap_std_ext::cap_std;
-    use ocidir::oci_spec::image::{
-        ImageConfigurationBuilder, Platform, PlatformBuilder, RootFsBuilder,
-    };
-
-    let oci_dir = parent.join("oci-image");
-    std::fs::create_dir_all(&oci_dir)?;
-
-    let dir = cap_std::fs::Dir::open_ambient_dir(&oci_dir, cap_std::ambient_authority())?;
-    let ocidir = ocidir::OciDir::ensure(dir)?;
-
-    // Create a new empty manifest
-    let mut manifest = ocidir.new_empty_manifest()?.build()?;
-
-    // Create config with architecture and OS
-    let rootfs = RootFsBuilder::default()
-        .typ("layers")
-        .diff_ids(Vec::<String>::new())
-        .build()?;
-    let mut config = ImageConfigurationBuilder::default()
-        .architecture("amd64")
-        .os("linux")
-        .rootfs(rootfs)
-        .build()?;
-
-    // Create a simple layer with a usr/ directory and one file
-    let mut layer_builder = ocidir.create_layer(None)?;
-    {
-        let mut dir_header = tar::Header::new_gnu();
-        dir_header.set_entry_type(tar::EntryType::Directory);
-        dir_header.set_size(0);
-        dir_header.set_mode(0o755);
-        dir_header.set_uid(0);
-        dir_header.set_gid(0);
-        dir_header.set_mtime(1234567890);
-        dir_header.set_cksum();
-        layer_builder.append_data(&mut dir_header, "usr/", &[] as &[u8])?;
-    }
-    {
-        let data = b"hello from test layer\n";
-        let mut header = tar::Header::new_gnu();
-        header.set_size(data.len() as u64);
-        header.set_mode(0o644);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_mtime(1234567890);
-        header.set_cksum();
-        layer_builder.append_data(&mut header, "hello.txt", &data[..])?;
-    }
-    let layer = layer_builder.into_inner()?.complete()?;
-
-    // Push the layer to manifest and config
-    ocidir.push_layer(&mut manifest, &mut config, layer, "test layer", None);
-
-    // Create platform for the manifest
-    let platform: Platform = PlatformBuilder::default()
-        .architecture("amd64")
-        .os("linux")
-        .build()?;
-
-    // Insert manifest and config into the OCI directory
-    ocidir.insert_manifest_and_config(manifest, config, None, platform)?;
-
-    Ok(oci_dir)
-}
-
 fn test_oci_pull_and_inspect() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
@@ -476,8 +406,8 @@ fn test_oci_layer_inspect() -> Result<()> {
     assert!(info["size"].as_u64().unwrap() > 0, "expected non-zero size");
     assert_eq!(
         info["entryCount"].as_u64().unwrap(),
-        2,
-        "expected exactly 2 entries (usr/ + hello.txt)"
+        4,
+        "expected exactly 4 entries (usr/ + usr/bin/ + etc/ + usr/bin/hello.txt)"
     );
     // Check splitstream metadata
     let splitstream = info
@@ -511,7 +441,7 @@ fn test_oci_layer_inspect() -> Result<()> {
         let entry = Entry::parse(line)
             .unwrap_or_else(|e| panic!("failed to parse dumpfile line '{line}': {e}"));
 
-        if entry.path.as_ref() == Path::new("/hello.txt") {
+        if entry.path.as_ref() == Path::new("/usr/bin/hello.txt") {
             found_hello_txt = true;
             // Verify it's a regular file with inline content
             match &entry.item {
@@ -530,7 +460,10 @@ fn test_oci_layer_inspect() -> Result<()> {
             assert_eq!(entry.mode, 0o100644, "expected mode 0o100644");
         }
     }
-    assert!(found_hello_txt, "expected to find /hello.txt in dumpfile");
+    assert!(
+        found_hello_txt,
+        "expected to find /usr/bin/hello.txt in dumpfile"
+    );
 
     // Test raw tar output - parse as actual tar and verify contents
     let tar_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci layer {layer_id}").output()?;
@@ -539,14 +472,17 @@ fn test_oci_layer_inspect() -> Result<()> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
-        if path.as_ref() == Path::new("hello.txt") {
+        if path.as_ref() == Path::new("usr/bin/hello.txt") {
             found_in_tar = true;
             let mut content = String::new();
             entry.read_to_string(&mut content)?;
             assert_eq!(content, "hello from test layer\n", "tar content mismatch");
         }
     }
-    assert!(found_in_tar, "expected to find hello.txt in tar output");
+    assert!(
+        found_in_tar,
+        "expected to find usr/bin/hello.txt in tar output"
+    );
 
     Ok(())
 }
@@ -1079,9 +1015,164 @@ fn test_oci_fsck_single_image() -> Result<()> {
 }
 integration_test!(test_oci_fsck_single_image);
 
-fn test_fsck_detects_broken_image_ref() -> Result<()> {
-    use cap_std_ext::cap_std;
+fn test_fsck_json_healthy() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
 
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs} my-image"
+    )
+    .read()?;
+
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck --json").read()?;
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v["ok"], true, "expected ok=true, got: {output}");
+    assert!(
+        v["objectsChecked"].as_u64().unwrap() > 0,
+        "expected objectsChecked > 0"
+    );
+    assert_eq!(v["objectsCorrupted"], 0);
+    assert!(v["errors"].as_array().unwrap().is_empty());
+    Ok(())
+}
+integration_test!(test_fsck_json_healthy);
+
+fn test_fsck_json_corrupted_exits_zero() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} create-image {rootfs} my-image"
+    )
+    .read()?;
+
+    // Corrupt an object
+    let objects_dir = repo.join("objects");
+    let mut corrupted = false;
+    'outer: for entry in std::fs::read_dir(&objects_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for obj_entry in std::fs::read_dir(entry.path())? {
+            let obj_entry = obj_entry?;
+            if obj_entry.file_type()?.is_file() {
+                let path = obj_entry.path();
+                std::fs::remove_file(&path)?;
+                std::fs::write(&path, b"CORRUPTED DATA")?;
+                corrupted = true;
+                break 'outer;
+            }
+        }
+    }
+    assert!(corrupted, "should have found an object to corrupt");
+
+    // --json should exit 0 even with corruption
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck --json").read()?;
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v["ok"], false, "expected ok=false, got: {output}");
+    assert!(
+        v["objectsCorrupted"].as_u64().unwrap() > 0,
+        "expected corrupted > 0"
+    );
+    assert!(
+        !v["errors"].as_array().unwrap().is_empty(),
+        "expected errors"
+    );
+    Ok(())
+}
+integration_test!(test_fsck_json_corrupted_exits_zero);
+
+fn test_oci_fsck_json() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci fsck --json").read()?;
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v["ok"], true, "expected ok=true, got: {output}");
+    assert_eq!(v["imagesChecked"], 1);
+    assert_eq!(v["imagesCorrupted"], 0);
+    Ok(())
+}
+integration_test!(test_oci_fsck_json);
+
+fn test_oci_fsck_json_with_corruption() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // Corrupt an object in the repository
+    let objects_dir = repo.join("objects");
+    let mut corrupted = false;
+    'outer: for entry in std::fs::read_dir(&objects_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for obj_entry in std::fs::read_dir(entry.path())? {
+            let obj_entry = obj_entry?;
+            if obj_entry.file_type()?.is_file() {
+                let path = obj_entry.path();
+                std::fs::remove_file(&path)?;
+                std::fs::write(&path, b"CORRUPTED OCI DATA")?;
+                corrupted = true;
+                break 'outer;
+            }
+        }
+    }
+    assert!(corrupted, "should have found an object to corrupt");
+
+    // --json should exit 0 even with corruption, reporting it in the output
+    let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci fsck --json").read()?;
+    let v: serde_json::Value = serde_json::from_str(&output)?;
+    assert_eq!(v["ok"], false, "expected ok=false, got: {output}");
+    let has_repo_errors = v["repoResult"]["errors"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    let has_oci_errors = v["errors"]
+        .as_array()
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    let has_repo_corruption = v["repoResult"]["objectsCorrupted"].as_u64().unwrap_or(0) > 0;
+    assert!(
+        has_repo_errors || has_oci_errors || has_repo_corruption,
+        "expected some errors in JSON output, got: {output}"
+    );
+    Ok(())
+}
+integration_test!(test_oci_fsck_json_with_corruption);
+
+fn test_fsck_detects_broken_image_ref() -> Result<()> {
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
     let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
@@ -1097,7 +1188,10 @@ fn test_fsck_detects_broken_image_ref() -> Result<()> {
 
     // Break the ref chain: images/refs/my-image -> ../HEXID -> ../objects/...
     // by removing the intermediate image symlink.
-    let dir = cap_std::fs::Dir::open_ambient_dir(repo, cap_std::ambient_authority())?;
+    let dir = cap_std_ext::cap_std::fs::Dir::open_ambient_dir(
+        repo,
+        cap_std_ext::cap_std::ambient_authority(),
+    )?;
     let refs_path = std::path::Path::new("images/refs");
     let mut broken = false;
     if dir.exists(refs_path) {
@@ -1307,3 +1401,451 @@ fn test_init_reset_metadata_changes_algorithm() -> Result<()> {
     Ok(())
 }
 integration_test!(test_init_reset_metadata_changes_algorithm);
+
+/// Test tagging and untagging OCI images.
+///
+/// Verifies that:
+/// - An image can be tagged with multiple names
+/// - Tags appear in `oci images` output
+/// - Tags can be removed with `oci untag`
+/// - Untagging one name doesn't affect other tags
+fn test_oci_tag_and_untag() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    // Pull and tag with first name
+    let pull_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} myimage:v1"
+    )
+    .read()?;
+
+    // Extract manifest digest from pull output (e.g., "manifest sha256:abc...")
+    let manifest_digest = pull_output
+        .lines()
+        .find(|line| line.contains("manifest sha256:"))
+        .and_then(|line| line.split_whitespace().find(|s| s.starts_with("sha256:")))
+        .expect("expected manifest digest in pull output");
+
+    // Add a second tag using the manifest digest
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci tag {manifest_digest} myimage:latest"
+    )
+    .read()?;
+
+    // Both tags should appear in list
+    let list_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
+    let images: serde_json::Value = serde_json::from_str(&list_output)?;
+    let names: Vec<&str> = images
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|img| img["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"myimage:v1"), "expected myimage:v1 in list");
+    assert!(
+        names.contains(&"myimage:latest"),
+        "expected myimage:latest in list"
+    );
+
+    // Remove one tag
+    cmd!(sh, "{cfsctl} --insecure --repo {repo} oci untag myimage:v1").read()?;
+
+    // Only the remaining tag should appear
+    let list_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
+    let images: serde_json::Value = serde_json::from_str(&list_output)?;
+    let names: Vec<&str> = images
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|img| img["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        !names.contains(&"myimage:v1"),
+        "myimage:v1 should be removed"
+    );
+    assert!(
+        names.contains(&"myimage:latest"),
+        "myimage:latest should still exist"
+    );
+
+    Ok(())
+}
+integration_test!(test_oci_tag_and_untag);
+
+/// Test that GC removes untagged OCI images.
+///
+/// Verifies that:
+/// - After untagging all references, GC collects the image
+/// - Objects are actually removed from the repository
+fn test_oci_gc_removes_untagged() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    // Pull an image
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // Verify it exists
+    let list_before = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
+    let images_before: Vec<serde_json::Value> = serde_json::from_str(&list_before)?;
+    assert_eq!(images_before.len(), 1, "expected 1 image before untag");
+
+    // Untag it
+    cmd!(sh, "{cfsctl} --insecure --repo {repo} oci untag test-image").read()?;
+
+    // Run GC
+    let gc_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} gc").read()?;
+    assert!(
+        gc_output.contains("removed"),
+        "expected GC to report removed objects: {gc_output}"
+    );
+
+    // Verify image is gone
+    let list_after = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
+    let images_after: Vec<serde_json::Value> = serde_json::from_str(&list_after)?;
+    assert!(
+        images_after.is_empty(),
+        "expected no images after GC, got: {:?}",
+        images_after
+    );
+
+    // Verify objects were actually removed (streams dir should be mostly empty)
+    let streams_dir = repo.join("streams");
+    let stream_count = if streams_dir.exists() {
+        std::fs::read_dir(&streams_dir)?
+            .filter(|e| e.as_ref().map(|e| e.file_name() != "refs").unwrap_or(false))
+            .count()
+    } else {
+        0
+    };
+    assert_eq!(
+        stream_count, 0,
+        "expected no non-ref streams after GC, got {}",
+        stream_count
+    );
+
+    Ok(())
+}
+integration_test!(test_oci_gc_removes_untagged);
+
+/// Test layer tar roundtrip: import a layer, extract as tar, verify integrity.
+///
+/// This verifies that the splitstream storage correctly preserves tar content
+/// by comparing the original tar with the reconstructed one.
+fn test_layer_tar_roundtrip() -> Result<()> {
+    use std::io::Read;
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    // Pull the image
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // Get the layer diff_id
+    let config_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci inspect test-image --config"
+    )
+    .read()?;
+    let config: serde_json::Value = serde_json::from_str(&config_output)?;
+    let layer_id = config["rootfs"]["diff_ids"][0]
+        .as_str()
+        .expect("expected layer diff_id");
+
+    // Extract the layer as tar
+    let tar_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci layer {layer_id}").output()?;
+    assert!(tar_output.status.success(), "layer extraction failed");
+
+    // Parse the tar and collect file entries
+    let mut archive = tar::Archive::new(tar_output.stdout.as_slice());
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_string_lossy().to_string();
+        let mut content = Vec::new();
+        entry.read_to_end(&mut content)?;
+        entries.push((path, content));
+    }
+
+    // Verify we got the expected files (usr/ directory and hello.txt)
+    assert_eq!(
+        entries.len(),
+        2,
+        "expected 2 entries in layer (usr/ and hello.txt)"
+    );
+
+    // Find hello.txt and verify content
+    let hello_entry = entries
+        .iter()
+        .find(|(path, _)| path == "hello.txt")
+        .expect("expected hello.txt in layer");
+    assert_eq!(
+        hello_entry.1, b"hello from test layer\n",
+        "hello.txt content mismatch"
+    );
+
+    // Verify usr/ directory exists
+    assert!(
+        entries
+            .iter()
+            .any(|(path, _)| path == "usr" || path == "usr/"),
+        "expected usr/ directory in layer"
+    );
+
+    Ok(())
+}
+integration_test!(test_layer_tar_roundtrip);
+
+/// Test computing the composefs image ID for an OCI image.
+///
+/// This verifies that we can compute the filesystem verity hash for an image,
+/// which is the prerequisite for sealing and mounting.
+fn test_compute_image_id() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    // Pull an image
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // Get the config digest from inspect output
+    let inspect_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci inspect test-image"
+    )
+    .read()?;
+    let inspect: serde_json::Value = serde_json::from_str(&inspect_output)?;
+    let config_digest = inspect["manifest"]["config"]["digest"]
+        .as_str()
+        .expect("expected config digest");
+
+    // Compute the image ID
+    let compute_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci compute-id {config_digest}"
+    )
+    .read()?;
+
+    // The output should be a valid hex digest
+    // composefs uses SHA-256 fs-verity which produces 64 hex chars
+    // (but the underlying digest could be longer in some configurations)
+    let image_id = compute_output.trim();
+    assert!(
+        image_id.len() >= 64,
+        "image ID should be at least 64 hex chars, got {} chars: {}",
+        image_id.len(),
+        image_id
+    );
+    assert!(
+        image_id.chars().all(|c| c.is_ascii_hexdigit()),
+        "image ID should be hex, got: {}",
+        image_id
+    );
+
+    // Computing the same image should produce the same ID (deterministic)
+    let compute_output2 = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci compute-id {config_digest}"
+    )
+    .read()?;
+    assert_eq!(
+        image_id,
+        compute_output2.trim(),
+        "compute-id should be deterministic"
+    );
+
+    Ok(())
+}
+integration_test!(test_compute_image_id);
+
+fn test_oci_push_to_layout() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    // Pull from OCI layout into repo
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // Push to a new OCI layout directory
+    let output_dir = tempfile::tempdir()?;
+    let output_path = output_dir.path().join("exported");
+    let push_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci push test-image oci:{output_path}"
+    )
+    .read()?;
+    assert!(
+        push_output.contains("Exported"),
+        "expected export confirmation, got: {push_output}"
+    );
+
+    assert!(
+        output_path.join("oci-layout").exists(),
+        "expected oci-layout file"
+    );
+    assert!(
+        output_path.join("index.json").exists(),
+        "expected index.json"
+    );
+    assert!(
+        output_path.join("blobs/sha256").exists(),
+        "expected blobs/sha256 directory"
+    );
+
+    let index_json = std::fs::read_to_string(output_path.join("index.json"))?;
+    let index: serde_json::Value = serde_json::from_str(&index_json)?;
+    let manifests = index["manifests"]
+        .as_array()
+        .expect("expected manifests array");
+    assert_eq!(manifests.len(), 1, "expected 1 manifest entry");
+
+    let annotations = manifests[0]["annotations"]
+        .as_object()
+        .expect("expected annotations");
+    assert_eq!(
+        annotations["org.opencontainers.image.ref.name"],
+        "test-image"
+    );
+
+    let manifest_digest = manifests[0]["digest"]
+        .as_str()
+        .expect("expected digest string");
+    let manifest_hash = manifest_digest
+        .strip_prefix("sha256:")
+        .expect("expected sha256 prefix");
+    let manifest_blob =
+        std::fs::read_to_string(output_path.join("blobs/sha256").join(manifest_hash))?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_blob)?;
+    let layers = manifest["layers"]
+        .as_array()
+        .expect("expected layers array");
+    assert!(!layers.is_empty(), "expected at least one layer");
+
+    assert_eq!(
+        layers[0]["mediaType"], "application/vnd.oci.image.layer.v1.tar",
+        "expected uncompressed tar media type"
+    );
+
+    for layer in layers {
+        let layer_digest = layer["digest"].as_str().expect("expected layer digest");
+        let layer_hash = layer_digest
+            .strip_prefix("sha256:")
+            .expect("expected sha256 prefix");
+        let layer_blob_path = output_path.join("blobs/sha256").join(layer_hash);
+        assert!(layer_blob_path.exists(), "layer blob should exist");
+        let metadata = std::fs::metadata(&layer_blob_path)?;
+        assert!(metadata.len() > 0, "layer blob should be non-empty");
+    }
+
+    let config_digest = manifest["config"]["digest"]
+        .as_str()
+        .expect("expected config digest");
+    let config_hash = config_digest
+        .strip_prefix("sha256:")
+        .expect("expected sha256 prefix");
+    assert!(
+        output_path.join("blobs/sha256").join(config_hash).exists(),
+        "config blob should exist"
+    );
+
+    Ok(())
+}
+integration_test!(test_oci_push_to_layout);
+
+fn test_oci_push_pull_roundtrip() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = tempfile::tempdir()?;
+    let repo = repo_dir.path();
+    let fixture_dir = tempfile::tempdir()?;
+    let oci_layout = create_oci_layout(fixture_dir.path())?;
+
+    // Pull from OCI layout into repo
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci pull oci:{oci_layout} test-image"
+    )
+    .read()?;
+
+    // Push to a new OCI layout directory
+    let output_dir = tempfile::tempdir()?;
+    let output_path = output_dir.path().join("exported");
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo} oci push test-image oci:{output_path}"
+    )
+    .read()?;
+
+    // Pull from the exported layout into a fresh repo
+    let repo2_dir = tempfile::tempdir()?;
+    let repo2 = repo2_dir.path();
+    let pull_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo2} oci pull oci:{output_path} roundtrip-image"
+    )
+    .read()?;
+    assert!(
+        pull_output.contains("manifest sha256:"),
+        "expected manifest digest in roundtrip pull, got: {pull_output}"
+    );
+
+    let list_output = cmd!(sh, "{cfsctl} --insecure --repo {repo2} oci images --json").read()?;
+    let images: serde_json::Value = serde_json::from_str(&list_output)?;
+    let arr = images.as_array().expect("expected array");
+    assert_eq!(arr.len(), 1, "expected 1 image in new repo");
+    assert_eq!(arr[0]["name"], "roundtrip-image");
+    assert_eq!(arr[0]["architecture"], "amd64");
+
+    let config_output = cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo2} oci inspect roundtrip-image --config"
+    )
+    .read()?;
+    let config: serde_json::Value = serde_json::from_str(&config_output)?;
+    assert_eq!(config["architecture"], "amd64");
+    assert_eq!(config["os"], "linux");
+
+    let diff_ids = config["rootfs"]["diff_ids"]
+        .as_array()
+        .expect("expected diff_ids");
+    assert_eq!(diff_ids.len(), 1, "expected 1 layer after roundtrip");
+
+    Ok(())
+}
+integration_test!(test_oci_push_pull_roundtrip);

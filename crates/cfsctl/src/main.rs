@@ -4,15 +4,22 @@
 //! creating and mounting filesystem images, handling OCI containers, and performing
 //! repository maintenance operations like garbage collection.
 
-use cfsctl::App;
-
 use anyhow::Result;
-use clap::Parser;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // If we were spawned as a userns helper process, handle that and exit.
+    // This MUST be called before the tokio runtime is created.
+    #[cfg(feature = "containers-storage")]
+    cstorage::init_if_helper();
+
+    // Now we can create the tokio runtime for the main application
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     env_logger::init();
-
-    let args = App::parse();
-    cfsctl::run_app(args).await
+    cfsctl::run_from_args().await
 }

@@ -45,20 +45,22 @@ clone:
 # `rev` (done when the bootc branch is updated) busts the podman build
 # cache.  This recipe just adds a [patch] override so Cargo resolves from
 # the bind-mounted local source instead of fetching from git.
+#
+# Errors if the composefs-rs tree has uncommitted changes.
 patch: clone
     #!/bin/bash
     set -euo pipefail
-    cd "$COMPOSEFS_BOOTC_PATH"
+
+    # Require a clean composefs-rs working tree so we test a real commit
+    if ! git -C "$_COMPOSEFS_SRC" diff --quiet HEAD 2>/dev/null; then
+        echo "error: composefs-rs has uncommitted changes — commit or stash first" >&2
+        git -C "$_COMPOSEFS_SRC" status --short >&2
+        exit 1
+    fi
 
     cfs_path="$_COMPOSEFS_SRC/crates/cfsctl"
 
-    # Check if already patched (idempotent)
-    if grep -q 'Patched by composefs-rs' Cargo.toml 2>/dev/null; then
-        echo "bootc already patched for composefs-rs"
-        exit 0
-    fi
-
-    echo "Patching bootc Cargo.toml to use $_COMPOSEFS_SRC"
+    cd "$COMPOSEFS_BOOTC_PATH"
 
     # Add or update the [patch] section with a path override
     patch_value="cfsctl = { path = \"${cfs_path}\" } # Patched by composefs-rs"
@@ -85,7 +87,12 @@ patch: clone
     # We intentionally don't run `cargo update` here because it rewrites
     # the workspace dependency line in Cargo.toml (replacing git+rev with path).
 
-    echo "bootc patched successfully"
+    # Update the rev comment in the [patch] section so Cargo.toml actually
+    # changes when composefs-rs moves to a new commit.  Since the file is
+    # part of the podman build context this busts the layer cache.
+    _rev=$(git -C "$_COMPOSEFS_SRC" rev-parse HEAD)
+    sed -i "s/^# Patched by composefs-rs.*/# Patched by composefs-rs at ${_rev}/" Cargo.toml
+    echo "bootc patched for composefs-rs at ${_rev}"
 
 # Build sealed bootc image using local composefs-rs
 # The path dependency is auto-detected and bind-mounted by bootc's Justfile
@@ -158,6 +165,6 @@ config:
 
     Example Usage:
       just bootc/build                                      # Clone main, patch, and build
-      COMPOSEFS_BOOTC_REF=v1.2.0 just bootc/build           # Use specific tag
+      COMPOSEFS_BOOTC_REF=v1.0.0 just bootc/build           # Use specific tag
       COMPOSEFS_BOOTC_REF=refs/pull/1791/head just bootc/build  # Use PR
     EOF
