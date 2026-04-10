@@ -58,18 +58,37 @@ cfsctl_features := env("COMPOSEFS_CFSCTL_FEATURES", "pre-6.15")
 _test_image := if base_image =~ "debian" { "localhost/composefs-rs-test-debian:latest" } else if base_image =~ "stream9" { "localhost/composefs-rs-test-c9s:latest" } else { "localhost/composefs-rs-test:latest" }
 
 # Run unprivileged integration tests against the cfsctl binary (no root, no VM)
-test-integration: build
-    CFSCTL_PATH=$(pwd)/target/debug/cfsctl cargo run -p integration-tests -- --skip privileged_
+# Prefers nextest for parallelism control and better UX; falls back to direct harness.
+test-integration *ARGS: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CFSCTL_PATH=$(pwd)/target/debug/cfsctl
+    if command -v cargo-nextest &> /dev/null; then
+        cargo nextest run -p integration-tests -E 'not test(/^privileged_/)' {{ ARGS }}
+    else
+        cargo test -p integration-tests --test cfsctl-integration-tests -- --skip privileged_ {{ ARGS }}
+    fi
 
 # Build the test container image for VM-based integration tests
 _integration-container-build:
     podman build --build-arg base_image={{base_image}} --build-arg cfsctl_features={{cfsctl_features}} -t {{_test_image}} .
 
 # Run all integration tests including privileged VM tests (requires podman + libvirt)
-test-integration-vm: build _integration-container-build
-    COMPOSEFS_TEST_IMAGE={{_test_image}} \
-        CFSCTL_PATH=$(pwd)/target/debug/cfsctl \
-        cargo run -p integration-tests
+# Uses nextest with the integration profile for parallelism control of VM tests.
+test-integration-vm *ARGS: build _integration-container-build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export COMPOSEFS_TEST_IMAGE={{_test_image}}
+    export CFSCTL_PATH=$(pwd)/target/debug/cfsctl
+    if command -v cargo-nextest &> /dev/null; then
+        cargo nextest run -P integration -p integration-tests {{ ARGS }}
+    else
+        cargo test -p integration-tests --test cfsctl-integration-tests -- {{ ARGS }}
+    fi
+
+# Install cargo-nextest if not already installed
+install-nextest:
+    @which cargo-nextest > /dev/null 2>&1 || cargo install cargo-nextest --locked
 
 # Run everything: checks + full integration tests including VM
 ci: check test-integration-vm

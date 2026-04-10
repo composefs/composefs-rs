@@ -557,4 +557,267 @@ mod test {
 
         Ok(())
     }
+
+    // --- Whiteout-specific tests ---
+
+    #[test]
+    fn test_whiteout_file_removes_entry() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        process_entry(&mut fs, file_entry("/etc/hosts"))?;
+        process_entry(&mut fs, file_entry("/etc/passwd"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/hosts", "/etc/passwd"])?;
+
+        // Whiteout hosts — only hosts should be removed
+        process_entry(&mut fs, file_entry("/etc/.wh.hosts"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/passwd"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_nonexistent_file_is_noop() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        process_entry(&mut fs, file_entry("/etc/hosts"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/hosts"])?;
+
+        // Whiteout a file that doesn't exist — should be a no-op
+        process_entry(&mut fs, file_entry("/etc/.wh.nosuchfile"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/hosts"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_directory() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/usr"))?;
+        process_entry(&mut fs, dir_entry("/usr/local"))?;
+        process_entry(&mut fs, file_entry("/usr/local/bin"))?;
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        assert_files(&fs, &["/", "/etc", "/usr", "/usr/local", "/usr/local/bin"])?;
+
+        // Whiteout the directory /usr/local (removes the entire subtree)
+        process_entry(&mut fs, file_entry("/usr/.wh.local"))?;
+        assert_files(&fs, &["/", "/etc", "/usr"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_in_root_directory() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/mydir"))?;
+        process_entry(&mut fs, file_entry("/toplevel"))?;
+        assert_files(&fs, &["/", "/mydir", "/toplevel"])?;
+
+        // Whiteout in root (no leading dir component)
+        process_entry(&mut fs, file_entry("/.wh.toplevel"))?;
+        assert_files(&fs, &["/", "/mydir"])?;
+
+        // Also works without leading slash
+        process_entry(&mut fs, file_entry(".wh.mydir"))?;
+        assert_files(&fs, &["/"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_in_nested_directory() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/a"))?;
+        process_entry(&mut fs, dir_entry("/a/b"))?;
+        process_entry(&mut fs, dir_entry("/a/b/c"))?;
+        process_entry(&mut fs, file_entry("/a/b/c/deep"))?;
+        assert_files(&fs, &["/", "/a", "/a/b", "/a/b/c", "/a/b/c/deep"])?;
+
+        process_entry(&mut fs, file_entry("/a/b/c/.wh.deep"))?;
+        assert_files(&fs, &["/", "/a", "/a/b", "/a/b/c"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_opaque_whiteout_clears_directory() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        process_entry(&mut fs, file_entry("/etc/hosts"))?;
+        process_entry(&mut fs, file_entry("/etc/passwd"))?;
+        process_entry(&mut fs, file_entry("/etc/resolv.conf"))?;
+        assert_files(
+            &fs,
+            &["/", "/etc", "/etc/hosts", "/etc/passwd", "/etc/resolv.conf"],
+        )?;
+
+        // Opaque whiteout — clears all entries in /etc
+        process_entry(&mut fs, file_entry("/etc/.wh..wh..opq"))?;
+        assert_files(&fs, &["/", "/etc"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_opaque_whiteout_then_add_new_entries() -> Result<()> {
+        // This is a very common pattern in container images: the layer
+        // marks a dir opaque (hiding all lower-layer contents), then
+        // adds new entries in the same directory.
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        process_entry(&mut fs, file_entry("/etc/old_config"))?;
+        process_entry(&mut fs, file_entry("/etc/another_old"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/another_old", "/etc/old_config"])?;
+
+        // Opaque whiteout clears everything
+        process_entry(&mut fs, file_entry("/etc/.wh..wh..opq"))?;
+        assert_files(&fs, &["/", "/etc"])?;
+
+        // Then re-add new entries
+        process_entry(&mut fs, file_entry("/etc/new_config"))?;
+        process_entry(&mut fs, file_entry("/etc/new_other"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/new_config", "/etc/new_other"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiple_whiteouts_in_single_layer() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/usr"))?;
+        process_entry(&mut fs, file_entry("/usr/a"))?;
+        process_entry(&mut fs, file_entry("/usr/b"))?;
+        process_entry(&mut fs, file_entry("/usr/c"))?;
+        process_entry(&mut fs, file_entry("/usr/d"))?;
+        assert_files(&fs, &["/", "/usr", "/usr/a", "/usr/b", "/usr/c", "/usr/d"])?;
+
+        // Multiple whiteouts in the same directory
+        process_entry(&mut fs, file_entry("/usr/.wh.a"))?;
+        process_entry(&mut fs, file_entry("/usr/.wh.c"))?;
+        assert_files(&fs, &["/", "/usr", "/usr/b", "/usr/d"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_double_whiteout_is_idempotent() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/d"))?;
+        process_entry(&mut fs, file_entry("/d/target"))?;
+        assert_files(&fs, &["/", "/d", "/d/target"])?;
+
+        // Whiteout the same file twice — the second is a no-op
+        process_entry(&mut fs, file_entry("/d/.wh.target"))?;
+        assert_files(&fs, &["/", "/d"])?;
+
+        process_entry(&mut fs, file_entry("/d/.wh.target"))?;
+        assert_files(&fs, &["/", "/d"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_unusual_name_dot_wh_dot() -> Result<()> {
+        // ".wh..wh." (without trailing "opq") is a whiteout for a file
+        // literally named ".wh." — it is NOT an opaque whiteout.
+        // The code checks `whiteout == b".wh..opq"` for the complete
+        // filename ".wh..wh..opq", so ".wh..wh." won't match.
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/d"))?;
+        process_entry(&mut fs, file_entry("/d/real_file"))?;
+        assert_files(&fs, &["/", "/d", "/d/real_file"])?;
+
+        // ".wh..wh." is interpreted as a whiteout for the file named ".wh."
+        // (strip ".wh." prefix → ".wh." remainder). Since no file named ".wh."
+        // exists, it's a no-op. Crucially, it is NOT treated as an opaque
+        // whiteout — those require the exact name ".wh..wh..opq".
+        process_entry(&mut fs, file_entry("/d/.wh..wh."))?;
+        assert_files(&fs, &["/", "/d", "/d/real_file"])?;
+
+        // Note: a tar entry named ".wh." is consumed as a whiteout for "" (empty
+        // name), which is effectively a no-op — the file is never stored.
+        process_entry(&mut fs, file_entry("/d/.wh."))?;
+        assert_files(&fs, &["/", "/d", "/d/real_file"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_across_multiple_directories() -> Result<()> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/a"))?;
+        process_entry(&mut fs, dir_entry("/b"))?;
+        process_entry(&mut fs, file_entry("/a/file1"))?;
+        process_entry(&mut fs, file_entry("/a/file2"))?;
+        process_entry(&mut fs, file_entry("/b/file1"))?;
+        process_entry(&mut fs, file_entry("/b/file2"))?;
+        assert_files(
+            &fs,
+            &[
+                "/", "/a", "/a/file1", "/a/file2", "/b", "/b/file1", "/b/file2",
+            ],
+        )?;
+
+        // Whiteout file1 in /a and file2 in /b independently
+        process_entry(&mut fs, file_entry("/a/.wh.file1"))?;
+        process_entry(&mut fs, file_entry("/b/.wh.file2"))?;
+        assert_files(&fs, &["/", "/a", "/a/file2", "/b", "/b/file1"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_opaque_whiteout_with_subdirectories() -> Result<()> {
+        // Opaque whiteout should clear subdirectories too
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/parent"))?;
+        process_entry(&mut fs, dir_entry("/parent/child"))?;
+        process_entry(&mut fs, file_entry("/parent/child/deep"))?;
+        process_entry(&mut fs, file_entry("/parent/sibling"))?;
+        assert_files(
+            &fs,
+            &[
+                "/",
+                "/parent",
+                "/parent/child",
+                "/parent/child/deep",
+                "/parent/sibling",
+            ],
+        )?;
+
+        process_entry(&mut fs, file_entry("/parent/.wh..wh..opq"))?;
+        assert_files(&fs, &["/", "/parent"])?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_whiteout_then_recreate() -> Result<()> {
+        // Delete a file with whiteout, then re-add it in the same layer
+        let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+
+        process_entry(&mut fs, dir_entry("/etc"))?;
+        process_entry(&mut fs, file_entry("/etc/config"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/config"])?;
+
+        // Whiteout and then re-add
+        process_entry(&mut fs, file_entry("/etc/.wh.config"))?;
+        assert_files(&fs, &["/", "/etc"])?;
+
+        process_entry(&mut fs, file_entry("/etc/config"))?;
+        assert_files(&fs, &["/", "/etc", "/etc/config"])?;
+
+        Ok(())
+    }
 }

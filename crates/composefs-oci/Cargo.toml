@@ -11,17 +11,21 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-test = ["tar", "composefs/test"]
+default = ["containers-storage"]
+test = ["tar", "rand", "composefs/test"]
 boot = ["composefs-boot"]
+containers-storage = ["dep:cstorage", "dep:base64", "cstorage/userns-helper"]
 
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
 async-compression = { version = "0.4.0", default-features = false, features = ["tokio", "zstd", "gzip"] }
+base64 = { version = "0.22", default-features = false, features = ["std"], optional = true }
 bytes = { version = "1", default-features = false }
 composefs = { workspace = true }
 composefs-boot = { workspace = true, optional = true }
 containers-image-proxy = { version = "0.9.2", default-features = false }
+cstorage = { path = "../cstorage", version = "0.3.0", optional = true }
 hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.18.0", default-features = false, features = ["tokio"] }
 rustix = { version = "1.0.0", features = ["fs"] }
@@ -29,16 +33,19 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 thiserror = { version = "2.0.0", default-features = false }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = { version = "0.11.0", default-features = false }
+rand = { version = "0.10.0", default-features = false, optional = true }
 tar = { version = "0.4.38", default-features = false, optional = true }
 tar-core = "0.1.0"
 tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+tracing = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 cap-std = { version = "4.0.0", default-features = false }
 cap-tempfile = { version = "4.0.0", default-features = false }
 similar-asserts = "1.7.0"
 tar = { version = "0.4.38", default-features = false }
+rand = { version = "0.10.0", default-features = false }
 composefs = { workspace = true, features = ["test"] }
 composefs-boot = { workspace = true }
 once_cell = "1.21.3"

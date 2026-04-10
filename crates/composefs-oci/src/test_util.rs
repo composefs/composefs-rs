@@ -18,7 +18,6 @@
 /// /usr/bin/sh 0 120777 1 0 0 0 0.0 busybox - -
 /// ```
 use std::collections::HashMap;
-use std::io::Read as _;
 use std::sync::Arc;
 
 use crate::oci_image::write_manifest;
@@ -41,12 +40,50 @@ fn hash(bytes: &[u8]) -> OciDigest {
         .unwrap()
 }
 
+/// Write a PAX extended header entry followed by the real entry to a
+/// [`tar::Builder`].
+///
+/// The `xattrs` are encoded as `SCHILY.xattr.<name>=<value>` PAX records,
+/// which is the de-facto standard used by GNU tar, BSD tar, and all
+/// container runtimes.
+fn append_with_xattrs<W: std::io::Write>(
+    builder: &mut ::tar::Builder<W>,
+    header: &mut ::tar::Header,
+    path: &str,
+    data: &[u8],
+    xattrs: &[(String, Vec<u8>)],
+) {
+    // Build the PAX extended header payload using tar_core's PaxBuilder.
+    let mut pax = tar_core::builder::PaxBuilder::new();
+    for (key, value) in xattrs {
+        pax.add(&format!("SCHILY.xattr.{key}"), value);
+    }
+    let pax_data = pax.finish();
+
+    // Write the PAX header entry (type 'x').
+    let mut pax_header = ::tar::Header::new_ustar();
+    pax_header.set_entry_type(::tar::EntryType::XHeader);
+    pax_header.set_size(pax_data.len() as u64);
+    pax_header.set_mode(0o644);
+    let pax_path = format!("PaxHeader/{path}");
+    builder
+        .append_data(&mut pax_header, &pax_path, &pax_data[..])
+        .unwrap();
+
+    // Write the actual entry immediately after (same archive stream).
+    builder.append_data(header, path, data).unwrap();
+}
+
 /// Convert composefs dumpfile lines into tar bytes.
 ///
 /// Parses each line as a composefs [`Entry`] and builds the corresponding
 /// tar entry.  The root directory (`/`) is skipped since tar archives don't
-/// include it.  Only regular files (inline), directories, and symlinks are
-/// supported — this is sufficient for test images.
+/// include it.  Regular files (inline and external), directories, and
+/// symlinks are supported.  Any xattrs present (e.g. `security.capability`)
+/// are emitted as PAX extended headers.
+///
+/// External files (`Item::Regular` with no inline content) get
+/// deterministic pseudo-random data from a seeded RNG (keyed on file size).
 fn dumpfile_to_tar(dumpfile: &str) -> Vec<u8> {
     let mut builder = ::tar::Builder::new(vec![]);
 
@@ -71,6 +108,20 @@ fn dumpfile_to_tar(dumpfile: &str) -> Vec<u8> {
             .expect("non-UTF8 path")
             .trim_start_matches('/');
 
+        // Collect xattrs for PAX headers.
+        let xattrs: Vec<(String, Vec<u8>)> = entry
+            .xattrs
+            .iter()
+            .map(|x| {
+                let key = x
+                    .key
+                    .to_str()
+                    .unwrap_or_else(|| panic!("non-UTF8 xattr key: {:?}", x.key));
+                (key.to_owned(), x.value.to_vec())
+            })
+            .collect();
+        let has_xattrs = !xattrs.is_empty();
+
         let ty = FileType::from_raw_mode(entry.mode);
         match ty {
             FileType::Directory => {
@@ -80,36 +131,40 @@ fn dumpfile_to_tar(dumpfile: &str) -> Vec<u8> {
                 header.set_mode(entry.mode & 0o7777);
                 header.set_entry_type(::tar::EntryType::Directory);
                 header.set_size(0);
-                builder
-                    .append_data(&mut header, path, std::io::empty())
-                    .unwrap();
+                if has_xattrs {
+                    append_with_xattrs(&mut builder, &mut header, path, &[], &xattrs);
+                } else {
+                    builder
+                        .append_data(&mut header, path, std::io::empty())
+                        .unwrap();
+                }
             }
-            FileType::RegularFile => match &entry.item {
-                Item::RegularInline { content, .. } => {
-                    let mut header = ::tar::Header::new_ustar();
-                    header.set_uid(entry.uid.into());
-                    header.set_gid(entry.gid.into());
-                    header.set_mode(entry.mode & 0o7777);
-                    header.set_entry_type(::tar::EntryType::Regular);
-                    header.set_size(content.len() as u64);
+            FileType::RegularFile => {
+                let content: Vec<u8> = match &entry.item {
+                    Item::RegularInline { content, .. } => content.to_vec(),
+                    Item::Regular { size, .. } => {
+                        use rand::{RngExt, SeedableRng, rngs::SmallRng};
+                        let mut rng = SmallRng::seed_from_u64(*size);
+                        let mut buf = vec![0u8; *size as usize];
+                        rng.fill(&mut buf[..]);
+                        buf
+                    }
+                    other => panic!("unexpected regular file item variant: {other:?}"),
+                };
+                let mut header = ::tar::Header::new_ustar();
+                header.set_uid(entry.uid.into());
+                header.set_gid(entry.gid.into());
+                header.set_mode(entry.mode & 0o7777);
+                header.set_entry_type(::tar::EntryType::Regular);
+                header.set_size(content.len() as u64);
+                if has_xattrs {
+                    append_with_xattrs(&mut builder, &mut header, path, &content, &xattrs);
+                } else {
                     builder
                         .append_data(&mut header, path, &content[..])
                         .unwrap();
                 }
-                Item::Regular { size, .. } => {
-                    // External file with no inline content — create sized entry
-                    let mut header = ::tar::Header::new_ustar();
-                    header.set_uid(entry.uid.into());
-                    header.set_gid(entry.gid.into());
-                    header.set_mode(entry.mode & 0o7777);
-                    header.set_entry_type(::tar::EntryType::Regular);
-                    header.set_size(*size);
-                    builder
-                        .append_data(&mut header, path, std::io::repeat(0u8).take(*size))
-                        .unwrap();
-                }
-                other => panic!("unexpected regular file item variant: {other:?}"),
-            },
+            }
             FileType::Symlink => {
                 let target = match &entry.item {
                     Item::Symlink { target, .. } => target,
@@ -124,9 +179,13 @@ fn dumpfile_to_tar(dumpfile: &str) -> Vec<u8> {
                 header
                     .set_link_name(target.as_ref())
                     .expect("failed to set symlink target");
-                builder
-                    .append_data(&mut header, path, std::io::empty())
-                    .unwrap();
+                if has_xattrs {
+                    append_with_xattrs(&mut builder, &mut header, path, &[], &xattrs);
+                } else {
+                    builder
+                        .append_data(&mut header, path, std::io::empty())
+                        .unwrap();
+                }
             }
             other => panic!("unsupported file type in test dumpfile: {other:?}"),
         }
@@ -252,12 +311,16 @@ async fn create_multi_layer_image(
 // ---------------------------------------------------------------------------
 // Layer definitions in composefs dumpfile format
 //
-// Format: /path size mode nlink uid gid rdev mtime payload content digest
+// Format: /path size mode nlink uid gid rdev mtime payload content digest [xattr=val ...]
 //
 // Directories:  /path 0 40755 2 0 0 0 0.0 - - -
 // Inline files: /path <len> 100644 1 0 0 0 0.0 - <content> -
+// External:     /path <len> 100644 1 0 0 0 0.0 / - -   (data is auto-generated)
 // Executables:  /path <len> 100755 1 0 0 0 0.0 - <content> -
 // Symlinks:     /path <targetlen> 120777 1 0 0 0 0.0 <target> - -
+//
+// Xattrs are appended as space-separated key=value pairs after the digest
+// (e.g. security.capability for file capabilities).
 // ---------------------------------------------------------------------------
 
 const LAYER_ROOT_STRUCTURE: &str = "\
@@ -271,14 +334,18 @@ const LAYER_ROOT_STRUCTURE: &str = "\
 /tmp 0 40755 2 0 0 0 0.0 - - -
 ";
 
+/// Busybox layer with a 4 KiB binary (external, > INLINE_CONTENT_MAX_V0).
 const LAYER_BUSYBOX: &str = "\
 / 0 40755 2 0 0 0 0.0 - - -
 /usr 0 40755 2 0 0 0 0.0 - - -
 /usr/bin 0 40755 2 0 0 0 0.0 - - -
-/usr/bin/busybox 22 100755 1 0 0 0 0.0 - busybox-binary-content -
+/usr/bin/busybox 4096 100755 1 0 0 0 0.0 / - -
 /usr/bin/sh 7 120777 1 0 0 0 0.0 busybox - -
 ";
 
+/// Core utils layer.  `/usr/bin/ping` carries a `security.capability` xattr
+/// granting CAP_NET_RAW (VFS_CAP_REVISION_2), which is the realistic pattern
+/// seen in real container images.
 const LAYER_CORE_UTILS: &str = "\
 / 0 40755 2 0 0 0 0.0 - - -
 /usr 0 40755 2 0 0 0 0.0 - - -
@@ -287,25 +354,29 @@ const LAYER_CORE_UTILS: &str = "\
 /usr/bin/cat 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/cp 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/mv 7 120777 1 0 0 0 0.0 busybox - -
+/usr/bin/ping 7 120777 1 0 0 0 0.0 busybox - - security.capability=\\x02\\x00\\x00\\x02\\x00\\x20\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00
 /usr/bin/rm 7 120777 1 0 0 0 0.0 busybox - -
 ";
 
+/// Config layer with /etc/passwd as a 100-byte external file.
 const LAYER_CONFIG: &str = "\
 / 0 40755 2 0 0 0 0.0 - - -
 /etc 0 40755 2 0 0 0 0.0 - - -
 /etc/os-release 26 100644 1 0 0 0 0.0 - ID=test\\nVERSION_ID=1.0\\n -
-/etc/hostname 9 100644 1 0 0 0 0.0 - testhost\\n -
-/etc/passwd 36 100644 1 0 0 0 0.0 - root:x:0:0:root:/root:/usr/bin/sh\\n -
+/etc/hostname 9 100644 1 0 0 0 0.0 - test-host -
+/etc/passwd 100 100644 1 0 0 0 0.0 / - -
 ";
 
+/// App layer with a 512-byte README and 256-byte JSON (both external).
 const LAYER_APP: &str = "\
 / 0 40755 2 0 0 0 0.0 - - -
 /usr 0 40755 2 0 0 0 0.0 - - -
 /usr/share 0 40755 2 0 0 0 0.0 - - -
-/usr/share/myapp 0 40755 2 0 0 0 0.0 - - -
-/usr/share/myapp/data.txt 16 100644 1 0 0 0 0.0 - application-data -
-/usr/bin 0 40755 2 0 0 0 0.0 - - -
-/usr/bin/myapp 26 100755 1 0 0 0 0.0 - #!/usr/bin/sh\\necho\\x20hello\\n -
+/usr/share/doc 0 40755 2 0 0 0 0.0 - - -
+/usr/share/doc/README 512 100644 1 0 0 0 0.0 / - -
+/var 0 40755 2 0 0 0 0.0 - - -
+/var/data 0 40755 2 0 0 0 0.0 - - -
+/var/data/app.json 256 100644 1 0 0 0 0.0 / - -
 ";
 
 const LAYER_BOOT_DIRS: &str = "\
@@ -420,16 +491,16 @@ const LAYER_LIBS_1: &str = "\
 / 0 40755 2 0 0 0 0.0 - - -
 /usr 0 40755 2 0 0 0 0.0 - - -
 /usr/lib 0 40755 2 0 0 0 0.0 - - -
-/usr/lib/libc.so.6 16 100644 1 0 0 0 0.0 - fake-libc-content -
-/usr/lib/libm.so.6 16 100644 1 0 0 0 0.0 - fake-libm-content -
+/usr/lib/libc.so.6 8192 100644 1 0 0 0 0.0 / - -
+/usr/lib/libm.so.6 4096 100644 1 0 0 0 0.0 / - -
 ";
 
 const LAYER_LIBS_2: &str = "\
 / 0 40755 2 0 0 0 0.0 - - -
 /usr 0 40755 2 0 0 0 0.0 - - -
 /usr/lib 0 40755 2 0 0 0 0.0 - - -
-/usr/lib/libpthread.so.0 22 100644 1 0 0 0 0.0 - fake-libpthread-content -
-/usr/lib/libdl.so.2 16 100644 1 0 0 0 0.0 - fake-libdl-content -
+/usr/lib/libpthread.so.0 4096 100644 1 0 0 0 0.0 / - -
+/usr/lib/libdl.so.2 2048 100644 1 0 0 0 0.0 / - -
 ";
 
 const LAYER_LOCALE: &str = "\

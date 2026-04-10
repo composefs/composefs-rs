@@ -14,6 +14,11 @@ failure-output = "immediate"
 success-output = "never"
 status-level = "pass"
 
+# Tests that pull OCI images need more time (especially on cold CI runners)
+[[profile.default.overrides]]
+filter = 'test(/digest_stability|oci_pull/)'
+slow-timeout = { period = "300s", terminate-after = 2 }
+
 # Profile for integration tests — run with limited parallelism due to QEMU/KVM resources
 [profile.integration]
 test-threads = 2
@@ -30,7 +35,12 @@ path = "junit.xml"
 store-success-output = true
 store-failure-output = true
 
-# VM tests boot an ephemeral QEMU instance per test, limit parallelism
+# Privileged tests boot an ephemeral QEMU instance per test — limit
+# parallelism to avoid OOM kills on 16 GB CI runners.
+# Requiring all 2 threads effectively serialises them.
+#
+# NOTE: use /regex/ syntax, not ~substring — the ~ operator treats ^ $ as
+# literal characters, so ~^foo never matches anything.
 [[profile.integration.overrides]]
-filter = 'test(~^vm_)'
-threads-required = 4
+filter = 'test(/^privileged_/)'
+threads-required = 2

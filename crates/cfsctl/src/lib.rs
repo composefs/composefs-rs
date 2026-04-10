@@ -928,20 +928,15 @@ where
             } => {
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
-                let (result, stats) =
-                    composefs_oci::pull_image(&repo, image, Some(tag_name), None).await?;
+
+                let result =
+                    composefs_oci::pull(&repo, image, Some(tag_name), Default::default()).await?;
 
                 println!("manifest {}", result.manifest_digest);
                 println!("config   {}", result.config_digest);
                 println!("verity   {}", result.manifest_verity.to_hex());
                 println!("tagged   {tag_name}");
-                println!(
-                    "objects  {} copied, {} already present, {} bytes copied, {} bytes inlined",
-                    stats.objects_copied,
-                    stats.objects_already_present,
-                    stats.bytes_copied,
-                    stats.bytes_inlined,
-                );
+                println!("objects  {}", result.stats);
 
                 if bootable {
                     let image_verity =

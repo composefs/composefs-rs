@@ -1,5 +1,21 @@
 [workspace]
 members = ["crates/*"]
+# Exclude integration-tests from default `cargo test` — those require a
+# built cfsctl binary and (for privileged tests) a VM.  Run them via
+# `just test-integration` or `just test-integration-vm` instead.
+default-members = [
+    "crates/cfsctl",
+    "crates/composefs",
+    "crates/composefs-boot",
+    "crates/composefs-fuse",
+    "crates/composefs-http",
+    "crates/composefs-ioctls",
+    "crates/composefs-oci",
+    "crates/composefs-setup-root",
+    "crates/cstorage",
+    "crates/erofs-debug",
+    "crates/splitfdstream",
+]
 resolver = "2"
 
 [workspace.package]
@@ -22,6 +38,9 @@ composefs-ioctls = { version = "0.3.0", path = "crates/composefs-ioctls", defaul
 composefs-oci = { version = "0.3.0", path = "crates/composefs-oci", default-features = false }
 composefs-boot = { version = "0.3.0", path = "crates/composefs-boot", default-features = false }
 composefs-http = { version = "0.3.0", path = "crates/composefs-http", default-features = false }
+
+# JSON-RPC with FD passing for userns helper
+jsonrpc-fdpass = { version = "0.1.0", default-features = false }
 
 [profile.dev.package.sha2]
 # this is *really* slow otherwise

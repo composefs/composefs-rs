@@ -14,7 +14,7 @@ use composefs::{
     dumpfile::write_dumpfile,
     erofs::{debug::debug_img, writer::mkfs_erofs},
     fsverity::{FsVerityHashValue, Sha256HashValue},
-    tree::{FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
+    tree::{FileSystem, Inode, LeafContent, RegularFile, Stat},
 };
 
 fn default_stat() -> Stat {

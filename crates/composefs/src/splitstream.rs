@@ -969,7 +969,7 @@ mod tests {
     use super::*;
     use crate::fsverity::{Sha256HashValue, compute_verity};
     use crate::test::tempdir;
-    use rustix::fs::{CWD, Mode, mkdirat};
+    use rustix::fs::CWD;
     use std::io::Cursor;
     use std::path::Path;
 

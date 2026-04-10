@@ -8,9 +8,13 @@
 //! - Pulling container images from registries using skopeo
 //! - Converting OCI image layers from tar format to composefs split streams
 //! - Creating mountable filesystems from OCI image configurations
+//! - Importing from containers-storage with zero-copy reflinks (optional feature)
+
 #![forbid(unsafe_code)]
 
 pub mod boot;
+#[cfg(feature = "containers-storage")]
+pub mod cstor;
 pub mod image;
 pub mod oci_image;
 pub mod skopeo;
@@ -67,27 +71,55 @@ pub use skopeo::pull_image;
 /// Statistics from an image import operation.
 #[derive(Debug, Clone, Default)]
 pub struct ImportStats {
-    /// Number of objects stored via copy.
+    /// Number of layers in the image.
+    pub layers: u64,
+    /// Number of layers that were already present (skipped).
+    pub layers_already_present: u64,
+    /// Number of objects stored via regular copy.
     pub objects_copied: u64,
+    /// Number of objects stored via reflink (zero-copy).
+    pub objects_reflinked: u64,
+    /// Number of objects stored via hardlink (zero-copy).
+    pub objects_hardlinked: u64,
     /// Number of objects that already existed (deduplicated).
     pub objects_already_present: u64,
-    /// Total bytes stored as new objects.
+    /// Total bytes stored via regular copy.
     pub bytes_copied: u64,
+    /// Total bytes stored via reflink.
+    pub bytes_reflinked: u64,
+    /// Total bytes stored via hardlink.
+    pub bytes_hardlinked: u64,
     /// Total bytes inlined in splitstreams (small files + headers).
     pub bytes_inlined: u64,
 }
 
 impl ImportStats {
+    /// Total number of new objects stored (copied + reflinked + hardlinked).
+    pub fn new_objects(&self) -> u64 {
+        self.objects_copied + self.objects_reflinked + self.objects_hardlinked
+    }
+
     /// Total number of objects processed (new + already present).
     pub fn total_objects(&self) -> u64 {
-        self.objects_copied + self.objects_already_present
+        self.new_objects() + self.objects_already_present
+    }
+
+    /// Total bytes stored as new objects (copied + reflinked + hardlinked).
+    pub fn new_bytes(&self) -> u64 {
+        self.bytes_copied + self.bytes_reflinked + self.bytes_hardlinked
     }
 
     /// Merge another `ImportStats` into this one.
     pub fn merge(&mut self, other: &ImportStats) {
+        self.layers += other.layers;
+        self.layers_already_present += other.layers_already_present;
         self.objects_copied += other.objects_copied;
+        self.objects_reflinked += other.objects_reflinked;
+        self.objects_hardlinked += other.objects_hardlinked;
         self.objects_already_present += other.objects_already_present;
         self.bytes_copied += other.bytes_copied;
+        self.bytes_reflinked += other.bytes_reflinked;
+        self.bytes_hardlinked += other.bytes_hardlinked;
         self.bytes_inlined += other.bytes_inlined;
     }
 
@@ -103,6 +135,14 @@ impl ImportStats {
                     stats.objects_copied += 1;
                     stats.bytes_copied += size;
                 }
+                ObjectStoreMethod::Reflinked => {
+                    stats.objects_reflinked += 1;
+                    stats.bytes_reflinked += size;
+                }
+                ObjectStoreMethod::Hardlinked => {
+                    stats.objects_hardlinked += 1;
+                    stats.bytes_hardlinked += size;
+                }
                 ObjectStoreMethod::AlreadyPresent => {
                     stats.objects_already_present += 1;
                 }
@@ -114,20 +154,90 @@ impl ImportStats {
 
 impl std::fmt::Display for ImportStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} new + {} already present objects; {} stored, {} inlined",
-            self.objects_copied,
-            self.objects_already_present,
-            indicatif::HumanBytes(self.bytes_copied),
-            indicatif::HumanBytes(self.bytes_inlined),
-        )
+        let has_zerocopy = self.objects_reflinked > 0 || self.objects_hardlinked > 0;
+        if has_zerocopy {
+            // Show detailed breakdown when zero-copy methods were used
+            let mut parts = Vec::new();
+            if self.objects_reflinked > 0 {
+                parts.push(format!("{} reflinked", self.objects_reflinked));
+            }
+            if self.objects_hardlinked > 0 {
+                parts.push(format!("{} hardlinked", self.objects_hardlinked));
+            }
+            parts.push(format!("{} copied", self.objects_copied));
+            parts.push(format!("{} already present", self.objects_already_present));
+            write!(f, "{} objects; ", parts.join(" + "))?;
+
+            let mut byte_parts = Vec::new();
+            if self.objects_reflinked > 0 {
+                byte_parts.push(format!(
+                    "{} reflinked",
+                    indicatif::HumanBytes(self.bytes_reflinked)
+                ));
+            }
+            if self.objects_hardlinked > 0 {
+                byte_parts.push(format!(
+                    "{} hardlinked",
+                    indicatif::HumanBytes(self.bytes_hardlinked)
+                ));
+            }
+            byte_parts.push(format!(
+                "{} copied",
+                indicatif::HumanBytes(self.bytes_copied)
+            ));
+            byte_parts.push(format!(
+                "{} inlined",
+                indicatif::HumanBytes(self.bytes_inlined)
+            ));
+            write!(f, "{}", byte_parts.join(", "))
+        } else {
+            write!(
+                f,
+                "{} new + {} already present objects; {} stored, {} inlined",
+                self.objects_copied,
+                self.objects_already_present,
+                indicatif::HumanBytes(self.bytes_copied),
+                indicatif::HumanBytes(self.bytes_inlined),
+            )
+        }
     }
+}
+
+/// Options for a [`pull`] operation.
+///
+/// Use `Default::default()` for the common case (skopeo transport, no
+/// zero-copy requirement).
+#[derive(Debug, Default)]
+pub struct PullOptions<'a> {
+    /// Image proxy configuration passed to skopeo (ignored for
+    /// `containers-storage:` references).
+    pub img_proxy_config: Option<ImageProxyConfig>,
+
+    /// If `true`, the containers-storage import path will error instead of
+    /// falling back to a data copy when neither reflink nor hardlink succeeds.
+    /// Intended for bootc's unified storage layout where the composefs repo
+    /// and containers-storage are always on the same filesystem.
+    pub zerocopy: bool,
+
+    /// Explicit containers-storage root.  When set, auto-discovery is skipped
+    /// and only this path (plus any `additional_image_stores`) is searched.
+    /// Only relevant for `containers-storage:` references.
+    pub storage_root: Option<&'a std::path::Path>,
+
+    /// Additional read-only image stores to search beyond the primary
+    /// (auto-discovered or explicit) store.  Equivalent to the
+    /// `additionalimagestore=` option in containers/storage.
+    /// Only relevant for `containers-storage:` references.
+    pub additional_image_stores: &'a [&'a std::path::Path],
 }
 
 /// Result of a pull operation.
 #[derive(Debug)]
 pub struct PullResult<ObjectID> {
+    /// The manifest digest (sha256:...).
+    pub manifest_digest: OciDigest,
+    /// The fs-verity hash of the manifest splitstream.
+    pub manifest_verity: ObjectID,
     /// The config digest (sha256:...).
     pub config_digest: OciDigest,
     /// The fs-verity hash of the config splitstream.
@@ -136,7 +246,8 @@ pub struct PullResult<ObjectID> {
     pub stats: ImportStats,
 }
 
-type ContentAndVerity<ObjectID> = (OciDigest, ObjectID);
+/// A tuple of (content digest, fs-verity ObjectID).
+pub type ContentAndVerity<ObjectID> = (OciDigest, ObjectID);
 
 /// Parsed OCI config and its associated references.
 pub struct OpenConfig<ObjectID> {
@@ -160,11 +271,11 @@ impl<ObjectID: std::fmt::Debug> std::fmt::Debug for OpenConfig<ObjectID> {
     }
 }
 
-fn layer_identifier(diff_id: &OciDigest) -> String {
+pub(crate) fn layer_identifier(diff_id: &OciDigest) -> String {
     format!("oci-layer-{diff_id}")
 }
 
-fn config_identifier(config: &OciDigest) -> String {
+pub(crate) fn config_identifier(config: &OciDigest) -> String {
     format!("oci-config-{config}")
 }
 
@@ -223,17 +334,47 @@ pub fn ls_layer<ObjectID: FsVerityHashValue>(
 
 /// Pull the target image, and add the provided tag. If this is a mountable
 /// image (i.e. not an artifact), it is *not* unpacked by default.
+///
+/// When the `containers-storage` feature is enabled and the image reference
+/// starts with `containers-storage:`, this uses the native cstor import path
+/// which supports zero-copy reflinks/hardlinks. Otherwise, it uses skopeo.
+///
+/// See [`PullOptions`] for tunable knobs (zero-copy mode, extra storage
+/// roots, image proxy configuration).
 pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
-    img_proxy_config: Option<ImageProxyConfig>,
+    opts: PullOptions<'_>,
 ) -> Result<PullResult<ObjectID>> {
-    let (config_digest, config_verity, stats) =
-        skopeo::pull(repo, imgref, reference, img_proxy_config).await?;
+    #[cfg(feature = "containers-storage")]
+    if let Some(image_id) = cstor::parse_containers_storage_ref(imgref) {
+        let (((manifest_digest, manifest_verity), (config_digest, config_verity)), stats) =
+            cstor::import_from_containers_storage(
+                repo,
+                image_id,
+                reference,
+                opts.zerocopy,
+                opts.storage_root,
+                opts.additional_image_stores,
+            )
+            .await?;
+        return Ok(PullResult {
+            manifest_digest,
+            manifest_verity,
+            config_digest,
+            config_verity,
+            stats,
+        });
+    }
+
+    let (result, stats) =
+        skopeo::pull_image(repo, imgref, reference, opts.img_proxy_config).await?;
     Ok(crate::PullResult {
-        config_digest,
-        config_verity,
+        manifest_digest: result.manifest_digest,
+        manifest_verity: result.manifest_verity,
+        config_digest: result.config_digest,
+        config_verity: result.config_verity,
         stats,
     })
 }
@@ -868,25 +1009,27 @@ mod test {
             "\
 / 0 40755 6 0 0 0 0.0 - - -
 /etc 0 40755 2 0 0 0 0.0 - - -
-/etc/hostname 9 100644 1 0 0 0 0.0 - testhost\\n -
+/etc/hostname 9 100644 1 0 0 0 0.0 - test-host -
 /etc/os-release 23 100644 1 0 0 0 0.0 - ID=test\\nVERSION_ID=1.0\\n -
-/etc/passwd 34 100644 1 0 0 0 0.0 - root:x:0:0:root:/root:/usr/bin/sh\\n -
+/etc/passwd 100 100644 1 0 0 0 0.0 f2/c4fd5735bd46db3b18d402ae87c5086c97c0e1321901cfd30f320b73ef25aa - f2c4fd5735bd46db3b18d402ae87c5086c97c0e1321901cfd30f320b73ef25aa
 /tmp 0 40755 2 0 0 0 0.0 - - -
 /usr 0 40755 5 0 0 0 0.0 - - -
 /usr/bin 0 40755 2 0 0 0 0.0 - - -
-/usr/bin/busybox 22 100755 1 0 0 0 0.0 - busybox-binary-content -
+/usr/bin/busybox 4096 100755 1 0 0 0 0.0 f0/f7e1e58fdd31f5792222087377a4a976760c416ecdf5f426193e608681b7a1 - f0f7e1e58fdd31f5792222087377a4a976760c416ecdf5f426193e608681b7a1
 /usr/bin/cat 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/cp 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/ls 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/mv 7 120777 1 0 0 0 0.0 busybox - -
-/usr/bin/myapp 25 100755 1 0 0 0 0.0 - #!/usr/bin/sh\\necho\\x20hello\\n -
+/usr/bin/ping 7 120777 1 0 0 0 0.0 busybox - - security.capability=\\x02\\x00\\x00\\x02\\x00\\x20\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00
 /usr/bin/rm 7 120777 1 0 0 0 0.0 busybox - -
 /usr/bin/sh 7 120777 1 0 0 0 0.0 busybox - -
 /usr/lib 0 40755 2 0 0 0 0.0 - - -
 /usr/share 0 40755 3 0 0 0 0.0 - - -
-/usr/share/myapp 0 40755 2 0 0 0 0.0 - - -
-/usr/share/myapp/data.txt 16 100644 1 0 0 0 0.0 - application-data -
-/var 0 40755 2 0 0 0 0.0 - - -
+/usr/share/doc 0 40755 2 0 0 0 0.0 - - -
+/usr/share/doc/README 512 100644 1 0 0 0 0.0 51/44b8f80be57c3518f410d930e18c4e405387c82e4993c18265a1ba4a80263b - 5144b8f80be57c3518f410d930e18c4e405387c82e4993c18265a1ba4a80263b
+/var 0 40755 3 0 0 0 0.0 - - -
+/var/data 0 40755 2 0 0 0 0.0 - - -
+/var/data/app.json 256 100644 1 0 0 0 0.0 c9/21965b74ac1780bc437cec640b27186d85317b9afdb3dbb68626aed5ecd2b6 - c921965b74ac1780bc437cec640b27186d85317b9afdb3dbb68626aed5ecd2b6
 "
         );
     }
@@ -936,9 +1079,10 @@ mod test {
         // Untag and GC — everything gets collected
         oci_image::untag_image(repo, "gctest:v1").unwrap();
         let gc2 = repo.gc(&[]).unwrap();
-        // 10 objects: 5 layer splitstreams + config JSON + manifest JSON
-        //   + EROFS image + new config splitstream + new manifest splitstream
-        assert_eq!(gc2.objects_removed, 10, "all objects collected after untag");
+        // 14 objects: 5 layer splitstreams + 4 external file objects
+        //   + config JSON + manifest JSON + EROFS image
+        //   + new config splitstream + new manifest splitstream
+        assert_eq!(gc2.objects_removed, 14, "all objects collected after untag");
         // 7 streams: 5 layers + 1 config + 1 manifest (tag ref removed by untag)
         assert_eq!(gc2.streams_pruned, 7, "all stream symlinks pruned");
         // 1 image: the EROFS symlink under images/
@@ -1072,16 +1216,77 @@ mod test {
 
     #[test]
     fn test_import_stats_display() {
+        // Copy-only stats (no reflinks)
         let stats = ImportStats {
             objects_copied: 42,
             objects_already_present: 100,
             bytes_copied: 1_500_000,
             bytes_inlined: 800,
+            ..Default::default()
         };
         assert_eq!(
             stats.to_string(),
             "42 new + 100 already present objects; 1.43 MiB stored, 800 B inlined"
         );
+        assert_eq!(stats.total_objects(), 142);
+        assert_eq!(stats.new_objects(), 42);
+        assert_eq!(stats.new_bytes(), 1_500_000);
+
+        // Stats with reflinks
+        let reflink_stats = ImportStats {
+            objects_reflinked: 30,
+            objects_copied: 12,
+            objects_already_present: 100,
+            bytes_reflinked: 1_000_000,
+            bytes_copied: 500_000,
+            bytes_inlined: 800,
+            ..Default::default()
+        };
+        assert_eq!(
+            reflink_stats.to_string(),
+            "30 reflinked + 12 copied + 100 already present objects; 976.56 KiB reflinked, 488.28 KiB copied, 800 B inlined"
+        );
+        assert_eq!(reflink_stats.total_objects(), 142);
+        assert_eq!(reflink_stats.new_objects(), 42);
+        assert_eq!(reflink_stats.new_bytes(), 1_500_000);
+
+        // Stats with hardlinks only
+        let hardlink_stats = ImportStats {
+            objects_hardlinked: 20,
+            objects_copied: 5,
+            objects_already_present: 50,
+            bytes_hardlinked: 800_000,
+            bytes_copied: 200_000,
+            bytes_inlined: 400,
+            ..Default::default()
+        };
+        assert_eq!(
+            hardlink_stats.to_string(),
+            "20 hardlinked + 5 copied + 50 already present objects; 781.25 KiB hardlinked, 195.31 KiB copied, 400 B inlined"
+        );
+        assert_eq!(hardlink_stats.total_objects(), 75);
+        assert_eq!(hardlink_stats.new_objects(), 25);
+        assert_eq!(hardlink_stats.new_bytes(), 1_000_000);
+
+        // Stats with both reflinks and hardlinks
+        let mixed_stats = ImportStats {
+            objects_reflinked: 10,
+            objects_hardlinked: 15,
+            objects_copied: 5,
+            objects_already_present: 70,
+            bytes_reflinked: 500_000,
+            bytes_hardlinked: 750_000,
+            bytes_copied: 250_000,
+            bytes_inlined: 600,
+            ..Default::default()
+        };
+        assert_eq!(
+            mixed_stats.to_string(),
+            "10 reflinked + 15 hardlinked + 5 copied + 70 already present objects; 488.28 KiB reflinked, 732.42 KiB hardlinked, 244.14 KiB copied, 600 B inlined"
+        );
+        assert_eq!(mixed_stats.total_objects(), 100);
+        assert_eq!(mixed_stats.new_objects(), 30);
+        assert_eq!(mixed_stats.new_bytes(), 1_500_000);
 
         let empty = ImportStats::default();
         assert_eq!(
@@ -1089,6 +1294,247 @@ mod test {
             "0 new + 0 already present objects; 0 B stored, 0 B inlined"
         );
         assert_eq!(empty.total_objects(), 0);
-        assert_eq!(stats.total_objects(), 142);
+    }
+
+    /// End-to-end test: multi-layer OCI image with nontrivial whiteout usage.
+    ///
+    /// Builds three tar layers exercising individual file whiteouts (`.wh.<name>`)
+    /// and opaque directory whiteouts (`.wh..wh..opq`), imports them through the
+    /// full OCI pipeline (tar → splitstream → OCI config/manifest → EROFS), and
+    /// verifies the resulting filesystem contains exactly the expected files.
+    #[tokio::test]
+    async fn test_whiteout_multi_layer_import() {
+        use composefs::test::TestRepo;
+        use containers_image_proxy::oci_spec::image::{
+            ConfigBuilder, DescriptorBuilder, ImageConfigurationBuilder, ImageManifestBuilder,
+            MediaType, RootFsBuilder,
+        };
+
+        // --- Tar builder helpers (local to this test) ---
+
+        fn tar_dir(builder: &mut ::tar::Builder<Vec<u8>>, name: &str) {
+            let mut header = ::tar::Header::new_ustar();
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(0o755);
+            header.set_entry_type(::tar::EntryType::Directory);
+            header.set_size(0);
+            builder
+                .append_data(&mut header, name, std::io::empty())
+                .unwrap();
+        }
+
+        fn tar_file(builder: &mut ::tar::Builder<Vec<u8>>, name: &str, content: &[u8]) {
+            let mut header = ::tar::Header::new_ustar();
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(0o644);
+            header.set_entry_type(::tar::EntryType::Regular);
+            header.set_size(content.len() as u64);
+            builder.append_data(&mut header, name, content).unwrap();
+        }
+
+        /// Zero-length regular file — used for `.wh.<name>` and `.wh..wh..opq` entries.
+        fn tar_whiteout(builder: &mut ::tar::Builder<Vec<u8>>, name: &str) {
+            tar_file(builder, name, &[]);
+        }
+
+        // --- Build the three layers ---
+
+        // Layer 1 (base): create initial filesystem
+        let layer1 = {
+            let mut b = ::tar::Builder::new(vec![]);
+            tar_dir(&mut b, "etc");
+            tar_file(&mut b, "etc/config.toml", b"[server]\nport = 8080\n");
+            tar_file(&mut b, "etc/hosts", b"127.0.0.1 localhost\n");
+            tar_dir(&mut b, "usr");
+            tar_dir(&mut b, "usr/bin");
+            tar_file(&mut b, "usr/bin/app", b"#!/bin/sh\necho hello\n");
+            tar_dir(&mut b, "usr/lib");
+            tar_file(&mut b, "usr/lib/old-lib.so", b"fake-old-lib-content");
+            tar_file(&mut b, "usr/lib/shared.so", b"fake-shared-lib-content");
+            tar_dir(&mut b, "tmp");
+            tar_dir(&mut b, "tmp/cache");
+            tar_file(&mut b, "tmp/cache/data.bin", b"cached-data-payload");
+            tar_file(&mut b, "tmp/cache/index.db", b"cached-index-payload");
+            b.into_inner().unwrap()
+        };
+
+        // Layer 2 (whiteout + modify):
+        //  - delete /etc/hosts (file whiteout)
+        //  - delete /usr/lib/old-lib.so (file whiteout)
+        //  - add /etc/hosts.new (replacement)
+        //  - opaque whiteout on /tmp/cache (clears data.bin + index.db)
+        //  - add /tmp/cache/fresh.bin (re-populate after opaque)
+        let layer2 = {
+            let mut b = ::tar::Builder::new(vec![]);
+            tar_dir(&mut b, "etc");
+            tar_whiteout(&mut b, "etc/.wh.hosts");
+            tar_file(&mut b, "etc/hosts.new", b"127.0.0.1 localhost.new\n");
+            tar_dir(&mut b, "usr");
+            tar_dir(&mut b, "usr/lib");
+            tar_whiteout(&mut b, "usr/lib/.wh.old-lib.so");
+            tar_dir(&mut b, "tmp");
+            tar_dir(&mut b, "tmp/cache");
+            tar_whiteout(&mut b, "tmp/cache/.wh..wh..opq");
+            tar_file(&mut b, "tmp/cache/fresh.bin", b"fresh-cache-content");
+            b.into_inner().unwrap()
+        };
+
+        // Layer 3 (more whiteouts):
+        //  - delete /usr/bin/app (file whiteout)
+        //  - add /usr/bin/app-v2 (replacement)
+        let layer3 = {
+            let mut b = ::tar::Builder::new(vec![]);
+            tar_dir(&mut b, "usr");
+            tar_dir(&mut b, "usr/bin");
+            tar_whiteout(&mut b, "usr/bin/.wh.app");
+            tar_file(&mut b, "usr/bin/app-v2", b"#!/bin/sh\necho hello v2\n");
+            b.into_inner().unwrap()
+        };
+
+        // --- Import layers and build OCI image ---
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let layers_data = [&layer1[..], &layer2[..], &layer3[..]];
+        let mut layer_digests = Vec::new();
+        let mut layer_verities_map: HashMap<Box<str>, composefs::fsverity::Sha256HashValue> =
+            HashMap::new();
+        let mut layer_descriptors = Vec::new();
+
+        for tar_data in &layers_data {
+            let digest = hash_sha256(tar_data);
+            let (verity, _stats) = import_layer(repo, &digest, None, *tar_data).await.unwrap();
+
+            let descriptor = DescriptorBuilder::default()
+                .media_type(MediaType::ImageLayerGzip)
+                .digest(digest.clone())
+                .size(tar_data.len() as u64)
+                .build()
+                .unwrap();
+
+            layer_verities_map.insert(digest.to_string().into_boxed_str(), verity);
+            layer_digests.push(digest.to_string());
+            layer_descriptors.push(descriptor);
+        }
+
+        // Build OCI config
+        let rootfs = RootFsBuilder::default()
+            .typ("layers")
+            .diff_ids(layer_digests.clone())
+            .build()
+            .unwrap();
+
+        let cfg = ConfigBuilder::default().build().unwrap();
+
+        let config = ImageConfigurationBuilder::default()
+            .architecture("amd64")
+            .os("linux")
+            .rootfs(rootfs)
+            .config(cfg)
+            .build()
+            .unwrap();
+
+        let config_json = config.to_string().unwrap();
+        let config_digest = hash_sha256(config_json.as_bytes());
+
+        let mut config_stream = repo.create_stream(skopeo::OCI_CONFIG_CONTENT_TYPE).unwrap();
+        for (digest, verity) in &layer_verities_map {
+            config_stream.add_named_stream_ref(digest, verity);
+        }
+        config_stream
+            .write_external(config_json.as_bytes())
+            .unwrap();
+        let config_verity = repo
+            .write_stream(config_stream, &config_identifier(&config_digest), None)
+            .unwrap();
+
+        // Build OCI manifest
+        let config_descriptor = DescriptorBuilder::default()
+            .media_type(MediaType::ImageConfig)
+            .digest(config_digest.clone())
+            .size(config_json.len() as u64)
+            .build()
+            .unwrap();
+
+        let manifest = ImageManifestBuilder::default()
+            .schema_version(2u32)
+            .media_type(MediaType::ImageManifest)
+            .config(config_descriptor)
+            .layers(layer_descriptors)
+            .build()
+            .unwrap();
+
+        let manifest_json = manifest.to_string().unwrap();
+        let manifest_digest = hash_sha256(manifest_json.as_bytes());
+
+        let (_stored_digest, manifest_verity) = oci_image::write_manifest(
+            repo,
+            &manifest,
+            &manifest_digest,
+            &config_verity,
+            &layer_verities_map,
+            Some("whiteout-test:v1"),
+        )
+        .unwrap();
+
+        // --- Create the EROFS image ---
+
+        let erofs_id = ensure_oci_composefs_erofs(
+            repo,
+            &manifest_digest,
+            Some(&manifest_verity),
+            Some("whiteout-test:v1"),
+        )
+        .unwrap()
+        .expect("container image should produce EROFS");
+
+        // --- Verify the flattened filesystem ---
+
+        let erofs_data = repo.read_object(&erofs_id).unwrap();
+        let fs =
+            composefs::erofs::reader::erofs_to_filesystem::<Sha256HashValue>(&erofs_data).unwrap();
+        let mut dump = Vec::new();
+        composefs::dumpfile::write_dumpfile(&mut dump, &fs).unwrap();
+        let dump = String::from_utf8(dump).unwrap();
+
+        // Extract just the paths from the dumpfile for structural verification
+        let paths: Vec<&str> = dump.lines().map(|l| l.split_once(' ').unwrap().0).collect();
+
+        // Files that SHOULD exist after all three layers
+        let expected_present = [
+            "/",
+            "/etc",
+            "/etc/config.toml", // layer 1, survived
+            "/etc/hosts.new",   // layer 2 addition
+            "/tmp",
+            "/tmp/cache",
+            "/tmp/cache/fresh.bin", // layer 2, after opaque whiteout
+            "/usr",
+            "/usr/bin",
+            "/usr/bin/app-v2", // layer 3 replacement
+            "/usr/lib",
+            "/usr/lib/shared.so", // layer 1, survived
+        ];
+
+        // Files that MUST NOT exist (removed by whiteouts)
+        let must_not_exist = [
+            "/etc/hosts",          // deleted by layer 2 file whiteout
+            "/usr/lib/old-lib.so", // deleted by layer 2 file whiteout
+            "/usr/bin/app",        // deleted by layer 3 file whiteout
+            "/tmp/cache/data.bin", // cleared by layer 2 opaque whiteout
+            "/tmp/cache/index.db", // cleared by layer 2 opaque whiteout
+        ];
+
+        similar_asserts::assert_eq!(paths, expected_present);
+
+        for path in &must_not_exist {
+            assert!(
+                !paths.contains(path),
+                "{path} should have been removed by whiteout but is still present"
+            );
+        }
     }
 }

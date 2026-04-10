@@ -1,6 +1,9 @@
 [package]
 name = "integration-tests"
 publish = false
+description = "Integration tests for composefs-rs (not published)"
+autobins = false
+autotests = false
 
 edition.workspace = true
 license.workspace = true
@@ -8,9 +11,23 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+# The integration test runner is declared as both [[bin]] (for the container
+# image build) and [[test]] (so nextest discovers the libtest-mimic tests).
+# The integration-tests crate is excluded from workspace default-members so
+# that plain `cargo test` does not run these; use `just test-integration`.
+# Cargo warns about the shared source file — this is harmless.
 [[bin]]
 name = "cfsctl-integration-tests"
 path = "src/main.rs"
+
+[[test]]
+name = "cfsctl-integration-tests"
+path = "src/main.rs"
+harness = false
+
+[[bin]]
+name = "test-cleanup"
+path = "src/cleanup.rs"
 
 [dependencies]
 anyhow = "1"
@@ -18,15 +35,18 @@ cap-std-ext = "5.0"
 composefs = { workspace = true }
 # Only the test_util module is used — for creating test OCI images.
 # All verification must go through the cfsctl CLI.
-composefs-oci = { workspace = true, features = ["test", "boot"] }
+composefs-oci = { workspace = true, features = ["test", "boot", "containers-storage"] }
+hex = "0.4"
 libtest-mimic = "0.8"
 linkme = "0.3"
 ocidir = "0.7"
 paste = "1"
-rustix = { version = "1.0.0", default-features = false, features = ["process"] }
-serde_json = "1.0"
+rustix = { version = "1", features = ["fs", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tar = "0.4"
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 xshell = "0.2"
 
 [lints]

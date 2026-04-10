@@ -574,7 +574,7 @@ pub fn list_images<ObjectID: FsVerityHashValue>(
                 });
             }
             Err(e) => {
-                eprintln!("Warning: skipping image {name}: {e:#}");
+                tracing::warn!("skipping image {name}: {e:#}");
                 continue;
             }
         }
