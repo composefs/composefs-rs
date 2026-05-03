@@ -735,6 +735,10 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     repository: OwnedFd,
     objects: OnceCell<OwnedFd>,
     write_semaphore: OnceCell<Arc<Semaphore>>,
+    /// Optional override for the number of concurrent object writes.
+    /// Set via [`set_write_concurrency`](Self::set_write_concurrency) before the semaphore
+    /// is first used; if `None`, defaults to [`available_parallelism`].
+    write_concurrency: Option<usize>,
     insecure: bool,
     metadata: RepoMetadata,
     /// When true, SplitStreamWriter::done() writes old-format (pre-repr(C))
@@ -1028,15 +1032,40 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .get_or_try_init(|| ensure_dir_and_openat(&self.repository, "objects", OFlags::PATH))
     }
 
+    /// Override the maximum number of concurrent object writes.
+    ///
+    /// Must be called before the first use of [`write_semaphore`](Self::write_semaphore);
+    /// has no effect if the semaphore has already been initialized.
+    pub fn set_write_concurrency(&mut self, n: usize) {
+        // Guard: the semaphore is lazily initialized on first use. If it's
+        // already been initialized, this call has no effect. Callers must
+        // set concurrency before any write operations begin.
+        debug_assert!(
+            self.write_semaphore.get().is_none(),
+            "set_write_concurrency called after write_semaphore was already initialized; \
+             call this before any write operations"
+        );
+        if self.write_semaphore.get().is_some() {
+            log::warn!(
+                "set_write_concurrency called after semaphore was already initialized; ignoring"
+            );
+            return;
+        }
+        self.write_concurrency = Some(n);
+    }
+
     /// Return a shared semaphore for limiting concurrent object writes.
     ///
-    /// This semaphore is lazily initialized with `available_parallelism()` permits,
+    /// This semaphore is lazily initialized with `available_parallelism()` permits
+    /// (or the value set via [`set_write_concurrency`](Self::set_write_concurrency)),
     /// and shared across all operations on this repository. Use this to limit
     /// concurrent I/O when processing multiple files or layers in parallel.
     pub fn write_semaphore(&self) -> Arc<Semaphore> {
         self.write_semaphore
             .get_or_init(|| {
-                let max_concurrent = available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let max_concurrent = self
+                    .write_concurrency
+                    .unwrap_or_else(|| available_parallelism().map(|n| n.get()).unwrap_or(4));
                 Arc::new(Semaphore::new(max_concurrent))
             })
             .clone()
@@ -1152,6 +1181,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             repository,
             objects: OnceCell::new(),
             write_semaphore: OnceCell::new(),
+            write_concurrency: None,
             insecure: !has_verity,
             metadata,
             #[cfg(any(test, feature = "test"))]
