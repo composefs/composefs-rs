@@ -164,16 +164,20 @@ pub(crate) mod proptest_strategies {
             0..=0o7777u32,        // permission bits
             0..=65535u32,         // uid
             0..=65535u32,         // gid
-            0..=2_000_000_000i64, // mtime
+            0..=2_000_000_000i64, // mtime sec
+            0..1_000_000_000u32,  // mtime nsec
             xattrs(),
         )
-            .prop_map(|(mode, uid, gid, mtime, xattrs)| tree::Stat {
-                st_mode: mode,
-                st_uid: uid,
-                st_gid: gid,
-                st_mtim_sec: mtime,
-                xattrs,
-            })
+            .prop_map(
+                |(mode, uid, gid, mtime_sec, mtime_nsec, xattrs)| tree::Stat {
+                    st_mode: mode,
+                    st_uid: uid,
+                    st_gid: gid,
+                    st_mtim_sec: mtime_sec,
+                    st_mtim_nsec: mtime_nsec,
+                    xattrs,
+                },
+            )
     }
 
     /// Strategy for xattr keys covering all erofs prefix namespaces.

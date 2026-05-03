@@ -456,6 +456,7 @@ pub fn get_entry<ObjectID: FsVerityHashValue>(
                             st_gid: entry.gid as u32,
                             st_mode: entry.mode,
                             st_mtim_sec: entry.mtime as i64,
+                            st_mtim_nsec: 0,
                             xattrs,
                         },
                         item,

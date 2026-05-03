@@ -28,6 +28,7 @@ fn stat(mode: u32, uid: u32, gid: u32, mtime: i64) -> Stat {
         st_uid: uid,
         st_gid: gid,
         st_mtim_sec: mtime,
+        st_mtim_nsec: 0,
         xattrs: BTreeMap::new(),
     }
 }

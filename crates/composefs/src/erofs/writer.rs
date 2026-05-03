@@ -418,9 +418,13 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
     /// - mtime matches min_mtime (stored in superblock build_time)
     /// - nlink, uid, gid fit in u16
     /// - size fits in u32
-    fn fits_in_compact(&self, min_mtime_sec: u64, size: u64, nlink: usize) -> bool {
-        // mtime must match the minimum (which will be stored in superblock build_time)
-        if self.stat.st_mtim_sec as u64 != min_mtime_sec {
+    fn fits_in_compact(&self, min_mtime: (u64, u32), size: u64, nlink: usize) -> bool {
+        // mtime (both sec and nsec) must match the minimum (which will be stored in superblock
+        // build_time / build_time_nsec). The C implementation requires both to match.
+        if self.stat.st_mtim_sec as u64 != min_mtime.0 {
+            return false;
+        }
+        if self.stat.st_mtim_nsec != min_mtime.1 {
             return false;
         }
 
@@ -462,7 +466,7 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
 
         // V1: compact inodes when possible; V2: always extended
         let use_compact =
-            version == format::FormatVersion::V1 && self.fits_in_compact(min_mtime.0, size, nlink);
+            version == format::FormatVersion::V1 && self.fits_in_compact(min_mtime, size, nlink);
 
         let inode_header_size = if use_compact {
             size_of::<format::CompactInodeHeader>()
@@ -557,16 +561,24 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
                 output.len()
             );
 
+            // V1 uses the BFS index as i_ino (matching C mkcomposefs behaviour).
+            // V2 uses the NID (byte offset / 32) for 32-bit stat compatibility.
+            let ino = match version {
+                format::FormatVersion::V1 => idx as u32,
+                format::FormatVersion::V2 => (output.len() / 32) as u32,
+            };
+
             output.write_struct(format::ExtendedInodeHeader {
                 format,
                 xattr_icount: xattr_icount.into(),
                 mode: self.file_type() | self.stat.st_mode,
                 size: size.into(),
                 u: u.into(),
-                ino: ((output.len() / 32) as u32).into(),
+                ino: ino.into(),
                 uid: self.stat.st_uid.into(),
                 gid: self.stat.st_gid.into(),
                 mtime: (self.stat.st_mtim_sec as u64).into(),
+                mtime_nsec: self.stat.st_mtim_nsec.into(),
                 nlink: (nlink as u32).into(),
                 ..Default::default()
             });
@@ -1031,12 +1043,9 @@ fn calculate_min_mtime(inodes: &[Inode<impl FsVerityHashValue>]) -> (u64, u32) {
 
     for inode in inodes {
         let mtime_sec = inode.stat.st_mtim_sec as u64;
-        if mtime_sec < min_sec {
+        if mtime_sec < min_sec || (mtime_sec == min_sec && inode.stat.st_mtim_nsec < min_nsec) {
             min_sec = mtime_sec;
-            // When we find a new minimum second, use its nsec
-            // Note: st_mtim_nsec would need to be tracked if we want nsec precision
-            // For now, we use 0 for nsec as the stat structure may not have it
-            min_nsec = 0;
+            min_nsec = inode.stat.st_mtim_nsec;
         }
     }
 

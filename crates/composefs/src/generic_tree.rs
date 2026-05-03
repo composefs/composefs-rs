@@ -21,6 +21,8 @@ pub struct Stat {
     pub st_gid: u32,
     /// Modification time in seconds since Unix epoch.
     pub st_mtim_sec: i64,
+    /// Modification time nanosecond component (0..999_999_999).
+    pub st_mtim_nsec: u32,
     /// Extended attributes as key-value pairs.
     pub xattrs: BTreeMap<Box<OsStr>, Box<[u8]>>,
 }
@@ -46,6 +48,7 @@ impl Stat {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         }
     }
@@ -508,14 +511,18 @@ impl<T> Directory<T> {
     /// Recursively finds the newest modification time in this directory tree.
     ///
     /// Returns the maximum modification time among this directory's metadata
-    /// and all files and subdirectories it contains.
+    /// and all files and subdirectories it contains, as a `(sec, nsec)` tuple
+    /// for full nanosecond precision.
     ///
     /// The `leaves` table is needed to resolve leaf mtimes.
-    pub fn newest_file(&self, leaves: &[Leaf<T>]) -> i64 {
-        let mut newest = self.stat.st_mtim_sec;
+    pub fn newest_file(&self, leaves: &[Leaf<T>]) -> (i64, u32) {
+        let mut newest = (self.stat.st_mtim_sec, self.stat.st_mtim_nsec);
         for inode in self.entries.values() {
             let mtime = match inode {
-                Inode::Leaf(id, _) => leaves[id.0].stat.st_mtim_sec,
+                Inode::Leaf(id, _) => {
+                    let s = &leaves[id.0].stat;
+                    (s.st_mtim_sec, s.st_mtim_nsec)
+                }
                 Inode::Directory(dir) => dir.newest_file(leaves),
             };
             if mtime > newest {
@@ -610,7 +617,9 @@ impl<T> FileSystem<T> {
             st_uid: self.root.stat.st_uid,
             st_gid: self.root.stat.st_gid,
             st_mtim_sec: self.root.stat.st_mtim_sec,
-
+            st_mtim_nsec: self.root.stat.st_mtim_nsec,
+            // Inherit root's xattrs (e.g. SELinux label) — C mkcomposefs does the same:
+            // whiteout entries copy all metadata including xattrs from the root inode.
             xattrs: self.root.stat.xattrs.clone(),
         };
 
@@ -688,6 +697,7 @@ impl<T> FileSystem<T> {
         let st_uid = usr.stat.st_uid;
         let st_gid = usr.stat.st_gid;
         let st_mtim_sec = usr.stat.st_mtim_sec;
+        let st_mtim_nsec = usr.stat.st_mtim_nsec;
         let xattrs = usr.stat.xattrs.clone();
 
         // Apply copied metadata to root
@@ -695,6 +705,7 @@ impl<T> FileSystem<T> {
         self.root.stat.st_uid = st_uid;
         self.root.stat.st_gid = st_gid;
         self.root.stat.st_mtim_sec = st_mtim_sec;
+        self.root.stat.st_mtim_nsec = st_mtim_nsec;
         self.root.stat.xattrs = xattrs;
 
         Ok(())
@@ -779,9 +790,10 @@ impl<T> FileSystem<T> {
     /// Returns an error if `/usr` does not exist (needed to get the mtime).
     pub fn canonicalize_run(&mut self) -> Result<(), ImageError> {
         if self.root.get_directory_opt(OsStr::new("run"))?.is_some() {
-            let usr_mtime = self.root.get_directory(OsStr::new("usr"))?.stat.st_mtim_sec;
+            let usr = self.root.get_directory(OsStr::new("usr"))?.stat.clone();
             let run_dir = self.root.get_directory_mut(OsStr::new("run"))?;
-            run_dir.stat.st_mtim_sec = usr_mtime;
+            run_dir.stat.st_mtim_sec = usr.st_mtim_sec;
+            run_dir.stat.st_mtim_nsec = usr.st_mtim_nsec;
             run_dir.clear();
         }
         Ok(())
@@ -1036,7 +1048,9 @@ impl<'a, T> DirectoryRef<'a, T> {
     }
 
     /// Recursively finds the newest modification time in this directory tree.
-    pub fn newest_file(&self) -> i64 {
+    ///
+    /// Returns a `(sec, nsec)` tuple for full nanosecond precision.
+    pub fn newest_file(&self) -> (i64, u32) {
         self.dir.newest_file(self.leaves)
     }
 }
@@ -1058,6 +1072,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         }
     }
@@ -1069,6 +1084,7 @@ mod tests {
             st_uid: 1000,
             st_gid: 1000,
             st_mtim_sec: mtime,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         }
     }
@@ -1298,27 +1314,27 @@ mod tests {
         let mut leaves = Vec::new();
 
         let mut root = Directory::new(stat_with_mtime(5));
-        assert_eq!(root.newest_file(&leaves), 5);
+        assert_eq!(root.newest_file(&leaves), (5, 0));
 
         let leaf_id_10 = push_leaf_file(&mut leaves, 10);
         root.insert(OsStr::new("file1"), Inode::leaf(leaf_id_10));
-        assert_eq!(root.newest_file(&leaves), 10);
+        assert_eq!(root.newest_file(&leaves), (10, 0));
 
         let subdir_stat = stat_with_mtime(15);
         let mut subdir = Box::new(Directory::new(subdir_stat));
         let leaf_id_12 = push_leaf_file(&mut leaves, 12);
         subdir.insert(OsStr::new("subfile1"), Inode::leaf(leaf_id_12));
         root.insert(OsStr::new("subdir"), Inode::Directory(subdir));
-        assert_eq!(root.newest_file(&leaves), 15);
+        assert_eq!(root.newest_file(&leaves), (15, 0));
 
         if let Some(Inode::Directory(sd)) = root.entries.get_mut(OsStr::new("subdir")) {
             let leaf_id_20 = push_leaf_file(&mut leaves, 20);
             sd.insert(OsStr::new("subfile2"), Inode::leaf(leaf_id_20));
         }
-        assert_eq!(root.newest_file(&leaves), 20);
+        assert_eq!(root.newest_file(&leaves), (20, 0));
 
         root.stat.st_mtim_sec = 25;
-        assert_eq!(root.newest_file(&leaves), 25);
+        assert_eq!(root.newest_file(&leaves), (25, 0));
     }
 
     #[test]
@@ -1370,6 +1386,7 @@ mod tests {
             st_uid: 42,
             st_gid: 43,
             st_mtim_sec: 1234567890,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::from([(
                 Box::from(OsStr::new("security.selinux")),
                 Box::from(b"system_u:object_r:usr_t:s0".as_slice()),
@@ -1415,6 +1432,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::from([
                 (
                     Box::from(OsStr::new("security.selinux")),
@@ -1667,6 +1685,7 @@ mod tests {
             st_uid: 100,
             st_gid: 200,
             st_mtim_sec: 54321,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::from([(
                 Box::from(OsStr::new("user.test")),
                 Box::from(b"val".as_slice()),
@@ -1847,6 +1866,7 @@ mod tests {
             st_uid: 1000,
             st_gid: 2000,
             st_mtim_sec: 12345,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::from([(
                 Box::from(OsStr::new("security.selinux")),
                 Box::from(b"system_u:object_r:root_t:s0".as_slice()),

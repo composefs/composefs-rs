@@ -27,6 +27,7 @@ fn default_stat() -> Stat {
         st_uid: 0,
         st_gid: 0,
         st_mtim_sec: 0,
+        st_mtim_nsec: 0,
         xattrs: BTreeMap::new(),
     }
 }
@@ -58,6 +59,7 @@ fn add_leaf<ObjectID: FsVerityHashValue>(
             st_uid: 0,
             st_mode: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         },
         content,

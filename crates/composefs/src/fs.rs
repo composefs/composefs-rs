@@ -216,6 +216,7 @@ fn stat_fd(fd: &OwnedFd, ifmt: FileType) -> Result<(rustix::fs::Stat, generic_tr
             st_uid: buf.st_uid,
             st_gid: buf.st_gid,
             st_mtim_sec: buf.st_mtime as i64,
+            st_mtim_nsec: buf.st_mtime_nsec as u32,
             xattrs: read_xattrs(fd)?,
         },
     ))
@@ -689,6 +690,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: Default::default(),
+            st_mtim_nsec: Default::default(),
             xattrs: Default::default(),
         };
         set_file_contents(&td, OsStr::new("testfile"), &st, b"new contents").unwrap();
