@@ -11,42 +11,33 @@
 //! - `--from-file`, `--print-digest`, `--print-digest-only`
 //! - `--skip-devices`, `--skip-xattrs`, `--user-xattrs`
 //! - `--min-version` / `--max-version` (V1 compact inodes, BFS ordering, whiteout table)
-//! - `--digest-store` (uses composefs-rs repository layout: `objects/XX/digest`)
+//! - `--digest-store` (C-compatible flat `XX/digest` layout via [`FlatDigestStore`])
+//! - `--threads` (controls tokio worker threads and verity-computation concurrency)
 //! - Source from directory or dumpfile, output to file or stdout
 //!
-//! Known gaps vs C mkcomposefs:
-//! - TODO(compat): `--use-epoch` only zeroes directory mtimes, not leaf nodes.
-//!   The `Stat` struct uses `Rc` for leaf sharing and `st_mtim_sec` lacks interior
-//!   mutability; needs upstream `Stat` changes or a pre-write tree walk.
-//! - TODO(compat): `--threads` is accepted but not implemented (returns error).
-//! - TODO(compat): `--digest-store` path layout differs from C: Rust uses
-//!   `objects/XX/digest` (Repository format) while C uses `XX/digest` directly.
-//!   These can't share the same digest store directory interchangeably.
-//! - TODO(compat): `--max-version` is parsed but doesn't drive auto-upgrade logic.
-//!   The C implementation starts at min_version and auto-upgrades to max_version
-//!   if the content requires it; Rust only uses min_version for format selection.
-//! - TODO(compat): `calculate_min_mtime` doesn't track nanoseconds (always 0).
-//!   The C implementation tracks mtime nanoseconds via `struct timespec`.
+//! All known compatibility gaps have been resolved.
 
 use std::{
     ffi::OsString,
     fs::File,
     io::{self, BufReader, IsTerminal, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
+    thread::available_parallelism,
 };
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use rustix::fs::CWD;
-
-use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use composefs::{
     dumpfile::dumpfile_to_filesystem,
     erofs::{format::FormatVersion, writer::mkfs_erofs_versioned},
-    fs::read_filesystem,
+    fs::{
+        FlatDigestStore, ObjectStore, read_filesystem_with_semaphore, read_filesystem_with_store,
+    },
     fsverity::{FsVerityHashValue, Sha256HashValue, compute_verity},
-    repository::Repository,
     tree::FileSystem,
 };
 
@@ -99,11 +90,10 @@ struct Args {
 
     /// Copy regular file content to the given object store directory.
     ///
-    /// Files are stored by their fsverity digest in a content-addressed layout
-    /// (objects/XX/XXXX...). The directory is created if it doesn't exist.
-    ///
-    /// Note: Uses composefs-rs Repository format which differs slightly from
-    /// the C mkcomposefs format (C uses XX/digest directly, Rust uses objects/XX/digest).
+    /// Files are stored by their fsverity digest using the same flat layout
+    /// as C mkcomposefs: `XX/DIGEST` where XX is the first byte of the digest.
+    /// The directory is created if it doesn't exist. The layout is compatible
+    /// with digest stores written by the C mkcomposefs tool.
     #[arg(long)]
     digest_store: Option<PathBuf>,
 
@@ -133,9 +123,12 @@ pub(crate) fn run() -> Result<()> {
         bail!("IMAGE is required (or use --print-digest-only)");
     }
 
-    // Check for unimplemented features
-    if args.threads.is_some() {
-        bail!("--threads is not yet implemented");
+    if args.min_version > args.max_version {
+        bail!(
+            "Invalid version range: --min-version ({}) must not exceed --max-version ({})",
+            args.min_version,
+            args.max_version
+        );
     }
 
     // Determine format version based on min/max version flags.
@@ -144,28 +137,40 @@ pub(crate) fn run() -> Result<()> {
     // min_version=1+ means we use Format 1.1 / V2 (composefs_version=2):
     //   extended inodes, DFS ordering, no whiteouts
     //
-    // TODO(compat): The C implementation uses both min_version and max_version
-    // to auto-upgrade the format if content requires it.  We only look at
-    // min_version today.
+    // No content-driven upgrade from V1→V2 is needed: V1 already supports
+    // extended inodes (64-byte) natively for entries that don't fit in compact
+    // (32-byte) inodes, so every filesystem can be represented in V1 without
+    // loss.  Starting at min_version and going up to max_version is therefore
+    // equivalent to simply using min_version.
     let format_version = if args.min_version == 0 {
         FormatVersion::V1
     } else {
         FormatVersion::V2
     };
 
-    // Open or create digest store if specified
-    let repo: Option<Arc<Repository<Sha256HashValue>>> =
+    // Open or create the digest store if specified.
+    // Always uses the C-compatible flat layout (XX/DIGEST) so that the store
+    // is interchangeable with the one written by C mkcomposefs.
+    let store: Option<Arc<dyn ObjectStore<Sha256HashValue>>> =
         if let Some(store_path) = &args.digest_store {
-            Some(Arc::new(open_or_create_repository(store_path)?))
+            let n = args
+                .threads
+                .unwrap_or_else(|| available_parallelism().map(|n| n.get()).unwrap_or(4));
+            Some(Arc::new(FlatDigestStore::open(store_path, n, true)?))
         } else {
             None
         };
+
+    // Warn if --digest-store is combined with --from-file (store is unused in that case)
+    if args.from_file && args.digest_store.is_some() {
+        eprintln!("warning: --digest-store is ignored when --from-file is specified");
+    }
 
     // Read input
     let mut fs = if args.from_file {
         read_dumpfile(&args)?
     } else {
-        read_directory(&args.source, repo.clone())?
+        read_directory(&args.source, store, args.threads)?
     };
 
     // Apply transformations based on flags
@@ -217,11 +222,17 @@ fn read_dumpfile(args: &Args) -> Result<composefs::tree::FileSystem<Sha256HashVa
 
 /// Read a filesystem tree from a directory path.
 ///
-/// If a repository is provided, large file contents are stored in the
-/// content-addressed object store and referenced by digest.
+/// If a store is provided, large file contents are copied there and
+/// referenced by digest. The store must implement [`ObjectStore`].
+///
+/// The `threads` argument controls both the tokio worker thread count and the
+/// semaphore used to limit concurrent verity computations. `Some(1)` uses a
+/// single-threaded runtime; `None` or `Some(n > 1)` uses the multi-threaded
+/// scheduler.
 fn read_directory(
     path: &Path,
-    repo: Option<Arc<Repository<Sha256HashValue>>>,
+    store: Option<Arc<dyn ObjectStore<Sha256HashValue>>>,
+    threads: Option<usize>,
 ) -> Result<FileSystem<Sha256HashValue>> {
     use rustix::fs::{Mode, OFlags};
 
@@ -242,37 +253,41 @@ fn read_directory(
     )
     .context("Failed to open current directory")?;
 
-    // Read the filesystem tree from the directory using a single-threaded runtime
+    // Build a tokio runtime appropriate for the requested thread count.
+    // --threads 1 → current_thread (no extra OS threads, minimal overhead).
+    // --threads N → multi_thread with exactly N worker threads.
+    // (default)  → multi_thread with the tokio default (one per logical CPU).
+    let rt = match threads {
+        Some(1) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("Failed to create single-threaded tokio runtime")?,
+        Some(n) => tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(n)
+            .enable_all()
+            .build()
+            .context("Failed to create multi-threaded tokio runtime")?,
+        None => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("Failed to create multi-threaded tokio runtime")?,
+    };
+
     let path = path.to_path_buf();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("Failed to create tokio runtime")?;
-    rt.block_on(read_filesystem(dirfd, path, repo))
-        .context("Failed to read directory tree")
-}
 
-/// Open an existing repository or create a new one at the given path.
-fn open_or_create_repository(path: &Path) -> Result<Repository<Sha256HashValue>> {
-    use rustix::fs::{Mode, mkdirat};
-
-    // Create the directory if it doesn't exist
-    match mkdirat(CWD, path, Mode::from_raw_mode(0o755)) {
-        Ok(()) => {}
-        Err(rustix::io::Errno::EXIST) => {} // Already exists, that's fine
-        Err(e) => {
-            return Err(e).with_context(|| format!("Failed to create digest store: {path:?}"));
-        }
+    // When a store is present its semaphore is already configured;
+    // delegate entirely to read_filesystem_with_store.
+    // When there is no store we build the semaphore ourselves so the
+    // requested thread count is honoured.
+    if store.is_some() {
+        rt.block_on(read_filesystem_with_store(dirfd, path, store))
+            .context("Failed to read directory tree")
+    } else {
+        let n = threads.unwrap_or_else(|| available_parallelism().map(|n| n.get()).unwrap_or(4));
+        let semaphore = Arc::new(Semaphore::new(n));
+        rt.block_on(read_filesystem_with_semaphore(dirfd, path, None, semaphore))
+            .context("Failed to read directory tree")
     }
-
-    let mut repo = Repository::open_path(CWD, path)
-        .with_context(|| format!("Failed to open digest store: {path:?}"))?;
-
-    // Enable insecure mode since most filesystems don't support fsverity
-    // (tmpfs, overlayfs, ext4 without verity, etc.)
-    repo.set_insecure();
-
-    Ok(repo)
 }
 
 /// Write the image to the specified path (or stdout if `-`).

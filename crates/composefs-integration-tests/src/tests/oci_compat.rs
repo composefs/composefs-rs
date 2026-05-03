@@ -411,3 +411,105 @@ fn test_symlinks_compat() -> Result<()> {
     Ok(())
 }
 integration_test!(test_symlinks_compat);
+
+/// Test that `--digest-store` writes files in the C-compatible flat `XX/DIGEST` layout.
+///
+/// Creates a rootfs with a file large enough to be stored externally (> 4096 bytes),
+/// runs Rust mkcomposefs with `--digest-store`, and verifies that the store contains
+/// objects at `XX/DIGEST` paths (not under an `objects/` subdirectory).
+fn test_digest_store_flat_layout() -> Result<()> {
+    let rust_mkcomposefs = rust_mkcomposefs_path()?;
+
+    let td = tempfile::tempdir()?;
+    let rootfs = td.path().join("rootfs");
+    let store = td.path().join("store");
+    let image = td.path().join("image.img");
+
+    fs::create_dir_all(&rootfs)?;
+
+    // Write a file large enough to be stored as an external object (> 4096 bytes).
+    let large_content = "x".repeat(8192);
+    fs::write(rootfs.join("bigfile"), &large_content)?;
+    // Also a small inline file.
+    fs::write(rootfs.join("small"), "tiny")?;
+
+    // Run Rust mkcomposefs with --digest-store on the directory directly.
+    let output = Command::new(&rust_mkcomposefs)
+        .args([
+            "--digest-store",
+            store.to_str().unwrap(),
+            rootfs.to_str().unwrap(),
+            image.to_str().unwrap(),
+        ])
+        .output()
+        .context("Failed to run Rust mkcomposefs")?;
+
+    if !output.status.success() {
+        bail!(
+            "Rust mkcomposefs failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // The store should exist and contain objects in flat XX/DIGEST layout.
+    assert!(store.exists(), "Digest store directory should exist");
+
+    // Walk the store and collect object paths.
+    let mut found_objects = Vec::new();
+    for entry in fs::read_dir(&store)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Should be exactly 2-char hex directories (e.g. "a3") — no "objects/" subdirectory.
+        if entry.file_type()?.is_dir() {
+            assert_eq!(
+                name.len(),
+                2,
+                "Store subdirectory should be 2-char hex, got {:?}",
+                name
+            );
+            assert!(
+                name.chars().all(|c| c.is_ascii_hexdigit()),
+                "Store subdirectory should be hex, got {:?}",
+                name
+            );
+            for obj in fs::read_dir(entry.path())? {
+                let obj = obj?;
+                found_objects.push(format!("{}/{}", name, obj.file_name().to_string_lossy()));
+            }
+        }
+    }
+
+    // The large file should have been stored externally.
+    assert!(
+        !found_objects.is_empty(),
+        "At least one object should be stored (large file should be external)"
+    );
+
+    eprintln!(
+        "Digest store flat layout: found {} object(s)",
+        found_objects.len()
+    );
+    for path in &found_objects {
+        eprintln!("  {path}");
+        // Verify it's a valid 2-char prefix / 62-char hex path.
+        let parts: Vec<&str> = path.splitn(2, '/').collect();
+        assert_eq!(parts.len(), 2, "Expected XX/DIGEST format");
+        assert_eq!(parts[0].len(), 2);
+        assert_eq!(
+            parts[1].len(),
+            62,
+            "Expected 62-char remainder of sha256 hex"
+        );
+        assert!(
+            parts
+                .iter()
+                .flat_map(|s| s.chars())
+                .all(|c| c.is_ascii_hexdigit()),
+            "All characters should be hex"
+        );
+    }
+
+    Ok(())
+}
+integration_test!(test_digest_store_flat_layout);

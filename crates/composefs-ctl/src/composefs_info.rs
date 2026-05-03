@@ -20,6 +20,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::path::Path;
 use std::{fs::File, io::Read, path::PathBuf};
 
 use anyhow::{Context, Result};
@@ -47,14 +48,6 @@ use zerocopy::FromBytes;
     about = "Query information from composefs images"
 )]
 struct Cli {
-    /// Filter entries by type or pattern (can be specified multiple times).
-    #[arg(long = "filter", action = clap::ArgAction::Append)]
-    filter: Vec<String>,
-
-    /// Base directory for object lookups.
-    #[arg(long)]
-    basedir: Option<PathBuf>,
-
     /// The subcommand to run.
     #[command(subcommand)]
     command: Command,
@@ -65,12 +58,18 @@ struct Cli {
 enum Command {
     /// Simple listing of files and directories in the image.
     Ls {
+        /// Filter entries at the root level by name (can be specified multiple times).
+        #[arg(long = "filter", action = clap::ArgAction::Append)]
+        filter: Vec<String>,
         /// Composefs image files to inspect.
         images: Vec<PathBuf>,
     },
 
     /// Full dump in composefs-dump(5) format.
     Dump {
+        /// Filter entries at the root level by name (can be specified multiple times).
+        #[arg(long = "filter", action = clap::ArgAction::Append)]
+        filter: Vec<String>,
         /// Composefs image files to dump.
         images: Vec<PathBuf>,
     },
@@ -83,6 +82,9 @@ enum Command {
 
     /// List backing files not present in basedir.
     MissingObjects {
+        /// Base directory for object lookups.
+        #[arg(long = "basedir", required = true)]
+        basedir: PathBuf,
         /// Composefs image files to inspect.
         images: Vec<PathBuf>,
     },
@@ -99,10 +101,10 @@ pub(crate) fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Command::Ls { images } => cmd_ls(&cli, images),
-        Command::Dump { images } => cmd_dump(&cli, images),
-        Command::Objects { images } => cmd_objects(&cli, images),
-        Command::MissingObjects { images } => cmd_missing_objects(&cli, images),
+        Command::Ls { filter, images } => cmd_ls(filter, images),
+        Command::Dump { filter, images } => cmd_dump(filter, images),
+        Command::Objects { images } => cmd_objects(images),
+        Command::MissingObjects { basedir, images } => cmd_missing_objects(basedir, images),
         Command::MeasureFile { files } => cmd_measure_file(files),
     }
 }
@@ -271,7 +273,7 @@ impl<'a> CollectContext<'a> {
 }
 
 /// List files and directories in the image.
-fn cmd_ls(cli: &Cli, images: &[PathBuf]) -> Result<()> {
+fn cmd_ls(filter: &[String], images: &[PathBuf]) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
@@ -280,7 +282,7 @@ fn cmd_ls(cli: &Cli, images: &[PathBuf]) -> Result<()> {
         let img = Image::open(&image_data)?;
 
         let root_nid = img.sb.root_nid.get() as u64;
-        let mut ctx = CollectContext::new(&img, &cli.filter);
+        let mut ctx = CollectContext::new(&img, filter);
         ctx.collect(root_nid, b"", 0)?;
 
         for entry in ctx.entries {
@@ -329,7 +331,7 @@ fn cmd_ls(cli: &Cli, images: &[PathBuf]) -> Result<()> {
 ///
 /// This matches the C composefs-info dump output: the EROFS image is parsed
 /// back into a filesystem tree which is then serialized as a dumpfile.
-fn cmd_dump(_cli: &Cli, images: &[PathBuf]) -> Result<()> {
+fn cmd_dump(_filter: &[String], images: &[PathBuf]) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
@@ -345,15 +347,13 @@ fn cmd_dump(_cli: &Cli, images: &[PathBuf]) -> Result<()> {
 }
 
 /// List all object paths from the images.
-fn cmd_objects(_cli: &Cli, images: &[PathBuf]) -> Result<()> {
+fn cmd_objects(images: &[PathBuf]) -> Result<()> {
     for image_path in images {
         let image_data = read_image(image_path)?;
         let objects: std::collections::HashSet<Sha256HashValue> =
             collect_objects(&image_data).context("Failed to collect objects from image")?;
 
-        // Convert to sorted list for deterministic output
-        let mut object_list: Vec<_> = objects.into_iter().collect();
-        object_list.sort_by_key(|a| a.to_hex());
+        let object_list: Vec<_> = objects.into_iter().collect();
 
         for obj in object_list {
             // Output in standard composefs object path format: XX/XXXX...
@@ -365,12 +365,7 @@ fn cmd_objects(_cli: &Cli, images: &[PathBuf]) -> Result<()> {
 }
 
 /// List objects not present in basedir.
-fn cmd_missing_objects(cli: &Cli, images: &[PathBuf]) -> Result<()> {
-    let basedir = cli
-        .basedir
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("--basedir is required for missing-objects command"))?;
-
+fn cmd_missing_objects(basedir: &Path, images: &[PathBuf]) -> Result<()> {
     // Collect all objects from all images
     let mut all_objects: HashSet<Sha256HashValue> = HashSet::new();
     for image_path in images {
