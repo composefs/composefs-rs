@@ -39,8 +39,200 @@ use crate::{
     repository::Repository,
     shared_internals::IO_BUF_CAPACITY,
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
-    util::proc_self_fd,
+    util::{create_tmpfile_in, proc_self_fd, reopen_tmpfile_ro},
 };
+
+// ---------------------------------------------------------------------------
+// ObjectStore trait
+// ---------------------------------------------------------------------------
+
+/// An abstraction over content-addressed storage for file objects.
+///
+/// Both [`Repository`] and the C-compatible [`FlatDigestStore`] implement
+/// this trait so that [`read_filesystem`] can write file content to either
+/// layout without duplicating the scanning logic.
+pub trait ObjectStore<ObjectID: FsVerityHashValue>: Send + Sync {
+    /// Store `fd` as an object, returning its verity digest.
+    ///
+    /// If an object with the same digest already exists, this is a no-op
+    /// and the existing digest is returned.
+    fn ensure_object_from_fd(&self, fd: OwnedFd, size: u64) -> Result<ObjectID>;
+
+    /// Return a semaphore that gates concurrent object writes.
+    fn write_semaphore(&self) -> Arc<Semaphore>;
+}
+
+impl<ObjectID: FsVerityHashValue> ObjectStore<ObjectID> for Repository<ObjectID> {
+    fn ensure_object_from_fd(&self, fd: OwnedFd, size: u64) -> Result<ObjectID> {
+        self.ensure_object_from_fd(fd, size)
+    }
+
+    fn write_semaphore(&self) -> Arc<Semaphore> {
+        self.write_semaphore()
+    }
+}
+
+/// C-compatible flat digest store (`<store>/XX/DIGEST`).
+///
+/// This mirrors the layout written by `mkcomposefs --digest-store` from the C
+/// implementation, where file objects live at `<store>/<first-byte-hex>/<full-hex-digest>`
+/// (e.g. `<store>/ab/abcdef01234...`).  This is distinct from the composefs-rs
+/// [`Repository`] layout which nests objects under an `objects/` subdirectory.
+///
+/// The flat layout makes the digest store interchangeable with the C tooling.
+#[derive(Debug)]
+pub struct FlatDigestStore {
+    /// Open directory fd for the store root.
+    root: Arc<OwnedFd>,
+    semaphore: Arc<Semaphore>,
+    /// If true, fall back to userspace hashing when kernel fs-verity is
+    /// unavailable (e.g. tmpfs, overlayfs). Matches `Repository::insecure`.
+    insecure: bool,
+}
+
+impl FlatDigestStore {
+    /// Open or create a flat digest store at `path`.
+    ///
+    /// `concurrency` controls how many concurrent object writes are permitted.
+    /// `insecure` enables userspace-hashing fallback when fs-verity is unavailable
+    /// (e.g. on tmpfs or overlayfs). Set to `true` for CLI use where the filesystem
+    /// may not support verity; set to `false` for strict security requirements.
+    pub fn open(path: &Path, concurrency: usize, insecure: bool) -> Result<Self> {
+        use rustix::fs::{Mode, mkdirat};
+
+        match mkdirat(CWD, path, Mode::from_raw_mode(0o755)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to create flat digest store: {path:?}"));
+            }
+        }
+
+        let root = openat(
+            CWD,
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("Failed to open flat digest store: {path:?}"))?;
+
+        Ok(Self {
+            root: Arc::new(root),
+            semaphore: Arc::new(Semaphore::new(concurrency)),
+            insecure,
+        })
+    }
+}
+
+impl<ObjectID: FsVerityHashValue> ObjectStore<ObjectID> for FlatDigestStore {
+    fn ensure_object_from_fd(&self, fd: OwnedFd, size: u64) -> Result<ObjectID> {
+        use crate::fsverity::{EnableVerityError, enable_verity_maybe_copy, measure_verity};
+        use std::io::BufRead as _;
+
+        // 1. Create an anonymous O_TMPFILE in the store root.
+        //    No name collision possible; invisible until linked.
+        let tmpfile_fd = create_tmpfile_in(self.root.as_fd())
+            .context("Creating O_TMPFILE in flat digest store")?;
+
+        // 2. Stream from source fd into tmpfile (no in-memory buffering).
+        let mut src = std::io::BufReader::with_capacity(IO_BUF_CAPACITY, File::from(fd));
+        let mut dst = File::from(tmpfile_fd.try_clone().context("Cloning tmpfile fd")?);
+        let copied = std::io::copy(&mut src, &mut dst).context("Copying object data to tmpfile")?;
+        ensure!(
+            copied == size,
+            "object size mismatch: expected {size}, copied {copied}"
+        );
+        drop(dst);
+
+        // 3. Reopen as read-only (kernel requires no writable fds to enable verity).
+        let ro_fd =
+            reopen_tmpfile_ro(File::from(tmpfile_fd)).context("Reopening tmpfile as read-only")?;
+
+        // 4. Enable kernel fs-verity (kernel reads and hashes the file for us).
+        let (ro_fd, verity_enabled) =
+            match enable_verity_maybe_copy::<ObjectID>(self.root.as_fd(), ro_fd.as_fd()) {
+                Ok(None) => (ro_fd, true),
+                Ok(Some(new_fd)) => (new_fd, true),
+                Err(EnableVerityError::AlreadyEnabled) => (ro_fd, true),
+                Err(EnableVerityError::FilesystemNotSupported) if self.insecure => (ro_fd, false),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(e)).context("Enabling verity on object tmpfile");
+                }
+            };
+
+        // 5. Get the digest — from the kernel (fast) or userspace fallback.
+        let id: ObjectID = if verity_enabled {
+            measure_verity(&ro_fd).context("Measuring verity digest after enable")?
+        } else {
+            // Insecure fallback: re-read the tmpfile to compute the digest.
+            let mut reader = std::io::BufReader::with_capacity(
+                IO_BUF_CAPACITY,
+                File::from(ro_fd.try_clone().context("Cloning ro_fd for digest")?),
+            );
+            let mut hasher = FsVerityHasher::<ObjectID>::new();
+            loop {
+                let buf = reader.fill_buf().context("Reading tmpfile for digest")?;
+                if buf.is_empty() {
+                    break;
+                }
+                let chunk = &buf[..buf.len().min(FsVerityHasher::<ObjectID>::BLOCK_SIZE)];
+                hasher.add_block(chunk);
+                let n = chunk.len();
+                reader.consume(n);
+            }
+            hasher.digest()
+        };
+
+        // 6. Derive flat path: XX/rest-of-hex (C-compatible layout).
+        let obj_path = id.to_object_pathname();
+        let slash = obj_path
+            .find('/')
+            .expect("to_object_pathname always has '/'");
+        let dir_name = &obj_path[..slash];
+        let file_name = &obj_path[slash + 1..];
+
+        // 7. Create XX/ subdirectory if needed.
+        match mkdirat(self.root.as_fd(), dir_name, Mode::from_raw_mode(0o755)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Creating digest store subdirectory {dir_name:?}"));
+            }
+        }
+
+        // 8. Open the XX/ subdirectory for use as linkat target.
+        let subdir = openat(
+            self.root.as_fd(),
+            dir_name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("Opening digest store subdirectory {dir_name:?}"))?;
+
+        // 9. Atomically link the tmpfile into its final content-addressed path.
+        //    EEXIST means another writer already stored the same object — fine.
+        match linkat(
+            CWD,
+            proc_self_fd(&ro_fd),
+            &subdir,
+            file_name,
+            AtFlags::SYMLINK_FOLLOW,
+        ) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Linking object into flat digest store: {obj_path:?}")
+                });
+            }
+        }
+
+        Ok(id)
+    }
+
+    fn write_semaphore(&self) -> Arc<Semaphore> {
+        self.semaphore.clone()
+    }
+}
 
 /// Attempt to use O_TMPFILE + rename to atomically set file contents.
 /// Will fall back to a non-atomic write if the target doesn't support O_TMPFILE.
@@ -542,32 +734,63 @@ pub async fn read_filesystem<ObjectID: FsVerityHashValue>(
     path: PathBuf,
     repo: Option<Arc<Repository<ObjectID>>>,
 ) -> Result<FileSystem<ObjectID>> {
-    read_filesystem_impl(dirfd, path, repo, None).await
+    let store: Option<Arc<dyn ObjectStore<ObjectID>>> =
+        repo.map(|r| r as Arc<dyn ObjectStore<ObjectID>>);
+    read_filesystem_impl(dirfd, path, store, None).await
 }
 
-/// Like [`read_filesystem`] but with an explicit concurrency limit.
+/// Options for [`read_filesystem_with_opts`].
+pub struct ReadFilesystemOpts<ObjectID: FsVerityHashValue> {
+    /// Object store to use for storing file content. When `None`, fsverity
+    /// digests are computed without writing to disk.
+    pub store: Option<Arc<dyn ObjectStore<ObjectID>>>,
+    /// Override the default concurrency limit. When `None`, the semaphore is
+    /// derived from the store (if any) or from [`available_parallelism`].
+    pub semaphore: Option<Arc<Semaphore>>,
+}
+
+impl<ObjectID: FsVerityHashValue> std::fmt::Debug for ReadFilesystemOpts<ObjectID> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadFilesystemOpts")
+            .field("store", &self.store.as_ref().map(|_| "<store>"))
+            .field("semaphore", &self.semaphore)
+            .finish()
+    }
+}
+
+impl<ObjectID: FsVerityHashValue> Default for ReadFilesystemOpts<ObjectID> {
+    fn default() -> Self {
+        Self {
+            store: None,
+            semaphore: None,
+        }
+    }
+}
+
+/// Like [`read_filesystem`] but with full control over store and concurrency.
 ///
-/// The `semaphore`, if provided, overrides the default parallelism derived from
-/// the repository or [`available_parallelism`]. This is the recommended way to
-/// honour a user-supplied `--threads` argument when no repository is present.
-pub async fn read_filesystem_with_semaphore<ObjectID: FsVerityHashValue>(
+/// This is the preferred entry point when you need to supply a custom
+/// [`ObjectStore`] (e.g. [`FlatDigestStore`] for C-compatible `--digest-store`
+/// behaviour) and/or override the thread concurrency limit (e.g. to honour a
+/// user-supplied `--threads` argument).
+pub async fn read_filesystem_with_opts<ObjectID: FsVerityHashValue>(
     dirfd: OwnedFd,
     path: PathBuf,
-    repo: Option<Arc<Repository<ObjectID>>>,
-    semaphore: Arc<Semaphore>,
+    opts: ReadFilesystemOpts<ObjectID>,
 ) -> Result<FileSystem<ObjectID>> {
-    read_filesystem_impl(dirfd, path, repo, Some(semaphore)).await
+    read_filesystem_impl(dirfd, path, opts.store, opts.semaphore).await
 }
 
 async fn read_filesystem_impl<ObjectID: FsVerityHashValue>(
     dirfd: OwnedFd,
     path: PathBuf,
-    repo: Option<Arc<Repository<ObjectID>>>,
+    store: Option<Arc<dyn ObjectStore<ObjectID>>>,
     semaphore_override: Option<Arc<Semaphore>>,
 ) -> Result<FileSystem<ObjectID>> {
     let semaphore = semaphore_override.unwrap_or_else(|| {
-        repo.as_ref()
-            .map(|r| r.write_semaphore())
+        store
+            .as_ref()
+            .map(|s| s.write_semaphore())
             .unwrap_or_else(|| {
                 let n = available_parallelism().map(|n| n.get()).unwrap_or(4);
                 Arc::new(Semaphore::new(n))
@@ -626,11 +849,11 @@ async fn read_filesystem_impl<ObjectID: FsVerityHashValue>(
             item = items.next(), if items_open => {
                 match item {
                     Some(((key, fd, size), permit)) => {
-                        let repo = repo.clone();
+                        let store = store.clone();
                         tasks.spawn_blocking(move || {
                             let _permit = permit;
-                            let id = if let Some(repo) = repo {
-                                repo.ensure_object_from_fd(fd, size)?
+                            let id = if let Some(store) = store {
+                                store.ensure_object_from_fd(fd, size)?
                             } else {
                                 compute_verity_from_fd::<ObjectID>(fd)?
                             };
@@ -722,6 +945,62 @@ mod tests {
         set_file_contents(&td, OsStr::new("testfile"), &st, b"new contents").unwrap();
         drop(td);
         assert_eq!(std::fs::read(testpath)?, b"new contents");
+        Ok(())
+    }
+
+    /// Verify that `FlatDigestStore` stores objects in the C-compatible `XX/DIGEST` layout.
+    #[test]
+    fn test_flat_digest_store_layout() -> Result<()> {
+        use crate::fsverity::Sha256HashValue;
+
+        let td = tempfile::tempdir()?;
+        let store_path = td.path().join("store");
+        let store = FlatDigestStore::open(&store_path, 1, true)?;
+
+        // Store a small piece of content.
+        let content = b"hello, flat digest store!";
+        let src_dir = tempfile::tempdir()?;
+        let src_path = src_dir.path().join("file");
+        std::fs::write(&src_path, content)?;
+        let src_fd = openat(
+            CWD,
+            &src_path,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0),
+        )?;
+
+        let id = <FlatDigestStore as ObjectStore<Sha256HashValue>>::ensure_object_from_fd(
+            &store,
+            src_fd,
+            content.len() as u64,
+        )?;
+
+        // Verify the layout: store/XX/rest-of-digest
+        let expected_path = id.to_object_pathname(); // e.g. "ab/cdef0123..."
+        let full_path = store_path.join(&expected_path);
+        assert!(
+            full_path.exists(),
+            "Expected object at flat path {full_path:?}"
+        );
+
+        // Verify content is intact.
+        let stored = std::fs::read(&full_path)?;
+        assert_eq!(stored, content);
+
+        // Idempotent: storing the same object again should succeed.
+        let src_fd2 = openat(
+            CWD,
+            &src_path,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0),
+        )?;
+        let id2 = <FlatDigestStore as ObjectStore<Sha256HashValue>>::ensure_object_from_fd(
+            &store,
+            src_fd2,
+            content.len() as u64,
+        )?;
+        assert_eq!(id, id2);
+
         Ok(())
     }
 }
