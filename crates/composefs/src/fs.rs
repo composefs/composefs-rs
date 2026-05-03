@@ -533,18 +533,46 @@ pub fn read_file<ObjectID: FsVerityHashValue>(
 ///
 /// If `repo` is `Some`, file objects are stored in the repository.
 /// If `None`, fsverity digests are computed without writing to disk.
+///
+/// An optional `semaphore` can be provided to override the default concurrency
+/// control. When `None`, the semaphore is derived from the repository (if any)
+/// or from [`available_parallelism`].
 pub async fn read_filesystem<ObjectID: FsVerityHashValue>(
     dirfd: OwnedFd,
     path: PathBuf,
     repo: Option<Arc<Repository<ObjectID>>>,
 ) -> Result<FileSystem<ObjectID>> {
-    let semaphore = repo
-        .as_ref()
-        .map(|r| r.write_semaphore())
-        .unwrap_or_else(|| {
-            let n = available_parallelism().map(|n| n.get()).unwrap_or(4);
-            Arc::new(Semaphore::new(n))
-        });
+    read_filesystem_impl(dirfd, path, repo, None).await
+}
+
+/// Like [`read_filesystem`] but with an explicit concurrency limit.
+///
+/// The `semaphore`, if provided, overrides the default parallelism derived from
+/// the repository or [`available_parallelism`]. This is the recommended way to
+/// honour a user-supplied `--threads` argument when no repository is present.
+pub async fn read_filesystem_with_semaphore<ObjectID: FsVerityHashValue>(
+    dirfd: OwnedFd,
+    path: PathBuf,
+    repo: Option<Arc<Repository<ObjectID>>>,
+    semaphore: Arc<Semaphore>,
+) -> Result<FileSystem<ObjectID>> {
+    read_filesystem_impl(dirfd, path, repo, Some(semaphore)).await
+}
+
+async fn read_filesystem_impl<ObjectID: FsVerityHashValue>(
+    dirfd: OwnedFd,
+    path: PathBuf,
+    repo: Option<Arc<Repository<ObjectID>>>,
+    semaphore_override: Option<Arc<Semaphore>>,
+) -> Result<FileSystem<ObjectID>> {
+    let semaphore = semaphore_override.unwrap_or_else(|| {
+        repo.as_ref()
+            .map(|r| r.write_semaphore())
+            .unwrap_or_else(|| {
+                let n = available_parallelism().map(|n| n.get()).unwrap_or(4);
+                Arc::new(Semaphore::new(n))
+            })
+    });
 
     // Channel for streaming work items from the scan thread to the
     // async runtime. The scan sends (key, fd, size) as files are
