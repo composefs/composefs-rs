@@ -367,6 +367,31 @@ enum OciCommand {
     },
 }
 
+#[cfg(feature = "ostree")]
+#[derive(Debug, Subcommand)]
+enum OstreeCommand {
+    PullLocal {
+        ostree_repo_path: PathBuf,
+        ostree_ref: String,
+        #[clap(long)]
+        base_name: Option<String>,
+    },
+    Pull {
+        ostree_repo_url: String,
+        ostree_ref: String,
+        #[clap(long)]
+        base_name: Option<String>,
+    },
+    CreateImage {
+        commit_name: String,
+        #[clap(long)]
+        image_name: Option<String>,
+    },
+    Inspect {
+        commit_name: String,
+    },
+}
+
 /// Common options for reading a filesystem from a path
 #[derive(Debug, Parser)]
 struct FsReadOptions {
@@ -430,6 +455,11 @@ enum Command {
     Oci {
         #[clap(subcommand)]
         cmd: OciCommand,
+    },
+    #[cfg(feature = "ostree")]
+    Ostree {
+        #[clap(subcommand)]
+        cmd: OstreeCommand,
     },
     /// Mounts a composefs image, possibly enforcing fsverity of the image
     Mount {
@@ -1166,6 +1196,50 @@ where
                         anyhow::bail!("OCI integrity check failed");
                     }
                 }
+            }
+        },
+        #[cfg(feature = "ostree")]
+        Command::Ostree { cmd: ostree_cmd } => match ostree_cmd {
+            OstreeCommand::PullLocal {
+                ref ostree_repo_path,
+                ref ostree_ref,
+                base_name,
+            } => {
+                let verity = composefs_ostree::pull_local(
+                    &repo,
+                    ostree_repo_path,
+                    ostree_ref,
+                    base_name.as_deref(),
+                )
+                .await?;
+
+                println!("verity {}", verity.to_hex());
+            }
+            OstreeCommand::Pull {
+                ref ostree_repo_url,
+                ref ostree_ref,
+                base_name,
+            } => {
+                let verity = composefs_ostree::pull(
+                    &repo,
+                    ostree_repo_url,
+                    ostree_ref,
+                    base_name.as_deref(),
+                )
+                .await?;
+
+                println!("verity {}", verity.to_hex());
+            }
+            OstreeCommand::CreateImage {
+                ref commit_name,
+                ref image_name,
+            } => {
+                let fs = composefs_ostree::create_filesystem(&repo, commit_name)?;
+                let image_id = fs.commit_image(&repo, image_name.as_deref())?;
+                println!("{}", image_id.to_id());
+            }
+            OstreeCommand::Inspect { ref commit_name } => {
+                composefs_ostree::inspect(&repo, commit_name)?;
             }
         },
         Command::CreateImage {

@@ -1294,14 +1294,22 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// avoiding a second read pass.
     #[context("Ensuring object from file descriptor")]
     pub(crate) fn ensure_object_from_fd(&self, source: OwnedFd, size: u64) -> Result<ObjectID> {
+        self.ensure_object_from_reader(File::from(source), size)
+    }
+
+    /// Ensures that the given data is stored as an object in the repository,
+    /// reading from any source that implements [`Read`].
+    ///
+    /// In insecure mode, the fs-verity digest is computed while copying,
+    /// avoiding a second read pass.
+    #[context("Ensuring object from reader")]
+    pub fn ensure_object_from_reader(&self, mut source: impl Read, size: u64) -> Result<ObjectID> {
         let writable = self.ensure_writable_token()?;
         let tmpfile_fd = self.create_object_tmpfile_impl(&writable)?;
 
         if self.insecure {
-            // Insecure mode: compute verity digest while copying, avoiding
-            // a second read of the data in finalize_object_tmpfile_impl.
             let mut hasher = FsVerityHasher::<ObjectID>::new();
-            let mut src = std::io::BufReader::with_capacity(IO_BUF_CAPACITY, File::from(source));
+            let mut src = std::io::BufReader::with_capacity(IO_BUF_CAPACITY, &mut source);
             let mut dst = File::from(tmpfile_fd.try_clone()?);
 
             loop {
@@ -1327,9 +1335,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             // Secure mode: let std::io::copy use copy_file_range for
             // potential reflinks, then finalize_object_tmpfile_impl
             // enables kernel verity and measures the digest.
-            let mut src = File::from(source);
             let mut dst = File::from(tmpfile_fd.try_clone()?);
-            let copied = std::io::copy(&mut src, &mut dst)?;
+            let copied = std::io::copy(&mut source, &mut dst)?;
             ensure!(copied == size, "Expected {size} bytes, got {copied}");
             drop(dst);
 
