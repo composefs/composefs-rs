@@ -317,14 +317,14 @@ impl FromStr for Mtime {
         let (sec, nsec) = s
             .split_once('.')
             .ok_or_else(|| anyhow!("Missing . in mtime"))?;
-        let nsec = u64::from_str(nsec)?;
+        let nsec = u32::from_str(nsec)?;
         anyhow::ensure!(
             nsec < 1_000_000_000,
             "Invalid mtime nanoseconds: {nsec} (must be < 1_000_000_000)"
         );
         Ok(Self {
             sec: u64::from_str(sec)?,
-            nsec,
+            nsec: u64::from(nsec),
         })
     }
 }

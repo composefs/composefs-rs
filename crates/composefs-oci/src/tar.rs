@@ -64,10 +64,11 @@ fn pax_mtime_nsec(pax: &[u8]) -> u32 {
                 &frac[..9]
             } else {
                 // fewer than 9 digits: treat as leading digits, e.g. "5" → 500_000_000
+                let padding_digits = 9u32.saturating_sub(frac.len() as u32);
                 return frac
                     .parse::<u32>()
                     .ok()
-                    .map_or(0, |v| v * 10u32.pow(9 - frac.len() as u32));
+                    .map_or(0, |v| v * 10u32.pow(padding_digits));
             };
             return frac.parse::<u32>().unwrap_or(0);
         }
