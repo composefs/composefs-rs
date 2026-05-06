@@ -57,6 +57,7 @@ mod tests {
             st_uid: 1000,
             st_gid: 1000,
             st_mtim_sec: mtime,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         }
     }
@@ -76,6 +77,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         }
     }

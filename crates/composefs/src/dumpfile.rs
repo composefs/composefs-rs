@@ -114,11 +114,12 @@ fn write_entry(
     let uid = stat.st_uid;
     let gid = stat.st_gid;
     let mtim_sec = stat.st_mtim_sec;
+    let mtim_nsec = stat.st_mtim_nsec;
 
     write_escaped(writer, path.as_os_str().as_bytes())?;
     write!(
         writer,
-        " {size} {mode:o} {nlink} {uid} {gid} {rdev} {mtim_sec}.0 "
+        " {size} {mode:o} {nlink} {uid} {gid} {rdev} {mtim_sec}.{mtim_nsec} "
     )?;
     write_escaped(writer, payload.as_ref().as_bytes())?;
     write!(writer, " ")?;
@@ -540,6 +541,7 @@ fn entry_to_stat(entry: &Entry<'_>) -> Stat {
         st_uid: entry.uid,
         st_gid: entry.gid,
         st_mtim_sec: entry.mtime.sec as i64,
+        st_mtim_nsec: entry.mtime.nsec as u32,
         xattrs,
     }
 }
@@ -724,6 +726,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         });
         let leaf_id = fs.push_leaf(
@@ -732,6 +735,7 @@ mod tests {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
+                st_mtim_nsec: 0,
                 xattrs,
             },
             LeafContent::Regular(RegularFile::Inline(b"test".to_vec().into())),
@@ -757,6 +761,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         };
 

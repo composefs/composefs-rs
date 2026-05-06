@@ -1078,7 +1078,7 @@ fn construct_xattr_name(xattr: &XAttr) -> Result<Vec<u8>, ErofsReaderError> {
 /// - Strips `trusted.overlay.metacopy` and `trusted.overlay.redirect`
 /// - Unescapes `trusted.overlay.overlay.X` back to `trusted.overlay.X`
 fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tree::Stat> {
-    let (st_mode, st_uid, st_gid, st_mtim_sec) = match inode {
+    let (st_mode, st_uid, st_gid, st_mtim_sec, st_mtim_nsec) = match inode {
         InodeType::Compact(inode) => (
             inode.header.mode.0.get() as u32 & 0o7777,
             inode.header.uid.get() as u32,
@@ -1087,12 +1087,14 @@ fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tr
             // but for round-trip purposes, 0 matches what was written for
             // compact headers (the writer always uses ExtendedInodeHeader)
             0i64,
+            img.sb.build_time_nsec.get(),
         ),
         InodeType::Extended(inode) => (
             inode.header.mode.0.get() as u32 & 0o7777,
             inode.header.uid.get(),
             inode.header.gid.get(),
             inode.header.mtime.get() as i64,
+            inode.header.mtime_nsec.get(),
         ),
     };
 
@@ -1120,6 +1122,7 @@ fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tr
         st_uid,
         st_gid,
         st_mtim_sec,
+        st_mtim_nsec,
         xattrs,
     })
 }

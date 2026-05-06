@@ -180,7 +180,8 @@ impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
 
     fn fileattr(&self, ino: Ino, nlink_map: &[u32]) -> FileAttr {
         let stat = self.stat();
-        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtim_sec as u64);
+        let mtime =
+            SystemTime::UNIX_EPOCH + Duration::new(stat.st_mtim_sec as u64, stat.st_mtim_nsec);
 
         FileAttr {
             ino,

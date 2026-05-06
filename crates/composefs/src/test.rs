@@ -172,6 +172,7 @@ pub(crate) mod proptest_strategies {
                 st_uid: uid,
                 st_gid: gid,
                 st_mtim_sec: mtime,
+                st_mtim_nsec: 0,
                 xattrs,
             })
     }

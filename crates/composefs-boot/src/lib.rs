@@ -44,11 +44,15 @@ const REQUIRED_TOPLEVEL_TO_EMPTY_DIRS: &[&str] = &["boot", "sysroot"];
 
 /// Empty the required top-level directories and set their mtime to match /usr.
 fn empty_toplevel_dirs<ObjectID: FsVerityHashValue>(fs: &mut FileSystem<ObjectID>) -> Result<()> {
-    let usr_mtime = fs.root.get_directory(OsStr::new("usr"))?.stat.st_mtim_sec;
+    let usr_mtime = {
+        let stat = &fs.root.get_directory(OsStr::new("usr"))?.stat;
+        (stat.st_mtim_sec, stat.st_mtim_nsec)
+    };
 
     for d in REQUIRED_TOPLEVEL_TO_EMPTY_DIRS {
         let d = fs.root.get_directory_mut(d.as_ref())?;
-        d.stat.st_mtim_sec = usr_mtime;
+        d.stat.st_mtim_sec = usr_mtime.0;
+        d.stat.st_mtim_nsec = usr_mtime.1;
         d.clear();
     }
 

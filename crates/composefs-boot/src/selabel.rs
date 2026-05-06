@@ -508,6 +508,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: Default::default(),
         };
 
@@ -522,6 +523,7 @@ mod tests {
                         st_uid: 0,
                         st_gid: 0,
                         st_mtim_sec: 0,
+                        st_mtim_nsec: 0,
                         xattrs: Default::default(),
                     },
                     LeafContent::Regular(RegularFile::Inline(data.to_vec().into_boxed_slice())),

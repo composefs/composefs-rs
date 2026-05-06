@@ -9,11 +9,9 @@ We currently create a composefs image using the granularity of data as
 typically appears in OCI tarballs:
  - atime and ctime are not present (these are actually not physically present
    in the erofs inode structure at all, either the compact or extended forms)
- - mtime is set to the mtime in seconds; the sub-seconds value is simply
-   truncated (ie: we always round down).  erofs has an nsec field, but it's not
-   normally present in OCI tarballs.  That's down to the fact that the usual
-   tar header only has timestamps in seconds and extended headers are not
-   usually added for this purpose.
+ - mtime is set to the mtime from the tar metadata.  The usual tar header only
+   stores timestamps in seconds; when PAX extended headers include a fractional
+   `mtime`, we preserve that value in erofs' nsec field.
  - we take great care to faithfully represent hardlinks: even though the
    produced filesystem is read-only and we have data de-duplication via the
    objects store, we make sure that hardlinks result in an actual shared inode

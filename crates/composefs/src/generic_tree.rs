@@ -21,6 +21,8 @@ pub struct Stat {
     pub st_gid: u32,
     /// Modification time in seconds since Unix epoch.
     pub st_mtim_sec: i64,
+    /// Nanosecond component of the modification time.
+    pub st_mtim_nsec: u32,
     /// Extended attributes as key-value pairs.
     pub xattrs: BTreeMap<Box<OsStr>, Box<[u8]>>,
 }
@@ -46,6 +48,7 @@ impl Stat {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         }
     }
@@ -631,6 +634,7 @@ impl<T> FileSystem<T> {
         let st_uid = usr.stat.st_uid;
         let st_gid = usr.stat.st_gid;
         let st_mtim_sec = usr.stat.st_mtim_sec;
+        let st_mtim_nsec = usr.stat.st_mtim_nsec;
         let xattrs = usr.stat.xattrs.clone();
 
         // Apply copied metadata to root
@@ -638,6 +642,7 @@ impl<T> FileSystem<T> {
         self.root.stat.st_uid = st_uid;
         self.root.stat.st_gid = st_gid;
         self.root.stat.st_mtim_sec = st_mtim_sec;
+        self.root.stat.st_mtim_nsec = st_mtim_nsec;
         self.root.stat.xattrs = xattrs;
 
         Ok(())
@@ -722,9 +727,10 @@ impl<T> FileSystem<T> {
     /// Returns an error if `/usr` does not exist (needed to get the mtime).
     pub fn canonicalize_run(&mut self) -> Result<(), ImageError> {
         if self.root.get_directory_opt(OsStr::new("run"))?.is_some() {
-            let usr_mtime = self.root.get_directory(OsStr::new("usr"))?.stat.st_mtim_sec;
+            let usr = self.root.get_directory(OsStr::new("usr"))?.stat.clone();
             let run_dir = self.root.get_directory_mut(OsStr::new("run"))?;
-            run_dir.stat.st_mtim_sec = usr_mtime;
+            run_dir.stat.st_mtim_sec = usr.st_mtim_sec;
+            run_dir.stat.st_mtim_nsec = usr.st_mtim_nsec;
             run_dir.clear();
         }
         Ok(())
@@ -1001,6 +1007,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         }
     }
@@ -1012,6 +1019,7 @@ mod tests {
             st_uid: 1000,
             st_gid: 1000,
             st_mtim_sec: mtime,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         }
     }
@@ -1313,6 +1321,7 @@ mod tests {
             st_uid: 42,
             st_gid: 43,
             st_mtim_sec: 1234567890,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::from([(
                 Box::from(OsStr::new("security.selinux")),
                 Box::from(b"system_u:object_r:usr_t:s0".as_slice()),
@@ -1358,6 +1367,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::from([
                 (
                     Box::from(OsStr::new("security.selinux")),
@@ -1610,6 +1620,7 @@ mod tests {
             st_uid: 100,
             st_gid: 200,
             st_mtim_sec: 54321,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::from([(
                 Box::from(OsStr::new("user.test")),
                 Box::from(b"val".as_slice()),

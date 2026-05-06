@@ -395,6 +395,7 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
             uid: self.stat.st_uid.into(),
             gid: self.stat.st_gid.into(),
             mtime: (self.stat.st_mtim_sec as u64).into(),
+            mtime_nsec: self.stat.st_mtim_nsec.into(),
             nlink: (nlink as u32).into(),
             ..Default::default()
         });
