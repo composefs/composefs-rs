@@ -735,6 +735,10 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     repository: OwnedFd,
     objects: OnceCell<OwnedFd>,
     write_semaphore: OnceCell<Arc<Semaphore>>,
+    /// Optional override for the number of concurrent object writes.
+    /// Set via [`set_write_concurrency`](Self::set_write_concurrency) before the semaphore
+    /// is first used; if `None`, defaults to [`available_parallelism`].
+    write_concurrency: Option<usize>,
     insecure: bool,
     metadata: RepoMetadata,
     /// When true, SplitStreamWriter::done() writes old-format (pre-repr(C))
@@ -1028,15 +1032,40 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .get_or_try_init(|| ensure_dir_and_openat(&self.repository, "objects", OFlags::PATH))
     }
 
+    /// Override the maximum number of concurrent object writes.
+    ///
+    /// Must be called before the first use of [`write_semaphore`](Self::write_semaphore);
+    /// has no effect if the semaphore has already been initialized.
+    pub fn set_write_concurrency(&mut self, n: usize) {
+        // Guard: the semaphore is lazily initialized on first use. If it's
+        // already been initialized, this call has no effect. Callers must
+        // set concurrency before any write operations begin.
+        debug_assert!(
+            self.write_semaphore.get().is_none(),
+            "set_write_concurrency called after write_semaphore was already initialized; \
+             call this before any write operations"
+        );
+        if self.write_semaphore.get().is_some() {
+            log::warn!(
+                "set_write_concurrency called after semaphore was already initialized; ignoring"
+            );
+            return;
+        }
+        self.write_concurrency = Some(n);
+    }
+
     /// Return a shared semaphore for limiting concurrent object writes.
     ///
-    /// This semaphore is lazily initialized with `available_parallelism()` permits,
+    /// This semaphore is lazily initialized with `available_parallelism()` permits
+    /// (or the value set via [`set_write_concurrency`](Self::set_write_concurrency)),
     /// and shared across all operations on this repository. Use this to limit
     /// concurrent I/O when processing multiple files or layers in parallel.
     pub fn write_semaphore(&self) -> Arc<Semaphore> {
         self.write_semaphore
             .get_or_init(|| {
-                let max_concurrent = available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let max_concurrent = self
+                    .write_concurrency
+                    .unwrap_or_else(|| available_parallelism().map(|n| n.get()).unwrap_or(4));
                 Arc::new(Semaphore::new(max_concurrent))
             })
             .clone()
@@ -1152,6 +1181,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             repository,
             objects: OnceCell::new(),
             write_semaphore: OnceCell::new(),
+            write_concurrency: None,
             insecure: !has_verity,
             metadata,
             #[cfg(any(test, feature = "test"))]
@@ -3916,6 +3946,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: Default::default(),
         }
     }
@@ -3929,6 +3960,7 @@ mod tests {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
+                st_mtim_nsec: 0,
                 xattrs: Default::default(),
             },
             LeafContent::Regular(RegularFile::External(obj.clone(), size)),
@@ -4091,6 +4123,7 @@ mod tests {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
+                st_mtim_nsec: 0,
                 xattrs: Default::default(),
             },
             LeafContent::Regular(RegularFile::External(obj2.clone(), size2)),
@@ -4793,6 +4826,45 @@ mod tests {
         Ok(())
     }
 
+    /// Helper to create a V1 (C-compatible) EROFS image and write it to the repo.
+    fn commit_v1_image(
+        repo: &Repository<Sha512HashValue>,
+        obj_id: &Sha512HashValue,
+        obj_size: u64,
+    ) -> Result<Sha512HashValue> {
+        use crate::erofs::format::FormatVersion;
+        use crate::erofs::writer::mkfs_erofs_versioned;
+
+        let mut fs = make_test_fs(obj_id, obj_size);
+        fs.add_overlay_whiteouts();
+        let image_data = mkfs_erofs_versioned(&fs, FormatVersion::V1);
+        repo.write_image(None, &image_data)
+    }
+
+    #[tokio::test]
+    async fn test_fsck_validates_v1_erofs_image() -> Result<()> {
+        // V1 images (C-compatible format) should pass fsck just like V2.
+        // This catches regressions where fsck or the reader doesn't handle
+        // compact inodes, BFS ordering, or the whiteout table.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj_size: u64 = 32 * 1024;
+        let obj = generate_test_data(obj_size, 0xBB);
+        let obj_id = repo.ensure_object(&obj)?;
+
+        commit_v1_image(&repo, &obj_id, obj_size)?;
+        repo.sync()?;
+
+        let result = repo.fsck().await?;
+        assert!(
+            result.is_ok(),
+            "V1 (C-compatible) erofs image should pass fsck: {result}"
+        );
+        assert!(result.images_checked > 0, "should have checked the image");
+        Ok(())
+    }
+
     // ---- Fsck metadata validation tests ----
 
     #[tokio::test]
@@ -5105,5 +5177,44 @@ mod tests {
         let (_repo, upgraded) =
             Repository::<Sha256HashValue>::open_upgrade(CWD, &repo_path).unwrap();
         assert!(!upgraded);
+    }
+
+    #[tokio::test]
+    async fn test_fsck_v1_image_detects_missing_object() -> Result<()> {
+        // Same as test_fsck_validates_erofs_image_objects but with a V1 image,
+        // ensuring fsck correctly parses V1 images to find object references.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj_size: u64 = 32 * 1024;
+        let obj = generate_test_data(obj_size, 0xBC);
+        let obj_id = repo.ensure_object(&obj)?;
+
+        commit_v1_image(&repo, &obj_id, obj_size)?;
+        repo.sync()?;
+
+        // Sanity: passes before we break it
+        let result = repo.fsck().await?;
+        assert!(
+            result.is_ok(),
+            "healthy V1 image should pass fsck: {result}"
+        );
+
+        // Delete the referenced object
+        let hex = obj_id.to_hex();
+        let (prefix, rest) = hex.split_at(2);
+        let dir = open_test_repo_dir(&tmp);
+        dir.remove_file(format!("objects/{prefix}/{rest}"))?;
+
+        let result = repo.fsck().await?;
+        assert!(
+            !result.is_ok(),
+            "fsck should detect missing object in V1 erofs image: {result}"
+        );
+        assert!(
+            result.missing_objects > 0,
+            "should report missing objects: {result}"
+        );
+        Ok(())
     }
 }

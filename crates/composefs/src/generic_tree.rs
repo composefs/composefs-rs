@@ -21,6 +21,8 @@ pub struct Stat {
     pub st_gid: u32,
     /// Modification time in seconds since Unix epoch.
     pub st_mtim_sec: i64,
+    /// Modification time nanosecond component (0..999_999_999).
+    pub st_mtim_nsec: u32,
     /// Extended attributes as key-value pairs.
     pub xattrs: BTreeMap<Box<OsStr>, Box<[u8]>>,
 }
@@ -46,6 +48,7 @@ impl Stat {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         }
     }
@@ -100,7 +103,7 @@ pub struct Leaf<T> {
 }
 
 /// A directory node containing named entries.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Directory<T> {
     /// Metadata for this directory.
     pub stat: Stat,
@@ -109,7 +112,7 @@ pub struct Directory<T> {
 }
 
 /// A filesystem inode representing either a directory or a leaf node.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Inode<T> {
     /// A directory inode.
     Directory(Box<Directory<T>>),
@@ -496,17 +499,30 @@ impl<T> Directory<T> {
         self.entries.clear();
     }
 
+    /// Retains only top-level entries whose names satisfy the predicate.
+    /// This is used for filtering dump output to specific entries.
+    pub fn retain_top_level(&mut self, mut f: impl FnMut(&str) -> bool) {
+        self.entries.retain(|name, _| {
+            // Convert OsStr to str for comparison; non-UTF8 names never match
+            name.to_str().is_some_and(&mut f)
+        });
+    }
+
     /// Recursively finds the newest modification time in this directory tree.
     ///
     /// Returns the maximum modification time among this directory's metadata
-    /// and all files and subdirectories it contains.
+    /// and all files and subdirectories it contains, as a `(sec, nsec)` tuple
+    /// for full nanosecond precision.
     ///
     /// The `leaves` table is needed to resolve leaf mtimes.
-    pub fn newest_file(&self, leaves: &[Leaf<T>]) -> i64 {
-        let mut newest = self.stat.st_mtim_sec;
+    pub fn newest_file(&self, leaves: &[Leaf<T>]) -> (i64, u32) {
+        let mut newest = (self.stat.st_mtim_sec, self.stat.st_mtim_nsec);
         for inode in self.entries.values() {
             let mtime = match inode {
-                Inode::Leaf(id, _) => leaves[id.0].stat.st_mtim_sec,
+                Inode::Leaf(id, _) => {
+                    let s = &leaves[id.0].stat;
+                    (s.st_mtim_sec, s.st_mtim_nsec)
+                }
                 Inode::Directory(dir) => dir.newest_file(leaves),
             };
             if mtime > newest {
@@ -583,6 +599,56 @@ pub struct FileSystem<T> {
 }
 
 impl<T> FileSystem<T> {
+    /// Add 256 overlay whiteout stub entries to the root directory.
+    ///
+    /// This is required for Format 1.0 compatibility with the C mkcomposefs.
+    /// Each whiteout is a character device named "00" through "ff" with rdev=0.
+    /// They inherit uid/gid/mtime from the root directory but have empty xattrs.
+    ///
+    /// These entries allow overlay filesystems to efficiently represent
+    /// deleted files using device stubs that match the naming convention.
+    pub fn add_overlay_whiteouts(&mut self) {
+        use std::ffi::OsString;
+
+        // Copy root's stat for the whiteout entries (inherit uid/gid/mtime)
+        // Mode is set to 0o644 (rw-r--r--) as per C mkcomposefs
+        let whiteout_stat = Stat {
+            st_mode: 0o644,
+            st_uid: self.root.stat.st_uid,
+            st_gid: self.root.stat.st_gid,
+            st_mtim_sec: self.root.stat.st_mtim_sec,
+            st_mtim_nsec: self.root.stat.st_mtim_nsec,
+            // Inherit root's xattrs (e.g. SELinux label) — C mkcomposefs does the same:
+            // whiteout entries copy all metadata including xattrs from the root inode.
+            xattrs: self.root.stat.xattrs.clone(),
+        };
+
+        for i in 0..=255u8 {
+            let name = OsString::from(format!("{:02x}", i));
+
+            // Skip if entry already exists
+            if self.root.entries.contains_key(name.as_os_str()) {
+                continue;
+            }
+
+            let leaf_id = self.push_leaf(whiteout_stat.clone(), LeafContent::CharacterDevice(0));
+            self.root
+                .entries
+                .insert(name.into_boxed_os_str(), Inode::leaf(leaf_id));
+        }
+    }
+
+    /// Add trusted.overlay.opaque="y" xattr to root directory.
+    ///
+    /// This is required for Format 1.0 when whiteout entries are present,
+    /// marking the directory as opaque for the overlay filesystem.
+    pub fn set_overlay_opaque(&mut self) {
+        self.root.stat.xattrs.insert(
+            Box::from(std::ffi::OsStr::new("trusted.overlay.opaque")),
+            Box::from(*b"y"),
+        );
+    }
+
     /// Creates a new filesystem with a root directory having the given metadata.
     pub fn new(root_stat: Stat) -> Self {
         Self {
@@ -631,6 +697,7 @@ impl<T> FileSystem<T> {
         let st_uid = usr.stat.st_uid;
         let st_gid = usr.stat.st_gid;
         let st_mtim_sec = usr.stat.st_mtim_sec;
+        let st_mtim_nsec = usr.stat.st_mtim_nsec;
         let xattrs = usr.stat.xattrs.clone();
 
         // Apply copied metadata to root
@@ -638,6 +705,7 @@ impl<T> FileSystem<T> {
         self.root.stat.st_uid = st_uid;
         self.root.stat.st_gid = st_gid;
         self.root.stat.st_mtim_sec = st_mtim_sec;
+        self.root.stat.st_mtim_nsec = st_mtim_nsec;
         self.root.stat.xattrs = xattrs;
 
         Ok(())
@@ -722,9 +790,10 @@ impl<T> FileSystem<T> {
     /// Returns an error if `/usr` does not exist (needed to get the mtime).
     pub fn canonicalize_run(&mut self) -> Result<(), ImageError> {
         if self.root.get_directory_opt(OsStr::new("run"))?.is_some() {
-            let usr_mtime = self.root.get_directory(OsStr::new("usr"))?.stat.st_mtim_sec;
+            let usr = self.root.get_directory(OsStr::new("usr"))?.stat.clone();
             let run_dir = self.root.get_directory_mut(OsStr::new("run"))?;
-            run_dir.stat.st_mtim_sec = usr_mtime;
+            run_dir.stat.st_mtim_sec = usr.st_mtim_sec;
+            run_dir.stat.st_mtim_nsec = usr.st_mtim_nsec;
             run_dir.clear();
         }
         Ok(())
@@ -979,7 +1048,9 @@ impl<'a, T> DirectoryRef<'a, T> {
     }
 
     /// Recursively finds the newest modification time in this directory tree.
-    pub fn newest_file(&self) -> i64 {
+    ///
+    /// Returns a `(sec, nsec)` tuple for full nanosecond precision.
+    pub fn newest_file(&self) -> (i64, u32) {
         self.dir.newest_file(self.leaves)
     }
 }
@@ -1001,6 +1072,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         }
     }
@@ -1012,6 +1084,7 @@ mod tests {
             st_uid: 1000,
             st_gid: 1000,
             st_mtim_sec: mtime,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         }
     }
@@ -1241,27 +1314,27 @@ mod tests {
         let mut leaves = Vec::new();
 
         let mut root = Directory::new(stat_with_mtime(5));
-        assert_eq!(root.newest_file(&leaves), 5);
+        assert_eq!(root.newest_file(&leaves), (5, 0));
 
         let leaf_id_10 = push_leaf_file(&mut leaves, 10);
         root.insert(OsStr::new("file1"), Inode::leaf(leaf_id_10));
-        assert_eq!(root.newest_file(&leaves), 10);
+        assert_eq!(root.newest_file(&leaves), (10, 0));
 
         let subdir_stat = stat_with_mtime(15);
         let mut subdir = Box::new(Directory::new(subdir_stat));
         let leaf_id_12 = push_leaf_file(&mut leaves, 12);
         subdir.insert(OsStr::new("subfile1"), Inode::leaf(leaf_id_12));
         root.insert(OsStr::new("subdir"), Inode::Directory(subdir));
-        assert_eq!(root.newest_file(&leaves), 15);
+        assert_eq!(root.newest_file(&leaves), (15, 0));
 
         if let Some(Inode::Directory(sd)) = root.entries.get_mut(OsStr::new("subdir")) {
             let leaf_id_20 = push_leaf_file(&mut leaves, 20);
             sd.insert(OsStr::new("subfile2"), Inode::leaf(leaf_id_20));
         }
-        assert_eq!(root.newest_file(&leaves), 20);
+        assert_eq!(root.newest_file(&leaves), (20, 0));
 
         root.stat.st_mtim_sec = 25;
-        assert_eq!(root.newest_file(&leaves), 25);
+        assert_eq!(root.newest_file(&leaves), (25, 0));
     }
 
     #[test]
@@ -1313,6 +1386,7 @@ mod tests {
             st_uid: 42,
             st_gid: 43,
             st_mtim_sec: 1234567890,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::from([(
                 Box::from(OsStr::new("security.selinux")),
                 Box::from(b"system_u:object_r:usr_t:s0".as_slice()),
@@ -1358,6 +1432,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::from([
                 (
                     Box::from(OsStr::new("security.selinux")),
@@ -1610,6 +1685,7 @@ mod tests {
             st_uid: 100,
             st_gid: 200,
             st_mtim_sec: 54321,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::from([(
                 Box::from(OsStr::new("user.test")),
                 Box::from(b"val".as_slice()),
@@ -1781,5 +1857,97 @@ mod tests {
 
         assert_eq!(fs.root.stat.st_mtim_sec, 200);
         assert_eq!(fs.leaves[0].stat.st_mtim_sec, 400);
+    }
+
+    #[test]
+    fn test_add_overlay_whiteouts() {
+        let root_stat = Stat {
+            st_mode: 0o755,
+            st_uid: 1000,
+            st_gid: 2000,
+            st_mtim_sec: 12345,
+            st_mtim_nsec: 0,
+            xattrs: BTreeMap::from([(
+                Box::from(OsStr::new("security.selinux")),
+                Box::from(b"system_u:object_r:root_t:s0".as_slice()),
+            )]),
+        };
+        let mut fs = FileSystem::<FileContents>::new(root_stat);
+
+        // Add a pre-existing entry that should not be overwritten
+        let pre_id = fs.push_leaf(
+            stat_with_mtime(99999),
+            LeafContent::Regular(FileContents {}),
+        );
+        fs.root.insert(OsStr::new("00"), Inode::leaf(pre_id));
+
+        fs.add_overlay_whiteouts();
+
+        // Should have 256 whiteout entries (255 new + 1 pre-existing)
+        assert_eq!(fs.root.entries.len(), 256);
+
+        // The pre-existing "00" should still have its original mtime
+        if let Some(Inode::Leaf(id, _)) = fs.root.entries.get(OsStr::new("00")) {
+            assert_eq!(fs.leaf(*id).stat.st_mtim_sec, 99999);
+        } else {
+            panic!("Expected '00' to remain a leaf");
+        }
+
+        // Check a newly created whiteout entry
+        if let Some(Inode::Leaf(id, _)) = fs.root.entries.get(OsStr::new("ff")) {
+            let leaf = fs.leaf(*id);
+            // Should be a character device with rdev=0
+            assert!(matches!(leaf.content, LeafContent::CharacterDevice(0)));
+            // Should have mode 0o644
+            assert_eq!(leaf.stat.st_mode, 0o644);
+            // Should inherit uid/gid/mtime from root
+            assert_eq!(leaf.stat.st_uid, 1000);
+            assert_eq!(leaf.stat.st_gid, 2000);
+            assert_eq!(leaf.stat.st_mtim_sec, 12345);
+            // Should inherit xattrs from root (e.g. SELinux label) — matching
+            // C mkcomposefs behaviour where whiteout entries copy root metadata.
+            assert_eq!(
+                leaf.stat
+                    .xattrs
+                    .get(OsStr::new("security.selinux"))
+                    .map(|v| v.as_ref()),
+                Some(b"system_u:object_r:root_t:s0".as_slice())
+            );
+        } else {
+            panic!("Expected 'ff' to be a leaf");
+        }
+
+        // Check some middle entries exist
+        assert!(fs.root.entries.contains_key(OsStr::new("7f")));
+        assert!(fs.root.entries.contains_key(OsStr::new("a0")));
+    }
+
+    #[test]
+    fn test_set_overlay_opaque() {
+        let mut fs = FileSystem::<FileContents>::new(default_stat());
+
+        fs.set_overlay_opaque();
+
+        let opaque = fs
+            .root
+            .stat
+            .xattrs
+            .get(OsStr::new("trusted.overlay.opaque"));
+        assert!(opaque.is_some());
+        assert_eq!(opaque.unwrap().as_ref(), b"y");
+    }
+
+    #[test]
+    fn test_add_overlay_whiteouts_empty_fs() {
+        let mut fs = FileSystem::<FileContents>::new(default_stat());
+
+        fs.add_overlay_whiteouts();
+
+        // Should have exactly 256 entries
+        assert_eq!(fs.root.entries.len(), 256);
+
+        // Check first and last entries
+        assert!(fs.root.entries.contains_key(OsStr::new("00")));
+        assert!(fs.root.entries.contains_key(OsStr::new("ff")));
     }
 }

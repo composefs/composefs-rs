@@ -26,6 +26,7 @@ enum Offset {
     Header,
     Superblock,
     Inode,
+    InodesEnd,
     XAttr,
     Block,
     End,
@@ -48,7 +49,18 @@ trait Output {
         self.get_div(Offset::Inode, idx, 32) as u64
     }
 
-    fn get_xattr(&self, idx: usize) -> u32 {
+    fn get_xattr_v1(&self, idx: usize) -> u32 {
+        // V1: Calculate relative offset within xattr block, matching C implementation.
+        // C formula: (inodes_end % BLKSIZ + xattr_offset_from_inodes_end) / 4
+        let absolute_offset = self.get(Offset::XAttr, idx);
+        let inodes_end = self.get(Offset::InodesEnd, 0);
+        let offset_within_block = inodes_end % format::BLOCK_SIZE as usize;
+        let xattr_offset_from_inodes_end = absolute_offset - inodes_end;
+        ((offset_within_block + xattr_offset_from_inodes_end) / 4) as u32
+    }
+
+    fn get_xattr_v2(&self, idx: usize) -> u32 {
+        // V2: Simple absolute offset / 4
         self.get_div(Offset::XAttr, idx, 4).try_into().unwrap()
     }
 
@@ -57,11 +69,36 @@ trait Output {
     }
 }
 
+/// Extended attribute stored in EROFS format.
+///
+/// The derived Ord sorts by (prefix, suffix, value) which is used for V2.
+/// For V1, use `cmp_by_full_key` which sorts by full key name (prefix string + suffix)
+/// to match C mkcomposefs behavior.
 #[derive(PartialOrd, PartialEq, Eq, Ord, Clone)]
 struct XAttr {
     prefix: u8,
     suffix: Box<[u8]>,
     value: Box<[u8]>,
+}
+
+impl XAttr {
+    /// Returns the full key name (prefix + suffix) for V1 comparison purposes.
+    fn full_key(&self) -> Vec<u8> {
+        let prefix_str = format::XATTR_PREFIXES[self.prefix as usize];
+        let mut key = Vec::with_capacity(prefix_str.len() + self.suffix.len());
+        key.extend_from_slice(prefix_str);
+        key.extend_from_slice(&self.suffix);
+        key
+    }
+
+    /// Compare by full key name (prefix string + suffix), then by value.
+    /// This matches C mkcomposefs `cmp_xattr` which uses `strcmp(na->key, nb->key)`.
+    fn cmp_by_full_key(&self, other: &Self) -> std::cmp::Ordering {
+        match self.full_key().cmp(&other.full_key()) {
+            std::cmp::Ordering::Equal => self.value.cmp(&other.value),
+            ord => ord,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -133,7 +170,7 @@ impl InodeXAttrs {
         unreachable!("{:?}", std::str::from_utf8(name)); // worst case: we matched the empty prefix (0)
     }
 
-    fn write(&self, output: &mut impl Output) {
+    fn write(&self, output: &mut impl Output, version: format::FormatVersion) {
         if self.filter != 0 {
             trace!("  write xattrs block");
             output.write_struct(format::InodeXAttrHeader {
@@ -143,7 +180,11 @@ impl InodeXAttrs {
             });
             for idx in &self.shared {
                 trace!("    shared {} @{}", idx, output.len());
-                output.write(&output.get_xattr(*idx).to_le_bytes());
+                let xattr_ref = match version {
+                    format::FormatVersion::V1 => output.get_xattr_v1(*idx),
+                    format::FormatVersion::V2 => output.get_xattr_v2(*idx),
+                };
+                output.write(&xattr_ref.to_le_bytes());
             }
             for attr in &self.local {
                 trace!("    local @{}", output.len());
@@ -272,8 +313,44 @@ impl<'a> Directory<'a> {
     }
 }
 
+/// Calculates the chunk format bits for an external file based on its size.
+///
+/// For EROFS chunk-based inodes, the `u` field contains the chunk format
+/// which encodes the chunk size as `chunkbits - BLOCK_BITS`.
+///
+/// The algorithm matches the C implementation:
+/// 1. Calculate chunkbits = ilog2(size - 1) + 1
+/// 2. Clamp to at least BLOCK_BITS (12)
+/// 3. Clamp to at most BLOCK_BITS + 31 (max representable)
+/// 4. Return chunkbits - BLOCK_BITS
+fn compute_chunk_format(file_size: u64) -> u32 {
+    const BLOCK_BITS: u32 = format::BLOCK_BITS as u32;
+    const CHUNK_FORMAT_BLKBITS_MASK: u32 = 0x001F; // 31
+
+    // Compute the chunkbits to use for the file size.
+    // We want as few chunks as possible, but not an unnecessarily large chunk.
+    let mut chunkbits = if file_size > 1 {
+        // ilog2(file_size - 1) + 1
+        64 - (file_size - 1).leading_zeros()
+    } else {
+        1
+    };
+
+    // At least one logical block
+    if chunkbits < BLOCK_BITS {
+        chunkbits = BLOCK_BITS;
+    }
+
+    // Not larger chunks than max possible
+    if chunkbits - BLOCK_BITS > CHUNK_FORMAT_BLKBITS_MASK {
+        chunkbits = CHUNK_FORMAT_BLKBITS_MASK + BLOCK_BITS;
+    }
+
+    chunkbits - BLOCK_BITS
+}
+
 impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
-    fn inode_meta(&self) -> (format::DataLayout, u32, u64, usize) {
+    fn inode_meta(&self, version: format::FormatVersion) -> (format::DataLayout, u32, u64, usize) {
         let (layout, u, size) = match &self.content {
             tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => {
                 if data.is_empty() {
@@ -283,7 +360,13 @@ impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
                 }
             }
             tree::LeafContent::Regular(tree::RegularFile::External(.., size)) => {
-                (format::DataLayout::ChunkBased, 31, *size)
+                // V1: compute chunk format from file size
+                // V2: hardcode 31 (origin/main behavior)
+                let chunk_format = match version {
+                    format::FormatVersion::V1 => compute_chunk_format(*size),
+                    format::FormatVersion::V2 => 31,
+                };
+                (format::DataLayout::ChunkBased, chunk_format, *size)
             }
             tree::LeafContent::CharacterDevice(rdev) | tree::LeafContent::BlockDevice(rdev) => {
                 (format::DataLayout::FlatPlain, *rdev as u32, 0)
@@ -329,77 +412,179 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
         }
     }
 
-    fn write_inode(&self, output: &mut impl Output, idx: usize) {
+    /// Check if this inode can use compact format (32 bytes instead of 64).
+    ///
+    /// Compact format is used when:
+    /// - mtime matches min_mtime (stored in superblock build_time)
+    /// - nlink, uid, gid fit in u16
+    /// - size fits in u32
+    fn fits_in_compact(&self, min_mtime: (u64, u32), size: u64, nlink: usize) -> bool {
+        // mtime (both sec and nsec) must match the minimum (which will be stored in superblock
+        // build_time / build_time_nsec). The C implementation requires both to match.
+        if self.stat.st_mtim_sec as u64 != min_mtime.0 {
+            return false;
+        }
+        if self.stat.st_mtim_nsec != min_mtime.1 {
+            return false;
+        }
+
+        // nlink must fit in u16
+        if nlink > u16::MAX as usize {
+            return false;
+        }
+
+        // uid and gid must fit in u16
+        if self.stat.st_uid > u16::MAX as u32 || self.stat.st_gid > u16::MAX as u32 {
+            return false;
+        }
+
+        // size must fit in u32
+        if size > u32::MAX as u64 {
+            return false;
+        }
+
+        true
+    }
+
+    fn write_inode(
+        &self,
+        output: &mut impl Output,
+        idx: usize,
+        version: format::FormatVersion,
+        min_mtime: (u64, u32),
+    ) {
         let (layout, u, size, nlink) = match &self.content {
             InodeContent::Directory(dir) => dir.inode_meta(output.get(Offset::Block, idx)),
-            InodeContent::Leaf(leaf) => leaf.inode_meta(),
+            InodeContent::Leaf(leaf) => leaf.inode_meta(version),
         };
 
         let xattr_size = {
             let mut xattr = FirstPass::default();
-            self.xattrs.write(&mut xattr);
+            self.xattrs.write(&mut xattr, version);
             xattr.offset
+        };
+
+        // V1: compact inodes when possible; V2: always extended
+        let use_compact =
+            version == format::FormatVersion::V1 && self.fits_in_compact(min_mtime, size, nlink);
+
+        let inode_header_size = if use_compact {
+            size_of::<format::CompactInodeHeader>()
+        } else {
+            size_of::<format::ExtendedInodeHeader>()
         };
 
         // We need to make sure the inline part doesn't overlap a block boundary
         output.pad(32);
         if matches!(layout, format::DataLayout::FlatInline) {
             let block_size = u64::from(format::BLOCK_SIZE);
-            let inode_and_xattr_size: u64 = (size_of::<format::ExtendedInodeHeader>() + xattr_size)
-                .try_into()
-                .unwrap();
-            let inline_start: u64 = output.len().try_into().unwrap();
-            let inline_start = inline_start + inode_and_xattr_size;
-            let end_of_metadata = inline_start - 1;
-            let inline_end = inline_start + (size % block_size);
-            if end_of_metadata / block_size != inline_end / block_size {
-                // If we proceed, then we'll violate the rule about crossing block boundaries.
-                // The easiest thing to do is to add padding so that the inline data starts close
-                // to the start of a fresh block boundary, while ensuring inode alignment.
-                // pad_size is always < block_size (4096), so fits in usize
-                let pad_size = (block_size - end_of_metadata % block_size) as usize;
-                let pad = vec![0; pad_size];
-                trace!("added pad {}", pad.len());
-                output.write(&pad);
-                output.pad(32);
+            let inode_and_xattr_size: u64 = (inode_header_size + xattr_size).try_into().unwrap();
+
+            match version {
+                format::FormatVersion::V1 => {
+                    // V1: C mkcomposefs logic from compute_erofs_inode_padding_for_tail()
+                    let current_pos: u64 = output.len().try_into().unwrap();
+                    let inline_start = current_pos + inode_and_xattr_size;
+                    let inline_size = size % block_size;
+                    let block_remainder = block_size - (inline_start % block_size);
+
+                    if block_remainder < inline_size {
+                        let pad_size = (block_remainder.div_ceil(32) * 32) as usize;
+                        let pad = vec![0; pad_size];
+                        trace!("added pad {}", pad.len());
+                        output.write(&pad);
+                    }
+                }
+                format::FormatVersion::V2 => {
+                    // V2: origin/main algorithm
+                    let inline_start: u64 = output.len().try_into().unwrap();
+                    let inline_start = inline_start + inode_and_xattr_size;
+                    let end_of_metadata = inline_start - 1;
+                    let inline_end = inline_start + (size % block_size);
+                    if end_of_metadata / block_size != inline_end / block_size {
+                        let pad_size = (block_size - end_of_metadata % block_size) as usize;
+                        let pad = vec![0; pad_size];
+                        trace!("added pad {}", pad.len());
+                        output.write(&pad);
+                        output.pad(32);
+                    }
+                }
             }
         }
 
-        let format = format::InodeLayout::Extended | layout;
-
-        trace!(
-            "write inode {idx} nid {} {:?} {:?} xattrsize{xattr_size} icount{} inline{} @{}",
-            output.len() / 32,
-            format,
-            self.file_type(),
-            match xattr_size {
-                0 => 0,
-                n => (1 + (n - 12) / 4) as u16,
-            },
-            size % 4096,
-            output.len()
-        );
+        let xattr_icount: u16 = match xattr_size {
+            0 => 0,
+            n => (1 + (n - 12) / 4) as u16,
+        };
 
         output.note_offset(Offset::Inode);
-        output.write_struct(format::ExtendedInodeHeader {
-            format,
-            xattr_icount: match xattr_size {
-                0 => 0,
-                n => (1 + (n - 12) / 4) as u16,
-            }
-            .into(),
-            mode: self.file_type() | self.stat.st_mode,
-            size: size.into(),
-            u: u.into(),
-            ino: ((output.len() / 32) as u32).into(),
-            uid: self.stat.st_uid.into(),
-            gid: self.stat.st_gid.into(),
-            mtime: (self.stat.st_mtim_sec as u64).into(),
-            nlink: (nlink as u32).into(),
-            ..Default::default()
-        });
 
-        self.xattrs.write(output);
+        if use_compact {
+            let format = format::InodeLayout::Compact | layout;
+
+            trace!(
+                "write compact inode {idx} nid {} {:?} {:?} xattrsize{xattr_size} icount{} inline{} @{}",
+                output.len() / 32,
+                format,
+                self.file_type(),
+                xattr_icount,
+                size % 4096,
+                output.len()
+            );
+
+            // V1: use sequential ino
+            let ino = idx as u32;
+
+            output.write_struct(format::CompactInodeHeader {
+                format,
+                xattr_icount: xattr_icount.into(),
+                mode: self.file_type() | self.stat.st_mode,
+                nlink: (nlink as u16).into(),
+                size: (size as u32).into(),
+                reserved: 0.into(),
+                u: u.into(),
+                ino: ino.into(),
+                uid: (self.stat.st_uid as u16).into(),
+                gid: (self.stat.st_gid as u16).into(),
+                reserved2: [0; 4],
+            });
+        } else {
+            let format = format::InodeLayout::Extended | layout;
+
+            trace!(
+                "write extended inode {idx} nid {} {:?} {:?} xattrsize{xattr_size} icount{} inline{} @{}",
+                output.len() / 32,
+                format,
+                self.file_type(),
+                xattr_icount,
+                size % 4096,
+                output.len()
+            );
+
+            // V1 uses the BFS index as i_ino (matching C mkcomposefs behaviour).
+            // V2 uses the NID (byte offset / 32) for 32-bit stat compatibility.
+            let ino = match version {
+                format::FormatVersion::V1 => idx as u32,
+                format::FormatVersion::V2 => (output.len() / 32) as u32,
+            };
+
+            output.write_struct(format::ExtendedInodeHeader {
+                format,
+                xattr_icount: xattr_icount.into(),
+                mode: self.file_type() | self.stat.st_mode,
+                size: size.into(),
+                u: u.into(),
+                ino: ino.into(),
+                uid: self.stat.st_uid.into(),
+                gid: self.stat.st_gid.into(),
+                mtime: (self.stat.st_mtim_sec as u64).into(),
+                mtime_nsec: self.stat.st_mtim_nsec.into(),
+                nlink: (nlink as u32).into(),
+                ..Default::default()
+            });
+        }
+
+        self.xattrs.write(output, version);
 
         match &self.content {
             InodeContent::Directory(dir) => dir.write_inline(output),
@@ -420,7 +605,7 @@ struct InodeCollector<'a, ObjectID: FsVerityHashValue> {
     inodes: Vec<Inode<'a, ObjectID>>,
     hardlinks: HashMap<LeafId, usize>,
     fs: &'a tree::FileSystem<ObjectID>,
-    nlink_map: &'a [u32],
+    nlink_map: Vec<u32>,
 }
 
 impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
@@ -505,6 +690,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         entries.insert(point, entry);
     }
 
+    /// Collect inodes using depth-first traversal (V2 / origin/main behavior).
     fn collect_dir(&mut self, dir: &'a tree::Directory<ObjectID>, parent: usize) -> usize {
         // The root inode number needs to fit in a u16.  That more or less compels us to write the
         // directory inode before the inode of the children of the directory.  Reserve a slot.
@@ -533,20 +719,71 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         me
     }
 
+    /// Collect all inodes using queue-based breadth-first traversal (V1).
+    ///
+    /// This algorithm matches the C mkcomposefs `lcfs_compute_tree()` function which uses
+    /// a linked-list queue to process directories. All nodes at depth N are assigned inode
+    /// numbers before any nodes at depth N+1.
+    fn collect_tree(&mut self, root: &'a tree::Directory<ObjectID>) {
+        use std::collections::VecDeque;
+
+        let root_inode = self.push_inode(&root.stat, InodeContent::Directory(Directory::default()));
+        let mut queue: VecDeque<(&'a tree::Directory<ObjectID>, usize, usize)> = VecDeque::new();
+        queue.push_back((root, root_inode, root_inode));
+
+        while let Some((dir, parent, me)) = queue.pop_front() {
+            let mut entries = vec![];
+
+            for (name, inode) in dir.sorted_entries() {
+                match inode {
+                    tree::Inode::Directory(subdir) => {
+                        let child = self.push_inode(
+                            &subdir.stat,
+                            InodeContent::Directory(Directory::default()),
+                        );
+                        queue.push_back((subdir, me, child));
+                        entries.push(DirEnt {
+                            name: name.as_bytes(),
+                            inode: child,
+                            file_type: format::FileType::Directory,
+                        });
+                    }
+                    tree::Inode::Leaf(leaf_id, _) => {
+                        let child = self.collect_leaf(*leaf_id);
+                        entries.push(DirEnt {
+                            name: name.as_bytes(),
+                            inode: child,
+                            file_type: self.inodes[child].file_type(),
+                        });
+                    }
+                }
+            }
+
+            Self::insert_sorted(&mut entries, b".", me, format::FileType::Directory);
+            Self::insert_sorted(&mut entries, b"..", parent, format::FileType::Directory);
+
+            self.inodes[me].content = InodeContent::Directory(Directory::from_entries(entries));
+        }
+    }
+
     pub fn collect(
         fs: &'a tree::FileSystem<ObjectID>,
-        nlink_map: &'a [u32],
+        version: format::FormatVersion,
     ) -> Vec<Inode<'a, ObjectID>> {
         let mut this = Self {
             inodes: vec![],
             hardlinks: HashMap::new(),
             fs,
-            nlink_map,
+            nlink_map: fs.nlinks(),
         };
 
-        // '..' of the root directory is the root directory again
-        let root_inode = this.collect_dir(&fs.root, 0);
-        assert_eq!(root_inode, 0);
+        match version {
+            format::FormatVersion::V1 => this.collect_tree(&fs.root),
+            format::FormatVersion::V2 => {
+                let root_inode = this.collect_dir(&fs.root, 0);
+                assert_eq!(root_inode, 0);
+            }
+        }
 
         this.inodes
     }
@@ -554,8 +791,22 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
 
 /// Takes a list of inodes where each inode contains only local xattr values, determines which
 /// xattrs (key, value) pairs appear more than once, and shares them.
-fn share_xattrs(inodes: &mut [Inode<impl FsVerityHashValue>]) -> Vec<XAttr> {
+///
+/// For V1: sorts locals by full key, reverses shared table, uses InodesEnd-relative xattr offsets.
+/// For V2: uses natural BTreeMap order (derived Ord), ascending shared table.
+fn share_xattrs(
+    inodes: &mut [Inode<impl FsVerityHashValue>],
+    version: format::FormatVersion,
+) -> Vec<XAttr> {
     let mut xattrs: BTreeMap<XAttr, usize> = BTreeMap::new();
+
+    // V1: sort local xattrs by full key to match C behavior
+    // V2: don't sort (insertion order is fine, BTreeMap handles shared ordering)
+    if version == format::FormatVersion::V1 {
+        for inode in inodes.iter_mut() {
+            inode.xattrs.local.sort_by(|a, b| a.cmp_by_full_key(b));
+        }
+    }
 
     // Collect all xattrs from the inodes
     for inode in inodes.iter() {
@@ -571,45 +822,103 @@ fn share_xattrs(inodes: &mut [Inode<impl FsVerityHashValue>]) -> Vec<XAttr> {
     // Share only xattrs with more than one user
     xattrs.retain(|_k, v| *v > 1);
 
-    // Repurpose the refcount field as an index lookup
-    for (idx, value) in xattrs.values_mut().enumerate() {
-        *value = idx;
-    }
+    match version {
+        format::FormatVersion::V1 => {
+            // C mkcomposefs sorts shared xattrs by full key string (strcmp), then writes
+            // them in DESCENDING order in the shared xattr block.  Our BTreeMap is ordered
+            // by (prefix_index, suffix, value) which differs from strcmp order when prefix
+            // indices don't sort the same way as prefix strings (e.g. "security."=6 sorts
+            // numerically after "trusted."=4, but 'security.' < 'trusted.' lexicographically).
+            // Collect into a Vec, sort by full key ascending, then reverse = descending.
+            let mut sorted: Vec<_> = xattrs.into_iter().collect();
+            sorted.sort_by(|(a, _), (b, _)| a.cmp_by_full_key(b));
+            let n_shared = sorted.len();
+            // Assign indices in descending order: first entry on disk gets the highest ref.
+            // After reversal, sorted[0] (ascending-smallest) ends up last on disk.
+            // We iterate ascending-sorted and assign index = n-1-i so that the entry
+            // written LAST (smallest key in ascending order) gets the SMALLEST index.
+            // Reconstruct a map for the lookup phase below.
+            let xattrs: BTreeMap<XAttr, usize> = sorted
+                .iter()
+                .enumerate()
+                .map(|(i, (k, _))| (k.clone(), n_shared - 1 - i))
+                .collect();
 
-    // Visit each inode and change local xattrs into shared xattrs
-    for inode in inodes.iter_mut() {
-        inode.xattrs.local.retain(|attr| {
-            if let Some(idx) = xattrs.get(attr) {
-                inode.xattrs.shared.push(*idx);
-                false // drop the local xattr: we converted it
-            } else {
-                true // retain the local xattr: we didn't convert it
+            // Visit each inode and change local xattrs into shared xattrs
+            for inode in inodes.iter_mut() {
+                inode.xattrs.local.retain(|attr| {
+                    if let Some(idx) = xattrs.get(attr) {
+                        inode.xattrs.shared.push(*idx);
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
-        });
-    }
 
-    // Return the shared xattrs as a vec
-    xattrs.into_keys().collect()
+            // Return in descending full-key order (last in ascending = first written)
+            sorted.reverse();
+            sorted.into_iter().map(|(k, _)| k).collect()
+        }
+        format::FormatVersion::V2 => {
+            // Ascending order: sequential index assignment
+            for (idx, value) in xattrs.values_mut().enumerate() {
+                *value = idx;
+            }
+
+            // Visit each inode and change local xattrs into shared xattrs
+            for inode in inodes.iter_mut() {
+                inode.xattrs.local.retain(|attr| {
+                    if let Some(idx) = xattrs.get(attr) {
+                        inode.xattrs.shared.push(*idx);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+
+            // Return in ascending order (natural BTreeMap order)
+            xattrs.into_keys().collect()
+        }
+    }
 }
 
 fn write_erofs(
     output: &mut impl Output,
     inodes: &[Inode<impl FsVerityHashValue>],
     xattrs: &[XAttr],
+    version: format::FormatVersion,
+    min_mtime: (u64, u32),
 ) {
+    // Determine build_time based on format version
+    // V1: use minimum mtime across all inodes for reproducibility
+    // V2: use 0 (not used)
+    let (build_time, build_time_nsec) = match version {
+        format::FormatVersion::V1 => min_mtime,
+        format::FormatVersion::V2 => (0, 0),
+    };
+
     // Write composefs header
     output.note_offset(Offset::Header);
     output.write_struct(format::ComposefsHeader {
         magic: format::COMPOSEFS_MAGIC,
         version: format::VERSION,
         flags: 0.into(),
-        composefs_version: format::COMPOSEFS_VERSION,
+        composefs_version: version.composefs_version(),
         ..Default::default()
     });
     output.pad(1024);
 
     // Write superblock
     output.note_offset(Offset::Superblock);
+    // V1: set xattr_blkaddr to computed value; V2: leave as 0
+    let xattr_blkaddr = match version {
+        format::FormatVersion::V1 => {
+            (output.get(Offset::InodesEnd, 0) / format::BLOCK_SIZE as usize) as u32
+        }
+        format::FormatVersion::V2 => 0,
+    };
     output.write_struct(format::Superblock {
         magic: format::MAGIC_V1,
         blkszbits: format::BLOCK_BITS,
@@ -617,14 +926,21 @@ fn write_erofs(
         root_nid: (output.get_nid(0) as u16).into(),
         inos: (inodes.len() as u64).into(),
         blocks: ((output.get(Offset::End, 0) / usize::from(format::BLOCK_SIZE)) as u32).into(),
+        build_time: build_time.into(),
+        build_time_nsec: build_time_nsec.into(),
+        xattr_blkaddr: xattr_blkaddr.into(),
         ..Default::default()
     });
 
     // Write inode table
     for (idx, inode) in inodes.iter().enumerate() {
         // The inode may add padding to itself, so it notes its own offset
-        inode.write_inode(output, idx);
+        inode.write_inode(output, idx, version, min_mtime);
     }
+
+    // Mark end of inode table (slot-aligned)
+    output.pad(32);
+    output.note_offset(Offset::InodesEnd);
 
     // Write shared xattr table
     for xattr in xattrs {
@@ -717,7 +1033,31 @@ impl Output for FirstPass {
     }
 }
 
-/// Creates an EROFS filesystem image from a composefs tree
+/// Calculates the minimum mtime across all inodes in the collection.
+///
+/// This is used for V1 compatibility where build_time is set to the
+/// minimum mtime for reproducibility.
+fn calculate_min_mtime(inodes: &[Inode<impl FsVerityHashValue>]) -> (u64, u32) {
+    let mut min_sec = u64::MAX;
+    let mut min_nsec = 0u32;
+
+    for inode in inodes {
+        let mtime_sec = inode.stat.st_mtim_sec as u64;
+        if mtime_sec < min_sec || (mtime_sec == min_sec && inode.stat.st_mtim_nsec < min_nsec) {
+            min_sec = mtime_sec;
+            min_nsec = inode.stat.st_mtim_nsec;
+        }
+    }
+
+    // Handle empty inode list
+    if min_sec == u64::MAX {
+        min_sec = 0;
+    }
+
+    (min_sec, min_nsec)
+}
+
+/// Creates an EROFS filesystem image from a composefs tree using the default format (V2).
 ///
 /// This function performs a two-pass generation:
 /// 1. First pass determines the layout and sizes of all structures
@@ -725,22 +1065,58 @@ impl Output for FirstPass {
 ///
 /// Returns the complete EROFS image as a byte array.
 pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(fs: &tree::FileSystem<ObjectID>) -> Box<[u8]> {
+    mkfs_erofs_versioned(fs, format::FormatVersion::default())
+}
+
+/// Creates an EROFS filesystem image from a composefs tree with an explicit format version.
+///
+/// The `version` parameter controls the format version:
+/// - `FormatVersion::V1`: C mkcomposefs compatible (composefs_version=0, compact inodes, BFS)
+/// - `FormatVersion::V2`: Current default (composefs_version=2, extended inodes, DFS)
+///
+/// Returns the complete EROFS image as a byte array.
+pub fn mkfs_erofs_versioned<ObjectID: FsVerityHashValue>(
+    fs: &tree::FileSystem<ObjectID>,
+    version: format::FormatVersion,
+) -> Box<[u8]> {
     // Create the intermediate representation: flattened inodes and shared xattrs
-    let nlink_map = fs.nlinks();
-    let mut inodes = InodeCollector::collect(fs, &nlink_map);
-    let xattrs = share_xattrs(&mut inodes);
+    let mut inodes = InodeCollector::collect(fs, version);
+
+    // For V1, add trusted.overlay.opaque xattr to root directory.
+    // This is done after collection (and thus after xattr escaping) to match
+    // the C implementation behavior.
+    if version == format::FormatVersion::V1 && !inodes.is_empty() {
+        inodes[0].xattrs.add(b"trusted.overlay.opaque", b"y");
+    }
+
+    let xattrs = share_xattrs(&mut inodes, version);
+
+    // Calculate minimum mtime for V1 build_time
+    let min_mtime = calculate_min_mtime(&inodes);
 
     // Do a first pass with the writer to determine the layout
     let mut first_pass = FirstPass::default();
-    write_erofs(&mut first_pass, &inodes, &xattrs);
+    write_erofs(&mut first_pass, &inodes, &xattrs, version, min_mtime);
 
     // Do a second pass with the writer to get the actual bytes
     let mut second_pass = SecondPass {
         output: vec![],
         layout: first_pass.layout,
     };
-    write_erofs(&mut second_pass, &inodes, &xattrs);
+    write_erofs(&mut second_pass, &inodes, &xattrs, version, min_mtime);
 
     // That's it
     second_pass.output.into_boxed_slice()
+}
+
+/// Creates an EROFS filesystem image using the default format version (V2)
+///
+/// This is a convenience function equivalent to calling
+/// `mkfs_erofs(fs)`.
+///
+/// Returns the complete EROFS image as a byte array.
+pub fn mkfs_erofs_default<ObjectID: FsVerityHashValue>(
+    fs: &tree::FileSystem<ObjectID>,
+) -> Box<[u8]> {
+    mkfs_erofs(fs)
 }
