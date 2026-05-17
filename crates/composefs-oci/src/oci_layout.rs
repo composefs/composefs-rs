@@ -82,6 +82,10 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
     layout_tag: Option<&str>,
     reporter: SharedReporter,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
+    // Check writability before touching the source, so a read-only repo gives
+    // a clear "not writable" error rather than a misleading source-open error.
+    repo.ensure_writable()?;
+
     // Open the OCI layout directory
     let dir = cap_std::fs::Dir::open_ambient_dir(layout_path, cap_std::ambient_authority())
         .with_context(|| format!("Opening OCI layout directory {}", layout_path.display()))?;
