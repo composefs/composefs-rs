@@ -51,10 +51,12 @@ patch: clone
     #!/bin/bash
     set -euo pipefail
 
-    # Require a clean composefs-rs working tree so we test a real commit
+    # Require a clean composefs-rs working tree so we test a real commit.
+    # Only tracked files matter; untracked files are allowed.
+    # git diff HEAD already excludes untracked files.
     if ! git -C "$_COMPOSEFS_SRC" diff --quiet HEAD 2>/dev/null; then
         echo "error: composefs-rs has uncommitted changes — commit or stash first" >&2
-        git -C "$_COMPOSEFS_SRC" status --short >&2
+        git -C "$_COMPOSEFS_SRC" diff --stat HEAD >&2
         exit 1
     fi
 
