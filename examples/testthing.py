@@ -184,19 +184,36 @@ def _find_qemu() -> Path:
     raise FileNotFoundError("Unable to find qemu-kvm")
 
 
-def _find_ovmf() -> tuple[str, Path]:
-    candidates = [
-        # path for Fedora/RHEL (our tasks container)
-        "/usr/share/OVMF/OVMF_CODE.fd",
+def _find_ovmf() -> tuple[str | tuple[str, str], ...]:
+    # Prefer split CODE+VARS pflash files (required on RHEL10/CentOS10 QEMU
+    # where -bios with the combined file hangs).  Fall back to -bios with a
+    # combined image for Ubuntu CI and Arch.
+    split_candidates = [
+        ("/usr/share/edk2/ovmf/OVMF_CODE.fd", "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
+        ("/usr/share/OVMF/OVMF_CODE.fd", "/usr/share/OVMF/OVMF_VARS.fd"),
+    ]
+    for code, varst in split_candidates:
+        if Path(code).exists() and Path(varst).exists():
+            # Copy VARS so UEFI can write to it without modifying the original.
+            import tempfile, shutil, atexit
+            tmp = tempfile.NamedTemporaryFile(suffix=".fd", delete=False)
+            shutil.copy2(varst, tmp.name)
+            atexit.register(lambda p=tmp.name: Path(p).unlink(missing_ok=True))
+            return (
+                ("-machine", "q35"),
+                ("-drive", f"if=pflash,format=raw,readonly=on,file={code}"),
+                ("-drive", f"if=pflash,format=raw,file={tmp.name}"),
+            )
+
+    bios_candidates = [
         # path for Ubuntu (GitHub Actions runners)
         "/usr/share/ovmf/OVMF.fd",
         # path for Arch
         "/usr/share/edk2/x64/OVMF.4m.fd",
     ]
-
-    for path in map(Path, candidates):
+    for path in map(Path, bios_candidates):
         if path.exists():
-            return "-bios", path
+            return (("-bios", str(path)),)
 
     raise FileNotFoundError("Unable to find OVMF UEFI BIOS")
 
@@ -618,7 +635,7 @@ class VirtualMachine:
         args = (
             _find_qemu(),
             "-nodefaults",
-            _find_ovmf(),
+            *_find_ovmf(),
             ("-cpu", "host"),
             ("-smp", f"{self._cpus}"),
             ("-m", f"{self._memory}"),
