@@ -408,7 +408,7 @@ class VirtualMachine:
         sit: bool = False,
         snapshot: bool = True,
         status_messages: bool = False,
-        timeout: float = 30.0,
+        timeout: float = 60.0,
         verbose: bool = False,
     ) -> None:
         """Construct a VM.
@@ -1077,7 +1077,7 @@ def _main() -> None:
         "--ssh-key", "-i", type=Path, help="Path to SSH private key (default: generate)"
     )
     parser.add_argument(
-        "--timeout", type=float, help="For startup, in seconds, or 'inf' (default: 30)"
+        "--timeout", type=float, help="For startup, in seconds, or 'inf' (default: 60)"
     )
     parser.add_argument("image", type=Path, help="The path to a qcow2 VM image to run")
     args = parser.parse_args()
