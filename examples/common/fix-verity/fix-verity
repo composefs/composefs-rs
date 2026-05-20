@@ -18,10 +18,29 @@ if [ ! -f ${fix_verity_efi} ]; then
     mv "${fix_verity_efi}.tmp" "${fix_verity_efi}"
 fi
 
+ovmf_code=""
+ovmf_vars=""
+for d in /usr/share/edk2/ovmf /usr/share/OVMF /usr/share/ovmf /usr/share/edk2/x64; do
+    if [ -f "$d/OVMF_CODE.fd" ] && [ -f "$d/OVMF_VARS.fd" ]; then
+        ovmf_code="$d/OVMF_CODE.fd"
+        ovmf_vars="$d/OVMF_VARS.fd"
+        break
+    fi
+done
+
+ovmf_vars_tmp=""
+if [ -n "$ovmf_code" ]; then
+    ovmf_vars_tmp="$(mktemp --suffix=.fd)"
+    cp "$ovmf_vars" "$ovmf_vars_tmp"
+    trap 'rm -f "$ovmf_vars_tmp"' EXIT
+fi
+
 qemu-system-x86_64 \
     -nographic \
     -m 4096 \
     -enable-kvm \
-    -bios /usr/share/edk2/ovmf/OVMF_CODE.fd \
+    -machine q35 \
+    ${ovmf_code:+-drive if=pflash,format=raw,readonly=on,file="$ovmf_code"} \
+    ${ovmf_vars_tmp:+-drive if=pflash,format=raw,file="$ovmf_vars_tmp"} \
     -drive file="$1",format=raw,if=virtio,media=disk \
     -kernel "${fix_verity_efi}"
