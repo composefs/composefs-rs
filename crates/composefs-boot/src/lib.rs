@@ -101,6 +101,10 @@ impl<ObjectID: FsVerityHashValue> BootOps<ObjectID> for FileSystem<ObjectID> {
     ) -> Result<Vec<BootEntry<ObjectID>>> {
         let boot_entries = get_boot_resources(self, repo)?;
         empty_toplevel_dirs(self)?;
+        // Compact the leaves table after clearing directories, so that leaves
+        // which were only referenced by /boot or /sysroot are removed and
+        // don't appear as orphans when the filesystem is validated.
+        self.compact();
         selabel::selabel(self, repo)?;
 
         Ok(boot_entries)
@@ -108,6 +112,8 @@ impl<ObjectID: FsVerityHashValue> BootOps<ObjectID> for FileSystem<ObjectID> {
 
     fn transform_for_boot_from_dir(&mut self, rootfs: impl AsFd) -> Result<()> {
         empty_toplevel_dirs(self)?;
+        // Same as above: compact to remove leaves orphaned by clearing dirs.
+        self.compact();
         selabel::selabel_from_dir(self, rootfs)?;
         Ok(())
     }

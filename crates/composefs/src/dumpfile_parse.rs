@@ -121,6 +121,11 @@ pub enum Item<'p> {
         /// Number of links
         nlink: u32,
     },
+    /// A Unix domain socket
+    Socket {
+        /// Number of links
+        nlink: u32,
+    },
     /// A directory
     Directory {
         /// Number of links
@@ -482,7 +487,10 @@ impl<'p> Entry<'p> {
                     Item::Directory { nlink }
                 }
                 FileType::Socket => {
-                    anyhow::bail!("sockets are not supported");
+                    Self::check_nonregfile(content, fsverity_digest)?;
+                    Self::check_rdev(rdev)?;
+
+                    Item::Socket { nlink }
                 }
                 FileType::Unknown => {
                     anyhow::bail!("Unhandled file type from raw mode: {mode}")
@@ -532,6 +540,7 @@ impl Item<'_> {
             Item::Symlink { nlink, .. } => *nlink,
             Item::Directory { nlink, .. } => *nlink,
             Item::Fifo { nlink, .. } => *nlink,
+            Item::Socket { nlink, .. } => *nlink,
             _ => 0,
         }
     }

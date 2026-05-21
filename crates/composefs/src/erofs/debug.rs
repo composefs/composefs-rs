@@ -341,64 +341,6 @@ impl<'img> ImageVisitor<'img> {
         }
     }
 
-    fn visit_directory_block(&mut self, block: &DirectoryBlock, path: &Path) -> Result<()> {
-        for entry in block.entries()? {
-            let entry = entry?;
-            if entry.name == b"." || entry.name == b".." {
-                // TODO: maybe we want to follow those and let deduplication happen
-                continue;
-            }
-            self.visit_inode(
-                entry.header.inode_offset.get(),
-                &path.join(OsStr::from_bytes(entry.name)),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn visit_inode(&mut self, id: u64, path: &Path) -> Result<()> {
-        let inode = self.image.inode(id)?;
-        let segment = match inode {
-            InodeType::Compact(inode) => SegmentType::CompactInode(inode),
-            InodeType::Extended(inode) => SegmentType::ExtendedInode(inode),
-        };
-        if self.note(segment, Some(path))? {
-            // TODO: maybe we want to throw an error if we detect loops
-            /* already processed */
-            return Ok(());
-        }
-
-        if let Some(xattrs) = inode.xattrs()? {
-            for id in xattrs.shared()? {
-                self.note(
-                    SegmentType::XAttr(self.image.shared_xattr(id.get())?),
-                    Some(path),
-                )?;
-            }
-        }
-
-        if inode.mode().is_dir() {
-            if let Some(inline) = inode.inline() {
-                let inline_block = DirectoryBlock::ref_from_bytes(inline)
-                    .map_err(|_| anyhow::anyhow!("invalid inline directory block"))?;
-                self.visit_directory_block(inline_block, path)?;
-            }
-
-            for id in self.image.inode_blocks(&inode)? {
-                let block = self.image.directory_block(id)?;
-                self.visit_directory_block(block, path)?;
-                self.note(SegmentType::DirectoryBlock(block), Some(path))?;
-            }
-        } else {
-            for id in self.image.inode_blocks(&inode)? {
-                let block = self.image.data_block(id)?;
-                self.note(SegmentType::DataBlock(block), Some(path))?;
-            }
-        }
-
-        Ok(())
-    }
-
     #[allow(clippy::type_complexity)]
     fn visit_image(
         image: &'img Image<'img>,
@@ -409,7 +351,70 @@ impl<'img> ImageVisitor<'img> {
         };
         this.note(SegmentType::Header(image.header), None)?;
         this.note(SegmentType::Superblock(image.sb), None)?;
-        this.visit_inode(image.sb.root_nid.get() as u64, &PathBuf::from("/"))?;
+
+        // Iterative traversal: push (nid, path) pairs rather than recursing.
+        // The previous mutual recursion (visit_inode ↔ visit_directory_block)
+        // had no depth limit and would stack-overflow on deeply nested images.
+        // Deduplication is by byte offset via note(), so cycles and hardlinks
+        // are safe: note() returns true on a second visit and we skip children.
+        let mut stack: Vec<(u64, PathBuf)> =
+            vec![(image.sb.root_nid.get() as u64, PathBuf::from("/"))];
+
+        while let Some((id, path)) = stack.pop() {
+            let inode = this.image.inode(id)?;
+            let segment = match inode {
+                InodeType::Compact(inode) => SegmentType::CompactInode(inode),
+                InodeType::Extended(inode) => SegmentType::ExtendedInode(inode),
+            };
+            if this.note(segment, Some(&path))? {
+                // Already visited this byte offset — additional path recorded, skip children.
+                continue;
+            }
+
+            if let Some(xattrs) = inode.xattrs()? {
+                for xid in xattrs.shared()? {
+                    this.note(
+                        SegmentType::XAttr(this.image.shared_xattr(xid.get())?),
+                        Some(&path),
+                    )?;
+                }
+            }
+
+            if inode.mode().is_dir() {
+                if let Some(inline) = inode.inline() {
+                    let inline_block = DirectoryBlock::ref_from_bytes(inline)
+                        .map_err(|_| anyhow::anyhow!("invalid inline directory block"))?;
+                    for entry in inline_block.entries()? {
+                        let entry = entry?;
+                        if entry.name != b"." && entry.name != b".." {
+                            stack.push((
+                                entry.header.inode_offset.get(),
+                                path.join(OsStr::from_bytes(entry.name)),
+                            ));
+                        }
+                    }
+                }
+                for blkid in this.image.inode_blocks(&inode)? {
+                    let block = this.image.directory_block(blkid)?;
+                    for entry in block.entries()? {
+                        let entry = entry?;
+                        if entry.name != b"." && entry.name != b".." {
+                            stack.push((
+                                entry.header.inode_offset.get(),
+                                path.join(OsStr::from_bytes(entry.name)),
+                            ));
+                        }
+                    }
+                    this.note(SegmentType::DirectoryBlock(block), Some(&path))?;
+                }
+            } else {
+                for blkid in this.image.inode_blocks(&inode)? {
+                    let block = this.image.data_block(blkid)?;
+                    this.note(SegmentType::DataBlock(block), Some(&path))?;
+                }
+            }
+        }
+
         Ok(this.visited)
     }
 }

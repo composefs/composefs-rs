@@ -93,6 +93,21 @@ test-integration-vm *ARGS: build _integration-container-build
 install-nextest:
     @which cargo-nextest > /dev/null 2>&1 || cargo install cargo-nextest --locked
 
+# Build and run a bls example locally.
+# Usage: just test-example-local bls arch
+#        just test-example-local bls arch fsfmt=ext4 verity=none
+# 'fsfmt' defaults to ext4, 'verity' defaults to none (no fs-verity enforcement).
+# Requires: qemu-kvm, OVMF, skopeo, mtools, fsverity, mkfs.erofs, systemd-repart, podman.
+test-example-local example os fsfmt="ext4" verity="none": build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export FS_FORMAT={{ fsfmt }}
+    export FS_VERITY_MODE={{ verity }}
+    export CFSCTL_PATH=$(pwd)/target/debug/cfsctl
+    cd examples
+    {{ example }}/build {{ os }}
+    TEST_IMAGE="{{ example }}/{{ os }}-{{ example }}-efi.qcow2" pytest test -v
+
 # Run everything: checks + full integration tests including VM
 ci: check test-integration-vm
 

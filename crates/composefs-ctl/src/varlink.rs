@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use composefs::fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue};
-use composefs::repository::{FsckResult, Repository, system_path, user_path};
+use composefs::repository::{FsckResult, Repository, RepositoryConfig, system_path, user_path};
 use rustix::fs::CWD;
 use serde::{Deserialize, Serialize};
 
@@ -425,17 +425,26 @@ fn run_init_repository(
         })?;
     }
 
-    let enable_verity = !insecure;
     let created = match algorithm {
         Algorithm::Sha256 { .. } => {
-            Repository::<Sha256HashValue>::init_path(CWD, path, algorithm, enable_verity)
+            let config = if insecure {
+                RepositoryConfig::new(algorithm).set_insecure()
+            } else {
+                RepositoryConfig::new(algorithm)
+            };
+            Repository::<Sha256HashValue>::init_path(CWD, path, config)
                 .map_err(|e| RepositoryError::InternalError {
                     message: format!("{e:#}"),
                 })?
                 .1
         }
         Algorithm::Sha512 { .. } => {
-            Repository::<Sha512HashValue>::init_path(CWD, path, algorithm, enable_verity)
+            let config = if insecure {
+                RepositoryConfig::new(algorithm).set_insecure()
+            } else {
+                RepositoryConfig::new(algorithm)
+            };
+            Repository::<Sha512HashValue>::init_path(CWD, path, config)
                 .map_err(|e| RepositoryError::InternalError {
                     message: format!("{e:#}"),
                 })?
@@ -587,7 +596,7 @@ async fn run_compute_id<ObjectID: FsVerityHashValue>(
                 message: format!("{e:#}"),
             })?;
     }
-    let id = fs.compute_image_id();
+    let id = fs.compute_image_id(repo.erofs_version());
     Ok(oci::OciComputeIdReply {
         image_id: id.to_hex(),
     })

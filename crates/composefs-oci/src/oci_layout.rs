@@ -476,8 +476,7 @@ mod tests {
         let (repo, _) = composefs::repository::Repository::<Sha256HashValue>::init_path(
             rustix::fs::CWD,
             &repo_path,
-            composefs::fsverity::Algorithm::SHA256,
-            false,
+            composefs::repository::RepositoryConfig::default().set_insecure(),
         )
         .unwrap();
         let repo = std::sync::Arc::new(repo);

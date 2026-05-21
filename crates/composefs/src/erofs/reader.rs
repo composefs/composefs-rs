@@ -17,7 +17,8 @@ use zerocopy::{FromBytes, Immutable, KnownLayout, little_endian::U32};
 use super::{
     composefs::OverlayMetacopy,
     format::{
-        self, BLOCK_BITS, COMPOSEFS_MAGIC, CompactInodeHeader, ComposefsHeader, DataLayout,
+        self, BLOCK_BITS, COMPOSEFS_MAGIC, COMPOSEFS_VERSION, COMPOSEFS_VERSION_V0,
+        COMPOSEFS_VERSION_V1, CompactInodeHeader, ComposefsHeader, DataLayout,
         DirectoryEntryHeader, ExtendedInodeHeader, InodeXAttrHeader, MAGIC_V1, ModeField, S_IFBLK,
         S_IFCHR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, Superblock, VERSION, XATTR_PREFIXES,
         XAttrHeader,
@@ -494,8 +495,21 @@ impl<'img> Image<'img> {
                 self.header.version.get(),
             )));
         }
-        // Note: we don't enforce composefs_version here because C mkcomposefs
-        // writes version 0 while the Rust writer uses version 2.  Both are valid.
+        // Reject unknown composefs versions.
+        //   0 = V1 (C-compatible, no user whiteouts)
+        //   1 = V1 (C-compatible, user whiteouts present — C bumps version when it
+        //           encounters a char-device-rdev-0 entry in the input tree)
+        //   2 = V2 (Rust-native format)
+        let cv = self.header.composefs_version.get();
+        if cv != COMPOSEFS_VERSION.get()
+            && cv != COMPOSEFS_VERSION_V1.get()
+            && cv != COMPOSEFS_VERSION_V0.get()
+        {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "unknown composefs_version {cv} (expected 0, 1, or {})",
+                COMPOSEFS_VERSION.get(),
+            )));
+        }
 
         // Validate EROFS superblock magic
         if self.sb.magic != MAGIC_V1 {
@@ -649,17 +663,29 @@ impl<'img> Image<'img> {
     }
 
     /// Returns a data block by its ID
+    /// Returns a byte slice of the image at `[offset, offset+len)`, validating
+    /// that both the offset and the range lie within the image.
+    ///
+    /// This is the single choke point for all raw byte accesses derived from
+    /// image fields (block addresses, xattr offsets, etc.).  All callers that
+    /// compute `blkaddr * block_size + delta` should go through here rather
+    /// than slicing `self.image` directly.
+    pub fn image_slice(&self, offset: usize, len: usize) -> Result<&[u8], ErofsReaderError> {
+        let end = offset
+            .checked_add(len)
+            .ok_or(ErofsReaderError::OutOfBounds)?;
+        self.image
+            .get(offset..end)
+            .ok_or(ErofsReaderError::OutOfBounds)
+    }
+
+    /// Returns a block by its ID as a raw byte slice, validated against the image size.
     pub fn block(&self, id: u64) -> Result<&[u8], ErofsReaderError> {
         let start = usize::try_from(id)
             .ok()
             .and_then(|id| id.checked_mul(self.block_size))
             .ok_or(ErofsReaderError::OutOfBounds)?;
-        let end = start
-            .checked_add(self.block_size)
-            .ok_or(ErofsReaderError::OutOfBounds)?;
-        self.image
-            .get(start..end)
-            .ok_or(ErofsReaderError::OutOfBounds)
+        self.image_slice(start, self.block_size)
     }
 
     /// Returns a data block by its ID as a DataBlock reference
@@ -711,6 +737,303 @@ impl<'img> Image<'img> {
         Ok(range)
     }
 
+    /// Performs a full structural fsck of the image metadata by traversing the
+    /// entire inode tree.
+    ///
+    /// This is separate from [`Self::restrict_to_composefs`], which only checks
+    /// superblock and header fields without any traversal.  Call this when you
+    /// want a thorough integrity check (e.g. during repository fsck) rather than
+    /// just the cheap open-time validation.
+    ///
+    /// Currently checks:
+    /// - V1 images: no FlatInline symlink inode has a block-boundary layout that
+    ///   old Linux kernels (< 6.12) would reject with `EFSCORRUPTED` (`EUCLEAN`).
+    /// - Epoch-invariant rules (see [`Self::validate_epoch_invariants`]).
+    pub fn fsck_metadata(&self) -> Result<(), ErofsReaderError> {
+        self.validate_v1_inline_layout()?;
+        self.validate_epoch_invariants()
+    }
+
+    /// Validates epoch-invariant structural rules that must hold for every
+    /// well-formed composefs image depending on its format epoch.
+    ///
+    /// **Epoch1** (`composefs_version` 0 or 1 — compact inodes, BFS, whiteout table):
+    /// 1. The root directory must contain exactly 256 entries with 2-hex-char names
+    ///    (the whiteout stub table slots, 00–ff).  Each slot may be occupied by
+    ///    either a native whiteout stub (char-device rdev=0,0), an escaped whiteout
+    ///    (regular file + `trusted.overlay.overlay.whiteout` xattr), or a
+    ///    pre-existing user entry that shadowed the stub during image creation.
+    /// 2. No native whiteout (char-device rdev=0,0) may appear outside the root
+    ///    stub table.
+    ///
+    /// **Epoch2** (`composefs_version` 2 — extended inodes, DFS, no whiteout table):
+    /// 1. The root directory must contain no entries with a 2-hex-char name that
+    ///    are native whiteouts or escaped whiteouts (i.e., no stub-pattern entries).
+    /// 2. No escaped whiteout (regular file + `trusted.overlay.overlay.whiteout`
+    ///    xattr) may appear anywhere in the tree.
+    fn validate_epoch_invariants(&self) -> Result<(), ErofsReaderError> {
+        let cv = self.header.composefs_version.get();
+        let is_epoch1 =
+            cv == format::COMPOSEFS_VERSION_V0.get() || cv == format::COMPOSEFS_VERSION_V1.get();
+        let is_epoch2 = cv == format::COMPOSEFS_VERSION.get();
+
+        // Only validate images with a known composefs_version; images opened
+        // without restrict_to_composefs() may have an arbitrary version field.
+        if !is_epoch1 && !is_epoch2 {
+            return Ok(());
+        }
+
+        let root_nid = self.sb.root_nid.get() as u64;
+
+        // Helper: return true iff a name is exactly two *lowercase* hex digits.
+        // The stub table uses lowercase names (00..ff) generated by format!("{:02x}").
+        // Uppercase hex names (e.g. "AB") are distinct entries and are not stub slots.
+        let is_lowercase_hex2 = |name: &[u8]| -> bool {
+            name.len() == 2
+                && name
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+        };
+
+        // --- Walk all directories (BFS) ---
+        // We use an explicit stack to avoid recursion depth issues.
+        let mut stack = vec![root_nid];
+        let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+        // Track the number of hex-named root entries (used for Epoch1 check 1).
+        // Each of the 256 slots (00..ff) must appear exactly once.
+        let mut root_hex_slots: std::collections::HashSet<[u8; 2]> =
+            std::collections::HashSet::new();
+
+        while let Some(dir_nid) = stack.pop() {
+            if !visited.insert(dir_nid) {
+                continue;
+            }
+
+            let dir_inode = match self.inode(dir_nid) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+
+            if !dir_inode.mode().is_dir() {
+                continue;
+            }
+
+            let is_root = dir_nid == root_nid;
+
+            // Collect children from both block-based and inline directory data.
+            let mut children: Vec<(Vec<u8>, u64)> = Vec::new();
+
+            if let Ok(range) = self.inode_blocks(&dir_inode) {
+                for blkid in range {
+                    if let Ok(block) = self.directory_block(blkid)
+                        && let Ok(entries) = block.entries()
+                    {
+                        for entry in entries.flatten() {
+                            if entry.name != b"." && entry.name != b".." {
+                                children.push((entry.name.to_vec(), entry.nid()));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(inline) = dir_inode.inline()
+                && let Ok(block) = DirectoryBlock::ref_from_bytes(inline)
+                && let Ok(entries) = block.entries()
+            {
+                for entry in entries.flatten() {
+                    if entry.name != b"." && entry.name != b".." {
+                        children.push((entry.name.to_vec(), entry.nid()));
+                    }
+                }
+            }
+
+            for (name, child_nid) in children {
+                let child_inode = match self.inode(child_nid) {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+
+                // Track hex-named root entries for Epoch1 stub table check.
+                if is_epoch1 && is_root && is_lowercase_hex2(&name) {
+                    root_hex_slots.insert([name[0], name[1]]);
+                }
+
+                // Recurse into subdirectories.
+                if child_inode.mode().is_dir() {
+                    stack.push(child_nid);
+                    continue;
+                }
+
+                let is_native_whiteout = child_inode.is_whiteout();
+                let is_escaped = is_escaped_v1_whiteout(self, &child_inode)
+                    .map_err(|e| ErofsReaderError::InvalidImage(e.to_string()))?;
+
+                if is_epoch1 {
+                    if !is_root && is_native_whiteout {
+                        // Epoch1 must not have native whiteouts outside the root stub table.
+                        return Err(ErofsReaderError::InvalidImage(
+                            "Epoch1 image contains native whiteout outside root stubs".into(),
+                        ));
+                    }
+                } else {
+                    // is_epoch2: native whiteouts (char-device 0,0) are valid user
+                    // whiteouts regardless of their name or location.  The only thing
+                    // that must not appear is an *escaped* whiteout (regular file +
+                    // trusted.overlay.overlay.whiteout xattr), which is a V1-only
+                    // encoding and has no place in a V2 image.
+                    if is_escaped {
+                        return Err(ErofsReaderError::InvalidImage(
+                            "Epoch2 image contains escaped whiteout".into(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Epoch1: every hex slot 00..ff must be present in the root.
+        // The writer fills missing slots with stub entries; slots occupied by
+        // pre-existing user content are also valid (the stub was skipped).
+        if is_epoch1 && root_hex_slots.len() != 256 {
+            return Err(ErofsReaderError::InvalidImage(format!(
+                "Epoch1 image has {} hex-named root entries, expected 256 (00–ff)",
+                root_hex_slots.len(),
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Validates that the image does not contain FlatInline inodes with a layout
+    /// that old Linux kernels (< 6.12) would reject with `EFSCORRUPTED` (`EUCLEAN`).
+    ///
+    /// Only V1 (C-compatible, `composefs_version` = 0 or 1) images are expected to be
+    /// mounted on kernels that may predate the 6.12 fix; V2 images use a different
+    /// block-boundary strategy that is frozen for digest stability, so this check
+    /// is deliberately restricted to V1.
+    ///
+    /// The kernel's pre-6.12 fast-symlink path checks:
+    /// ```text
+    /// (inode_offset % block_size) + inode_and_xattr_size + inline_size > block_size
+    /// ```
+    /// and returns `-EFSCORRUPTED` if true.  This method returns an error for any
+    /// inode where that condition holds.
+    fn validate_v1_inline_layout(&self) -> Result<(), ErofsReaderError> {
+        // Only applies to V1 (C-compatible) images: composefs_version 0 (no user
+        // whiteouts) or 1 (user whiteouts present).  V2 images (composefs_version=2)
+        // use a frozen layout strategy and are never mounted on pre-6.12 kernels.
+        let cv = self.header.composefs_version.get();
+        if cv >= format::COMPOSEFS_VERSION.get() {
+            return Ok(());
+        }
+
+        let block_size = self.block_size as u64;
+
+        // Walk all reachable inodes from the root rather than iterating raw nid slots.
+        // The inode table is not densely packed — gaps arise from padding — so
+        // iterating 0..sb.inos by slot can hit mid-inode bytes that accidentally
+        // parse as valid-looking headers with garbage xattr_icount values.
+        let mut stack = vec![self.sb.root_nid.get() as u64];
+        let mut visited = std::collections::HashSet::new();
+
+        while let Some(nid) = stack.pop() {
+            if !visited.insert(nid) {
+                continue;
+            }
+            let inode = match self.inode(nid) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+
+            // Recurse into directories to find all symlink inodes.
+            if inode.mode().is_dir() {
+                // Collect child nids from both inline and block directory data.
+                let mut child_nids: Vec<u64> = Vec::new();
+                if let Some(inline) = inode.inline()
+                    && let Ok(block) = DirectoryBlock::ref_from_bytes(inline)
+                    && let Ok(entries) = block.entries()
+                {
+                    for entry in entries.flatten() {
+                        let name = entry.name;
+                        if name == b"." || name == b".." {
+                            continue;
+                        }
+                        child_nids.push(entry.nid());
+                    }
+                }
+                if let Ok(range) = self.inode_blocks(&inode) {
+                    for blkid in range {
+                        if let Ok(block) = self.directory_block(blkid)
+                            && let Ok(entries) = block.entries()
+                        {
+                            for entry in entries.flatten() {
+                                let name = entry.name;
+                                if name == b"." || name == b".." {
+                                    continue;
+                                }
+                                child_nids.push(entry.nid());
+                            }
+                        }
+                    }
+                }
+                stack.extend(child_nids);
+                continue;
+            }
+
+            // Only the pre-6.12 symlink fast-path checks the block boundary.
+            let mode = inode.mode().0.get();
+            if mode & S_IFMT != S_IFLNK {
+                continue;
+            }
+
+            let layout = match inode.data_layout() {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if !matches!(layout, DataLayout::FlatInline) {
+                continue; // symlink stored out-of-band (long target > block_size)
+            }
+
+            let inline_size = inode.size() % block_size;
+            if inline_size == 0 {
+                continue;
+            }
+
+            // nid * 32 is the byte offset from meta_start (which is 0 for composefs).
+            let inode_offset = nid
+                .checked_mul(32)
+                .ok_or_else(|| ErofsReaderError::InvalidImage("nid overflow".into()))?;
+            let inode_pos_in_block = inode_offset % block_size;
+
+            let header_size: u64 = match &inode {
+                InodeType::Compact(_) => size_of::<CompactInodeHeader>() as u64,
+                InodeType::Extended(_) => size_of::<ExtendedInodeHeader>() as u64,
+            };
+            let xattr_size = inode.xattr_size() as u64;
+            let inode_and_xattr_size = header_size.checked_add(xattr_size).ok_or_else(|| {
+                ErofsReaderError::InvalidImage("inode+xattr size overflow".into())
+            })?;
+
+            let total = inode_pos_in_block
+                .checked_add(inode_and_xattr_size)
+                .and_then(|t| t.checked_add(inline_size))
+                .ok_or_else(|| {
+                    ErofsReaderError::InvalidImage("inline layout size overflow".into())
+                })?;
+            if total > block_size {
+                return Err(ErofsReaderError::InvalidImage(format!(
+                    "inode at nid {nid} (FlatInline symlink, inode_pos_in_block={inode_pos_in_block}, \
+                     inode_and_xattr_size={inode_and_xattr_size}, inline_size={inline_size}) \
+                     would trigger EUCLEAN on kernels older than 6.12: \
+                     {inode_pos_in_block} + {inode_and_xattr_size} + {inline_size} = {total} > {block_size}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Finds a child directory entry by name within a directory inode.
     ///
     /// Returns the nid (inode number) of the child if found.
@@ -741,6 +1064,41 @@ impl<'img> Image<'img> {
         }
         Ok(None)
     }
+}
+
+/// Check if an inode is a V1 escaped whiteout (a regular file carrying the
+/// `trusted.overlay.overlay.whiteout` xattr added by the V1 writer).
+///
+/// C composefs v1.0.8 converts char-device-rdev-0 entries to regular files
+/// on write (whiteout escaping).  The reader must reverse this.
+fn is_escaped_v1_whiteout(img: &Image, inode: &InodeType) -> anyhow::Result<bool> {
+    // Only relevant for regular files
+    let mode = inode.mode().0.get();
+    if mode & S_IFMT != S_IFREG {
+        return Ok(false);
+    }
+
+    let Some(xattrs_section) = inode.xattrs()? else {
+        return Ok(false);
+    };
+
+    // Check shared xattrs
+    for id in xattrs_section.shared()? {
+        let xattr = img.shared_xattr(id.get())?;
+        let full_name = construct_xattr_name(xattr)?;
+        if full_name == format::XATTR_OVERLAY_WHITEOUT {
+            return Ok(true);
+        }
+    }
+    // Check local xattrs
+    for xattr in xattrs_section.local()? {
+        let xattr = xattr?;
+        let full_name = construct_xattr_name(xattr)?;
+        if full_name == format::XATTR_OVERLAY_WHITEOUT {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // TODO: there must be an easier way...
@@ -1041,6 +1399,7 @@ impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
 /// Returns a set of all referenced object IDs.
 pub fn collect_objects<ObjectID: FsVerityHashValue>(image: &[u8]) -> ReadResult<HashSet<ObjectID>> {
     let img = Image::open(image)?.restrict_to_composefs()?;
+    img.fsck_metadata()?;
     let mut this = ObjectCollector {
         visited_nids: HashSet::new(),
         nids_to_visit: BTreeSet::new(),
@@ -1078,21 +1437,23 @@ fn construct_xattr_name(xattr: &XAttr) -> Result<Vec<u8>, ErofsReaderError> {
 /// - Strips `trusted.overlay.metacopy` and `trusted.overlay.redirect`
 /// - Unescapes `trusted.overlay.overlay.X` back to `trusted.overlay.X`
 fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tree::Stat> {
-    let (st_mode, st_uid, st_gid, st_mtim_sec) = match inode {
+    let (st_mode, st_uid, st_gid, st_mtim_sec, st_mtim_nsec) = match inode {
         InodeType::Compact(inode) => (
             inode.header.mode.0.get() as u32 & 0o7777,
             inode.header.uid.get() as u32,
             inode.header.gid.get() as u32,
-            // Compact inodes don't store mtime; the writer uses build_time
-            // but for round-trip purposes, 0 matches what was written for
-            // compact headers (the writer always uses ExtendedInodeHeader)
-            0i64,
+            // Compact inodes don't store mtime; use superblock build_time
+            // (the writer sets build_time = min mtime across all inodes)
+            img.sb.build_time.get() as i64,
+            // and build_time_nsec for the nanosecond component
+            img.sb.build_time_nsec.get(),
         ),
         InodeType::Extended(inode) => (
             inode.header.mode.0.get() as u32 & 0o7777,
             inode.header.uid.get(),
             inode.header.gid.get(),
             inode.header.mtime.get() as i64,
+            inode.header.mtime_nsec.get(),
         ),
     };
 
@@ -1120,6 +1481,7 @@ fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tr
         st_uid,
         st_gid,
         st_mtim_sec,
+        st_mtim_nsec,
         xattrs,
     })
 }
@@ -1130,21 +1492,38 @@ fn stat_from_inode_for_tree(img: &Image, inode: &InodeType) -> anyhow::Result<tr
 fn transform_xattr(xattr: &XAttr) -> anyhow::Result<Option<(Box<OsStr>, Box<[u8]>)>> {
     let full_name = construct_xattr_name(xattr)?;
 
-    // Skip internal overlay xattrs added by the writer
-    if full_name == b"trusted.overlay.metacopy" || full_name == b"trusted.overlay.redirect" {
+    // Skip internal overlay xattrs added by the writer (metacopy/redirect
+    // are composefs-internal and should not be exposed to readers).
+    if full_name == format::XATTR_OVERLAY_METACOPY || full_name == format::XATTR_OVERLAY_REDIRECT {
+        return Ok(None);
+    }
+
+    // V1 whiteout escaping artifacts: strip these internal xattrs.
+    // XATTR_OVERLAY_WHITEOUT signals the inode is a whiteout (handled separately).
+    // The *_WHITEOUTS, *_OPAQUE, and user-namespace variants are parent-dir markers
+    // added by the V1 writer that are composefs-internal.
+    // Note: XATTR_OVERLAY_OPAQUE must be listed explicitly here because the general
+    // unescape handler below would otherwise expose it as trusted.overlay.opaque.
+    if full_name == format::XATTR_OVERLAY_WHITEOUT
+        || full_name == format::XATTR_OVERLAY_WHITEOUTS
+        || full_name == format::XATTR_OVERLAY_OPAQUE
+        || full_name == format::XATTR_USERXATTR_WHITEOUT
+        || full_name == format::XATTR_USERXATTR_WHITEOUTS
+        || full_name == format::XATTR_USERXATTR_OPAQUE
+    {
         return Ok(None);
     }
 
     // Unescape: trusted.overlay.overlay.X -> trusted.overlay.X
-    if let Some(rest) = full_name.strip_prefix(b"trusted.overlay.overlay.") {
-        let mut unescaped = b"trusted.overlay.".to_vec();
+    if let Some(rest) = full_name.strip_prefix(format::XATTR_OVERLAY_ESCAPED_PREFIX) {
+        let mut unescaped = format::XATTR_OVERLAY_PREFIX.to_vec();
         unescaped.extend_from_slice(rest);
         let name = Box::from(OsStr::from_bytes(&unescaped));
         let value = Box::from(xattr.value()?);
         return Ok(Some((name, value)));
     }
     // Skip all other trusted.overlay.* xattrs (internal to composefs)
-    if full_name.starts_with(b"trusted.overlay.") {
+    if full_name.starts_with(format::XATTR_OVERLAY_PREFIX) {
         return Ok(None);
     }
 
@@ -1393,6 +1772,25 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
         let name = OsStr::from_bytes(name_bytes);
         let child_inode = img.inode(nid)?;
 
+        // Skip overlay whiteout entries — but only in the root directory.
+        // C composefs only skips hex-named (00–ff) chardev(0,0) entries in root
+        // (lcfs-writer-erofs.c: "Skip real whiteouts (00-ff)").
+        // A chardev(0,0) in a subdirectory is a legitimate device node.
+        //
+        // In V1 images the writer escapes whiteouts to regular files with
+        // trusted.overlay.overlay.whiteout xattr, so we must check both
+        // the native chardev form and the escaped regular-file form.
+        let is_root_dir = dir_nid == img.sb.root_nid.get() as u64;
+        let is_escaped_whiteout = is_escaped_v1_whiteout(img, &child_inode)?;
+        let is_native_whiteout = child_inode.is_whiteout();
+        if is_root_dir
+            && (is_native_whiteout || is_escaped_whiteout)
+            && name_bytes.len() == 2
+            && name_bytes.iter().all(|b| b.is_ascii_hexdigit())
+        {
+            continue;
+        }
+
         if child_inode.mode().is_dir() {
             n_subdirs = n_subdirs
                 .checked_add(1)
@@ -1427,7 +1825,14 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
 
             let content = match file_type {
                 S_IFREG => {
-                    if let Some(digest) = extract_metacopy_digest::<ObjectID>(img, &child_inode)? {
+                    // V1 images escape whiteouts (char dev rdev=0) to regular files.
+                    // The is_escaped_whiteout flag was computed above (before the
+                    // root-dir skip check), so reuse it here.
+                    if is_escaped_whiteout {
+                        tree::LeafContent::CharacterDevice(0)
+                    } else if let Some(digest) =
+                        extract_metacopy_digest::<ObjectID>(img, &child_inode)?
+                    {
                         tree::LeafContent::Regular(tree::RegularFile::External(
                             digest,
                             child_inode.size(),
@@ -1468,10 +1873,19 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
                 _ => anyhow::bail!("unknown file type {:#o} for {:?}", file_type, name),
             };
 
+            // Hardlinked whiteouts are semantically invalid: a whiteout represents the
+            // absence of a file in an overlay, so nlink > 1 is meaningless.
+            let on_disk_nlink = child_inode.nlink();
+            if matches!(content, tree::LeafContent::CharacterDevice(0)) && on_disk_nlink > 1 {
+                anyhow::bail!(
+                    "invalid composefs image: whiteout inode {:?} has nlink > 1",
+                    name
+                );
+            }
+
             let leaf_id = builder.push_leaf(stat, content);
 
             // Track for hardlink detection if nlink > 1
-            let on_disk_nlink = child_inode.nlink();
             if on_disk_nlink > 1 {
                 builder.hardlinks.insert(nid, leaf_id);
             }
@@ -1572,7 +1986,7 @@ mod tests {
     use super::*;
     use crate::{
         dumpfile::{dumpfile_to_filesystem, write_dumpfile},
-        erofs::writer::mkfs_erofs,
+        erofs::writer::{ValidatedFileSystem, mkfs_erofs},
         fsverity::Sha256HashValue,
     };
     use std::collections::HashMap;
@@ -1653,7 +2067,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
         let img = Image::open(&image).unwrap();
 
         // Root should have . and .. and empty_dir
@@ -1698,7 +2112,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
         let img = Image::open(&image).unwrap();
 
         // Find dir1
@@ -1743,7 +2157,7 @@ mod tests {
         }
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(&dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
         let img = Image::open(&image).unwrap();
 
         // Find bigdir
@@ -1793,7 +2207,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
         let img = Image::open(&image).unwrap();
 
         // Navigate through the structure
@@ -1831,7 +2245,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
         let img = Image::open(&image).unwrap();
 
         let root_inode = img.root().unwrap();
@@ -1877,7 +2291,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
 
         // This should traverse all directories without error
         let result = collect_objects::<Sha256HashValue>(&image);
@@ -1953,7 +2367,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
         let img = Image::open(&image).unwrap();
 
         // Verify root entries
@@ -2000,7 +2414,7 @@ mod tests {
         write_dumpfile(&mut orig_output, &fs_orig).unwrap();
         let orig_str = String::from_utf8(orig_output).unwrap();
 
-        let image = mkfs_erofs(&fs_orig);
+        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs_orig).unwrap());
         let fs_rt = erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
 
         let mut rt_output = Vec::new();
@@ -2105,7 +2519,8 @@ mod tests {
 "#;
 
         let fs_orig = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs_orig);
+        let mut vfs_orig = ValidatedFileSystem::new(fs_orig).unwrap();
+        let image = mkfs_erofs(&mut vfs_orig);
         let fs_rt = erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
 
         // Verify hardlink sharing via LeafId
@@ -2120,7 +2535,7 @@ mod tests {
 
         // Verify dumpfile round-trips correctly
         let mut orig_output = Vec::new();
-        write_dumpfile(&mut orig_output, &fs_orig).unwrap();
+        write_dumpfile(&mut orig_output, &vfs_orig.0).unwrap();
         let orig_str = String::from_utf8(orig_output).unwrap();
 
         let mut rt_output = Vec::new();
@@ -2149,7 +2564,7 @@ mod tests {
         // Build a minimal valid composefs image (just a root directory).
         let dumpfile = "/ 0 40755 2 0 0 0 1000.0 - - -\n";
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let base_image = mkfs_erofs(&fs);
+        let base_image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
 
         // Sanity: the unmodified image passes restrict_to_composefs().
         Image::open(&base_image)
@@ -2278,7 +2693,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let base_image = mkfs_erofs(&fs);
+        let base_image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
 
         // Sanity: unmodified image round-trips fine
         erofs_to_filesystem::<Sha256HashValue>(&base_image)
@@ -2335,9 +2750,14 @@ mod tests {
 
         for case in &cases {
             let mut image = base_image.clone();
-            let offset = inline_offset + case.entry_byte_offset;
+            let entry_start = inline_offset + case.entry_byte_offset;
             // Write a bogus nid (0xDEAD) that doesn't match the directory's own nid
-            image[offset..offset + 8].copy_from_slice(&0xDEADu64.to_le_bytes());
+            // Use zerocopy to get a typed &mut DirectoryEntryHeader instead of raw bytes.
+            let hdr = DirectoryEntryHeader::mut_from_bytes(
+                &mut image[entry_start..entry_start + size_of::<DirectoryEntryHeader>()],
+            )
+            .expect("entry slice must be a valid DirectoryEntryHeader");
+            hdr.inode_offset = zerocopy::little_endian::U64::new(0xDEAD);
 
             let result = erofs_to_filesystem::<Sha256HashValue>(&image);
             let err = result.expect_err(&format!("{}: should have been rejected", case.name));
@@ -2369,7 +2789,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let base_image = mkfs_erofs(&fs);
+        let base_image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
 
         // Sanity check
         erofs_to_filesystem::<Sha256HashValue>(&base_image)
@@ -2380,22 +2800,26 @@ mod tests {
         let root_nid = img.sb.root_nid.get() as u64;
         let file_nid = img.find_child_nid(root_nid, b"file").unwrap().unwrap();
 
-        // Compute byte offset of the file's inode in the image
-        let block_size = img.block_size;
-        let meta_start = img.sb.meta_blkaddr.get() as usize * block_size;
-        let inode_byte_offset = meta_start + file_nid as usize * 32;
-        let is_extended = base_image[inode_byte_offset] & 1 != 0;
+        // Use the typed Image API to locate the inode slot without raw byte arithmetic.
+        let inode = img.inode(file_nid).unwrap();
+        let is_extended = matches!(inode, InodeType::Extended(_));
+        let inodes_start = img.image.len() - img.inodes.len();
+        let inode_slot_start = inodes_start + file_nid as usize * 32;
+        drop(inode);
         drop(img);
 
         let mut image = base_image.clone();
+        let slot = &mut image[inode_slot_start..];
         if is_extended {
-            // ExtendedInodeHeader.nlink is U32 at byte offset 44
-            let nlink_offset = inode_byte_offset + 44;
-            image[nlink_offset..nlink_offset + 4].copy_from_slice(&5u32.to_le_bytes());
+            let hdr =
+                ExtendedInodeHeader::mut_from_bytes(&mut slot[..size_of::<ExtendedInodeHeader>()])
+                    .expect("inode slot must be a valid ExtendedInodeHeader");
+            hdr.nlink = zerocopy::little_endian::U32::new(5);
         } else {
-            // CompactInodeHeader.nlink is U16 at byte offset 6
-            let nlink_offset = inode_byte_offset + 6;
-            image[nlink_offset..nlink_offset + 2].copy_from_slice(&5u16.to_le_bytes());
+            let hdr =
+                CompactInodeHeader::mut_from_bytes(&mut slot[..size_of::<CompactInodeHeader>()])
+                    .expect("inode slot must be a valid CompactInodeHeader");
+            hdr.nlink = zerocopy::little_endian::U16::new(5);
         }
 
         let result = erofs_to_filesystem::<Sha256HashValue>(&image);
@@ -2421,7 +2845,7 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let base_image = mkfs_erofs(&fs);
+        let base_image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
 
         // Sanity check
         erofs_to_filesystem::<Sha256HashValue>(&base_image)
@@ -2432,21 +2856,26 @@ mod tests {
         let root_nid = img.sb.root_nid.get() as u64;
         let dir_nid = img.find_child_nid(root_nid, b"dir").unwrap().unwrap();
 
-        let block_size = img.block_size;
-        let meta_start = img.sb.meta_blkaddr.get() as usize * block_size;
-        let inode_byte_offset = meta_start + dir_nid as usize * 32;
-        let is_extended = base_image[inode_byte_offset] & 1 != 0;
+        // Use the typed Image API to locate the inode slot without raw byte arithmetic.
+        let inode = img.inode(dir_nid).unwrap();
+        let is_extended = matches!(inode, InodeType::Extended(_));
+        let inodes_start = img.image.len() - img.inodes.len();
+        let inode_slot_start = inodes_start + dir_nid as usize * 32;
+        drop(inode);
         drop(img);
 
         let mut image = base_image.clone();
+        let slot = &mut image[inode_slot_start..];
         if is_extended {
-            // ExtendedInodeHeader.nlink is U32 at byte offset 44
-            let nlink_offset = inode_byte_offset + 44;
-            image[nlink_offset..nlink_offset + 4].copy_from_slice(&99u32.to_le_bytes());
+            let hdr =
+                ExtendedInodeHeader::mut_from_bytes(&mut slot[..size_of::<ExtendedInodeHeader>()])
+                    .expect("inode slot must be a valid ExtendedInodeHeader");
+            hdr.nlink = zerocopy::little_endian::U32::new(99);
         } else {
-            // CompactInodeHeader.nlink is U16 at byte offset 6
-            let nlink_offset = inode_byte_offset + 6;
-            image[nlink_offset..nlink_offset + 2].copy_from_slice(&99u16.to_le_bytes());
+            let hdr =
+                CompactInodeHeader::mut_from_bytes(&mut slot[..size_of::<CompactInodeHeader>()])
+                    .expect("inode slot must be a valid CompactInodeHeader");
+            hdr.nlink = zerocopy::little_endian::U16::new(99);
         }
 
         let result = erofs_to_filesystem::<Sha256HashValue>(&image);
@@ -2471,30 +2900,35 @@ mod tests {
         // stays the same and the inode still parses successfully.
         let dumpfile = "/ 0 40755 1 0 0 0 0.0 - - -\n";
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let mut image = mkfs_erofs(&fs);
+        let mut image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
 
         let img = Image::open(&image).unwrap();
-        let root_nid = img.sb.root_nid.get() as usize;
+        let root_nid = img.sb.root_nid.get() as u64;
         let block_size = img.block_size;
-        let meta_start = img.sb.meta_blkaddr.get() as usize * block_size;
-        let inode_offset = meta_start + root_nid * 32;
-        // Determine inode layout from the first byte
-        let is_extended = image[inode_offset] & 1 != 0;
+
+        // Use the typed Image API to locate the inode slot without raw byte arithmetic.
+        let inode = img.inode(root_nid).unwrap();
+        let is_extended = matches!(inode, InodeType::Extended(_));
+        let inodes_start = img.image.len() - img.inodes.len();
+        let inode_slot_start = inodes_start + root_nid as usize * 32;
+        drop(inode);
         drop(img);
 
         // Use a huge size that is a multiple of block_size (4096) so inline
         // tail size stays 0 and the inode remains parseable.
         let huge_size: u64 = (block_size as u64) * 1_000_000_000;
 
+        let slot = &mut image[inode_slot_start..];
         if is_extended {
-            // ExtendedInodeHeader.size is a U64 at byte offset 8
-            let size_offset = inode_offset + 8;
-            image[size_offset..size_offset + 8].copy_from_slice(&huge_size.to_le_bytes());
+            let hdr =
+                ExtendedInodeHeader::mut_from_bytes(&mut slot[..size_of::<ExtendedInodeHeader>()])
+                    .expect("inode slot must be a valid ExtendedInodeHeader");
+            hdr.size = zerocopy::little_endian::U64::new(huge_size);
         } else {
-            // CompactInodeHeader.size is a U32 at byte offset 8
-            let size_offset = inode_offset + 8;
-            let truncated = huge_size as u32;
-            image[size_offset..size_offset + 4].copy_from_slice(&truncated.to_le_bytes());
+            let hdr =
+                CompactInodeHeader::mut_from_bytes(&mut slot[..size_of::<CompactInodeHeader>()])
+                    .expect("inode slot must be a valid CompactInodeHeader");
+            hdr.size = zerocopy::little_endian::U32::new(huge_size as u32);
         }
 
         let img = Image::open(&image).unwrap();
@@ -2510,43 +2944,552 @@ mod tests {
 
     mod proptest_tests {
         use super::*;
+        use crate::erofs::{format::FormatVersion, writer::mkfs_erofs_versioned};
         use crate::fsverity::Sha512HashValue;
-        use crate::test::proptest_strategies::{build_filesystem, filesystem_spec};
+        use crate::test::proptest_strategies::{
+            FsSpec, build_filesystem, build_unusual_filesystem, filesystem_spec,
+            unusual_filesystem_spec,
+        };
         use proptest::prelude::*;
 
-        /// Round-trip a FileSystem through erofs and compare dumpfile output.
-        fn round_trip_filesystem<ObjectID: FsVerityHashValue>(
-            fs_orig: &tree::FileSystem<ObjectID>,
-        ) {
-            let mut orig_output = Vec::new();
-            write_dumpfile(&mut orig_output, fs_orig).unwrap();
+        /// Round-trip a FileSystem through V2 erofs and compare dumpfile output.
+        ///
+        /// V2 EROFS does not store mtime nanoseconds: the on-disk `mtime_nsec`
+        /// field is always zero.  Build the expected dumpfile from a copy of the
+        /// filesystem with `mtime_nsec` zeroed so the comparison reflects what
+        /// V2 actually stores, not what the in-memory tree carries.
+        fn round_trip_filesystem<ObjectID: FsVerityHashValue>(spec: FsSpec) {
+            // fs_write → source for the EROFS image.
+            // fs_expected → reference with mtime_nsec=0, matching V2 on-disk format.
+            let fs_write = build_filesystem::<ObjectID>(spec.clone());
+            let mut fs_expected = build_filesystem::<ObjectID>(spec);
+            // V2 EROFS does not store mtime nanoseconds; zero them before comparing.
+            fs_expected.for_each_stat_mut(|s| s.st_mtim_nsec = 0);
 
-            let image = mkfs_erofs(fs_orig);
+            let mut expected_output = Vec::new();
+            write_dumpfile(&mut expected_output, &fs_expected).unwrap();
+
+            let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs_write).unwrap());
             let fs_rt = erofs_to_filesystem::<ObjectID>(&image).unwrap();
 
             let mut rt_output = Vec::new();
             write_dumpfile(&mut rt_output, &fs_rt).unwrap();
 
             similar_asserts::assert_eq!(
-                String::from_utf8_lossy(&orig_output),
+                String::from_utf8_lossy(&expected_output),
                 String::from_utf8_lossy(&rt_output)
             );
         }
 
+        /// Round-trip a FileSystem through V1 erofs and compare dumpfile output.
+        ///
+        /// V1 uses compact inodes (when mtime matches the minimum), BFS ordering,
+        /// and includes overlay whiteout character device entries in the root.
+        /// The writer adds `trusted.overlay.opaque` to the root; the reader strips
+        /// internal overlay xattrs. Whiteout char-device entries (00–ff in root)
+        /// are also stripped, matching C composefs reader behaviour.
+        fn round_trip_filesystem_v1<ObjectID: FsVerityHashValue>(spec: FsSpec) {
+            // Build two separate filesystems from the same spec so we avoid
+            // Rc::strong_count issues from sharing leaf Rcs.
+            let fs_write = build_filesystem::<ObjectID>(spec.clone());
+            let fs_expected = build_filesystem::<ObjectID>(spec);
+
+            // The writer internally adds trusted.overlay.opaque=y to root and
+            // the 256 V1 whiteout stubs; the reader strips all trusted.overlay.*
+            // but the reader strips all trusted.overlay.* xattrs that aren't
+            // escaped user xattrs. So the expected filesystem should NOT have it.
+
+            // Generate the V1 image from the write filesystem.
+            let image = mkfs_erofs_versioned(
+                &mut ValidatedFileSystem::new(fs_write).unwrap(),
+                FormatVersion::V1,
+            );
+
+            // Validate the layout invariant: no FlatInline inode should
+            // trigger EUCLEAN on kernels < 6.12. This catches the
+            // block-boundary bug even when proptest doesn't generate a
+            // case large enough to trip it at mount time.
+            Image::open(&image)
+                .unwrap()
+                .fsck_metadata()
+                .expect("V1 image should have valid inline layout for pre-6.12 kernels");
+
+            // Read back from the image.
+            let fs_rt = erofs_to_filesystem::<ObjectID>(&image).unwrap();
+
+            // Compare via dumpfile serialization.
+            let mut expected_output = Vec::new();
+            write_dumpfile(&mut expected_output, &fs_expected).unwrap();
+
+            let mut rt_output = Vec::new();
+            write_dumpfile(&mut rt_output, &fs_rt).unwrap();
+
+            if expected_output != rt_output {
+                let expected_str = String::from_utf8_lossy(&expected_output);
+                let rt_str = String::from_utf8_lossy(&rt_output);
+                panic!(
+                    "V1 round-trip mismatch:\n--- expected ---\n{expected_str}\n--- got ---\n{rt_str}"
+                );
+            }
+        }
+
+        /// Verify that C composefs-info can parse an EROFS image we generated,
+        /// and that its dump output matches our Rust reader's interpretation.
+        ///
+        /// This is the critical compatibility test: it proves that EROFS images
+        /// produced by our writer are consumable by the C implementation.
+        fn verify_c_composefs_info_reads_image(image: &[u8]) {
+            use std::io::Write;
+
+            // Validate layout invariant before testing C reader compatibility.
+            Image::open(image)
+                .unwrap()
+                .fsck_metadata()
+                .expect("image should have valid inline layout for pre-6.12 kernels");
+
+            // Write image to a tempfile
+            let mut tmp = tempfile::NamedTempFile::new().unwrap();
+            tmp.write_all(image).unwrap();
+            tmp.flush().unwrap();
+
+            // Run C composefs-info dump on the image with a timeout.
+            let child = std::process::Command::new("composefs-info")
+                .arg("dump")
+                .arg(tmp.path())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+
+            let output = {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(child.wait_with_output());
+                });
+                rx.recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("composefs-info timed out after 10 seconds")
+                    .unwrap()
+            };
+
+            if !output.status.success() {
+                panic!(
+                    "C composefs-info dump failed (exit {:?}):\nstderr: {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+
+            let c_dump = String::from_utf8(output.stdout).expect("C dump should be valid UTF-8");
+
+            // Get our Rust reader's interpretation of the same image
+            let fs_rt = erofs_to_filesystem::<Sha256HashValue>(image).unwrap();
+            let mut rust_dump_bytes = Vec::new();
+            write_dumpfile(&mut rust_dump_bytes, &fs_rt).unwrap();
+            let rust_dump = String::from_utf8(rust_dump_bytes).unwrap();
+
+            // Parse both dumps into structured entries, then normalize and
+            // compare. This avoids fragile string munging and lets the
+            // dumpfile parser handle escaping, field splitting, etc.
+            //
+            // Apply the C reader empty-xattr workaround to the Rust dump as
+            // well: we are testing C-reader compatibility here, so we strip
+            // the same entries C would silently drop. Rust-only round-trip
+            // tests (test_erofs_round_trip_*) compare dumpfiles directly
+            // without this workaround, catching Rust writer bugs without masking them.
+            let c_entries = parse_c_dump(&c_dump);
+            let rust_entries = parse_c_dump(&rust_dump);
+
+            similar_asserts::assert_eq!(c_entries, rust_entries);
+        }
+
+        /// Parse a dump produced by C composefs-info and normalize for comparison.
+        ///
+        /// Applies the empty-xattr workaround for the known C reader bug: the
+        /// inline-xattr loop uses strict `<` instead of `<=` when checking the
+        /// end pointer, so it silently skips the last entry whenever it is exactly
+        /// 4 bytes (header only: name_len=0, value_size=0). This occurs for
+        /// system.posix_acl_access/default with empty values, where the prefix
+        /// index encodes the full key leaving a zero-length suffix.
+        fn parse_c_dump(dump: &str) -> Vec<String> {
+            normalize_dump(dump, true)
+        }
+
+        /// Parse a dump produced by our Rust reader and normalize for comparison.
+        ///
+        /// Does NOT apply the C reader empty-xattr workaround — Rust output must
+        /// be left unfiltered so any Rust writer bugs producing empty xattrs are
+        /// caught rather than silently masked.
+        ///
+        /// For C compat tests, use [`parse_c_dump`] on both sides so the
+        /// comparison accounts for the known C reader limitation.
+
+        fn normalize_dump(dump: &str, strip_empty_xattrs: bool) -> Vec<String> {
+            use crate::dumpfile_parse::{Entry, Item};
+            use std::os::unix::ffi::OsStrExt;
+
+            dump.lines()
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| {
+                    let mut entry = Entry::parse(line).unwrap_or_else(|e| {
+                        panic!("Failed to parse dump line: {e}\n  line: {line}")
+                    });
+
+                    // C composefs-info (lcfs_build_node_from_image) unconditionally
+                    // treats any chardev with rdev=0 as a whiteout and skips it,
+                    // returning ENOTSUP regardless of where in the tree it appears:
+                    //
+                    //   if (type == S_IFCHR && node->inode.st_rdev == 0) {
+                    //       errno = ENOTSUP;
+                    //       return NULL;
+                    //   }
+                    //
+                    // Our Rust reader preserves chardev(0,0) entries in subdirectories
+                    // (it only strips the root-level 00–ff overlay whiteout stubs).
+                    // Strip all chardev(0,0) entries from both sides of the comparison
+                    // so the test reflects what C actually outputs.
+                    if let Item::Device { rdev: 0, .. } = entry.item {
+                        if (entry.mode & 0o170000) == 0o20000 {
+                            return None;
+                        }
+                    }
+
+                    if strip_empty_xattrs {
+                        entry.xattrs.retain(|x| !x.value.is_empty());
+                    }
+                    // Strip overlay xattrs that the C reader keeps but our Rust reader
+                    // strips as composefs-internal:
+                    // - user.overlay.opaque: OVERLAY_XATTR_USERXATTR_OPAQUE, kept by C
+                    // - trusted.overlay.opaque: the C reader unescapes
+                    //   trusted.overlay.overlay.opaque to this; Rust strips the
+                    //   escaped form before unescaping so it never appears in Rust
+                    //   output.  Normalizing both sides makes the comparison test
+                    //   semantic content rather than internal overlay state.
+                    entry.xattrs.retain(|x| {
+                        x.key.as_bytes() != b"user.overlay.opaque"
+                            && x.key.as_bytes() != b"trusted.overlay.opaque"
+                    });
+                    Some(entry.to_string())
+                })
+                .collect()
+        }
+
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(64))]
+            #![proptest_config(ProptestConfig::with_cases(200))]
 
             #[test]
             fn test_erofs_round_trip_sha256(spec in filesystem_spec()) {
-                let fs = build_filesystem::<Sha256HashValue>(spec);
-                round_trip_filesystem(&fs);
+                round_trip_filesystem::<Sha256HashValue>(spec);
             }
 
             #[test]
             fn test_erofs_round_trip_sha512(spec in filesystem_spec()) {
-                let fs = build_filesystem::<Sha512HashValue>(spec);
-                round_trip_filesystem(&fs);
+                round_trip_filesystem::<Sha512HashValue>(spec);
             }
+
+            #[test]
+            fn test_erofs_round_trip_v1_sha256(spec in filesystem_spec()) {
+                round_trip_filesystem_v1::<Sha256HashValue>(spec);
+            }
+
+            #[test]
+            fn test_erofs_round_trip_v1_sha512(spec in filesystem_spec()) {
+                round_trip_filesystem_v1::<Sha512HashValue>(spec);
+            }
+
+        }
+
+        /// Verify C composefs-info can parse random V1 (C-compatible) EROFS
+        /// images generated by our writer, and that its dump output matches
+        /// our Rust reader's interpretation.
+        #[test_with::executable(composefs-info)]
+        #[test]
+        fn test_c_composefs_info_reads_v1() {
+            let mut runner =
+                proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(200));
+            runner
+                .run(&filesystem_spec(), |spec| {
+                    let fs = build_filesystem::<Sha256HashValue>(spec);
+                    let image = mkfs_erofs_versioned(
+                        &mut ValidatedFileSystem::new(fs).unwrap(),
+                        FormatVersion::V1,
+                    );
+                    verify_c_composefs_info_reads_image(&image);
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        /// Verify C composefs-info can parse random V2 (Rust-native) EROFS
+        /// images generated by our writer.
+        #[test_with::executable(composefs-info)]
+        #[test]
+        fn test_c_composefs_info_reads_v2() {
+            let mut runner =
+                proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(200));
+            runner
+                .run(&filesystem_spec(), |spec| {
+                    let fs = build_filesystem::<Sha256HashValue>(spec);
+                    let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
+                    verify_c_composefs_info_reads_image(&image);
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        /// Verify C composefs-info can parse random V2 EROFS images generated from
+        /// unusual content (whiteout escaping, ACLs, multiple overlay xattrs, large
+        /// external files, cross-type hardlinks), and that its dump output matches
+        /// our Rust reader's interpretation.
+        ///
+        /// Mirrors `test_v1_binary_identical_unusual_content` but for V2 images
+        /// where byte-for-byte C identity is not the goal (V2 is Rust-native);
+        /// instead we verify semantic equivalence via normalized dump comparison.
+        #[test_with::executable(composefs-info)]
+        #[test]
+        fn test_c_composefs_info_reads_v2_unusual() {
+            let mut runner =
+                proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(200));
+            runner
+                .run(&unusual_filesystem_spec(), |spec| {
+                    let fs = build_unusual_filesystem::<Sha256HashValue>(spec);
+                    let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
+                    verify_c_composefs_info_reads_image(&image);
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        /// Run `debug_img` on an image and return the structured dump as a String.
+        fn debug_dump(image: &[u8]) -> String {
+            use crate::erofs::debug::debug_img;
+            let mut out = Vec::new();
+            debug_img(&mut out, image).expect("debug_img failed");
+            String::from_utf8(out).expect("debug_img produced non-UTF8")
+        }
+
+        /// Diff two debug dumps, returning a unified-diff-style string of the differences.
+        fn diff_debug_dumps(label_a: &str, a: &str, label_b: &str, b: &str) -> String {
+            use std::fmt::Write;
+            let a_lines: Vec<&str> = a.lines().collect();
+            let b_lines: Vec<&str> = b.lines().collect();
+            let mut out = String::new();
+            let max = a_lines.len().max(b_lines.len());
+            let mut diffs = 0usize;
+            for i in 0..max {
+                let la = a_lines.get(i).copied().unwrap_or("<missing>");
+                let lb = b_lines.get(i).copied().unwrap_or("<missing>");
+                if la != lb {
+                    diffs += 1;
+                    if diffs <= 40 {
+                        writeln!(out, "line {i}:").unwrap();
+                        writeln!(out, "  {label_a}: {la}").unwrap();
+                        writeln!(out, "  {label_b}: {lb}").unwrap();
+                    }
+                }
+            }
+            if diffs > 40 {
+                writeln!(out, "... and {} more differing lines", diffs - 40).unwrap();
+            }
+            if diffs == 0 {
+                out.push_str("(no differences)");
+            }
+            out
+        }
+
+        /// Run C `mkcomposefs --from-file -` on a dumpfile string and return the raw image bytes.
+        fn c_mkcomposefs_from_dumpfile(dumpfile: &str) -> Vec<u8> {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            // Write dumpfile to a tempfile
+            let mut tf = tempfile::tempfile().unwrap();
+            tf.write_all(dumpfile.as_bytes()).unwrap();
+            tf.seek(SeekFrom::Start(0)).unwrap();
+            // Run mkcomposefs --from-file - -
+            let out_tf = tempfile::tempfile().unwrap();
+            let mut child = std::process::Command::new("mkcomposefs")
+                .args(["--from-file", "-", "-"])
+                .stdin(std::process::Stdio::from(tf))
+                .stdout(std::process::Stdio::from(out_tf.try_clone().unwrap()))
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .expect("failed to spawn mkcomposefs");
+            let status = child.wait().unwrap();
+            assert!(status.success(), "mkcomposefs failed: {status}");
+            let mut out_tf = out_tf;
+            out_tf.seek(SeekFrom::Start(0)).unwrap();
+            let mut bytes = Vec::new();
+            out_tf.read_to_end(&mut bytes).unwrap();
+            bytes
+        }
+
+        /// Verify that our Rust V1 writer produces byte-for-byte identical EROFS images
+        /// to C mkcomposefs for the same user-level input.
+        ///
+        /// This is a stronger check than `test_c_composefs_info_reads_v1`: instead of
+        /// comparing parsed dump output (which won't catch wrong binary layout like the
+        /// EUCLEAN block-boundary bug), we compare raw image bytes. If our V1 writer
+        /// disagrees with the C reference even on a single padding byte, this fails.
+        ///
+        /// The test mirrors the production flow: C receives a dumpfile of the user-level
+        /// tree (no whiteout stubs) and adds the 256 stubs internally; the Rust V1 writer
+        /// also adds the stubs automatically during image generation.
+        ///
+        /// On failure the structural diff from `debug_img` is printed to make the
+        /// divergence immediately obvious without a separate manual step.
+        #[test_with::executable(mkcomposefs)]
+        #[test]
+        fn test_v1_binary_identical_to_c_mkcomposefs() {
+            let mut runner =
+                proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(200));
+            runner
+                .run(&filesystem_spec(), |spec| {
+                    // Build two independent filesystems from the same spec:
+                    //   fs_c  — user entries only, serialized as dumpfile and fed to
+                    //           C mkcomposefs (which adds the 256 whiteout stubs internally)
+                    //   fs_rs — user entries only, fed directly to our Rust V1 writer
+                    //           (the writer adds the 256 whiteout stubs automatically)
+                    //
+                    // Using the same spec for both ensures the user-level content matches.
+                    let fs_c = build_filesystem::<Sha256HashValue>(spec.clone());
+                    let fs_rs = build_filesystem::<Sha256HashValue>(spec);
+
+                    // Serialize the pre-whiteout tree for C (no stubs in dumpfile)
+                    let mut dumpfile_bytes = Vec::new();
+                    write_dumpfile(&mut dumpfile_bytes, &fs_c).unwrap();
+                    let dumpfile = String::from_utf8(dumpfile_bytes).unwrap();
+
+                    // Get C mkcomposefs binary output (C adds stubs internally)
+                    let c_image = c_mkcomposefs_from_dumpfile(&dumpfile);
+
+                    // Get our Rust V0 writer binary output (stubs added automatically by writer)
+                    let rust_image = mkfs_erofs_versioned(
+                        &mut ValidatedFileSystem::new(fs_rs).unwrap(),
+                        FormatVersion::V0,
+                    );
+
+                    if c_image != rust_image.as_ref() {
+                        let c_debug = debug_dump(&c_image);
+                        let rust_debug = debug_dump(&rust_image);
+                        similar_asserts::assert_eq!(
+                            c_debug,
+                            rust_debug,
+                            "binary mismatch (c={} bytes, rust={} bytes)\ndumpfile:\n{dumpfile}",
+                            c_image.len(),
+                            rust_image.len(),
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        /// Binary-compatibility test using the unusual-content generator.
+        ///
+        /// Covers corner cases in the V1 writer that the ordinary random generator almost
+        /// never exercises: whiteout escaping, multiple trusted.overlay.* xattrs per inode,
+        /// system.posix_acl_access (HAS_ACL flag), large external file sizes, and
+        /// cross-type hardlinks (to symlinks, whiteouts, devices, FIFOs).
+        ///
+        /// Runs 64 cases against C mkcomposefs byte-for-byte.
+        #[test_with::executable(mkcomposefs)]
+        #[test]
+        fn test_v1_binary_identical_unusual_content() {
+            let mut runner =
+                proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(200));
+            runner
+                .run(&unusual_filesystem_spec(), |spec| {
+                    let fs_c = build_unusual_filesystem::<Sha256HashValue>(spec.clone());
+                    let fs_rs = build_unusual_filesystem::<Sha256HashValue>(spec);
+
+                    let mut dumpfile_bytes = Vec::new();
+                    write_dumpfile(&mut dumpfile_bytes, &fs_c).unwrap();
+                    let dumpfile = String::from_utf8(dumpfile_bytes).unwrap();
+
+                    let c_image = c_mkcomposefs_from_dumpfile(&dumpfile);
+                    let rust_image = mkfs_erofs_versioned(
+                        &mut ValidatedFileSystem::new(fs_rs).unwrap(),
+                        FormatVersion::V0,
+                    );
+
+                    if c_image != rust_image.as_ref() {
+                        let c_debug = debug_dump(&c_image);
+                        let rust_debug = debug_dump(&rust_image);
+                        similar_asserts::assert_eq!(
+                            c_debug,
+                            rust_debug,
+                            "binary mismatch (c={} bytes, rust={} bytes)\ndumpfile:\n{dumpfile}",
+                            c_image.len(),
+                            rust_image.len(),
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        /// Diagnostic: dump the structural diff between C mkcomposefs and our Rust V1
+        /// writer for a known-failing minimal case (large flat directory, no xattrs).
+        ///
+        /// This test is `#[ignore]` — run it manually with:
+        ///   cargo test -p composefs --lib -- erofs::reader::tests::proptest_tests::test_v1_binary_diff_diagnostic --ignored --nocapture
+        ///
+        /// It uses `debug_img` (our injective EROFS structure dumper) to show exactly
+        /// which fields diverge between the two images, making it easy to pinpoint
+        /// the bug in the writer without manually parsing hex dumps.
+        #[test_with::executable(mkcomposefs)]
+        #[test]
+        #[ignore]
+        fn test_v1_binary_diff_diagnostic() {
+            // Known-failing proptest case: use the exact dumpfile from a proptest failure.
+            // The flow matches the proptest exactly:
+            //   - fs_c is built from spec and serialized to dumpfile (no stubs) for C
+            //   - fs_rs is built from the same spec and fed to the Rust V1 writer
+            //     (which adds the 256 whiteout stubs automatically)
+            let dumpfile = "\
+/ 0 40000 3 0 0 0 0.0 - - -\n\
+/B 0 47123 2 32924 6322 0 334277904.419157028 - - - user.test_3=\\x14\\x11\\xf5\\xbe\\xf0\\x1f\\x15<\\\\\\x84Gu(\\x17T\\xdb\\xca\\xd5\n\
+/B/\\x06\\xc3} 43 102747 1 14780 50024 0 1909128638.32940851 - X\\xb8\\xac\\xf9[\\x8br\\x1a\\x11\\xed\\x96]\\x9c\\xed\\xba\\x8f\\x13\\xcc/i\\x12\\x7fE\\x18\\xf8n\\xaeV_E\\x8bS]x\\x93/g\\x92\\x0f?\\xd8\\xf4\\xf5 - security.capability=r\\x93\\x84\\x18M user.test_3=&+\\xf2\\xee\\x89sz user.test_4=\n\
+/B/\\x1f\\xe3\\x17\\xcb\\xe9\\x81\\x9aT\\xd2\\x13\\x19\\xf2\\xaf\\xee\\x20\\xba\\xb3 43 102274 1 41061 21812 0 446804811.557100600 - <\\x10@Z\\x00\\xc5\\xf9\\xca\\xe1=\\xfc\\xe0\\x81)p\\xa4\\x9f\\xa8\\x18+\\x88\\x0e\\xc3\\xa2\\xdf0\\x82*\\xc2q[x\\x86\\x88\\x80\\xf1]b$\\\\\\x1f]\\xeb - system.posix_acl_access= trusted.test_0=\\x92 trusted.test_2=\\\\\\xec\\x83\\x89\\x85\"\\xf9\\x9b\\xbc\\xa5\\xb0\\xef\\xbcC\\xe8Z\\x88F\\x83\\x17 user.test_1=\\xc4\\xc1\\x08\\xff\\xfa\\xd3\\xed\\xad\\x9bS6f\\tS\\x8d\n\
+/B/#\\xcd\\x17\\xb2\\xf0\\x03g\\xea\\x87iI\\xe3{_\\xe1 7 100554 1 50668 49879 0 1545457558.133147722 - \\xb6\\xa1$?\\xd2:\\xb9 - system.posix_acl_default=\\x97\\xde\\xd1S;,; user.test_4=\\xf7\\x82S\\xa5\\xc3,?\\x98\\x84p\\xbf\\x14&\\x91+\\x8e\\xdb\n\
+/B/3\\xf4\\xf5\\xc2e\\x07\\xb5\\xacC\\xa1 45 106705 1 56683 56444 0 1577642975.579080132 - \\xdf[\\x83j\\x1e\\x99\\xd8\\xc0[\\x8ba\\xc0f\\xec\\xe0\\x8b*\\xee\\x031\\x91\\x0f38\\x0f\\x08\\xc0\\xcd\\xa9\\x1a^\\x90]\\xc9!>\\xa9S*\\x94\\x8c\\x17\\xa8h\\xc3 - security.ima=E\\x04L\\tb@9\\x07!h) trusted.overlay.custom=~\\x16\\x1f-\\xfc\\xa3\\x07\\x17\\xd1\\xa0 trusted.test_2=O\n\
+/B/Eap_z828H.-6-_S 0 14476 1 4557 40071 0 206142614.191638235 - - - security.ima=H\\xfd\\x9e&\\x9a:\\xe5\\x93\\xa4 system.posix_acl_access=N\\x1c|\\xc7$O3\\x198%\\xb4\\xe8 trusted.overlay.origin=Y+\\xa4\\xd1\\x16r\\xdd|\\xfaG user.test_4=\n\
+/B/Gv7O_..._.faB2-_-22dNscP_eGqkxP35_.0l.w.hfrZXl_v4h.MGEE7___GGF221-V-__WgP-h-6Th_NIB_._j.-U.Qj_2_iA.P_3_-_..9.1oxn4_mM_6XEAJ196_.6Z9iR_YM-Wr0L_.kz.icFqb_EzB27-___AC7bGW_.t_rwee8rtQ4_0rD_t1-J__5iR.r1_8cNUQXai5w4.e2_G-.7j.DyiD__Rfv6Lhgfzn-QFr_-J 44 124140 1 29304 30605 0 620161379.796821778 ____SlN/.yp1zAst_-P/5_RO_-cy7O_Z__310L__d2yo - -\n\
+/B/IP-_jBs 1 126270 1 31623 24545 0 1072774021.893731176 \\xcb - -\n\
+/B/KAS.d8m.y6U 16 125603 1 24529 17343 0 340236667.19836524 9\\x14\\xe2{\\xe9[\\x96q\\x08h;\\xc8\\x83\\xa4\\xb3\\xb9 - - trusted.overlay.origin=b\\xec'\\x8c\\x16\\xea\\xcb\\x10\\xc8\\xbe\\x18\\xf7*\\x0c\\x04\\xb8\\xb1 trusted.overlay.overlay.nested= trusted.test_1=e\\x08#\n\
+/B/Mp 27 106753 1 37244 13252 0 91373000.857571176 - OV\\x8e!\\xfdw9I\\xab\\x8f\\x9a;!\\xb4]f\\n]\\xc8\\x7f\\xa5\\x94\\x07\\xd4%\\x97\\x85 -\n\
+/B/Ze.7.-.9_._Ocl1k2_ 46 107670 1 14097 58513 0 488459452.877162371 - \\xc1\\x17\\x1d\\xa7\\x14S)\\xcd}\\xc9/~\\xa4d\\x1cN\\xbeN\\x184\\x90\\xa9A\\x12\\x8bY/(\\x1a,%\"\\xe3\\xb3\\xf2\\x86\\xec\\x20\\xf6\"Ug;\\x84\\\\A - trusted.overlay.origin=\\xfe\\xda7D\\xbf\\xb0\\xe9\\x9ct0Q user.test_4=-\\xdc\n\
+/B/]\\x05\\x19i\\x97\\xeb\\x8c\\xc4k\\x02\\\\jB`j\\x8f\\xb4\\xb6\\xfbw5\\xef\\xf3\\x0fd 0 23230 1 31997 45657 7135 105859383.867998730 - - - system.posix_acl_default=\\xb1p\\x96\\xe45\\xdcC\\x8bI\\x0e\\xfd#\\x8d\n\
+/B/_tvW.__t_l_-jK.4j 554649 106606 1 29300 51208 0 705049404.750293896 e5/39a0e32972ef85332212be14f7b863409d9e4113f80603285d1cd52a852822 - e539a0e32972ef85332212be14f7b863409d9e4113f80603285d1cd52a852822 user.test_4=\\xbf\\xbbL\\xe9\\xbc\\x92$\\xa3\\xf9\\xc6\\x06.\\x3d^\n\
+/B/q._v.T_.Mba__ 32 122305 1 29088 34366 0 881062039.274688283 _C_Kn1_.r_.IK/TGai6_zqLoTt___w_e - - trusted.overlay.overlay.nested=6\\x03\\xee\\xff\\xdbI\\xdcu(\\\\\\xe1\\x9a\\xee\\xd3e\\x06 user.test_2=\\x9a\\xc4$\\xe1\n\
+/B/u 25 105023 2 14652 44878 0 294073763.291036424 - \\x84R\\xd6@\\x0e\\x8b\\x04\\xb4(e\\x93\\xe9\\x86\\xdc\\x03\\xc7\\xbf\\xe1,OmC\\xe9U\\xf1 - trusted.overlay.origin=\\xc4mH\\x9a\n\
+/B/\\x81X\\xef\\r\\xce\\x12\\xf4U(p\\xc3\\xb2\\x19\\xe3r\\xd2v9\\x1c\\x02\\xca 46 121141 1 3272 11859 0 1219611767.718731195 jfsk35_Gz__n4tv4xzFFcj_.Z_AV__IJS_k_1I__FuSb.2 - - security.selinux= trusted.overlay.upper=\\x07\\xe8\\xa1%\\xbe\\xb0\\xc8)\\xcf\\xc2\\xf8\\xbah\\x19\\xae_\\xccH\\x9f\\xf0 trusted.test_1=i\\xe6\\xd9\\xd0 user.test_2=\\xc8\\xa0K\\xb2\\xa0V\\xb0\\xb7\\xd1\\xec(\\x95\\xfe\\xbb`\n\
+/B/\\xc4\\xf8\\x92\\xc2}<4\\xc8\\xec\\xd2\\xa5\\xe6\\x9ee\\xf0\\x95\\xf8<r\\x0fe\\xbf&\\x97\\x18\\x1a\\x1b\\x8f 29 105203 1 56956 48331 0 1117763015.98007445 - \\xdc\\xf4P\\x19S\\x8b\\x8a}\\xcd\\x12\\xb8\\x0cG\\xf3\\xf3\\x03]Z\\x20\\x17p\\xae\\xb5*K}&\\xf2\\xa5 - trusted.overlay.custom=^\\x83\\xb3\\xfb\\x08\\xa1\\xd8\\x9b~\\x88\\x8aRXZ\\xd7\\xa1c\\xbe trusted.overlay.origin=\\x05\\xb8\n\
+/m.A3Q_rRtSZ20o_ 0 @120000 - - - - 0.0 /B/u - -\n";
+
+            // C receives the dumpfile directly and adds the 256 whiteout stubs internally.
+            // Our Rust writer also adds them automatically when producing V1 output.
+            let fs_rs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+
+            let c_image = c_mkcomposefs_from_dumpfile(dumpfile);
+            let rust_image = mkfs_erofs_versioned(
+                &mut ValidatedFileSystem::new(fs_rs).unwrap(),
+                FormatVersion::V1,
+            );
+
+            let c_debug = debug_dump(&c_image);
+            let rust_debug = debug_dump(&rust_image);
+
+            println!("=== C mkcomposefs ({} bytes) ===", c_image.len());
+            println!("{c_debug}");
+            println!("=== Rust V1 writer ({} bytes) ===", rust_image.len());
+            println!("{rust_debug}");
+            println!("=== Structural diff (c vs rust) ===");
+            println!("{}", diff_debug_dumps("c", &c_debug, "rust", &rust_debug));
+
+            assert_eq!(
+                c_image,
+                rust_image.as_ref(),
+                "images differ — see structural diff above"
+            );
         }
     }
 
@@ -2561,7 +3504,7 @@ mod tests {
 /bbb 5 100644 1 0 0 0 1000.0 - world -
 "#;
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&fs);
+        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
 
         // Sanity: the unmodified image round-trips fine
         erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
@@ -2580,6 +3523,653 @@ mod tests {
         assert!(
             msg.contains("Duplicate directory entry"),
             "unexpected error: {msg}"
+        );
+    }
+
+    /// Regression test for the block-boundary EUCLEAN bug (bug.md).
+    ///
+    /// Old kernels (< 6.12) return EFSCORRUPTED from erofs_fill_symlink() when:
+    ///   (inode_offset % block_size) + inode_and_xattr_size + symlink_len > block_size
+    ///
+    /// The V1 writer previously used the wrong condition (derived from the
+    /// non-symlink branch of the C reference) and padded the wrong target
+    /// (inline_start rather than inode_start), silently producing images that
+    /// would EUCLEAN on CentOS Stream 9 (kernel 5.14) for symlinks with large
+    /// SELinux xattrs such as those in /etc/pki/ca-trust/extracted/pem/directory-hash/.
+    ///
+    /// This test:
+    ///  1. Builds a V1 image that forces a symlink inode near a block boundary
+    ///     by packing enough filler inodes before it.
+    ///  2. Asserts the validator passes (writer fixed the layout).
+    ///  3. Asserts the symlink round-trips correctly.
+    ///
+    /// The construction: inode table starts at offset 1152. We add enough
+    /// compact filler inodes (FIFOs, 32 bytes each with min mtime) to push
+    /// the subsequent symlink to a position where the old code would have
+    /// placed it straddling the 4096-byte boundary.
+    #[test]
+    fn test_v1_symlink_block_boundary_euclean_regression() {
+        use crate::erofs::{format::FormatVersion, writer::mkfs_erofs_versioned};
+
+        // A realistic SELinux label of the kind found on ca-trust symlinks.
+        // 76 bytes — enough that header(64) + xattr(~140) + symlink(23) > 4096
+        // when the inode starts near offset 3968 within a block.
+        let selinux_label = "system_u:object_r:cert_t:s0\x00".repeat(2);
+        // Trim to exactly 56 bytes so xattr body is predictable
+        let selinux_label = &selinux_label[..selinux_label.len().min(56)];
+
+        // Build the dumpfile: root + many compact filler FIFOs + the victim symlink.
+        //
+        // Filler FIFOs: mtime=0, no xattrs → compact inode (32 bytes each in V1).
+        // The inode table starts at 1152. We need to fill up to offset ~3968 within
+        // some 4096-block, which is (3968 - 1152) % 4096 = 2816 bytes = 88 compact inodes
+        // in the first block.  Add a few more to cross into block 1 and land the
+        // victim at the right position in block 1.
+        //
+        // We overshoot slightly and rely on the writer's fix to pad correctly.
+        // The validator then confirms no inode violates the kernel condition.
+        let mut dumpfile = String::from("/ 0 40755 2 0 0 0 0.0 - - -\n");
+        for i in 0..120usize {
+            dumpfile.push_str(&format!("/filler{i:03} 0 10644 1 0 0 0 0.0 - - -\n"));
+        }
+        // Victim: symlink with a large SELinux xattr.
+        let target = "/etc/pki/ca-trust/source"; // 24-byte target
+        let target_len = target.len();
+        let xattr_val_hex: String = selinux_label
+            .bytes()
+            .map(|b| format!("\\x{b:02x}"))
+            .collect();
+        dumpfile.push_str(&format!(
+            "/victim {target_len} 120777 1 0 0 0 0.0 {target} - - security.selinux={xattr_val_hex}\n"
+        ));
+
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(&dumpfile).unwrap();
+        let image = mkfs_erofs_versioned(
+            &mut ValidatedFileSystem::new(fs).unwrap(),
+            FormatVersion::V1,
+        );
+
+        // The validator must pass: the writer should have padded the inode
+        // to a block boundary so the kernel condition is never violated.
+        Image::open(&image)
+            .unwrap()
+            .fsck_metadata()
+            .expect("V1 writer should produce valid inline layout (block-boundary fix)");
+
+        // The symlink target must round-trip correctly.
+        let fs_rt =
+            erofs_to_filesystem::<Sha256HashValue>(&image).expect("image should parse cleanly");
+        let victim_id = fs_rt
+            .root
+            .leaf_id(std::ffi::OsStr::new("victim"))
+            .expect("victim symlink not found in round-tripped filesystem");
+        let link_target = match &fs_rt.leaves[victim_id.0].content {
+            crate::tree::LeafContent::Symlink(t) => t.clone(),
+            other => panic!("victim should be a symlink, got {other:?}"),
+        };
+        assert_eq!(
+            link_target.as_ref(),
+            std::ffi::OsStr::new(target),
+            "symlink target mismatch after V1 round-trip"
+        );
+    }
+
+    /// Tests that `fsck_metadata` catches a V1 image where symlink
+    /// padding was suppressed, causing the inode+inline data to cross a block
+    /// boundary.  Uses `WriterFaults` to inject the fault rather than raw byte
+    /// surgery, so the image is otherwise structurally coherent.
+    #[test]
+    fn test_v1_inline_layout_validator_catches_bad_layout() {
+        use crate::erofs::{
+            format::FormatVersion,
+            writer::{WriterFaults, mkfs_erofs_versioned, mkfs_erofs_with_faults},
+        };
+
+        // Layout math (all sizes in bytes, block_size = 4096):
+        //
+        // A symlink crosses a block boundary when:
+        //   symlink_pos % 4096 + 32 (inode) + target_len > 4096
+        //   => symlink_pos % 4096 > 4096 - 32 - target_len
+        //
+        // With target_len = SYMLINK_MAX = 1024 (crate::SYMLINK_MAX):
+        //   symlink_pos % 4096 > 3040  (i.e. slot >= 96 within a block)
+        //
+        // Inode table layout (V1):
+        //   Bytes 0..1152  : composefs header (32 B) + pad to 1024 + EROFS superblock (128 B)
+        //                    = 36 slots (NID 0-35)
+        //   NID 36         : root inode (32 B inode header)
+        //   NID 36 inline  : root dir entries (inline, variable)
+        //
+        // With 50 filler files named "f00".."f49" (sort before "link"):
+        //   - 51 dirents: 51 * 12 = 612 B
+        //   - names: 50*3 + 4 = 154 B
+        //   - total inline: 766 B
+        //   - root occupies: 32 + ~766 = 798 B (slot-padded)
+        //   - 50 empty files: 50 * 32 = 1600 B
+        //   - symlink (without block-boundary padding): NID 113, pos_in_block=3616
+        //     3616 + 32 + 1024 = 4672 > 4096 → crossing condition ✓
+        //
+        // Note: the *good* image places the symlink at pos_in_block == 0 because
+        // the writer correctly pads it to a block boundary.  We verify crossing
+        // by checking the *bad* image (padding suppressed) instead.
+
+        // filler_count=50 places the symlink at NID 113 (pos_in_block=3616).
+        // Without the block-boundary padding: 3616 + 32 + 1024 = 4672 > 4096 ✓
+        // The assertion below verifies this whenever the test runs.
+        let filler_count = 50usize;
+        let mut lines = String::from("/ 0 40755 2 0 0 0 0.0 - - -\n");
+        for i in 0..filler_count {
+            lines.push_str(&format!("/f{i:02} 0 100644 1 0 0 0 0.0 - - -\n"));
+        }
+        let target = "a".repeat(crate::SYMLINK_MAX);
+        lines.push_str(&format!(
+            "/link {len} 120777 1 0 0 0 0.0 {target} - -\n",
+            len = target.len(),
+            target = target,
+        ));
+        let fs = dumpfile_to_filesystem::<Sha256HashValue>(&lines).unwrap();
+        let mut vfs = ValidatedFileSystem::new(fs).unwrap();
+
+        // The good image must pass validation.
+        let good_image = mkfs_erofs_versioned(&mut vfs, FormatVersion::V1);
+        Image::open(&good_image)
+            .unwrap()
+            .fsck_metadata()
+            .expect("valid image should pass");
+
+        // Build the faulted image (symlink pad suppressed).
+        let mut faults = WriterFaults::new(42);
+        faults.skip_symlink_pad_rate = 1.0; // always skip padding
+        let bad_image = mkfs_erofs_with_faults(&mut vfs, FormatVersion::V1, faults);
+
+        // Confirm the symlink in the bad image actually crosses a block boundary —
+        // i.e. the fault injection put the symlink at a dangerous slot.
+        {
+            let img = Image::open(&bad_image).unwrap();
+            let root_nid = img.sb.root_nid.get() as u64;
+            let link_nid = img
+                .find_child_nid(root_nid, b"link")
+                .unwrap()
+                .expect("link nid not found");
+            let link_offset = (link_nid * 32) as usize;
+            let pos_in_block = link_offset % 4096;
+            assert!(
+                pos_in_block + 32 + crate::SYMLINK_MAX > 4096,
+                "symlink at pos_in_block={pos_in_block} does not cross a block boundary \
+                 in the bad image (32+{symlink_max}={total} ≤ 4096); \
+                 increase filler_count (currently {filler_count})",
+                symlink_max = crate::SYMLINK_MAX,
+                total = 32 + crate::SYMLINK_MAX,
+            );
+        }
+
+        // The faulted image must fail validation.
+        let result = Image::open(&bad_image).unwrap().fsck_metadata();
+        assert!(
+            result.is_err(),
+            "validator should reject image with suppressed symlink padding"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("EUCLEAN") || msg.contains("nid"),
+            "error should mention EUCLEAN or nid, got: {msg}"
+        );
+    }
+
+    /// B2: Files with a negative `st_mtim_sec` (pre-epoch mtime) must not corrupt
+    /// the V1 superblock `build_time` field.
+    ///
+    /// `calculate_min_mtime` casts `st_mtim_sec as u64`.  A value of -1 wraps to
+    /// `u64::MAX`, which is larger than any positive timestamp, so positive mtimes
+    /// are correctly selected as the minimum.  This test verifies that a filesystem
+    /// containing one inode with mtime = -1 and one with mtime = 1000 produces a
+    /// V1 image whose superblock `build_time` equals 1000.
+    #[test]
+    fn test_negative_mtime_does_not_corrupt_build_time() {
+        use std::{collections::BTreeMap, ffi::OsStr};
+
+        use crate::{
+            erofs::{format::FormatVersion, writer::mkfs_erofs_versioned},
+            fsverity::Sha256HashValue,
+            generic_tree::{LeafContent, Stat},
+            tree::{self, RegularFile},
+        };
+
+        let root_stat = Stat {
+            st_mode: 0o40755,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 1000,
+            st_mtim_nsec: 0,
+            xattrs: BTreeMap::new(),
+        };
+
+        let mut fs = tree::FileSystem::<Sha256HashValue>::new(root_stat);
+
+        // Inode with negative mtime (-1).  As u64 this wraps to u64::MAX, which
+        // is larger than 1000, so it should NOT win the minimum comparison.
+        let neg_stat = Stat {
+            st_mode: 0o100644,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: -1,
+            st_mtim_nsec: 0,
+            xattrs: BTreeMap::new(),
+        };
+        let leaf_id = fs.push_leaf(
+            neg_stat,
+            LeafContent::Regular(RegularFile::Inline(Box::new([]))),
+        );
+        fs.root
+            .insert(OsStr::new("neg"), tree::Inode::leaf(leaf_id));
+
+        let image = mkfs_erofs_versioned(
+            &mut ValidatedFileSystem::new(fs).unwrap(),
+            FormatVersion::V1,
+        );
+        let img = Image::open(&image).expect("failed to open V1 image");
+
+        // The superblock build_time must be 1000 (the root mtime), not u64::MAX or 0.
+        assert_eq!(
+            img.sb.build_time.get(),
+            1000,
+            "build_time should be the positive minimum mtime (1000), \
+             not the wrapped negative value"
+        );
+    }
+
+    /// B3: Directories with enough entries to span multiple 4096-byte blocks must
+    /// survive a round-trip through the V2 EROFS writer.
+    ///
+    /// Each dirent is 12 bytes (header) + name length bytes.  With 50 entries of
+    /// 90-byte names: 50 × (12 + 90) = 5100 bytes > 4096, which forces
+    /// `Directory::from_entries` to split across at least two blocks.
+    ///
+    /// This test verifies that all entry names survive the round-trip intact.
+    #[test]
+    fn test_multiblock_directory_round_trip() {
+        use std::{collections::BTreeMap, ffi::OsStr};
+
+        use crate::{
+            erofs::writer::mkfs_erofs,
+            fsverity::Sha256HashValue,
+            generic_tree::{LeafContent, Stat},
+            tree::{self, RegularFile},
+        };
+
+        let root_stat = Stat {
+            st_mode: 0o40755,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 1000,
+            st_mtim_nsec: 0,
+            xattrs: BTreeMap::new(),
+        };
+
+        let leaf_stat = Stat {
+            st_mode: 0o100644,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 1000,
+            st_mtim_nsec: 0,
+            xattrs: BTreeMap::new(),
+        };
+
+        let mut fs = tree::FileSystem::<Sha256HashValue>::new(root_stat.clone());
+
+        const N: usize = 50;
+        let mut expected_names: Vec<String> = vec![".".into(), "..".into()];
+
+        // Build a subdirectory with N entries, each with a 90-byte name.
+        // N × (12 + 90) = 5100 bytes — forces a multi-block directory.
+        let mut subdir = tree::Directory::<Sha256HashValue>::new(root_stat);
+        for i in 0..N {
+            let name = format!("{:0>90}", i);
+            let leaf_id = fs.push_leaf(
+                leaf_stat.clone(),
+                LeafContent::Regular(RegularFile::Inline(Box::new([]))),
+            );
+            subdir.insert(OsStr::new(&name), tree::Inode::leaf(leaf_id));
+            expected_names.push(name);
+        }
+
+        fs.root.insert(
+            OsStr::new("bigdir"),
+            tree::Inode::Directory(Box::new(subdir)),
+        );
+
+        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
+        let img = Image::open(&image).expect("failed to open image");
+
+        // Locate "bigdir" in root
+        let root_nid = img.sb.root_nid.get() as u64;
+        let bigdir_nid = img
+            .find_child_nid(root_nid, b"bigdir")
+            .expect("find_child_nid error")
+            .expect("bigdir not found in root");
+
+        // Collect all entry names from bigdir (blocks + inline)
+        let bigdir_inode = img.inode(bigdir_nid).unwrap();
+        let mut found_names: Vec<String> = Vec::new();
+        if let Some(inline) = bigdir_inode.inline() {
+            let inline_block = DirectoryBlock::ref_from_bytes(inline).unwrap();
+            for entry in inline_block.entries().unwrap() {
+                let entry = entry.unwrap();
+                found_names.push(String::from_utf8(entry.name.to_vec()).unwrap());
+            }
+        }
+        for blkid in img.inode_blocks(&bigdir_inode).unwrap() {
+            let block = img.directory_block(blkid).unwrap();
+            for entry in block.entries().unwrap() {
+                let entry = entry.unwrap();
+                found_names.push(String::from_utf8(entry.name.to_vec()).unwrap());
+            }
+        }
+
+        found_names.sort();
+        expected_names.sort();
+
+        assert_eq!(
+            found_names, expected_names,
+            "multi-block directory lost entries after round-trip"
+        );
+
+        // Verify the image is a valid EROFS filesystem that can be round-tripped
+        let _fs_rt = erofs_to_filesystem::<Sha256HashValue>(&image)
+            .expect("erofs_to_filesystem failed on multi-block directory image");
+
+        // Sanity: verify the image passes fsck.erofs if available
+        if let Some(ok) = run_fsck_erofs(&image) {
+            assert!(
+                ok,
+                "fsck.erofs reported errors in multi-block directory image"
+            );
+        }
+    }
+
+    /// `ValidatedFileSystem::new` must reject a hardlinked whiteout.
+    /// A whiteout (chardev rdev=0) with nlink > 1 is semantically invalid.
+    #[test]
+    fn test_hardlinked_whiteout_writer_rejects() {
+        use std::ffi::OsStr;
+
+        use crate::{
+            erofs::writer::ValidatedFileSystem,
+            fsverity::Sha256HashValue,
+            generic_tree::{LeafContent, Stat},
+            tree,
+        };
+
+        let root_stat = Stat {
+            st_mode: 0o40755,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 1000,
+            st_mtim_nsec: 0,
+            xattrs: Default::default(),
+        };
+        let whiteout_stat = Stat {
+            st_mode: 0o20000,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 1000,
+            st_mtim_nsec: 0,
+            xattrs: Default::default(),
+        };
+
+        let mut fs = tree::FileSystem::<Sha256HashValue>::new(root_stat);
+        let leaf_id = fs.push_leaf(whiteout_stat, LeafContent::CharacterDevice(0));
+        fs.root
+            .insert(OsStr::new("whiteout"), tree::Inode::leaf(leaf_id));
+        fs.root.insert(
+            OsStr::new("hardlink_to_whiteout"),
+            tree::Inode::leaf(leaf_id),
+        );
+
+        let result = ValidatedFileSystem::new(fs);
+        assert!(
+            result.is_err(),
+            "ValidatedFileSystem::new should reject hardlinked whiteout"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("whiteout inode has nlink > 1"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    // ── Epoch-invariant validation tests ──────────────────────────────────────
+
+    /// Helper: build a simple filesystem from a dumpfile and write it as an
+    /// Epoch2 (V2) EROFS image.
+    fn build_epoch2_image(dumpfile: &str) -> Box<[u8]> {
+        use crate::erofs::writer::{ValidatedFileSystem, mkfs_erofs};
+        let fs = crate::dumpfile::dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap())
+    }
+
+    /// Helper: build a filesystem from a dumpfile and write it as an Epoch1 (V1)
+    /// EROFS image.
+    fn build_epoch1_image(dumpfile: &str) -> Box<[u8]> {
+        use crate::erofs::writer::ValidatedFileSystem;
+        use crate::erofs::{format::FormatVersion, writer::mkfs_erofs_versioned};
+        let fs = crate::dumpfile::dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        mkfs_erofs_versioned(
+            &mut ValidatedFileSystem::new(fs).unwrap(),
+            FormatVersion::V1,
+        )
+    }
+
+    /// An Epoch2 image produced by the Rust writer must pass epoch-invariant validation.
+    #[test]
+    fn test_epoch2_image_passes_epoch_invariants() {
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
+/file 5 100644 1 0 0 0 1000.0 - hello -
+/dir 0 40755 2 0 0 0 1000.0 - - -
+/dir/nested 3 100644 1 0 0 0 1000.0 - abc -
+"#;
+        let image = build_epoch2_image(dumpfile);
+        Image::open(&image)
+            .unwrap()
+            .fsck_metadata()
+            .expect("Epoch2 image should pass epoch-invariant validation");
+    }
+
+    /// An Epoch1 image produced by the Rust V1 writer must pass epoch-invariant
+    /// validation (exactly 256 root stubs, no native whiteouts elsewhere).
+    #[test]
+    fn test_epoch1_image_passes_epoch_invariants() {
+        let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
+/file 5 100644 1 0 0 0 1000.0 - hello -
+/dir 0 40755 2 0 0 0 1000.0 - - -
+/dir/nested 3 100644 1 0 0 0 1000.0 - abc -
+"#;
+        let image = build_epoch1_image(dumpfile);
+        Image::open(&image)
+            .unwrap()
+            .fsck_metadata()
+            .expect("Epoch1 image should pass epoch-invariant validation");
+    }
+
+    /// An Epoch2 image must not contain escaped whiteouts (regular file +
+    /// trusted.overlay.overlay.whiteout xattr). We craft one by building a V1
+    /// image with a user whiteout (which gets escaped in V1) and patching
+    /// composefs_version → 2, then verify that validate_epoch_invariants rejects it.
+    #[test]
+    fn test_epoch2_image_with_escaped_whiteout_fails_epoch_invariants() {
+        use crate::erofs::format::FormatVersion;
+        use crate::erofs::writer::{ValidatedFileSystem, mkfs_erofs_versioned};
+        use crate::generic_tree::{LeafContent, Stat};
+        use std::ffi::OsStr;
+
+        // Build a filesystem with a user whiteout (char-device rdev=0). When
+        // written as V1, the writer escapes it to a regular file + xattr.
+        let mut fs = crate::tree::FileSystem::<Sha256HashValue>::new(Stat {
+            st_mode: 0o755,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 0,
+            st_mtim_nsec: 0,
+            xattrs: Default::default(),
+        });
+        let wh_id = fs.push_leaf(
+            Stat {
+                st_mode: 0o777,
+                st_uid: 0,
+                st_gid: 0,
+                st_mtim_sec: 0,
+                st_mtim_nsec: 0,
+                xattrs: Default::default(),
+            },
+            LeafContent::CharacterDevice(0), // rdev=0 → whiteout
+        );
+        fs.root
+            .insert(OsStr::new("mywhiteout"), crate::tree::Inode::leaf(wh_id));
+
+        let mut image = mkfs_erofs_versioned(
+            &mut ValidatedFileSystem::new(fs).unwrap(),
+            FormatVersion::V1,
+        )
+        .to_vec();
+
+        // Patch composefs_version → 2; the escaped whiteout xattr is still present.
+        const COMPOSEFS_VERSION_OFFSET: usize = 12;
+        image[COMPOSEFS_VERSION_OFFSET..COMPOSEFS_VERSION_OFFSET + 4]
+            .copy_from_slice(&2u32.to_le_bytes());
+
+        let result = Image::open(&image).unwrap().fsck_metadata();
+        let err = result.expect_err("Epoch2 image with escaped whiteout should be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("escaped whiteout") || msg.contains("Epoch2"),
+            "expected escaped-whiteout error, got: {msg}",
+        );
+    }
+
+    /// An Epoch1 image with fewer than 256 root stubs must be rejected.
+    /// We craft this by building a V2 (Epoch2) image and patching
+    /// composefs_version → 1, turning it into an "Epoch1" image that lacks the
+    /// 256 required stubs.
+    #[test]
+    fn test_epoch1_image_missing_stubs_fails_epoch_invariants() {
+        // A V2 image has no stubs at all.  Patching its composefs_version to 1
+        // makes the validator treat it as Epoch1 and count 0 stubs (≠ 256).
+        let dumpfile = "/ 0 40755 2 0 0 0 1000.0 - - -\n";
+        let mut image = build_epoch2_image(dumpfile).to_vec();
+
+        // composefs_version is at offset 12 in ComposefsHeader (4th U32).
+        const COMPOSEFS_VERSION_OFFSET: usize = 12;
+        image[COMPOSEFS_VERSION_OFFSET..COMPOSEFS_VERSION_OFFSET + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+
+        let result = Image::open(&image).unwrap().fsck_metadata();
+        let err = result.expect_err("Epoch1 image missing stubs should be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("hex-named") || msg.contains("256") || msg.contains("Epoch1"),
+            "expected stub-count error, got: {msg}",
+        );
+    }
+
+    /// The reader must reject an image with a hardlinked whiteout.
+    ///
+    /// We build a valid image with a hardlinked chardev(rdev=1), which the writer
+    /// accepts.  We then patch the inode's `u` field (rdev) from 1 to 0 in the raw
+    /// image bytes, turning it into a whiteout on-disk while leaving nlink > 1.
+    /// The reader must detect this and return an error.
+    #[test]
+    fn test_hardlinked_whiteout_reader_rejects() {
+        use std::ffi::OsStr;
+
+        use crate::{
+            fsverity::Sha256HashValue,
+            generic_tree::{LeafContent, Stat},
+            tree,
+        };
+
+        let root_stat = Stat {
+            st_mode: 0o40755,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 1000,
+            st_mtim_nsec: 0,
+            xattrs: Default::default(),
+        };
+        let chardev_stat = Stat {
+            st_mode: 0o20000,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 1000,
+            st_mtim_nsec: 0,
+            xattrs: Default::default(),
+        };
+
+        let mut fs = tree::FileSystem::<Sha256HashValue>::new(root_stat);
+        // Use rdev=1 (not a whiteout) so the writer accepts the hardlink.
+        let leaf_id = fs.push_leaf(chardev_stat, LeafContent::CharacterDevice(1));
+        fs.root
+            .insert(OsStr::new("chardev"), tree::Inode::leaf(leaf_id));
+        fs.root.insert(
+            OsStr::new("hardlink_to_chardev"),
+            tree::Inode::leaf(leaf_id),
+        );
+
+        use crate::erofs::writer::mkfs_erofs;
+        let base_image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
+
+        // Sanity: the unpatched image must be accepted.
+        erofs_to_filesystem::<Sha256HashValue>(&base_image)
+            .expect("unmodified image with rdev=1 hardlink should be accepted");
+
+        // Locate the chardev inode in the image using the erofs Image API.
+        let img = Image::open(&base_image).unwrap();
+        let root_nid = img.sb.root_nid.get() as u64;
+        let chardev_nid = img
+            .find_child_nid(root_nid, b"chardev")
+            .unwrap()
+            .expect("chardev entry must exist");
+
+        // Parse the inode via the Image API to learn its layout (compact vs
+        // extended) and locate its slot in the image.  We record what we need
+        // before releasing the shared borrow so we can take `&mut` afterwards.
+        let inode = img.inode(chardev_nid).unwrap();
+        let is_extended = matches!(inode, InodeType::Extended(_));
+        // The inode region is the `inodes` sub-slice of `image`; the slot for
+        // NID n starts at n*32 bytes into that region.
+        let inodes_start = img.image.len() - img.inodes.len();
+        let inode_slot_start = inodes_start + chardev_nid as usize * 32;
+        drop(inode);
+        drop(img);
+
+        // Mutate a copy of the image: set the `u` field (rdev) from 1 → 0,
+        // turning the chardev into a whiteout on-disk while leaving nlink > 1.
+        // Use zerocopy to reinterpret the slot bytes as the concrete header type
+        // so we get a typed `&mut` rather than raw byte arithmetic.
+        let mut image = base_image.to_vec();
+        let slot = &mut image[inode_slot_start..];
+        if is_extended {
+            use core::mem::size_of;
+            let hdr =
+                ExtendedInodeHeader::mut_from_bytes(&mut slot[..size_of::<ExtendedInodeHeader>()])
+                    .expect("inode slot must be a valid ExtendedInodeHeader");
+            assert_eq!(hdr.u.get(), 1, "expected rdev=1 before patching");
+            hdr.u = zerocopy::little_endian::U32::new(0);
+        } else {
+            use core::mem::size_of;
+            let hdr =
+                CompactInodeHeader::mut_from_bytes(&mut slot[..size_of::<CompactInodeHeader>()])
+                    .expect("inode slot must be a valid CompactInodeHeader");
+            assert_eq!(hdr.u.get(), 1, "expected rdev=1 before patching");
+            hdr.u = zerocopy::little_endian::U32::new(0);
+        }
+
+        // The reader must reject the patched image.
+        let result = erofs_to_filesystem::<Sha256HashValue>(&image);
+        let err = result.expect_err("reader should reject image with hardlinked whiteout");
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("nlink"),
+            "error message should mention nlink, got: {err_msg}"
         );
     }
 }

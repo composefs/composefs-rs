@@ -12,7 +12,7 @@ pub use digest::FsVerityHasher;
 
 use std::{
     fs::File,
-    io::Seek,
+    io::{BufRead, BufReader, Seek},
     os::{
         fd::{AsFd, BorrowedFd, OwnedFd},
         unix::fs::PermissionsExt,
@@ -230,6 +230,35 @@ pub fn measure_verity_opt<H: FsVerityHashValue>(
         }
         Err(other) => Err(other),
     }
+}
+
+/// Try `FS_IOC_MEASURE_VERITY`; fall back to in-process Merkle-tree computation
+/// when the kernel reports that verity is absent or the filesystem doesn't
+/// support it.  This mirrors `lcfs_fd_get_fsverity()` in the C composefs library.
+///
+/// Other ioctl errors are returned as-is.
+pub fn measure_verity_with_fallback<H: FsVerityHashValue>(
+    fd: impl AsFd + std::io::Read,
+) -> Result<H, MeasureVerityError> {
+    match measure_verity_opt(&fd) {
+        Ok(Some(digest)) => return Ok(digest),
+        Ok(None) => {}
+        Err(e) => return Err(e),
+    }
+    // Software fallback: stream the file through the Merkle-tree hasher.
+    let mut hasher = FsVerityHasher::<H>::new();
+    let mut reader = BufReader::with_capacity(FsVerityHasher::<H>::BLOCK_SIZE * 2, fd);
+    loop {
+        let buf = reader.fill_buf().map_err(MeasureVerityError::Io)?;
+        if buf.is_empty() {
+            break;
+        }
+        let chunk = &buf[..buf.len().min(FsVerityHasher::<H>::BLOCK_SIZE)];
+        hasher.add_block(chunk);
+        let n = chunk.len();
+        reader.consume(n);
+    }
+    Ok(hasher.digest())
 }
 
 /// Check whether a file has fs-verity enabled, dispatching to the correct

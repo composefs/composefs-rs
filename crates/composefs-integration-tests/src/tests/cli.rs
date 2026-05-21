@@ -12,20 +12,28 @@ use xshell::{Shell, cmd};
 use crate::{cfsctl, create_test_rootfs, integration_test};
 
 // Pinned composefs image ID for the deterministic OCI layout built by
-// create_oci_layout() (single layer with usr/ dir + hello.txt, mtime=1234567890).
-const OCI_LAYOUT_COMPOSEFS_ID: &str = "f26c6eb439749b82f0d1520e83455bb21766572fb2b5cfe009dd7749a61caf74e0c42c56f1a2cbd9d\
-     359e7d172c8e2c65641666c9a18cc484a8b0f6e4e6d47ab";
+// create_oci_layout() (single layer with usr/ dir + hello.txt + hello-link.txt hardlink, mtime=1234567890).
+const OCI_LAYOUT_COMPOSEFS_ID: &str = "f7684c21050615c02cec250e0c7d4118fb0ff6340af5039e06f2f372a7614fff\
+     25dfd38cf7f28ad67d8b86e86371b7deafa9ae4bf543630322aee6196417de92";
 
 /// Create a fresh initialized insecure repository in a tempdir.
 ///
 /// Returns the tempdir (for lifetime) and the path to the repo.
+///
+/// Creates a V2 (legacy) EROFS repo explicitly so that tests which compare
+/// against pinned V2 digests (e.g. `OCI_LAYOUT_COMPOSEFS_ID`) continue to
+/// work correctly now that `cfsctl init` defaults to V1.
 pub(crate) fn init_insecure_repo(
     sh: &Shell,
     cfsctl: &std::path::Path,
 ) -> Result<tempfile::TempDir> {
     let repo_dir = tempfile::tempdir()?;
     let repo = repo_dir.path();
-    cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
+    cmd!(
+        sh,
+        "{cfsctl} --repo {repo} init --insecure --erofs-version 2"
+    )
+    .read()?;
     Ok(repo_dir)
 }
 
@@ -272,6 +280,16 @@ pub(crate) fn create_oci_layout(parent: &std::path::Path) -> Result<std::path::P
         header.set_cksum();
         layer_builder.append_data(&mut header, "hello.txt", &data[..])?;
     }
+    {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(1234567890);
+        header.set_cksum();
+        layer_builder.append_link(&mut header, "hello-link.txt", "hello.txt")?;
+    }
     let layer = layer_builder.into_inner()?.complete()?;
 
     // Push the layer to manifest and config
@@ -486,8 +504,8 @@ fn test_oci_layer_inspect() -> Result<()> {
     assert!(info["size"].as_u64().unwrap() > 0, "expected non-zero size");
     assert_eq!(
         info["entryCount"].as_u64().unwrap(),
-        2,
-        "expected exactly 2 entries (usr/ + hello.txt)"
+        3,
+        "expected exactly 3 entries (usr/ + hello.txt + hello-link.txt)"
     );
     // Check splitstream metadata
     let splitstream = info
@@ -1597,11 +1615,11 @@ fn test_layer_tar_roundtrip() -> Result<()> {
         entries.push((path, content));
     }
 
-    // Verify we got the expected files (usr/ directory and hello.txt)
+    // Verify we got the expected files (usr/ directory, hello.txt, and hello-link.txt)
     assert_eq!(
         entries.len(),
-        2,
-        "expected 2 entries in layer (usr/ and hello.txt)"
+        3,
+        "expected 3 entries in layer (usr/, hello.txt, and hello-link.txt)"
     );
 
     // Find hello.txt and verify content
@@ -1699,3 +1717,163 @@ fn test_compute_image_id() -> Result<()> {
     Ok(())
 }
 integration_test!(test_compute_image_id);
+
+/// Composefs header magic at offset 0 (little-endian 0xd078629a).
+const COMPOSEFS_MAGIC: [u8; 4] = [0x9a, 0x62, 0x78, 0xd0];
+/// EROFS superblock magic at offset 0x400 (little-endian 0xE0F5E1E2).
+const EROFS_MAGIC: [u8; 4] = [0xe2, 0xe1, 0xf5, 0xe0];
+/// Byte offset of the EROFS superblock within a composefs image.
+const EROFS_SUPERBLOCK_OFFSET: usize = 0x400;
+
+fn test_mkcomposefs_basic() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+    let out_dir = tempfile::tempdir()?;
+    let cfs = out_dir.path().join("out.cfs");
+
+    cmd!(sh, "{cfsctl} mkcomposefs --use-epoch {rootfs} {cfs}").run()?;
+
+    let bytes = std::fs::read(&cfs)?;
+    assert!(!bytes.is_empty(), "output .cfs file should not be empty");
+    // The composefs-specific header starts at offset 0
+    assert_eq!(
+        &bytes[..4],
+        &COMPOSEFS_MAGIC,
+        "expected composefs magic bytes at offset 0"
+    );
+    // The EROFS superblock starts at offset 0x400
+    assert!(
+        bytes.len() > EROFS_SUPERBLOCK_OFFSET + 4,
+        "file too small to contain EROFS superblock"
+    );
+    assert_eq!(
+        &bytes[EROFS_SUPERBLOCK_OFFSET..EROFS_SUPERBLOCK_OFFSET + 4],
+        &EROFS_MAGIC,
+        "expected EROFS magic at offset 0x400"
+    );
+    Ok(())
+}
+integration_test!(test_mkcomposefs_basic);
+
+fn test_mkcomposefs_print_digest_only() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+
+    let output = cmd!(
+        sh,
+        "{cfsctl} mkcomposefs --use-epoch --print-digest-only {rootfs}"
+    )
+    .read()?;
+    let digest = output.trim();
+
+    assert!(!digest.is_empty(), "digest output should not be empty");
+    assert!(
+        digest.chars().all(|c| c.is_ascii_hexdigit()),
+        "digest should be a hex string, got: {digest:?}"
+    );
+    Ok(())
+}
+integration_test!(test_mkcomposefs_print_digest_only);
+
+fn test_mkcomposefs_deterministic() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+    let out_dir = tempfile::tempdir()?;
+    let cfs1 = out_dir.path().join("out1.cfs");
+    let cfs2 = out_dir.path().join("out2.cfs");
+
+    cmd!(sh, "{cfsctl} mkcomposefs --use-epoch {rootfs} {cfs1}").run()?;
+    cmd!(sh, "{cfsctl} mkcomposefs --use-epoch {rootfs} {cfs2}").run()?;
+
+    let bytes1 = std::fs::read(&cfs1)?;
+    let bytes2 = std::fs::read(&cfs2)?;
+    assert_eq!(
+        bytes1, bytes2,
+        "two mkcomposefs runs with --use-epoch should produce identical images"
+    );
+    Ok(())
+}
+integration_test!(test_mkcomposefs_deterministic);
+
+/// Verify that `--hardlinks` produces a different image than the default when
+/// the source directory contains host hard links, and that the default is stable.
+fn test_mkcomposefs_hardlinks_dedup() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+
+    // Build a minimal dir with two names for the same inode.
+    let src_dir = tempfile::tempdir()?;
+    let dir = src_dir.path().join("dir");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("a"), "hello hardlink\n")?;
+    std::fs::hard_link(dir.join("a"), dir.join("b"))?;
+
+    let out_dir = tempfile::tempdir()?;
+    let no_hl = out_dir.path().join("no_hardlinks.cfs");
+    let with_hl = out_dir.path().join("with_hardlinks.cfs");
+    let no_hl_2 = out_dir.path().join("no_hardlinks_2.cfs");
+
+    cmd!(sh, "{cfsctl} mkcomposefs --use-epoch {dir} {no_hl}").run()?;
+    cmd!(
+        sh,
+        "{cfsctl} mkcomposefs --use-epoch --hardlinks {dir} {with_hl}"
+    )
+    .run()?;
+    // A second run without --hardlinks must be identical to the first.
+    cmd!(sh, "{cfsctl} mkcomposefs --use-epoch {dir} {no_hl_2}").run()?;
+
+    let bytes_no_hl = std::fs::read(&no_hl)?;
+    let bytes_with_hl = std::fs::read(&with_hl)?;
+    let bytes_no_hl_2 = std::fs::read(&no_hl_2)?;
+
+    assert_ne!(
+        bytes_no_hl, bytes_with_hl,
+        "--hardlinks should produce a different image than the default (no dedup)"
+    );
+    assert_eq!(
+        bytes_no_hl, bytes_no_hl_2,
+        "default (no --hardlinks) should be deterministic across runs"
+    );
+    Ok(())
+}
+integration_test!(test_mkcomposefs_hardlinks_dedup);
+
+/// Verify byte-for-byte identity with the C `mkcomposefs` tool.
+///
+/// Skipped automatically when `mkcomposefs` is not found in PATH.
+fn test_mkcomposefs_vs_c_mkcomposefs() -> Result<()> {
+    use std::process::Command;
+
+    // Skip if the C mkcomposefs tool is not available.
+    if Command::new("mkcomposefs")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+    // create_test_rootfs has no host hard links, so both tools should agree.
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+    let out_dir = tempfile::tempdir()?;
+    let rust_cfs = out_dir.path().join("rust.cfs");
+    let c_cfs = out_dir.path().join("c.cfs");
+
+    cmd!(sh, "{cfsctl} mkcomposefs --use-epoch {rootfs} {rust_cfs}").run()?;
+    cmd!(sh, "mkcomposefs --use-epoch {rootfs} {c_cfs}").run()?;
+
+    let rust_bytes = std::fs::read(&rust_cfs)?;
+    let c_bytes = std::fs::read(&c_cfs)?;
+    similar_asserts::assert_eq!(c_bytes, rust_bytes);
+    Ok(())
+}
+integration_test!(test_mkcomposefs_vs_c_mkcomposefs);

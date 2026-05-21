@@ -114,11 +114,12 @@ fn write_entry(
     let uid = stat.st_uid;
     let gid = stat.st_gid;
     let mtim_sec = stat.st_mtim_sec;
+    let mtim_nsec = stat.st_mtim_nsec;
 
     write_escaped(writer, path.as_os_str().as_bytes())?;
     write!(
         writer,
-        " {size} {mode:o} {nlink} {uid} {gid} {rdev} {mtim_sec}.0 "
+        " {size} {mode:o} {nlink} {uid} {gid} {rdev} {mtim_sec}.{mtim_nsec} "
     )?;
     write_escaped(writer, payload.as_ref().as_bytes())?;
     write!(writer, " ")?;
@@ -422,7 +423,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
 
     // Handle root directory specially
     if path == Path::new("/") {
-        let stat = entry_to_stat(&entry);
+        let stat = entry_to_stat(&entry)?;
         fs.set_root_stat(stat);
         return Ok(());
     }
@@ -439,7 +440,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
     // Convert the entry to an inode
     let inode = match entry.item {
         Item::Directory { .. } => {
-            let stat = entry_to_stat(&entry);
+            let stat = entry_to_stat(&entry)?;
             Inode::Directory(Box::new(Directory::new(stat)))
         }
         Item::Hardlink { ref target } => {
@@ -450,7 +451,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
             Inode::leaf(existing_id)
         }
         Item::RegularInline { ref content, .. } => {
-            let stat = entry_to_stat(&entry);
+            let stat = entry_to_stat(&entry)?;
             let data: Box<[u8]> = match content {
                 std::borrow::Cow::Borrowed(d) => Box::from(*d),
                 std::borrow::Cow::Owned(d) => d.clone().into_boxed_slice(),
@@ -464,7 +465,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
             ref fsverity_digest,
             ..
         } => {
-            let stat = entry_to_stat(&entry);
+            let stat = entry_to_stat(&entry)?;
             let digest = fsverity_digest
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("External file missing fsverity digest"))?;
@@ -473,10 +474,19 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
             let id = push_leaf(fs, stat, content);
             Inode::leaf(id)
         }
-        Item::Device { rdev, .. } => {
-            let stat = entry_to_stat(&entry);
+        Item::Device { rdev, nlink } => {
             // S_IFMT = 0o170000, S_IFBLK = 0o60000, S_IFCHR = 0o20000
-            let content = if entry.mode & 0o170000 == 0o60000 {
+            let is_chardev = entry.mode & 0o170000 != 0o60000;
+            // A whiteout is a character device with rdev=0; hardlinked whiteouts
+            // are invalid because composefs cannot represent them correctly.
+            if is_chardev && rdev == 0 && nlink > 1 {
+                anyhow::bail!(
+                    "invalid dumpfile: whiteout entry {:?} has nlink > 1",
+                    entry.path
+                );
+            }
+            let stat = entry_to_stat(&entry)?;
+            let content = if !is_chardev {
                 LeafContent::BlockDevice(rdev)
             } else {
                 LeafContent::CharacterDevice(rdev)
@@ -485,7 +495,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
             Inode::leaf(id)
         }
         Item::Symlink { ref target, .. } => {
-            let stat = entry_to_stat(&entry);
+            let stat = entry_to_stat(&entry)?;
             let target_os: Box<OsStr> = match target {
                 std::borrow::Cow::Borrowed(t) => Box::from(t.as_os_str()),
                 std::borrow::Cow::Owned(t) => Box::from(t.as_os_str()),
@@ -495,8 +505,14 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
             Inode::leaf(id)
         }
         Item::Fifo { .. } => {
-            let stat = entry_to_stat(&entry);
+            let stat = entry_to_stat(&entry)?;
             let content = LeafContent::Fifo;
+            let id = push_leaf(fs, stat, content);
+            Inode::leaf(id)
+        }
+        Item::Socket { .. } => {
+            let stat = entry_to_stat(&entry)?;
+            let content = LeafContent::Socket;
             let id = push_leaf(fs, stat, content);
             Inode::leaf(id)
         }
@@ -521,7 +537,7 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
 }
 
 /// Convert a dumpfile Entry's metadata into a tree Stat structure.
-fn entry_to_stat(entry: &Entry<'_>) -> Stat {
+fn entry_to_stat(entry: &Entry<'_>) -> Result<Stat> {
     let mut xattrs = BTreeMap::new();
     for xattr in &entry.xattrs {
         let key: Box<OsStr> = match &xattr.key {
@@ -535,13 +551,19 @@ fn entry_to_stat(entry: &Entry<'_>) -> Stat {
         xattrs.insert(key, value);
     }
 
-    Stat {
+    let nsec = entry.mtime.nsec;
+    if nsec >= 1_000_000_000 {
+        anyhow::bail!("Invalid mtime nanoseconds: {nsec} (must be < 1_000_000_000)");
+    }
+
+    Ok(Stat {
         st_mode: entry.mode & 0o7777, // Keep only permission bits
         st_uid: entry.uid,
         st_gid: entry.gid,
         st_mtim_sec: entry.mtime.sec as i64,
+        st_mtim_nsec: nsec as u32,
         xattrs,
-    }
+    })
 }
 
 /// Parse a dumpfile string and build a complete FileSystem.
@@ -566,7 +588,7 @@ pub fn dumpfile_to_filesystem<ObjectID: FsVerityHashValue>(
                     "Dumpfile must start with root directory entry, found: {:?}",
                     entry.path
                 );
-                break entry_to_stat(&entry);
+                break entry_to_stat(&entry)?;
             }
             None => anyhow::bail!("Dumpfile is empty, expected root directory entry"),
         }
@@ -589,6 +611,19 @@ pub fn dumpfile_to_filesystem<ObjectID: FsVerityHashValue>(
         "dumpfile parsing produced invalid filesystem"
     );
     Ok(fs)
+}
+
+/// Parse a composefs dumpfile string and validate the resulting filesystem
+/// for EROFS serialization.
+///
+/// Combines [`dumpfile_to_filesystem`] with [`ValidatedFileSystem::new`].
+/// Returns an error if the dumpfile is malformed or if the resulting
+/// filesystem violates EROFS invariants (e.g. hardlinked whiteouts).
+pub fn dumpfile_to_validated_filesystem<ObjectID: FsVerityHashValue>(
+    dumpfile: &str,
+) -> anyhow::Result<crate::erofs::writer::ValidatedFileSystem<ObjectID>> {
+    let fs = dumpfile_to_filesystem(dumpfile)?;
+    crate::erofs::writer::ValidatedFileSystem::new(fs)
 }
 
 #[cfg(test)]
@@ -724,6 +759,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         });
         let leaf_id = fs.push_leaf(
@@ -732,6 +768,7 @@ mod tests {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
+                st_mtim_nsec: 0,
                 xattrs,
             },
             LeafContent::Regular(RegularFile::Inline(b"test".to_vec().into())),
@@ -757,6 +794,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: 0,
+            st_mtim_nsec: 0,
             xattrs: BTreeMap::new(),
         };
 
@@ -791,6 +829,23 @@ mod tests {
         write_dumpfile(&mut out2, &fs2)?;
         assert_eq!(out, out2);
         Ok(())
+    }
+
+    /// A whiteout (chardev, rdev=0) with nlink > 1 must be rejected.
+    #[test]
+    fn test_hardlinked_whiteout_rejected() {
+        // /foo 0 20000 2 0 0 0 0.0 - - -
+        //       ^size  ^mode ^nlink ^uid ^gid ^rdev ^mtime ^payload ^digest ^xattrs
+        // mode 20000 = S_IFCHR (character device), rdev=0 → whiteout, nlink=2
+        let dumpfile = "/ 0 40755 2 0 0 0 0.0 - - -\n\
+                         /foo 0 20000 2 0 0 0 0.0 - - -\n";
+        let result = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile);
+        let err = result.expect_err("hardlinked whiteout must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nlink"),
+            "error should mention nlink, got: {msg}"
+        );
     }
 
     /// Helper to escape bytes through write_escaped and return the result.

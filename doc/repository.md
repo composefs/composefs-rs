@@ -65,10 +65,41 @@ created by `cfsctl init` and contains:
    - `read-only-compatible` — old tools may read but must not write.
    - `incompatible` — old tools must refuse the repository entirely.
 
+   The currently defined feature flags are:
+     - `v1_erofs` (read-only-compatible) — present on repositories whose
+       EROFS image format is V1 (C-tool compatible: compact inodes, BFS
+       ordering, whiteout table).  This is the single flag that encodes the
+       EROFS format version: present → V1, absent → V2 (the default).  Old
+       tools that do not recognise this flag open the repository read-only
+       rather than accidentally writing images in the wrong format.
+
 When `meta.json` is present, `cfsctl` auto-detects the hash algorithm and
 errors if `--hash` is explicitly passed with a conflicting value.  When
 the file is absent (for repositories created before this feature), `--hash`
 is honored as before and defaults to `sha512`.
+
+### `cfsctl init --erofs-version`
+
+The `--erofs-version` flag selects the EROFS format for newly committed
+images.  It controls the `v1_erofs` feature flag in `meta.json`:
+
+```
+cfsctl init                          # default: V2 EROFS (composefs-rs native)
+cfsctl init --erofs-version v1       # V1 EROFS (C-tool compatible)
+```
+
+**V2** (default) uses extended inodes, DFS ordering, and `composefs_version=2`
+in the EROFS superblock.  This is the composefs-rs native format and is what
+all repositories created before V1 support was added use.
+
+**V1** uses compact inodes where possible, BFS ordering, and a whiteout stub
+table, producing output byte-for-byte identical to the C `mkcomposefs` tool.
+The `v1_erofs` ro-compat flag is written to `meta.json` so that tools which
+predate V1 support open the repository read-only rather than writing images
+in the wrong format.
+
+Re-initializing an existing repository with a different `--erofs-version` is
+rejected with an error; the format version is fixed at init time.
 
 ## `objects/`
 
