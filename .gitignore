@@ -5,3 +5,6 @@
 **/fuzz/target/
 **/fuzz/corpus/
 **/fuzz/artifacts/
+.worktrees
+*.rpm
+crates/composefs/fuzz/fuzz-0.log

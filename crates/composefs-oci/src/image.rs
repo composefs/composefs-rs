@@ -157,6 +157,7 @@ mod test {
     use composefs::{
         dumpfile::write_dumpfile,
         fsverity::Sha256HashValue,
+        repository::RepositoryConfig,
         tree::{LeafContent, RegularFile, Stat},
     };
     use std::{collections::BTreeMap, io::BufRead, path::PathBuf};
@@ -171,6 +172,7 @@ mod test {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
+                st_mtim_nsec: 0,
                 xattrs: BTreeMap::new(),
             },
             item: TarItem::Leaf(LeafContent::Regular(RegularFile::Inline([].into()))),
@@ -185,6 +187,7 @@ mod test {
                 st_uid: 0,
                 st_gid: 0,
                 st_mtim_sec: 0,
+                st_mtim_nsec: 0,
                 xattrs: BTreeMap::new(),
             },
             item: TarItem::Directory,
@@ -344,8 +347,7 @@ mod test {
         let (repo, _) = Repository::<Sha256HashValue>::init_path(
             CWD,
             &repo_path,
-            composefs::fsverity::Algorithm::SHA256,
-            false,
+            RepositoryConfig::default().set_insecure(),
         )?;
         let repo = Arc::new(repo);
         let (verity, _stats) =

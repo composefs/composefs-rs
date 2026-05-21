@@ -13,7 +13,10 @@ use once_cell::sync::Lazy;
 use rustix::fs::CWD;
 use tempfile::TempDir;
 
-use crate::{fsverity::FsVerityHashValue, repository::Repository};
+use crate::{
+    fsverity::FsVerityHashValue,
+    repository::{Repository, RepositoryConfig},
+};
 
 static TMPDIR: Lazy<OsString> = Lazy::new(|| {
     if let Some(path) = std::env::var_os("CFS_TEST_TMPDIR") {
@@ -67,8 +70,12 @@ impl<ObjectID: FsVerityHashValue> TestRepo<ObjectID> {
     pub fn new() -> Self {
         let dir = tempdir();
         let repo_path = dir.path().join("repo");
-        let (repo, _) = Repository::init_path(CWD, &repo_path, ObjectID::ALGORITHM, false)
-            .expect("initializing test repo");
+        let (repo, _) = Repository::init_path(
+            CWD,
+            &repo_path,
+            RepositoryConfig::new(ObjectID::ALGORITHM).set_insecure(),
+        )
+        .expect("initializing test repo");
         Self {
             repo: Arc::new(repo),
             repo_path,
@@ -143,19 +150,37 @@ pub(crate) mod proptest_strategies {
     ///
     /// Linux filenames are arbitrary bytes except `/` (0x2F) and `\0` (0x00),
     /// with a max length of [`NAME_MAX`] (255) bytes.  We generate a mix of
-    /// ASCII names and binary names, occasionally long, to exercise directory
-    /// entry layout edge cases.
+    /// lengths to exercise directory entry layout edge cases:
+    ///
+    /// - Short ASCII (common case)
+    /// - Binary bytes (no NUL or `/`)
+    /// - Long ASCII (crosses xattr/inode inline-data boundaries)
+    /// - Near-NAME_MAX: lengths 252–255 exercise all four 4-byte padding
+    ///   residues in the erofs directory entry format (names are padded to the
+    ///   next 4-byte boundary, so a 255-byte name has 1 pad byte, 254 has 2,
+    ///   253 has 3, 252 has 0)
+    /// - Exactly NAME_MAX (255 bytes): the hard limit
     pub fn filename() -> impl Strategy<Value = OsString> {
         prop_oneof![
             // Short ASCII names (common case)
-            6 => proptest::string::string_regex("[a-zA-Z0-9._-]{1,20}")
+            5 => proptest::string::string_regex("[a-zA-Z0-9._-]{1,20}")
                 .expect("valid regex")
                 .prop_map(OsString::from),
             // Binary names with arbitrary bytes (no NUL or /)
-            3 => prop::collection::vec(1..=0xFEu8, 1..=30)
+            2 => prop::collection::vec(1..=0xFEu8, 1..=30)
                 .prop_map(|mut v| { v.iter_mut().for_each(|b| if *b == b'/' { *b = b'_' }); OsString::from_vec(v) }),
-            // Long ASCII names (up to NAME_MAX)
-            1 => proptest::string::string_regex(&format!("[a-zA-Z0-9._-]{{100,{NAME_MAX}}}"))
+            // Long ASCII names (100..=251) — crosses inline-data boundaries
+            1 => proptest::string::string_regex("[a-zA-Z0-9._-]{100,251}")
+                .expect("valid regex")
+                .prop_map(OsString::from),
+            // Near-NAME_MAX (252–254): all four mod-4 padding residues in erofs dirents
+            1 => (252usize..=254).prop_flat_map(|len| {
+                proptest::string::string_regex(&format!("[a-zA-Z0-9._-]{{{len}}}"))
+                    .expect("valid regex")
+                    .prop_map(OsString::from)
+            }),
+            // Exactly NAME_MAX (255): the hard limit
+            1 => proptest::string::string_regex(&format!("[a-zA-Z0-9._-]{{{NAME_MAX}}}"))
                 .expect("valid regex")
                 .prop_map(OsString::from),
         ]
@@ -166,29 +191,38 @@ pub(crate) mod proptest_strategies {
     pub fn stat() -> impl Strategy<Value = tree::Stat> {
         (
             0..=0o7777u32,        // permission bits
-            0..=65535u32,         // uid
-            0..=65535u32,         // gid
-            0..=2_000_000_000i64, // mtime
+            0..=131071u32,        // uid — crosses u16::MAX to exercise extended inodes
+            0..=131071u32,        // gid — crosses u16::MAX to exercise extended inodes
+            0..=2_000_000_000i64, // mtime sec
+            0..1_000_000_000u32,  // mtime nsec
             xattrs(),
         )
-            .prop_map(|(mode, uid, gid, mtime, xattrs)| tree::Stat {
-                st_mode: mode,
-                st_uid: uid,
-                st_gid: gid,
-                st_mtim_sec: mtime,
-                xattrs,
-            })
+            .prop_map(
+                |(mode, uid, gid, mtime_sec, mtime_nsec, xattrs)| tree::Stat {
+                    st_mode: mode,
+                    st_uid: uid,
+                    st_gid: gid,
+                    st_mtim_sec: mtime_sec,
+                    st_mtim_nsec: mtime_nsec,
+                    xattrs,
+                },
+            )
     }
 
     /// Strategy for xattr keys covering all erofs prefix namespaces.
     ///
     /// The erofs format uses prefix indices to compress xattr names:
-    ///   0 = "" (fallback), 1 = "user.", 2 = "system.posix_acl_access",
+    ///   0 = "" (fallback, for unrecognized prefixes like com.example.*),
+    ///   1 = "user.", 2 = "system.posix_acl_access",
     ///   3 = "system.posix_acl_default", 4 = "trusted.", 5 = "lustre.",
     ///   6 = "security."
     ///
     /// The writer also escapes `trusted.overlay.*` → `trusted.overlay.overlay.*`,
     /// so we must test that path too.
+    ///
+    /// `lustre.*` keys are included here. For V1 images the writer skips index 5 during
+    /// prefix matching, so lustre.* xattrs fall through to prefix index 0 (raw fallback),
+    /// matching C mkcomposefs v1.0.8 behavior.
     fn xattr_key() -> impl Strategy<Value = String> {
         prop_oneof![
             // user.* namespace (index 1) — most common
@@ -214,6 +248,16 @@ pub(crate) mod proptest_strategies {
             1 => Just("system.posix_acl_access".to_string()),
             // system.posix_acl_default (index 3) — exact name, no suffix
             1 => Just("system.posix_acl_default".to_string()),
+            // Fallback prefix (index 0) — unrecognized prefix, full key stored as suffix.
+            // Both Rust and C agree on index 0 for these keys.
+            1 => (0..3u32).prop_map(|n| format!("com.example.test_{n}")),
+            // lustre.* (index 5 in EROFS spec, but index 0 in C mkcomposefs v1.0.8).
+            // For V1 images, the writer skips index 5 so lustre.* falls through to index 0,
+            // matching C behavior for binary compatibility.
+            1 => prop_oneof![
+                Just("lustre.lov".to_string()),
+                Just("lustre.lma".to_string()),
+            ],
         ]
     }
 
@@ -229,6 +273,58 @@ pub(crate) mod proptest_strategies {
                 map.insert(Box::from(OsStr::new(&key)), value.into_boxed_slice());
             }
             map
+        })
+    }
+
+    /// Strategy for xattr keys that stress corner cases in the V1 writer:
+    /// - Multiple `trusted.overlay.*` keys → all get escaped on disk
+    /// - `trusted.overlay.overlay.X` → double-escaped to `trusted.overlay.overlay.overlay.X`
+    /// - `security.selinux` + `security.ima` combinations
+    /// - `system.posix_acl_access` → triggers LCFS_EROFS_FLAGS_HAS_ACL header bit
+    fn xattr_key_unusual() -> impl Strategy<Value = String> {
+        prop_oneof![
+            // trusted.overlay.* — each gets escaped to trusted.overlay.overlay.* on disk
+            4 => prop_oneof![
+                Just("trusted.overlay.custom".to_string()),
+                Just("trusted.overlay.origin".to_string()),
+                Just("trusted.overlay.upper".to_string()),
+                Just("trusted.overlay.redirect".to_string()),
+                Just("trusted.overlay.nfs_fh".to_string()),
+            ],
+            // Already-escaped key: trusted.overlay.overlay.X → double-escape on disk
+            2 => Just("trusted.overlay.overlay.nested".to_string()),
+            // security.* — two labels on same inode
+            3 => prop_oneof![
+                Just("security.selinux".to_string()),
+                Just("security.ima".to_string()),
+                Just("security.capability".to_string()),
+            ],
+            // ACL — triggers LCFS_EROFS_FLAGS_HAS_ACL
+            2 => Just("system.posix_acl_access".to_string()),
+            // user.* — filler
+            1 => proptest::string::string_regex("user\\.[a-z]{1,10}")
+                .expect("valid regex"),
+        ]
+    }
+
+    /// Xattr strategy for the unusual generator: 2–8 xattr pairs (key collisions are silently deduplicated by BTreeMap) with long values allowed.
+    fn xattrs_unusual() -> impl Strategy<Value = BTreeMap<Box<OsStr>, Box<[u8]>>> {
+        prop::collection::vec(
+            (
+                xattr_key_unusual(),
+                // Mix of short and long values — long values stress xattr dedup/block layout
+                prop_oneof![
+                    3 => prop::collection::vec(any::<u8>(), 0..=20),
+                    1 => prop::collection::vec(any::<u8>(), 64..=512),
+                ],
+            ),
+            2..=8,
+        )
+        .prop_map(|pairs| {
+            pairs
+                .into_iter()
+                .map(|(k, v)| (OsStr::new(&k).into(), v.into_boxed_slice()))
+                .collect()
         })
     }
 
@@ -256,7 +352,7 @@ pub(crate) mod proptest_strategies {
     ///
     /// External file references store raw hash bytes rather than a concrete
     /// `ObjectID` type, so the same spec works with any hash algorithm.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub enum LeafContentSpec {
         Inline(Vec<u8>),
         /// External file: random hash bytes (truncated to hash size at build time) and size.
@@ -265,6 +361,10 @@ pub(crate) mod proptest_strategies {
         BlockDevice(u64),
         CharacterDevice(u64),
         Fifo,
+        Socket,
+        /// Overlay whiteout: char device with rdev=0. Always maps to CharacterDevice(0).
+        /// Distinct from CharacterDevice(rdev) to allow weighted generation.
+        Whiteout,
     }
 
     /// Strategy for hash-type-agnostic leaf content.
@@ -274,7 +374,7 @@ pub(crate) mod proptest_strategies {
         // Inline file data is capped at INLINE_CONTENT_MAX_V0 (64 bytes) to match
         // the composefs invariant: larger files must be external (ChunkBased).
         (
-            0..10u8,
+            0..11u8,
             prop::collection::vec(any::<u8>(), 0..=INLINE_CONTENT_MAX_V0),
             symlink_target(),
             prop::collection::vec(any::<u8>(), 64..=64),
@@ -288,13 +388,14 @@ pub(crate) mod proptest_strategies {
                     5..=6 => LeafContentSpec::Symlink(symlink_target),
                     7 => LeafContentSpec::BlockDevice(rdev),
                     8 => LeafContentSpec::CharacterDevice(rdev),
-                    _ => LeafContentSpec::Fifo,
+                    9 => LeafContentSpec::Fifo,
+                    _ => LeafContentSpec::Socket,
                 },
             )
     }
 
     /// A hash-type-agnostic leaf node specification.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct LeafSpec {
         pub stat: tree::Stat,
         pub content: LeafContentSpec,
@@ -305,8 +406,17 @@ pub(crate) mod proptest_strategies {
     }
 
     /// Strategy for a list of uniquely-named leaf specs.
-    fn named_leaf_specs(max_entries: usize) -> impl Strategy<Value = Vec<(OsString, LeafSpec)>> {
-        prop::collection::vec((filename(), leaf_spec()), 0..=max_entries).prop_map(|entries| {
+    /// Strategy for a list of uniquely-named leaf specs with a given entry count range.
+    ///
+    /// The `min..=max` range controls how many entries are attempted before
+    /// deduplication.  Use `named_leaf_specs(0, 30)` for a small directory and
+    /// `named_leaf_specs(150, 300)` to reliably cross a 4 KiB directory block
+    /// boundary (~170 entries with typical short names × ~20 bytes each).
+    fn named_leaf_specs(
+        min: usize,
+        max: usize,
+    ) -> impl Strategy<Value = Vec<(OsString, LeafSpec)>> {
+        prop::collection::vec((filename(), leaf_spec()), min..=max).prop_map(|entries| {
             let mut seen = std::collections::HashSet::new();
             entries
                 .into_iter()
@@ -316,7 +426,7 @@ pub(crate) mod proptest_strategies {
     }
 
     /// Description of a directory to be built, including potential hardlinks.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct DirSpec {
         /// Stat metadata for this directory.
         pub stat: tree::Stat,
@@ -327,7 +437,7 @@ pub(crate) mod proptest_strategies {
     }
 
     /// Description of a filesystem to be built, with hardlink info.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct FsSpec {
         /// Root directory specification.
         pub root: DirSpec,
@@ -344,9 +454,35 @@ pub(crate) mod proptest_strategies {
         pub link_name: OsString,
     }
 
+    /// Hardlink spec for the unusual generator: places hardlink in root or a named subdir.
+    /// `target_dir_index: None` → root; `Some(i)` → subdirs[i % subdirs.len()]`.
+    #[derive(Debug, Clone)]
+    pub struct UnusualHardlinkSpec {
+        /// Index into the flat all-leaves list (root leaves first, then subdir leaves in order).
+        pub source_leaf_index: usize,
+        /// Name for the hardlink entry.
+        pub link_name: OsString,
+        /// Which directory receives the hardlink entry.
+        pub target_dir_index: Option<usize>,
+    }
+
+    /// Filesystem description for the unusual generator.
+    #[derive(Debug, Clone)]
+    pub struct UnusualFsSpec {
+        pub root: DirSpec,
+        pub hardlinks: Vec<UnusualHardlinkSpec>,
+    }
+
     /// Strategy for a subdirectory (no further nesting).
+    ///
+    /// Usually small (0–20 entries), but 1-in-4 times generates a large
+    /// directory (150–300 entries) to exercise multi-block directory layout.
     fn subdir_spec() -> impl Strategy<Value = (OsString, DirSpec)> {
-        (filename(), stat(), named_leaf_specs(10)).prop_map(|(name, stat, leaves)| {
+        let leaves_strat = prop_oneof![
+            3 => named_leaf_specs(0, 20),
+            1 => named_leaf_specs(150, 300),
+        ];
+        (filename(), stat(), leaves_strat).prop_map(|(name, stat, leaves)| {
             (
                 name,
                 DirSpec {
@@ -370,14 +506,19 @@ pub(crate) mod proptest_strategies {
 
     /// Strategy for generating a complete `FsSpec`.
     ///
-    /// Generates a root directory with up to 15 file entries and up to 5
-    /// subdirectories (each with up to 10 entries, max depth 2). Then
-    /// optionally generates 0-3 hardlinks that reference existing leaves.
+    /// Root directory entry count is weighted: usually small (0–30), but
+    /// 1-in-4 times large (150–300) to reliably cross the 4 KiB directory
+    /// block boundary.  Subdirectories use the same weighted split inside
+    /// `subdir_spec`.
     pub fn filesystem_spec() -> impl Strategy<Value = FsSpec> {
+        let root_leaves_strat = prop_oneof![
+            3 => named_leaf_specs(0, 30),
+            1 => named_leaf_specs(150, 300),
+        ];
         (
             stat(),
-            named_leaf_specs(15),
-            unique_subdirs(5),
+            root_leaves_strat,
+            unique_subdirs(10),
             // Hardlink candidates: (source index placeholder, link name)
             prop::collection::vec((any::<usize>(), filename()), 0..=3),
         )
@@ -420,6 +561,153 @@ pub(crate) mod proptest_strategies {
             )
     }
 
+    /// Strategy for the "unusual content" proptest generator.
+    ///
+    /// Explicitly constructs filesystem trees that stress corner cases in the V1 writer:
+    ///   - Whiteout files (rdev=0 char devices) at root and in subdirs
+    ///   - Multiple trusted.overlay.* xattrs per inode (escape path)
+    ///   - Large external file sizes (up to 30 GB)
+    ///   - Hardlinks across all leaf types and directories (post-generation pass)
+    pub fn unusual_filesystem_spec() -> impl Strategy<Value = UnusualFsSpec> {
+        fn unusual_stat() -> impl Strategy<Value = tree::Stat> {
+            (
+                0u32..=0o7777u32,
+                0u32..=131071u32,
+                0u32..=131071u32,
+                0u64..=u32::MAX as u64,
+                0u32..=999_999_999u32,
+                xattrs_unusual(),
+            )
+                .prop_map(|(mode, uid, gid, mtime_sec, mtime_nsec, xattrs)| {
+                    tree::Stat {
+                        st_mode: mode,
+                        st_uid: uid,
+                        st_gid: gid,
+                        st_mtim_sec: mtime_sec as i64,
+                        st_mtim_nsec: mtime_nsec,
+                        xattrs,
+                    }
+                })
+        }
+
+        fn unusual_leaf_content_spec() -> impl Strategy<Value = LeafContentSpec> {
+            let hash_bytes = prop::collection::vec(any::<u8>(), 64..=64);
+            let ext_size = prop_oneof![
+                5 => 1u64..=1_000_000u64,
+                3 => 1_000_001u64..=100_000_000u64,
+                2 => 100_000_001u64..=30_000_000_000u64,
+            ];
+            (
+                0u8..=10u8,
+                prop::collection::vec(any::<u8>(), 0..=INLINE_CONTENT_MAX_V0),
+                symlink_target(),
+                hash_bytes,
+                ext_size,
+                1u64..=65535u64,
+            )
+                .prop_map(
+                    |(tag, file_data, symlink_target, hash_bytes, ext_size, rdev)| match tag {
+                        0..=1 => LeafContentSpec::Inline(file_data),
+                        2..=3 => LeafContentSpec::External(hash_bytes, ext_size),
+                        4..=5 => LeafContentSpec::Symlink(symlink_target),
+                        6..=7 => LeafContentSpec::Whiteout,
+                        8 => LeafContentSpec::BlockDevice(rdev),
+                        9 => LeafContentSpec::Fifo,
+                        _ => LeafContentSpec::Socket,
+                    },
+                )
+        }
+
+        fn unusual_leaf_spec() -> impl Strategy<Value = LeafSpec> {
+            (unusual_stat(), unusual_leaf_content_spec())
+                .prop_map(|(stat, content)| LeafSpec { stat, content })
+        }
+
+        fn unusual_named_leaves(max: usize) -> impl Strategy<Value = Vec<(OsString, LeafSpec)>> {
+            prop::collection::vec((filename(), unusual_leaf_spec()), 0..=max).prop_map(|entries| {
+                let mut seen = std::collections::HashSet::new();
+                entries
+                    .into_iter()
+                    .filter(|(name, _)| seen.insert(name.clone()))
+                    .collect()
+            })
+        }
+
+        fn unusual_subdir_spec() -> impl Strategy<Value = (OsString, DirSpec)> {
+            (filename(), unusual_stat(), unusual_named_leaves(10)).prop_map(
+                |(name, stat, leaves)| {
+                    (
+                        name,
+                        DirSpec {
+                            stat,
+                            leaves,
+                            subdirs: vec![],
+                        },
+                    )
+                },
+            )
+        }
+
+        fn unusual_unique_subdirs(max: usize) -> impl Strategy<Value = Vec<(OsString, DirSpec)>> {
+            prop::collection::vec(unusual_subdir_spec(), 0..=max).prop_map(|dirs| {
+                let mut seen = std::collections::HashSet::new();
+                dirs.into_iter()
+                    .filter(|(name, _)| seen.insert(name.clone()))
+                    .collect()
+            })
+        }
+
+        (
+            unusual_stat(),
+            unusual_named_leaves(15),
+            unusual_unique_subdirs(5),
+            prop::collection::vec((any::<usize>(), filename(), any::<usize>()), 0..=5),
+        )
+            .prop_map(
+                |(root_stat, mut root_leaves, mut root_subdirs, hl_candidates)| {
+                    let mut seen: std::collections::HashSet<OsString> =
+                        std::collections::HashSet::new();
+                    root_subdirs.retain(|(name, _)| seen.insert(name.clone()));
+                    root_leaves.retain(|(name, _)| seen.insert(name.clone()));
+
+                    let root_leaf_count = root_leaves.len();
+                    let total_leaves: usize = root_leaf_count
+                        + root_subdirs
+                            .iter()
+                            .map(|(_, d)| d.leaves.len())
+                            .sum::<usize>();
+
+                    let hardlinks = if total_leaves > 0 {
+                        hl_candidates
+                            .into_iter()
+                            .map(|(src_idx, name, dir_idx)| UnusualHardlinkSpec {
+                                source_leaf_index: src_idx % total_leaves,
+                                link_name: name,
+                                target_dir_index: if root_subdirs.is_empty() {
+                                    None
+                                } else if dir_idx % 2 == 0 {
+                                    None
+                                } else {
+                                    Some(dir_idx % root_subdirs.len())
+                                },
+                            })
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+
+                    UnusualFsSpec {
+                        root: DirSpec {
+                            stat: root_stat,
+                            leaves: root_leaves,
+                            subdirs: root_subdirs,
+                        },
+                        hardlinks,
+                    }
+                },
+            )
+    }
+
     /// Convert a `LeafContentSpec` into a concrete `tree::LeafContent<ObjectID>`.
     fn build_leaf_content<ObjectID: FsVerityHashValue>(
         spec: LeafContentSpec,
@@ -440,6 +728,8 @@ pub(crate) mod proptest_strategies {
             LeafContentSpec::BlockDevice(rdev) => tree::LeafContent::BlockDevice(rdev),
             LeafContentSpec::CharacterDevice(rdev) => tree::LeafContent::CharacterDevice(rdev),
             LeafContentSpec::Fifo => tree::LeafContent::Fifo,
+            LeafContentSpec::Socket => tree::LeafContent::Socket,
+            LeafContentSpec::Whiteout => tree::LeafContent::CharacterDevice(0),
         }
     }
 
@@ -483,6 +773,81 @@ pub(crate) mod proptest_strategies {
                 if used_names.insert(hl.link_name.clone()) {
                     let leaf_id = all_leaf_ids[idx];
                     fs.root.insert(&hl.link_name, tree::Inode::leaf(leaf_id));
+                }
+            }
+        }
+
+        fs
+    }
+
+    /// Build a `tree::FileSystem` from an `UnusualFsSpec`.
+    ///
+    /// Handles post-generation hardlink injection: hardlinks can target any leaf type
+    /// (symlinks, whiteouts, devices, FIFOs) and can be placed in root or any subdir.
+    pub fn build_unusual_filesystem<ObjectID: FsVerityHashValue>(
+        spec: UnusualFsSpec,
+    ) -> tree::FileSystem<ObjectID> {
+        let mut fs = tree::FileSystem::new(spec.root.stat);
+
+        let mut all_leaf_ids: Vec<LeafId> = Vec::new();
+        let mut root_used_names: std::collections::HashSet<OsString> =
+            std::collections::HashSet::new();
+
+        // Insert root leaves
+        for (name, leaf_spec) in spec.root.leaves {
+            let leaf_id = fs.push_leaf(leaf_spec.stat, build_leaf_content(leaf_spec.content));
+            all_leaf_ids.push(leaf_id);
+            root_used_names.insert(name.clone());
+            fs.root.insert(&name, tree::Inode::leaf(leaf_id));
+        }
+
+        // Remember subdir names and per-subdir used-name sets for hardlink dedup
+        let mut subdir_names: Vec<OsString> = Vec::new();
+        let mut subdir_used_names: Vec<std::collections::HashSet<OsString>> = Vec::new();
+
+        for (dir_name, dir_spec) in spec.root.subdirs {
+            subdir_names.push(dir_name.clone());
+            let mut used: std::collections::HashSet<OsString> = std::collections::HashSet::new();
+            let mut subdir = tree::Directory::new(dir_spec.stat);
+            for (name, leaf_spec) in dir_spec.leaves {
+                let leaf_id = fs.push_leaf(leaf_spec.stat, build_leaf_content(leaf_spec.content));
+                all_leaf_ids.push(leaf_id);
+                used.insert(name.clone());
+                subdir.insert(&name, tree::Inode::leaf(leaf_id));
+            }
+            subdir_used_names.push(used);
+            root_used_names.insert(dir_name.clone());
+            fs.root
+                .insert(&dir_name, tree::Inode::Directory(Box::new(subdir)));
+        }
+
+        // Post-generation hardlink pass: inject hardlinks to any leaf type, any dir.
+        // Whiteouts (chardev rdev=0) are excluded: hardlinked whiteouts are invalid.
+        let non_whiteout_leaf_ids: Vec<LeafId> = all_leaf_ids
+            .iter()
+            .copied()
+            .filter(|&id| !matches!(fs.leaf(id).content, tree::LeafContent::CharacterDevice(0)))
+            .collect();
+        if !non_whiteout_leaf_ids.is_empty() {
+            for hl in spec.hardlinks {
+                let leaf_id =
+                    non_whiteout_leaf_ids[hl.source_leaf_index % non_whiteout_leaf_ids.len()];
+                match hl.target_dir_index {
+                    None => {
+                        if root_used_names.insert(hl.link_name.clone()) {
+                            fs.root.insert(&hl.link_name, tree::Inode::leaf(leaf_id));
+                        }
+                    }
+                    Some(raw_idx) => {
+                        let idx = raw_idx % subdir_names.len();
+                        if subdir_used_names[idx].insert(hl.link_name.clone()) {
+                            if let Ok(subdir) =
+                                fs.root.get_directory_mut(subdir_names[idx].as_os_str())
+                            {
+                                subdir.insert(&hl.link_name, tree::Inode::leaf(leaf_id));
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -44,3 +44,8 @@ jobs:
 
       - name: Build and test bootc with local composefs-rs
         run: just bootc/test
+        env:
+          # Use bootc branch adapted to composefs-rs API changes
+          # TODO: revert to main once bootc-dev/bootc merges these adaptations
+          COMPOSEFS_BOOTC_REPO: https://github.com/cgwalters/bootc
+          COMPOSEFS_BOOTC_REF: adapt-composefs-rs-api

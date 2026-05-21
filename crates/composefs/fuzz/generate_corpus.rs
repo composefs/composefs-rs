@@ -12,7 +12,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
 
-use composefs::erofs::writer::mkfs_erofs;
+use composefs::erofs::format::FormatVersion;
+use composefs::erofs::writer::{ValidatedFileSystem, mkfs_erofs, mkfs_erofs_versioned};
 use composefs::fsverity::{FsVerityHashValue, Sha256HashValue};
 use composefs::generic_tree::{self, LeafContent, Stat};
 use composefs::tree::{self, FileSystem, RegularFile};
@@ -27,6 +28,7 @@ fn stat(mode: u32, uid: u32, gid: u32, mtime: i64) -> Stat {
         st_uid: uid,
         st_gid: gid,
         st_mtim_sec: mtime,
+        st_mtim_nsec: 0,
         xattrs: BTreeMap::new(),
     }
 }
@@ -55,20 +57,44 @@ fn insert_dir<'a>(parent: &'a mut Dir, name: &str, s: Stat) -> &'a mut Dir {
     parent.get_directory_mut(OsStr::new(name)).unwrap()
 }
 
+/// Generate V0, V1, and V2 images for a filesystem, pushing them into seeds.
+///
+/// The V2 image uses the name as-is; V1 appends "_v1"; V0 appends "_v0".
+/// V0/V1 whiteout stubs are added automatically by the writer.
+fn push_all_versions(
+    seeds: &mut Vec<(String, Vec<u8>)>,
+    name: &str,
+    build_fs: impl Fn() -> FileSystem<Sha256HashValue>,
+) {
+    // V2 (Rust-native extended inodes, DFS ordering, no stubs)
+    let image = mkfs_erofs(&mut ValidatedFileSystem::new(build_fs()).unwrap());
+    seeds.push((name.to_string(), image.into()));
+
+    // V1 (compact inodes, always composefs_version=1, stubs injected)
+    let image = mkfs_erofs_versioned(
+        &mut ValidatedFileSystem::new(build_fs()).unwrap(),
+        FormatVersion::V1,
+    );
+    seeds.push((format!("{name}_v1"), image.into()));
+
+    // V0 (compact inodes, composefs_version auto-bumps to 1 only if whiteouts present)
+    let image = mkfs_erofs_versioned(
+        &mut ValidatedFileSystem::new(build_fs()).unwrap(),
+        FormatVersion::V0,
+    );
+    seeds.push((format!("{name}_v0"), image.into()));
+}
+
 fn main() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 
-    let mut seeds: Vec<(&str, Vec<u8>)> = Vec::new();
+    let mut seeds: Vec<(String, Vec<u8>)> = Vec::new();
 
     // 1. Empty root
-    {
-        let fs = empty_root();
-        let image = mkfs_erofs(&fs);
-        seeds.push(("empty_root", image.into()));
-    }
+    push_all_versions(&mut seeds, "empty_root", empty_root);
 
     // 2. Single inline file (small content stored in inode)
-    {
+    push_all_versions(&mut seeds, "single_inline_file", || {
         let mut fs = empty_root();
         let id = fs.push_leaf(
             file_stat(),
@@ -77,12 +103,11 @@ fn main() {
             )),
         );
         fs.root.insert(OsStr::new("hello.txt"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("single_inline_file", image.into()));
-    }
+        fs
+    });
 
     // 3. Single external (chunk-based) regular file
-    {
+    push_all_versions(&mut seeds, "single_external_file", || {
         let mut fs = empty_root();
         let hash = Sha256HashValue::EMPTY;
         let id = fs.push_leaf(
@@ -90,66 +115,60 @@ fn main() {
             LeafContent::Regular(RegularFile::External(hash, 65536)),
         );
         fs.root.insert(OsStr::new("data.bin"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("single_external_file", image.into()));
-    }
+        fs
+    });
 
     // 4. Symlink
-    {
+    push_all_versions(&mut seeds, "symlink", || {
         let mut fs = empty_root();
         let id = fs.push_leaf(
             stat(0o777, 0, 0, 0),
             LeafContent::Symlink(OsString::from("/target/path").into_boxed_os_str()),
         );
         fs.root.insert(OsStr::new("link"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("symlink", image.into()));
-    }
+        fs
+    });
 
     // 5. FIFO
-    {
+    push_all_versions(&mut seeds, "fifo", || {
         let mut fs = empty_root();
         let id = fs.push_leaf(file_stat(), LeafContent::Fifo);
         fs.root.insert(OsStr::new("mypipe"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("fifo", image.into()));
-    }
+        fs
+    });
 
     // 6. Character device
-    {
+    push_all_versions(&mut seeds, "chardev", || {
         let mut fs = empty_root();
         let id = fs.push_leaf(
             stat(0o666, 0, 0, 0),
             LeafContent::CharacterDevice(makedev(1, 3)),
         );
         fs.root.insert(OsStr::new("null"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("chardev", image.into()));
-    }
+        fs
+    });
 
     // 7. Block device
-    {
+    push_all_versions(&mut seeds, "blockdev", || {
         let mut fs = empty_root();
         let id = fs.push_leaf(
             stat(0o660, 0, 6, 0),
             LeafContent::BlockDevice(makedev(8, 0)),
         );
         fs.root.insert(OsStr::new("sda"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("blockdev", image.into()));
-    }
+        fs
+    });
 
     // 8. Socket
-    {
+    push_all_versions(&mut seeds, "socket", || {
         let mut fs = empty_root();
         let id = fs.push_leaf(file_stat(), LeafContent::Socket);
         fs.root.insert(OsStr::new("mysock"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("socket", image.into()));
-    }
+        fs
+    });
 
     // 9. Nested directories: /a/b/c/file
-    {
+    push_all_versions(&mut seeds, "nested_dirs", || {
         let mut fs = empty_root();
         let id = fs.push_leaf(
             file_stat(),
@@ -161,30 +180,26 @@ fn main() {
         let b = insert_dir(a, "b", dir_stat());
         let c = insert_dir(b, "c", dir_stat());
         c.insert(OsStr::new("file"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("nested_dirs", image.into()));
-    }
+        fs
+    });
 
     // 10. Many entries (20+ files to exercise multi-block directories)
-    {
+    push_all_versions(&mut seeds, "many_entries", || {
         let mut fs = empty_root();
         for i in 0..25 {
             let name = format!("file_{i:03}");
             let content = format!("content of file {i}");
             let id = fs.push_leaf(
                 file_stat(),
-                LeafContent::Regular(RegularFile::Inline(
-                    content.into_bytes().into_boxed_slice(),
-                )),
+                LeafContent::Regular(RegularFile::Inline(content.into_bytes().into_boxed_slice())),
             );
             fs.root.insert(OsStr::new(&name), Inode::leaf(id));
         }
-        let image = mkfs_erofs(&fs);
-        seeds.push(("many_entries", image.into()));
-    }
+        fs
+    });
 
     // 11. Extended attributes
-    {
+    push_all_versions(&mut seeds, "xattrs", || {
         let mut fs = empty_root();
         let mut xattrs = BTreeMap::new();
         xattrs.insert(
@@ -206,19 +221,16 @@ fn main() {
             )),
         );
         fs.root.insert(OsStr::new("xattr_file"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("xattrs", image.into()));
-    }
+        fs
+    });
 
     // 12. Mixed types — one of every file type in a single directory
-    {
+    push_all_versions(&mut seeds, "mixed_types", || {
         let mut fs = empty_root();
         let ids = [
             fs.push_leaf(
                 file_stat(),
-                LeafContent::Regular(RegularFile::Inline(
-                    b"data".to_vec().into_boxed_slice(),
-                )),
+                LeafContent::Regular(RegularFile::Inline(b"data".to_vec().into_boxed_slice())),
             ),
             fs.push_leaf(
                 stat(0o777, 0, 0, 0),
@@ -246,12 +258,11 @@ fn main() {
             LeafContent::Regular(RegularFile::External(hash, 4096)),
         );
         fs.root.insert(OsStr::new("external"), Inode::leaf(ext_id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("mixed_types", image.into()));
-    }
+        fs
+    });
 
     // 13. Hardlink — two entries sharing the same LeafId (nlink > 1)
-    {
+    push_all_versions(&mut seeds, "hardlink", || {
         let mut fs = empty_root();
         let shared_id = fs.push_leaf(
             file_stat(),
@@ -263,12 +274,11 @@ fn main() {
             .insert(OsStr::new("original"), Inode::leaf(shared_id));
         fs.root
             .insert(OsStr::new("hardlink"), Inode::leaf(shared_id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("hardlink", image.into()));
-    }
+        fs
+    });
 
     // 14. Large inline — file with maximum inline content (just under 4096 bytes)
-    {
+    push_all_versions(&mut seeds, "large_inline", || {
         let mut fs = empty_root();
         let content = vec![0xABu8; 4000]; // just under block size
         let id = fs.push_leaf(
@@ -277,18 +287,15 @@ fn main() {
         );
         fs.root
             .insert(OsStr::new("large_inline.bin"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("large_inline", image.into()));
-    }
+        fs
+    });
 
     // 15. Deep nesting — 8 levels of directories
-    {
+    push_all_versions(&mut seeds, "deep_nesting", || {
         let mut fs = empty_root();
         let id = fs.push_leaf(
             file_stat(),
-            LeafContent::Regular(RegularFile::Inline(
-                b"deep".to_vec().into_boxed_slice(),
-            )),
+            LeafContent::Regular(RegularFile::Inline(b"deep".to_vec().into_boxed_slice())),
         );
         let names = ["d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8"];
         let mut current = &mut fs.root;
@@ -296,45 +303,36 @@ fn main() {
             current = insert_dir(current, name, dir_stat());
         }
         current.insert(OsStr::new("deep_file"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("deep_nesting", image.into()));
-    }
+        fs
+    });
 
     // 16. Nonzero mtime
-    {
+    push_all_versions(&mut seeds, "nonzero_mtime", || {
         let mut fs = FileSystem::new(stat(0o755, 0, 0, 1000000));
         let id1 = fs.push_leaf(
             stat(0o644, 0, 0, 500000),
-            LeafContent::Regular(RegularFile::Inline(
-                b"old file".to_vec().into_boxed_slice(),
-            )),
+            LeafContent::Regular(RegularFile::Inline(b"old file".to_vec().into_boxed_slice())),
         );
         let id2 = fs.push_leaf(
             stat(0o644, 0, 0, 1700000000),
-            LeafContent::Regular(RegularFile::Inline(
-                b"new file".to_vec().into_boxed_slice(),
-            )),
+            LeafContent::Regular(RegularFile::Inline(b"new file".to_vec().into_boxed_slice())),
         );
         fs.root.insert(OsStr::new("old"), Inode::leaf(id1));
         fs.root.insert(OsStr::new("new"), Inode::leaf(id2));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("nonzero_mtime", image.into()));
-    }
+        fs
+    });
 
     // 17. Large uid/gid — forces extended inodes
-    {
+    push_all_versions(&mut seeds, "large_uid_gid", || {
         let big_id = u16::MAX as u32 + 1; // 65536, won't fit in u16
         let mut fs = FileSystem::new(stat(0o755, big_id, big_id, 0));
         let id = fs.push_leaf(
             stat(0o644, big_id, big_id, 0),
-            LeafContent::Regular(RegularFile::Inline(
-                b"big ids".to_vec().into_boxed_slice(),
-            )),
+            LeafContent::Regular(RegularFile::Inline(b"big ids".to_vec().into_boxed_slice())),
         );
         fs.root.insert(OsStr::new("bigids.txt"), Inode::leaf(id));
-        let image = mkfs_erofs(&fs);
-        seeds.push(("large_uid_gid", image.into()));
-    }
+        fs
+    });
 
     // Write seeds to corpus directories for both fuzz targets
     let targets = ["read_image", "debug_image"];

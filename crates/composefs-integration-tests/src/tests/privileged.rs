@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail, ensure};
 use xshell::{Shell, cmd};
 
 use composefs_oci::composefs::fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue};
-use composefs_oci::composefs::repository::Repository;
+use composefs_oci::composefs::repository::{Repository, RepositoryConfig};
 
 use crate::{cfsctl, integration_test};
 
@@ -665,8 +665,11 @@ fn init_insecure_repo_at<ObjectID: FsVerityHashValue>(
         rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::RDONLY,
         0.into(),
     )?;
-    let (mut repo, _created) = Repository::<ObjectID>::init_path(&fd, ".", algorithm, false)?;
-    repo.set_insecure();
+    let (repo, _created) = Repository::<ObjectID>::init_path(
+        &fd,
+        ".",
+        RepositoryConfig::new(algorithm).set_insecure(),
+    )?;
     Ok(Arc::new(repo))
 }
 

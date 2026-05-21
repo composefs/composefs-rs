@@ -408,6 +408,7 @@ fn stat_fd(fd: &OwnedFd, ifmt: FileType) -> Result<(rustix::fs::Stat, generic_tr
             st_uid: buf.st_uid,
             st_gid: buf.st_gid,
             st_mtim_sec: buf.st_mtime as i64,
+            st_mtim_nsec: buf.st_mtime_nsec as u32,
             xattrs: read_xattrs(fd)?,
         },
     ))
@@ -458,14 +459,16 @@ struct FilesystemScanner {
     inodes: HashMap<FileDevIno, generic_tree::LeafId>,
     leaves: Vec<generic_tree::Leaf<PendingFile>>,
     handler: ChannelHandler,
+    hardlinks: HardlinkBehavior,
 }
 
 impl FilesystemScanner {
-    fn new(handler: ChannelHandler) -> Self {
+    fn new(handler: ChannelHandler, hardlinks: HardlinkBehavior) -> Self {
         Self {
             inodes: HashMap::new(),
             leaves: Vec::new(),
             handler,
+            hardlinks,
         }
     }
 
@@ -560,20 +563,27 @@ impl FilesystemScanner {
 
         let (buf, stat) = stat_fd(&fd, ifmt)?;
 
-        // NB: We could check `st_nlink > 1` to find out if we should track a file as a potential
-        // hardlink or not, but some filesystems (like fuse-overlayfs) can report this incorrectly.
-        // Track all files.  https://github.com/containers/fuse-overlayfs/issues/435
-        let key = FileDevIno {
-            dev: buf.st_dev,
-            ino: buf.st_ino,
-        };
-        if let Some(&id) = self.inodes.get(&key) {
-            Ok(id)
-        } else {
+        if self.hardlinks == HardlinkBehavior::Tracked {
+            // NB: We could check `st_nlink > 1` to find out if we should track a file as a
+            // potential hardlink or not, but some filesystems (like fuse-overlayfs) can report
+            // this incorrectly.  Track all files.
+            // https://github.com/containers/fuse-overlayfs/issues/435
+            let key = FileDevIno {
+                dev: buf.st_dev,
+                ino: buf.st_ino,
+            };
+            if let Some(&id) = self.inodes.get(&key) {
+                return Ok(id);
+            }
             let content = self.scan_leaf_content(fd, &buf)?;
             let id = self.push_leaf(stat, content);
             self.inodes.insert(key, id);
             Ok(id)
+        } else {
+            // No deduplication: every path gets its own inode (i_nlink == 1),
+            // matching the behaviour of the C mkcomposefs tool.
+            let content = self.scan_leaf_content(fd, &buf)?;
+            Ok(self.push_leaf(stat, content))
         }
     }
 
@@ -714,6 +724,26 @@ pub fn read_file<ObjectID: FsVerityHashValue>(
 // Async filesystem reading
 // ---------------------------------------------------------------------------
 
+/// Controls whether host hard links are deduplicated during a filesystem scan.
+///
+/// When scanning a live container rootfs the source hard links carry semantic
+/// meaning (they represent the same file object) and must be preserved so that
+/// the composefs image matches the one produced from the OCI tar layer stream.
+///
+/// When running as a drop-in replacement for the C `mkcomposefs` tool the
+/// default is [`HardlinkBehavior::Break`] for byte-for-byte compatibility; pass
+/// [`HardlinkBehavior::Tracked`] to opt in to deduplication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardlinkBehavior {
+    /// Deduplicate directory entries that share an inode into a single EROFS
+    /// leaf (i_nlink > 1).  This is the correct behaviour when scanning a real
+    /// container filesystem.
+    Tracked,
+    /// Treat every directory entry as an independent inode (i_nlink == 1),
+    /// matching the default output of the C `mkcomposefs` tool.
+    Break,
+}
+
 /// Load a filesystem tree from the given path, parallelizing verity
 /// computation and object storage across available cores.
 ///
@@ -721,7 +751,7 @@ pub fn read_file<ObjectID: FsVerityHashValue>(
 /// scan discovers large files, they are immediately dispatched for
 /// verity hashing on the async runtime while the scan continues.
 ///
-/// Hardlinks are deduplicated — each unique inode is processed only once.
+/// Hard links are deduplicated — each unique inode is processed only once.
 ///
 /// If `repo` is `Some`, file objects are stored in the repository.
 /// If `None`, fsverity digests are computed without writing to disk.
@@ -736,7 +766,7 @@ pub async fn read_filesystem<ObjectID: FsVerityHashValue>(
 ) -> Result<FileSystem<ObjectID>> {
     let store: Option<Arc<dyn ObjectStore<ObjectID>>> =
         repo.map(|r| r as Arc<dyn ObjectStore<ObjectID>>);
-    read_filesystem_impl(dirfd, path, store, None).await
+    read_filesystem_impl(dirfd, path, store, None, HardlinkBehavior::Tracked).await
 }
 
 /// Options for [`read_filesystem_with_opts`].
@@ -747,6 +777,8 @@ pub struct ReadFilesystemOpts<ObjectID: FsVerityHashValue> {
     /// Override the default concurrency limit. When `None`, the semaphore is
     /// derived from the store (if any) or from [`available_parallelism`].
     pub semaphore: Option<Arc<Semaphore>>,
+    /// Controls how hard links are handled during the scan.
+    pub hardlinks: HardlinkBehavior,
 }
 
 impl<ObjectID: FsVerityHashValue> std::fmt::Debug for ReadFilesystemOpts<ObjectID> {
@@ -754,6 +786,7 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for ReadFilesystemOpts<ObjectI
         f.debug_struct("ReadFilesystemOpts")
             .field("store", &self.store.as_ref().map(|_| "<store>"))
             .field("semaphore", &self.semaphore)
+            .field("hardlinks", &self.hardlinks)
             .finish()
     }
 }
@@ -763,11 +796,13 @@ impl<ObjectID: FsVerityHashValue> Default for ReadFilesystemOpts<ObjectID> {
         Self {
             store: None,
             semaphore: None,
+            hardlinks: HardlinkBehavior::Tracked,
         }
     }
 }
 
-/// Like [`read_filesystem`] but with full control over store and concurrency.
+/// Like [`read_filesystem`] but with full control over store, concurrency, and
+/// hard-link behaviour.
 ///
 /// This is the preferred entry point when you need to supply a custom
 /// [`ObjectStore`] (e.g. [`FlatDigestStore`] for C-compatible `--digest-store`
@@ -778,7 +813,7 @@ pub async fn read_filesystem_with_opts<ObjectID: FsVerityHashValue>(
     path: PathBuf,
     opts: ReadFilesystemOpts<ObjectID>,
 ) -> Result<FileSystem<ObjectID>> {
-    read_filesystem_impl(dirfd, path, opts.store, opts.semaphore).await
+    read_filesystem_impl(dirfd, path, opts.store, opts.semaphore, opts.hardlinks).await
 }
 
 async fn read_filesystem_impl<ObjectID: FsVerityHashValue>(
@@ -786,6 +821,7 @@ async fn read_filesystem_impl<ObjectID: FsVerityHashValue>(
     path: PathBuf,
     store: Option<Arc<dyn ObjectStore<ObjectID>>>,
     semaphore_override: Option<Arc<Semaphore>>,
+    hardlinks: HardlinkBehavior,
 ) -> Result<FileSystem<ObjectID>> {
     let semaphore = semaphore_override.unwrap_or_else(|| {
         store
@@ -819,7 +855,7 @@ async fn read_filesystem_impl<ObjectID: FsVerityHashValue>(
     // items over the channel as files are discovered.
     tasks.spawn_blocking(move || {
         let handler = ChannelHandler { tx };
-        let mut scanner = FilesystemScanner::new(handler);
+        let mut scanner = FilesystemScanner::new(handler, hardlinks);
         let fs = scanner
             .scan(&dirfd, path.as_os_str())
             .with_context(|| format!("Async reading filesystem from {}", path.display()))?;
@@ -940,6 +976,7 @@ mod tests {
             st_uid: 0,
             st_gid: 0,
             st_mtim_sec: Default::default(),
+            st_mtim_nsec: Default::default(),
             xattrs: Default::default(),
         };
         set_file_contents(&td, OsStr::new("testfile"), &st, b"new contents").unwrap();

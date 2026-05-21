@@ -456,6 +456,7 @@ pub fn get_entry<ObjectID: FsVerityHashValue>(
                             st_gid: entry.gid as u32,
                             st_mode: entry.mode,
                             st_mtim_sec: entry.mtime as i64,
+                            st_mtim_nsec: 0,
                             xattrs,
                         },
                         item,
@@ -475,7 +476,9 @@ mod tests {
 
     use super::*;
     use composefs::{
-        fsverity::Sha256HashValue, generic_tree::LeafContent, repository::Repository,
+        fsverity::Sha256HashValue,
+        generic_tree::LeafContent,
+        repository::{Repository, RepositoryConfig},
         splitstream::SplitStreamReader,
     };
     use std::{io::Read, path::Path, sync::Arc};
@@ -493,8 +496,7 @@ mod tests {
         let (repo, _) = Repository::init_path(
             rustix::fs::CWD,
             &repo_path,
-            composefs::fsverity::Algorithm::SHA256,
-            false,
+            RepositoryConfig::default().set_insecure(),
         )?;
 
         // Store tempdir in static to keep it alive

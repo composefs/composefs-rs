@@ -11,8 +11,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::Result;
-use composefs_oci::composefs::fsverity::{Algorithm, Sha256HashValue};
-use composefs_oci::composefs::repository::Repository;
+use composefs_oci::composefs::fsverity::Sha256HashValue;
+use composefs_oci::composefs::repository::{Repository, RepositoryConfig};
 use tempfile::TempDir;
 
 /// A test function that returns a Result.
@@ -110,9 +110,11 @@ pub fn create_test_repository(tempdir: &TempDir) -> Result<Arc<Repository<Sha256
         0.into(),
     )?;
 
-    let (mut repo, _created) =
-        Repository::<Sha256HashValue>::init_path(&fd, ".", Algorithm::SHA256, false)?;
-    repo.set_insecure();
+    let (repo, _created) = Repository::<Sha256HashValue>::init_path(
+        &fd,
+        ".",
+        RepositoryConfig::default().set_insecure(),
+    )?;
     Ok(Arc::new(repo))
 }
 

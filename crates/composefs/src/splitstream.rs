@@ -1168,8 +1168,11 @@ mod tests {
 
     /// Create a test repository in insecure mode (no fs-verity required).
     fn create_test_repo(path: &Path) -> Result<Arc<Repository<Sha256HashValue>>> {
-        let (repo, _) =
-            Repository::init_path(CWD, path, crate::fsverity::Algorithm::SHA256, false)?;
+        let (repo, _) = Repository::init_path(
+            CWD,
+            path,
+            crate::repository::RepositoryConfig::default().set_insecure(),
+        )?;
         Ok(Arc::new(repo))
     }
 

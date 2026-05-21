@@ -24,7 +24,7 @@ use crate::oci_image::write_manifest;
 use crate::skopeo::OCI_CONFIG_CONTENT_TYPE;
 use composefs::dumpfile_parse::{Entry, Item};
 use composefs::fsverity::Sha256HashValue;
-use composefs::repository::Repository;
+use composefs::repository::{Repository, RepositoryConfig};
 use containers_image_proxy::oci_spec::image::{
     ConfigBuilder, DescriptorBuilder, Digest as OciDigest, ImageConfigurationBuilder,
     ImageManifestBuilder, MediaType, RootFsBuilder,
@@ -639,13 +639,11 @@ pub async fn create_bootable_image(
 /// paths rather than `Repository` handles. Opens the repo, creates the
 /// image with `create_base_image`, generates the EROFS, and returns.
 pub fn create_test_oci_image(repo_path: &std::path::Path, tag: &str) -> anyhow::Result<()> {
-    let (mut repo, _) = Repository::<Sha256HashValue>::init_path(
+    let (repo, _) = Repository::<Sha256HashValue>::init_path(
         rustix::fs::CWD,
         repo_path,
-        composefs::fsverity::Algorithm::SHA256,
-        false,
+        RepositoryConfig::default().set_insecure(),
     )?;
-    repo.set_insecure();
     let repo = Arc::new(repo);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(create_base_image(&repo, Some(tag)));
@@ -663,13 +661,11 @@ pub fn create_test_bootable_oci_image(
     repo_path: &std::path::Path,
     tag: &str,
 ) -> anyhow::Result<()> {
-    let (mut repo, _) = Repository::<Sha256HashValue>::init_path(
+    let (repo, _) = Repository::<Sha256HashValue>::init_path(
         rustix::fs::CWD,
         repo_path,
-        composefs::fsverity::Algorithm::SHA256,
-        false,
+        RepositoryConfig::default().set_insecure(),
     )?;
-    repo.set_insecure();
     let repo = Arc::new(repo);
     let rt = tokio::runtime::Runtime::new()?;
     let img = rt.block_on(create_bootable_image(&repo, Some(tag), 1));

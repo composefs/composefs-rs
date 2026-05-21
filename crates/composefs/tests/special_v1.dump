@@ -1,0 +1,7 @@
+/ 4096 40555 2 0 0 0 1633950376.0 - - - trusted.foo1=bar-1 user.foo2=bar-2
+/blockdev 0 60777 1 0 0 107690 1633950376.0 - - - trusted.bar=bar-2
+/chardev 0 20777 1 0 0 10769 1633950376.0 - - - trusted.foo=bar-2
+/escaped-xattr 0 100777 1 0 0 0 1633950376.0 - - - trusted.overlay.redirect=/foo\n user.overlay.redirect=/foo\n user.foo=bar-2
+/fifo 0 10777 1 0 0 0 1633950376.0 - - - trusted.bar=bar-2
+/inline 15 100777 1 0 0 0 1633950376.0 - FOOBAR\nINAFILE\n - user.foo=bar-2
+/whiteout 0 20777 1 0 0 0 1633950376.0 - - - trusted.foo=bar-2
