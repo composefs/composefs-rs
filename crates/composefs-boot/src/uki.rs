@@ -104,9 +104,9 @@ pub fn get_text_section<'a>(
     std::str::from_utf8(bytes).or(Err(UkiError::UnicodeError(section_name.into())))
 }
 
-/// Buffered version of [`get_text_section`]. 
+/// Buffered version of [`get_text_section`].
 ///
-/// See [`get_text_section`] for details. This version works with any [`Read`] + [`Seek`] 
+/// See [`get_text_section`] for details. This version works with any [`Read`] + [`Seek`]
 /// source instead of requiring the entire image in memory.
 pub fn get_text_section_buffered<'a, R: Read + Seek>(
     image: &'a mut R,
@@ -179,7 +179,7 @@ pub fn get_section<'a>(
 
 /// Buffered version of [`get_section`].
 ///
-/// See [`get_section`] for details. This version works with any [`Read`] + [`Seek`] 
+/// See [`get_section`] for details. This version works with any [`Read`] + [`Seek`]
 /// source and returns owned data instead of borrowed slices.
 pub fn get_section_buffered<R: Read + Seek>(
     image: &mut R,
@@ -352,8 +352,16 @@ ID=pretty-os
 "#,
         );
 
+        // Test slice-based functions
         assert_eq!(
             get_boot_label(uki.as_ref()).unwrap(),
+            "prettyOS Rocky Racoon"
+        );
+
+        // Test buffered functions produce same results
+        let mut cursor = std::io::Cursor::new(&uki);
+        assert_eq!(
+            get_boot_label_buffered(&mut cursor).unwrap(),
             "prettyOS Rocky Racoon"
         );
     }
@@ -369,6 +377,13 @@ ID=pretty-os
         fn no_sec(img: &[u8]) {
             assert!(matches!(
                 get_boot_label(img),
+                Err(UkiError::MissingSection(s)) if s == ".osrel"
+            ));
+
+            // Test buffered version
+            let mut cursor = std::io::Cursor::new(img);
+            assert!(matches!(
+                get_boot_label_buffered(&mut cursor),
                 Err(UkiError::MissingSection(s)) if s == ".osrel"
             ));
         }
@@ -412,5 +427,94 @@ ID=pretty-os
             }],
             &[],
         ));
+    }
+
+    #[test]
+    fn test_section_functions() {
+        let osrel_data = b"PRETTY_NAME='TestOS'\nVERSION_ID=1.0\n";
+        let cmdline_data = b"root=/dev/sda1 quiet";
+
+        let osrel_offset = data_offset(2);
+        let cmdline_offset = osrel_offset + osrel_data.len();
+
+        let uki = peify(
+            b"",
+            &[
+                SectionHeader {
+                    name: *b".osrel\0\0",
+                    virtual_size: U32::new(osrel_data.len() as u32),
+                    pointer_to_raw_data: U32::new(osrel_offset as u32),
+                    ..Default::default()
+                },
+                SectionHeader {
+                    name: *b".cmdline",
+                    virtual_size: U32::new(cmdline_data.len() as u32),
+                    pointer_to_raw_data: U32::new(cmdline_offset as u32),
+                    ..Default::default()
+                },
+            ],
+            &[osrel_data, cmdline_data],
+        );
+
+        // Test slice-based functions
+        let osrel_section = get_section(&uki, ".osrel").unwrap().unwrap();
+        assert_eq!(osrel_section, osrel_data);
+
+        let cmdline_section = get_section(&uki, ".cmdline").unwrap().unwrap();
+        assert_eq!(cmdline_section, cmdline_data);
+
+        let osrel_text = get_text_section(&uki, ".osrel").unwrap();
+        assert_eq!(osrel_text, "PRETTY_NAME='TestOS'\nVERSION_ID=1.0\n");
+
+        let cmdline_text = get_cmdline(&uki).unwrap();
+        assert_eq!(cmdline_text, "root=/dev/sda1 quiet");
+
+        // Test buffered functions produce same results
+        let mut cursor = std::io::Cursor::new(&uki);
+        let osrel_section_buf = get_section_buffered(&mut cursor, ".osrel").unwrap();
+        assert_eq!(osrel_section_buf, osrel_data);
+
+        cursor.set_position(0);
+        let cmdline_section_buf = get_section_buffered(&mut cursor, ".cmdline").unwrap();
+        assert_eq!(cmdline_section_buf, cmdline_data);
+
+        cursor.set_position(0);
+        let osrel_text_buf = get_text_section_buffered(&mut cursor, ".osrel").unwrap();
+        assert_eq!(osrel_text_buf, "PRETTY_NAME='TestOS'\nVERSION_ID=1.0\n");
+
+        cursor.set_position(0);
+        let cmdline_text_buf = get_cmdline_buffered(&mut cursor).unwrap();
+        assert_eq!(cmdline_text_buf, "root=/dev/sda1 quiet");
+
+        // Test missing section
+        cursor.set_position(0);
+        let missing_result = get_section_buffered(&mut cursor, ".missing");
+        assert!(matches!(missing_result, Err(UkiError::MissingSection(s)) if s == ".missing"));
+    }
+
+    #[test]
+    fn test_invalid_utf8() {
+        let invalid_utf8 = b"\xff\xfe\xfd";
+        let osrel_offset = data_offset(1);
+
+        let uki = peify(
+            b"",
+            &[SectionHeader {
+                name: *b".osrel\0\0",
+                virtual_size: U32::new(invalid_utf8.len() as u32),
+                pointer_to_raw_data: U32::new(osrel_offset as u32),
+                ..Default::default()
+            }],
+            &[invalid_utf8],
+        );
+
+        // Test slice-based function
+        let result = get_text_section(&uki, ".osrel");
+        assert!(matches!(result, Err(UkiError::UnicodeError(s)) if s == ".osrel"));
+
+        // Test buffered function gives same error
+        let mut cursor = std::io::Cursor::new(&uki);
+        let result_buf = get_text_section_buffered(&mut cursor, ".osrel");
+        assert!(matches!(result_buf, Err(UkiError::UnicodeError(s)) if s == ".osrel"));
     }
 }
