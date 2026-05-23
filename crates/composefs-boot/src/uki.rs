@@ -5,6 +5,7 @@
 //! Specification Type 2 requirements for UKI boot entries, including extraction of boot
 //! labels from os-release information embedded in the UKI binary.
 
+use std::io::{Read, Seek, SeekFrom};
 use thiserror::Error;
 use zerocopy::{
     FromBytes, Immutable, KnownLayout,
@@ -62,17 +63,20 @@ struct SectionHeader {
 }
 
 /// Errors that can occur when parsing UKI files.
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Error)]
 pub enum UkiError {
+    /// IO Error while reading or seeking
+    #[error("IO Error")]
+    Io(#[from] std::io::Error),
     /// The file is not a valid Portable Executable (PE/EFI) format
     #[error("UKI is not valid EFI executable")]
     PortableExecutableError,
     /// A required PE section is missing from the UKI
     #[error("UKI doesn't contain a '{0}' section")]
-    MissingSection(&'static str),
+    MissingSection(String),
     /// A PE section contains invalid UTF-8
     #[error("UKI section '{0}' is not UTF-8")]
-    UnicodeError(&'static str),
+    UnicodeError(String),
     /// The .osrel section lacks name information
     #[error("No name information found in .osrel section")]
     NoName,
@@ -97,7 +101,19 @@ pub fn get_text_section<'a>(
     section_name: &'static str,
 ) -> Result<&'a str, UkiError> {
     let bytes = get_section(image, section_name).ok_or(UkiError::PortableExecutableError)??;
-    std::str::from_utf8(bytes).or(Err(UkiError::UnicodeError(section_name)))
+    std::str::from_utf8(bytes).or(Err(UkiError::UnicodeError(section_name.into())))
+}
+
+/// Buffered version of [`get_text_section`]. 
+///
+/// See [`get_text_section`] for details. This version works with any [`Read`] + [`Seek`] 
+/// source instead of requiring the entire image in memory.
+pub fn get_text_section_buffered<'a, R: Read + Seek>(
+    image: &'a mut R,
+    section_name: &'a str,
+) -> Result<String, UkiError> {
+    let bytes = get_section_buffered(image, section_name)?;
+    String::from_utf8(bytes).or(Err(UkiError::UnicodeError(section_name.into())))
 }
 
 /// Extracts a raw section from a UKI PE file by name.
@@ -158,7 +174,64 @@ pub fn get_section<'a>(
         }
     }
 
-    Some(Err(UkiError::MissingSection(section_name)))
+    Some(Err(UkiError::MissingSection(section_name.into())))
+}
+
+/// Buffered version of [`get_section`].
+///
+/// See [`get_section`] for details. This version works with any [`Read`] + [`Seek`] 
+/// source and returns owned data instead of borrowed slices.
+pub fn get_section_buffered<R: Read + Seek>(
+    image: &mut R,
+    section_name: &str,
+) -> Result<Vec<u8>, UkiError> {
+    use std::io::Error as IOError;
+
+    // Turn the section_name ".osrel" into a section_key b".osrel\0\0".
+    // This will panic if section_name.len() > 8, which is what we want.
+    let mut section_key = [0u8; 8];
+    section_key[..section_name.len()].copy_from_slice(section_name.as_bytes());
+
+    // Skip the DOS stub
+    let mut buf: Vec<u8> = vec![0; std::mem::size_of::<DosStub>()];
+    image.read_exact(&mut buf)?;
+    let dos_stub =
+        DosStub::ref_from_bytes(&buf).map_err(|e| UkiError::Io(IOError::other(e.to_string())))?;
+    image.seek(SeekFrom::Start(dos_stub.pe_offset.get() as u64))?;
+
+    // Get the PE header
+    let mut buf: Vec<u8> = vec![0; std::mem::size_of::<PeHeader>()];
+    image.read_exact(&mut buf)?;
+    let pe_header =
+        PeHeader::ref_from_bytes(&buf).map_err(|e| UkiError::Io(IOError::other(e.to_string())))?;
+    if pe_header.pe_magic != PE_MAGIC {
+        return Err(UkiError::PortableExecutableError);
+    }
+
+    // Skip the optional header
+    image.seek(SeekFrom::Current(
+        pe_header.coff_file_header.size_of_optional_header.get() as i64,
+    ))?;
+
+    // Try to load the section headers
+    let n_sections = pe_header.coff_file_header.number_of_sections.get() as usize;
+    let mut sections = vec![0; std::mem::size_of::<SectionHeader>() * n_sections];
+    image.read_exact(&mut sections)?;
+    let sections = <[SectionHeader]>::ref_from_bytes_with_elems(&sections, n_sections)
+        .map_err(|e| UkiError::Io(IOError::other(e.to_string())))?;
+
+    for section in sections {
+        if section.name != section_key {
+            continue;
+        }
+
+        let mut buffer = vec![0; section.virtual_size.get() as usize];
+        image.seek(SeekFrom::Start(section.pointer_to_raw_data.get() as u64))?;
+        image.read_exact(&mut buffer)?;
+        return Ok(buffer);
+    }
+
+    Err(UkiError::MissingSection(section_name.to_string()))
 }
 
 /// Gets an appropriate label for display in the boot menu for the given UKI image, according to
@@ -189,9 +262,24 @@ pub fn get_boot_label(image: &[u8]) -> Result<String, UkiError> {
         .ok_or(UkiError::NoName)
 }
 
+/// Buffered version of [`get_boot_label`].
+///
+/// See [`get_boot_label`] for details. This version works with any [`Read`] + [`Seek`] source.
+pub fn get_boot_label_buffered<R: Read + Seek>(image: &mut R) -> Result<String, UkiError> {
+    let osrel = get_text_section_buffered(image, ".osrel")?;
+    OsReleaseInfo::parse(&osrel)
+        .get_boot_label()
+        .ok_or(UkiError::NoName)
+}
+
 /// Gets the contents of the .cmdline section of a UKI.
 pub fn get_cmdline(image: &[u8]) -> Result<&str, UkiError> {
     get_text_section(image, ".cmdline")
+}
+
+/// Buffered version of [`get_cmdline`]. See [`get_cmdline`] for details.
+pub fn get_cmdline_buffered<R: Read + Seek>(image: &mut R) -> Result<String, UkiError> {
+    get_text_section_buffered(image, ".cmdline")
 }
 
 #[cfg(test)]
@@ -273,10 +361,16 @@ ID=pretty-os
     #[test]
     fn test_bad_pe() {
         fn pe_err(img: &[u8]) {
-            assert_eq!(get_boot_label(img), Err(UkiError::PortableExecutableError));
+            assert!(matches!(
+                get_boot_label(img),
+                Err(UkiError::PortableExecutableError)
+            ));
         }
         fn no_sec(img: &[u8]) {
-            assert_eq!(get_boot_label(img), Err(UkiError::MissingSection(".osrel")));
+            assert!(matches!(
+                get_boot_label(img),
+                Err(UkiError::MissingSection(s)) if s == ".osrel"
+            ));
         }
 
         pe_err(b"");
