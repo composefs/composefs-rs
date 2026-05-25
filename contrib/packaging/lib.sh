@@ -33,9 +33,13 @@ pkg_install() {
             dnf clean all
             ;;
         debian|ubuntu)
+            export DEBIAN_FRONTEND=noninteractive
             debian_apt_init
             apt-get -o APT::Sandbox::User=root update
-            apt-get -o APT::Sandbox::User=root install -y --no-install-recommends "$@"
+            apt-get -o APT::Sandbox::User=root \
+                    -o Dpkg::Options::="--force-confold" \
+                    -o Dpkg::Options::="--force-confdef" \
+                install -y --no-install-recommends "$@"
             rm -rf /var/lib/apt/lists/*
             ;;
         *)
