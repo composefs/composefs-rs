@@ -15,6 +15,7 @@ default = ["containers-storage"]
 test = ["tar", "rand", "composefs/test"]
 boot = ["composefs-boot"]
 containers-storage = ["dep:cstorage", "dep:base64", "cstorage/userns-helper"]
+varlink = ['dep:zlink-core', 'composefs/varlink']
 
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
@@ -23,6 +24,7 @@ async-compression = { version = "0.4.0", default-features = false, features = ["
 base64 = { version = "0.22", default-features = false, features = ["std"], optional = true }
 bytes = { version = "1", default-features = false }
 composefs = { workspace = true }
+zlink-core = { workspace = true, optional = true }
 composefs-boot = { workspace = true, optional = true }
 containers-image-proxy = { version = "0.10", default-features = false }
 cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.4.0", optional = true }

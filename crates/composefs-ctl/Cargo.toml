@@ -19,7 +19,7 @@ path = "src/main.rs"
 [features]
 default = ['pre-6.15', 'oci', 'containers-storage']
 http = ['composefs-http']
-oci = ['composefs-oci']
+oci = ['composefs-oci', 'composefs-oci/varlink']
 containers-storage = ['composefs-oci/containers-storage', 'cstorage']
 rhel9 = ['composefs/rhel9']
 'pre-6.15' = ['composefs/pre-6.15']
@@ -29,7 +29,7 @@ anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
 clap = { version = "4.5.0", default-features = false, features = ["std", "help", "usage", "derive", "wrap_help"] }
 comfy-table = { version = "7.1", default-features = false }
-composefs = { workspace = true }
+composefs = { workspace = true, features = ["varlink"] }
 composefs-boot = { workspace = true }
 composefs-oci = { workspace = true, optional = true, features = ["boot"] }
 composefs-http = { workspace = true, optional = true }
@@ -37,10 +37,13 @@ cstorage = { package = "composefs-storage", path = "../composefs-storage", versi
 env_logger = { version = "0.11.0", default-features = false }
 hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.17.0", default-features = false }
+libsystemd = { version = "0.7" }
+log = { version = "0.4", default-features = false }
 rustix = { version = "1.0.0", default-features = false, features = ["fs", "process"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-tokio = { version = "1.24.2", default-features = false, features = ["io-std", "io-util"] }
+tokio = { version = "1.24.2", default-features = false, features = ["io-std", "io-util", "net", "rt", "sync"] }
+zlink = { workspace = true }
 
 [lints]
 workspace = true

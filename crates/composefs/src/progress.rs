@@ -21,6 +21,14 @@ impl ComponentId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Consume the id and return the owned underlying string.
+    ///
+    /// Useful when converting an owned [`ProgressEvent`] into another
+    /// representation without re-allocating the identifier.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
 }
 
 impl<S: Into<String>> From<S> for ComponentId {

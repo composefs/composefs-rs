@@ -38,11 +38,13 @@ composefs-ioctls = { version = "0.4.0", path = "crates/composefs-ioctls", defaul
 composefs-oci = { version = "0.4.0", path = "crates/composefs-oci", default-features = false }
 composefs-boot = { version = "0.4.0", path = "crates/composefs-boot", default-features = false }
 composefs-http = { version = "0.4.0", path = "crates/composefs-http", default-features = false }
-cap-std-ext = "5.0"
+cap-std-ext = "5.1.2"
 ocidir = "0.7.2"
 
 # JSON-RPC with FD passing for userns helper
 jsonrpc-fdpass = { version = "0.1.0", default-features = false }
+zlink = { version = "0.5", default-features = false, features = ["tokio", "introspection", "proxy", "server", "service", "tracing"] }
+zlink-core = { version = "0.5", default-features = false, features = ["introspection", "std", "tracing"] }
 
 [profile.dev.package.sha2]
 # this is *really* slow otherwise

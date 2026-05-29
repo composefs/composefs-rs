@@ -36,6 +36,10 @@ composefs = { workspace = true }
 # Only the test_util module is used — for creating test OCI images.
 # All verification must go through the cfsctl CLI.
 composefs-oci = { workspace = true, features = ["test", "boot", "containers-storage"] }
+# Used by the varlink tests to drive the service through zlink's native typed
+# proxy bindings (alongside the external `varlinkctl` CLI), and to assert on the
+# typed wire reply/error types.
+composefs-ctl = { workspace = true, features = ["oci"] }
 hex = "0.4"
 libtest-mimic = "0.8"
 linkme = "0.3"
@@ -48,6 +52,7 @@ tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 xshell = "0.2"
+zlink = { workspace = true }
 
 [lints]
 workspace = true

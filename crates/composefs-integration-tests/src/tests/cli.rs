@@ -19,7 +19,10 @@ const OCI_LAYOUT_COMPOSEFS_ID: &str = "f26c6eb439749b82f0d1520e83455bb21766572fb
 /// Create a fresh initialized insecure repository in a tempdir.
 ///
 /// Returns the tempdir (for lifetime) and the path to the repo.
-fn init_insecure_repo(sh: &Shell, cfsctl: &std::path::Path) -> Result<tempfile::TempDir> {
+pub(crate) fn init_insecure_repo(
+    sh: &Shell,
+    cfsctl: &std::path::Path,
+) -> Result<tempfile::TempDir> {
     let repo_dir = tempfile::tempdir()?;
     let repo = repo_dir.path();
     cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
@@ -199,11 +202,14 @@ fn test_oci_images_json_empty_repo() -> Result<()> {
     let repo = repo_dir.path();
 
     let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
-    // Empty JSON array
+    // Empty image list: { "images": [] }
     let parsed: serde_json::Value = serde_json::from_str(&output)?;
     assert!(
-        parsed.as_array().map(|a| a.is_empty()).unwrap_or(false),
-        "expected empty JSON array, got: {output}"
+        parsed["images"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(false),
+        "expected empty images array, got: {output}"
     );
     Ok(())
 }
@@ -212,7 +218,7 @@ integration_test!(test_oci_images_json_empty_repo);
 /// Creates a minimal OCI image layout directory for testing using the ocidir crate.
 ///
 /// Returns the path to the OCI layout directory.
-fn create_oci_layout(parent: &std::path::Path) -> Result<std::path::PathBuf> {
+pub(crate) fn create_oci_layout(parent: &std::path::Path) -> Result<std::path::PathBuf> {
     use cap_std_ext::cap_std;
     use ocidir::oci_spec::image::{
         ConfigBuilder, ImageConfigurationBuilder, Platform, PlatformBuilder, RootFsBuilder,
@@ -316,7 +322,7 @@ fn test_oci_pull_and_inspect() -> Result<()> {
     // List images as JSON
     let json_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
     let images: serde_json::Value = serde_json::from_str(&json_output)?;
-    let arr = images.as_array().expect("expected array");
+    let arr = images["images"].as_array().expect("expected images array");
     assert_eq!(arr.len(), 1, "expected 1 image");
     assert_eq!(arr[0]["name"], "test-image");
     assert_eq!(arr[0]["architecture"], "amd64");
@@ -622,7 +628,7 @@ integration_test!(test_dump_files);
 ///
 /// Walks `objects/XX/` directories, deletes the first regular file found,
 /// and replaces it with junk data. Panics if no object is found.
-fn corrupt_one_object(repo: &std::path::Path) -> Result<()> {
+pub(crate) fn corrupt_one_object(repo: &std::path::Path) -> Result<()> {
     use cap_std_ext::cap_std;
 
     let dir = cap_std::fs::Dir::open_ambient_dir(repo, cap_std::ambient_authority())?;
@@ -902,8 +908,8 @@ fn test_fsck_empty_repo() -> Result<()> {
     let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck --json").read()?;
     let v: serde_json::Value = serde_json::from_str(&output)?;
     assert_eq!(v["ok"], true);
-    assert_eq!(v["objectsChecked"], 0);
-    assert_eq!(v["objectsCorrupted"], 0);
+    assert_eq!(v["objects_checked"], 0);
+    assert_eq!(v["objects_corrupted"], 0);
     assert!(v["errors"].as_array().unwrap().is_empty());
     Ok(())
 }
@@ -926,8 +932,8 @@ fn test_fsck_healthy_repo() -> Result<()> {
     let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck --json").read()?;
     let v: serde_json::Value = serde_json::from_str(&output)?;
     assert_eq!(v["ok"], true);
-    assert!(v["objectsChecked"].as_u64().unwrap() > 0);
-    assert_eq!(v["objectsCorrupted"], 0);
+    assert!(v["objects_checked"].as_u64().unwrap() > 0);
+    assert_eq!(v["objects_corrupted"], 0);
     assert!(v["errors"].as_array().unwrap().is_empty());
     Ok(())
 }
@@ -951,7 +957,7 @@ fn test_fsck_detects_corrupted_object() -> Result<()> {
     let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck --json").read()?;
     let v: serde_json::Value = serde_json::from_str(&output)?;
     assert_eq!(v["ok"], false);
-    assert!(v["objectsCorrupted"].as_u64().unwrap() > 0);
+    assert!(v["objects_corrupted"].as_u64().unwrap() > 0);
     assert!(!v["errors"].as_array().unwrap().is_empty());
     Ok(())
 }
@@ -997,8 +1003,8 @@ fn test_oci_fsck_healthy() -> Result<()> {
     let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci fsck --json").read()?;
     let v: serde_json::Value = serde_json::from_str(&output)?;
     assert_eq!(v["ok"], true);
-    assert_eq!(v["imagesChecked"], 1);
-    assert_eq!(v["imagesCorrupted"], 0);
+    assert_eq!(v["images_checked"], 1);
+    assert_eq!(v["images_corrupted"], 0);
     Ok(())
 }
 integration_test!(test_oci_fsck_healthy);
@@ -1070,7 +1076,7 @@ fn test_oci_fsck_single_image() -> Result<()> {
     .read()?;
     let v: serde_json::Value = serde_json::from_str(&output)?;
     assert_eq!(v["ok"], true);
-    assert_eq!(v["imagesChecked"], 1);
+    assert_eq!(v["images_checked"], 1);
 
     // A nonexistent image is a hard error (not a corruption finding)
     cmd!(
@@ -1214,7 +1220,7 @@ fn test_fsck_detects_broken_image_ref() -> Result<()> {
     let output = cmd!(sh, "{cfsctl} --insecure --repo {repo} fsck --json").read()?;
     let v: serde_json::Value = serde_json::from_str(&output)?;
     assert_eq!(v["ok"], false);
-    assert!(v["brokenLinks"].as_u64().unwrap() > 0);
+    assert!(v["broken_links"].as_u64().unwrap() > 0);
     Ok(())
 }
 integration_test!(test_fsck_detects_broken_image_ref);
@@ -1441,7 +1447,7 @@ fn test_oci_tag_and_untag() -> Result<()> {
     // Both tags should appear in list
     let list_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
     let images: serde_json::Value = serde_json::from_str(&list_output)?;
-    let names: Vec<&str> = images
+    let names: Vec<&str> = images["images"]
         .as_array()
         .unwrap()
         .iter()
@@ -1459,7 +1465,7 @@ fn test_oci_tag_and_untag() -> Result<()> {
     // Only the remaining tag should appear
     let list_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
     let images: serde_json::Value = serde_json::from_str(&list_output)?;
-    let names: Vec<&str> = images
+    let names: Vec<&str> = images["images"]
         .as_array()
         .unwrap()
         .iter()
@@ -1500,7 +1506,8 @@ fn test_oci_gc_removes_untagged() -> Result<()> {
 
     // Verify it exists
     let list_before = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
-    let images_before: Vec<serde_json::Value> = serde_json::from_str(&list_before)?;
+    let images_before: serde_json::Value = serde_json::from_str(&list_before)?;
+    let images_before = images_before["images"].as_array().expect("images array");
     assert_eq!(images_before.len(), 1, "expected 1 image before untag");
 
     // Untag it
@@ -1515,7 +1522,8 @@ fn test_oci_gc_removes_untagged() -> Result<()> {
 
     // Verify image is gone
     let list_after = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
-    let images_after: Vec<serde_json::Value> = serde_json::from_str(&list_after)?;
+    let images_after: serde_json::Value = serde_json::from_str(&list_after)?;
+    let images_after = images_after["images"].as_array().expect("images array");
     assert!(
         images_after.is_empty(),
         "expected no images after GC, got: {:?}",
@@ -1644,7 +1652,10 @@ fn test_compute_image_id() -> Result<()> {
     )
     .read()?;
     let inspect: serde_json::Value = serde_json::from_str(&inspect_output)?;
-    let config_digest = inspect["manifest"]["config"]["digest"]
+    // The inspect reply carries the manifest as a raw JSON string.
+    let manifest: serde_json::Value =
+        serde_json::from_str(inspect["manifest"].as_str().expect("manifest string"))?;
+    let config_digest = manifest["config"]["digest"]
         .as_str()
         .expect("expected config digest");
     // Digests must be prefixed with '@' to distinguish from named refs

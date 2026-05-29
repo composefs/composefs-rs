@@ -238,6 +238,11 @@ pub enum HelperError {
 /// 3. Exit when the parent closes the connection
 ///
 /// If this is not a helper process, this function returns immediately.
+//
+// Runs in a forked helper subprocess whose stdin is the IPC socket; there is
+// no logging facility or error channel back to the parent, so fatal
+// diagnostics are written to stderr before exiting.
+#[allow(clippy::print_stderr)]
 pub fn init_if_helper() {
     // Check if we're a helper via environment variable
     if std::env::var(HELPER_ENV).is_err() {

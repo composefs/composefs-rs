@@ -5,3 +5,4 @@ pub mod cstor;
 pub mod digest_stability;
 pub mod old_format;
 pub mod privileged;
+pub mod varlink;

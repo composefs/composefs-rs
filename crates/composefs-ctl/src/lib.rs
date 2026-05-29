@@ -22,6 +22,9 @@ pub use composefs_http;
 #[cfg(feature = "oci")]
 pub use composefs_oci;
 
+/// Varlink RPC service exposing repository operations over a Unix socket.
+pub mod varlink;
+
 #[cfg(any(feature = "oci", feature = "http"))]
 use std::collections::HashMap;
 use std::io::Read;
@@ -42,7 +45,6 @@ use comfy_table::{Table, presets::UTF8_FULL};
 #[cfg(any(feature = "oci", feature = "http"))]
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rustix::fs::{CWD, Mode, OFlags};
-use serde::Serialize;
 
 #[cfg(any(feature = "oci", feature = "http"))]
 use composefs::progress::{
@@ -151,23 +153,6 @@ impl ProgressReporter for IndicatifReporter {
     }
 }
 
-/// JSON output wrapper for `cfsctl fsck --json`.
-#[derive(Serialize)]
-struct FsckJsonOutput {
-    ok: bool,
-    #[serde(flatten)]
-    result: composefs::repository::FsckResult,
-}
-
-/// JSON output wrapper for `cfsctl oci fsck --json`.
-#[cfg(feature = "oci")]
-#[derive(Serialize)]
-struct OciFsckJsonOutput {
-    ok: bool,
-    #[serde(flatten)]
-    result: composefs_oci::OciFsckResult,
-}
-
 /// cfsctl
 #[derive(Debug, Parser)]
 #[clap(name = "cfsctl", version)]
@@ -241,7 +226,7 @@ pub enum HashType {
 /// start with `@`.
 #[cfg(feature = "oci")]
 #[derive(Debug, Clone)]
-enum OciReference {
+pub(crate) enum OciReference {
     /// A content-addressable digest such as `sha256:abcdef…`.
     Digest(composefs_oci::OciDigest),
     /// A named ref resolved through the repository's ref tree, typically
@@ -328,11 +313,6 @@ enum OciCommand {
         digest: composefs_oci::OciDigest,
         /// Optional human-readable name for the layer
         name: Option<String>,
-    },
-    /// List the contents of a stored tar layer
-    LsLayer {
-        /// Layer content digest, e.g. sha256:a1b2c3...
-        name: composefs_oci::OciDigest,
     },
     /// Dump the rootfs of a stored OCI image as a composefs dumpfile to stdout
     ///
@@ -463,6 +443,16 @@ enum OciCommand {
         #[clap(long)]
         json: bool,
     },
+    /// Serve the varlink RPC API on a Unix socket or systemd socket.
+    ///
+    /// Equivalent to `cfsctl varlink`: a single service answers both the
+    /// `org.composefs.Repository` and `org.composefs.Oci` interfaces on one
+    /// socket. Kept for discoverability under the `oci` subcommand.
+    Varlink {
+        /// Unix socket path to listen on (omit when using systemd socket activation).
+        #[clap(long)]
+        address: Option<PathBuf>,
+    },
 }
 
 /// Common options for reading a filesystem from a path
@@ -585,9 +575,23 @@ enum Command {
         /// Output results as JSON (always exits 0 unless the check itself fails)
         #[clap(long)]
         json: bool,
+        /// Skip per-object fs-verity verification; check only metadata and
+        /// symlink structure (much faster on large repositories)
+        #[clap(long)]
+        metadata_only: bool,
     },
     #[cfg(feature = "http")]
     Fetch { url: String, name: String },
+    /// Serve the varlink RPC API on a Unix socket or systemd socket.
+    ///
+    /// A single service answers both the `org.composefs.Repository` and (when
+    /// the `oci` feature is enabled) `org.composefs.Oci` interfaces on one
+    /// socket.
+    Varlink {
+        /// Unix socket path to listen on (omit when using systemd socket activation).
+        #[clap(long)]
+        address: Option<PathBuf>,
+    },
 }
 
 /// Acts as a proxy for the `cfsctl` CLI by executing the CLI logic programmatically
@@ -608,7 +612,7 @@ where
 }
 
 #[cfg(feature = "oci")]
-fn verity_opt<ObjectID>(opt: &Option<String>) -> Result<Option<ObjectID>>
+pub(crate) fn verity_opt<ObjectID>(opt: &Option<String>) -> Result<Option<ObjectID>>
 where
     ObjectID: FsVerityHashValue,
 {
@@ -618,21 +622,32 @@ where
     })
 }
 
+/// Resolve the default repository path based on the effective uid.
+///
+/// Root operates on the system repository; everyone else on their per-user
+/// repository. Used both when no `--repo`/`--user`/`--system` is given and by
+/// the socket-activated path (which has no CLI args to consult).
+pub(crate) fn default_repo_path() -> Result<PathBuf> {
+    if rustix::process::getuid().is_root() {
+        Ok(system_path())
+    } else {
+        user_path()
+    }
+}
+
 /// Resolve the repository path from CLI args without opening it.
 ///
 /// Uses [`user_path`] and [`system_path`] to avoid duplicating
 /// path constants.
-fn resolve_repo_path(args: &App) -> Result<PathBuf> {
+pub(crate) fn resolve_repo_path(args: &App) -> Result<PathBuf> {
     if let Some(path) = &args.repo {
         Ok(path.clone())
     } else if args.system {
         Ok(system_path())
     } else if args.user {
         user_path()
-    } else if rustix::process::getuid().is_root() {
-        Ok(system_path())
     } else {
-        user_path()
+        default_repo_path()
     }
 }
 
@@ -647,7 +662,7 @@ fn resolve_repo_path(args: &App) -> Result<PathBuf> {
 /// Note: we read the metadata file directly here (rather than via
 /// `Repository::metadata`) because this runs *before* we know which
 /// generic `ObjectID` type to use — that's exactly what we're deciding.
-fn resolve_hash_type(
+pub(crate) fn resolve_hash_type(
     repo_path: &Path,
     cli_hash: Option<HashType>,
     upgrade: bool,
@@ -702,6 +717,38 @@ fn resolve_hash_type(
     Ok(detected)
 }
 
+/// If the process was started *bare* via systemd socket activation, serve the
+/// varlink API on the activated socket and return `Ok(true)`. Otherwise return
+/// `Ok(false)` so the caller falls through to normal CLI parsing.
+///
+/// This runs *before* clap to support a truly argument-less invocation —
+/// notably `varlinkctl exec:cfsctl`, which hands us the connected socket on fd
+/// 3 but passes no subcommand for clap to parse. A client selects a repository
+/// at runtime via the `OpenRepository` method.
+///
+/// The shortcut is taken *only* when there are no command-line arguments
+/// (`argv` is just the program name). When any argument is present — e.g. a
+/// systemd unit running `cfsctl varlink` — we fall through to clap; the
+/// `varlink`/`oci varlink` subcommand's [`serve`](crate::varlink::serve)
+/// detects and serves on the activation fd itself. We must NOT call
+/// [`try_activated_listener`](crate::varlink::try_activated_listener) on that
+/// path: it consumes `LISTEN_FDS`/`LISTEN_PID` (via `receive_descriptors`),
+/// which would prevent `serve` from finding the fd later.
+pub async fn run_if_socket_activated() -> Result<bool> {
+    // Only take the pre-clap shortcut for a bare invocation (`argv[0]` only).
+    // Check argv before touching the activation env so the latter is consumed
+    // only when we actually intend to serve from this shortcut.
+    if std::env::args_os().len() != 1 {
+        return Ok(false);
+    }
+    let Some(listener) = crate::varlink::try_activated_listener()? else {
+        return Ok(false);
+    };
+    let service = crate::varlink::CfsctlService::activated();
+    crate::varlink::serve_activated(service, listener).await?;
+    Ok(true)
+}
+
 /// Top-level dispatch: handle init specially, otherwise open repo and run.
 pub async fn run_app(args: App) -> Result<()> {
     // Init is handled before opening a repo since it creates one
@@ -719,6 +766,25 @@ pub async fn run_app(args: App) -> Result<()> {
             reset_metadata,
             &args,
         );
+    }
+
+    // The varlink service opens repositories on demand via `OpenRepository`
+    // (handling both hash types), so it bypasses the generic repo-open dispatch
+    // below. A single `CfsctlService` answers both the `org.composefs.Repository`
+    // and (when the `oci` feature is enabled) `org.composefs.Oci` interfaces, so
+    // `cfsctl varlink` and `cfsctl oci varlink` serve the same combined service.
+    if let Command::Varlink { ref address } = args.cmd {
+        let service = crate::varlink::CfsctlService::from_app(&args);
+        return crate::varlink::serve(service, address.as_deref()).await;
+    }
+
+    #[cfg(feature = "oci")]
+    if let Command::Oci {
+        cmd: OciCommand::Varlink { ref address },
+    } = args.cmd
+    {
+        let service = crate::varlink::CfsctlService::from_app(&args);
+        return crate::varlink::serve(service, address.as_deref()).await;
     }
 
     // Commands that only need verity digests (no object storage) can
@@ -815,8 +881,8 @@ fn run_init(
 /// `no_upgrade` is set.
 ///
 /// This is the parameterized core shared by [`open_repo`] (which derives the
-/// path and flags from [`App`]) and other callers that hold these values
-/// directly rather than as a parsed [`App`].
+/// path and flags from [`App`]) and the varlink service (which holds these
+/// values directly).
 pub(crate) fn open_repo_at<ObjectID>(
     path: &Path,
     insecure: bool,
@@ -855,7 +921,7 @@ where
 
 /// Resolve an [`OciReference`] to an [`OciImage`].
 #[cfg(feature = "oci")]
-fn resolve_oci_image<ObjectID: FsVerityHashValue>(
+pub(crate) fn resolve_oci_image<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     reference: &OciReference,
 ) -> Result<composefs_oci::oci_image::OciImage<ObjectID>> {
@@ -872,7 +938,7 @@ fn resolve_oci_image<ObjectID: FsVerityHashValue>(
 /// When resolving via a named ref, the verity override is ignored since
 /// the image metadata provides the correct verity.
 #[cfg(feature = "oci")]
-fn resolve_oci_config<ObjectID: FsVerityHashValue>(
+pub(crate) fn resolve_oci_config<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     reference: &OciReference,
     verity_override: Option<ObjectID>,
@@ -1052,9 +1118,6 @@ where
                 .await?;
                 println!("{}", object_id.to_id());
             }
-            OciCommand::LsLayer { ref name } => {
-                composefs_oci::ls_layer(&repo, name)?;
-            }
             OciCommand::Dump { config_opts } => {
                 let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
                 fs.print_dumpfile()?;
@@ -1127,7 +1190,14 @@ where
                 let images = composefs_oci::oci_image::list_images(&repo)?;
 
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&images)?);
+                    let reply = crate::varlink::ListImagesReply {
+                        images: images
+                            .iter()
+                            .map(crate::varlink::ImageEntry::from)
+                            .collect(),
+                    };
+                    serde_json::to_writer_pretty(std::io::stdout().lock(), &reply)?;
+                    println!();
                 } else if images.is_empty() {
                     println!("No images found");
                 } else {
@@ -1178,8 +1248,9 @@ where
                     println!();
                 } else {
                     // Default: output combined JSON with manifest, config, and referrers
-                    let output = img.inspect_json(&repo)?;
-                    println!("{}", serde_json::to_string_pretty(&output)?);
+                    let output = crate::varlink::OciInspectReply::from_image(&repo, &img)?;
+                    serde_json::to_writer_pretty(std::io::stdout().lock(), &output)?;
+                    println!();
                 }
             }
             OciCommand::Tag {
@@ -1200,7 +1271,8 @@ where
             } => {
                 if json {
                     let info = composefs_oci::layer_info(&repo, layer)?;
-                    println!("{}", serde_json::to_string_pretty(&info)?);
+                    serde_json::to_writer_pretty(std::io::stdout().lock(), &info)?;
+                    println!();
                 } else if dumpfile {
                     composefs_oci::layer_dumpfile(&repo, layer, &mut std::io::stdout())?;
                 } else {
@@ -1272,10 +1344,7 @@ where
                     composefs_oci::oci_fsck(&repo).await?
                 };
                 if json {
-                    let output = OciFsckJsonOutput {
-                        ok: result.is_ok(),
-                        result,
-                    };
+                    let output = crate::varlink::OciFsckReply::from(&result);
                     serde_json::to_writer_pretty(std::io::stdout().lock(), &output)?;
                     println!();
                 } else {
@@ -1284,6 +1353,9 @@ where
                         anyhow::bail!("OCI integrity check failed");
                     }
                 }
+            }
+            OciCommand::Varlink { .. } => {
+                unreachable!("oci varlink is handled before opening a repository");
             }
         },
         Command::CreateImage {
@@ -1344,13 +1416,17 @@ where
                 backing_path_only,
             )?;
         }
-        Command::Fsck { json } => {
-            let result = repo.fsck().await?;
+        Command::Fsck {
+            json,
+            metadata_only,
+        } => {
+            let result = if metadata_only {
+                repo.fsck_metadata_only().await?
+            } else {
+                repo.fsck().await?
+            };
             if json {
-                let output = FsckJsonOutput {
-                    ok: result.is_ok(),
-                    result,
-                };
+                let output = crate::varlink::FsckReply::from(&result);
                 serde_json::to_writer_pretty(std::io::stdout().lock(), &output)?;
                 println!();
             } else {
@@ -1359,6 +1435,10 @@ where
                     anyhow::bail!("repository integrity check failed");
                 }
             }
+        }
+        Command::Varlink { .. } => {
+            // Handled in run_app before opening the repo.
+            unreachable!("varlink is handled before opening a repository");
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {

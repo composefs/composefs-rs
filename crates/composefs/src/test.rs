@@ -2,6 +2,10 @@
 //!
 //! This module provides helpers for writing tests, including temporary
 //! directory allocation and repository initialization.
+//!
+//! These are test helpers (exposed for downstream crates' tests), so the
+//! diagnostics here intentionally go to stderr.
+#![allow(clippy::print_stderr)]
 
 use std::{ffi::OsString, fs::create_dir_all, path::PathBuf, sync::Arc};
 

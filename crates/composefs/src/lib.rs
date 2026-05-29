@@ -5,6 +5,10 @@
 //! and fs-verity for integrity verification.
 
 #![forbid(unsafe_code)]
+// This is a library: emit diagnostics via the `log` crate (or return them),
+// never by writing to the process's stdout/stderr. Genuinely-intentional
+// exceptions carry a local `#[allow]` with justification. Test code is exempt.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 pub mod dumpfile;
 pub mod dumpfile_parse;
@@ -16,6 +20,7 @@ pub mod mount;
 pub mod mountcompat;
 pub mod progress;
 pub mod repository;
+pub use repository::ImageNotFound;
 pub mod splitstream;
 pub mod tree;
 pub mod util;
