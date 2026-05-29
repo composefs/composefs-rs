@@ -63,6 +63,7 @@ use composefs::{
     erofs::reader::erofs_to_filesystem,
     fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     generic_tree::{FileSystem, Inode},
+    mount::MountOptions,
     repository::{
         REPO_METADATA_FILENAME, Repository, RepositoryConfig, read_repo_algorithm, system_path,
         user_path,
@@ -437,6 +438,15 @@ enum OciCommand {
         /// Mount the bootable variant instead of the regular EROFS image
         #[arg(long)]
         bootable: bool,
+        /// Writable upper layer directory for overlayfs
+        #[arg(long, requires = "workdir")]
+        upperdir: Option<PathBuf>,
+        /// Work directory for overlayfs (required with --upperdir)
+        #[arg(long, requires = "upperdir")]
+        workdir: Option<PathBuf>,
+        /// Mount read-write (requires --upperdir)
+        #[arg(long, requires = "upperdir")]
+        read_write: bool,
     },
     /// Compute the composefs image ID of a stored OCI image's rootfs
     ///
@@ -564,6 +574,15 @@ enum Command {
         name: String,
         /// the mountpoint
         mountpoint: String,
+        /// Writable upper layer directory for overlayfs
+        #[arg(long, requires = "workdir")]
+        upperdir: Option<PathBuf>,
+        /// Work directory for overlayfs (required with --upperdir)
+        #[arg(long, requires = "upperdir")]
+        workdir: Option<PathBuf>,
+        /// Mount read-write (requires --upperdir)
+        #[arg(long, requires = "upperdir")]
+        read_write: bool,
     },
     /// Read rootfs located at a path, add all files to the repo, then create the composefs image of the rootfs,
     /// commit it to the repo, and print its image object ID
@@ -664,6 +683,31 @@ where
     );
 
     run_app(args).await
+}
+
+fn get_mount_options(
+    upperdir: Option<&Path>,
+    workdir: Option<&Path>,
+    read_write: bool,
+) -> Result<MountOptions> {
+    let mut options = MountOptions::default();
+    if let (Some(u), Some(w)) = (upperdir, workdir) {
+        let upper_fd = rustix::fs::open(
+            u,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("Opening upperdir '{}'", u.display()))?;
+        let work_fd = rustix::fs::open(
+            w,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .with_context(|| format!("Opening workdir '{}'", w.display()))?;
+        options.set_overlay(upper_fd, work_fd);
+    }
+    options.set_read_write(read_write);
+    Ok(options)
 }
 
 #[cfg(feature = "oci")]
@@ -1217,7 +1261,12 @@ where
                 ref image,
                 ref mountpoint,
                 bootable,
+                ref upperdir,
+                ref workdir,
+                read_write,
             } => {
+                let mount_options =
+                    get_mount_options(upperdir.as_deref(), workdir.as_deref(), read_write)?;
                 let img = if image.starts_with("sha256:") {
                     let digest: composefs_oci::OciDigest =
                         image.parse().context("Parsing manifest digest")?;
@@ -1240,7 +1289,7 @@ where
                         ),
                     }
                 };
-                repo.mount_at(&erofs_id.to_hex(), mountpoint.as_str())?;
+                repo.mount_at(&erofs_id.to_hex(), mountpoint.as_str(), &mount_options)?;
             }
             OciCommand::ComputeId { config_opts } => {
                 let mut fs = load_filesystem_from_oci_image(&repo, config_opts)?;
@@ -1461,8 +1510,16 @@ where
             // Handled in run_app before opening the repo
             unreachable!("compute-id and create-dumpfile are dispatched without a repo");
         }
-        Command::Mount { name, mountpoint } => {
-            repo.mount_at(&name, &mountpoint)?;
+        Command::Mount {
+            name,
+            mountpoint,
+            ref upperdir,
+            ref workdir,
+            read_write,
+        } => {
+            let mount_options =
+                get_mount_options(upperdir.as_deref(), workdir.as_deref(), read_write)?;
+            repo.mount_at(&name, &mountpoint, &mount_options)?;
         }
         Command::ImageObjects { name } => {
             let objects = repo.objects_for_image(&name)?;

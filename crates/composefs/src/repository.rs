@@ -113,7 +113,7 @@ use crate::{
         FsVerityHasher, MeasureVerityError, compute_verity, enable_verity_maybe_copy,
         ensure_verity_equal, has_verity, measure_verity, measure_verity_opt,
     },
-    mount::{composefs_fsmount, mount_at},
+    mount::{MountOptions, composefs_fsmount, mount_at},
     shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamReader, SplitStreamWriter},
     util::{ErrnoFilter, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
@@ -2517,7 +2517,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Create a detached mount of an image. This file descriptor can then
     /// be attached via e.g. `move_mount`.
     #[context("Mounting image '{name}'")]
-    pub fn mount(&self, name: &str) -> Result<OwnedFd> {
+    pub fn mount_with_options(&self, name: &str, options: &MountOptions) -> Result<OwnedFd> {
         let (image, enable_verity) = self.open_image(name)?;
 
         composefs_fsmount(
@@ -2526,15 +2526,28 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             self.objects_dir()
                 .context("Getting objects directory for mount")?,
             enable_verity,
+            options,
         )
         .context("Creating filesystem mount")
     }
 
+    /// Create a detached read-only mount of an image.
+    /// This file descriptor can then be attached via e.g. `move_mount`.
+    #[context("Mounting image '{name}'")]
+    pub fn mount(&self, name: &str) -> Result<OwnedFd> {
+        self.mount_with_options(name, &MountOptions::default())
+    }
+
     /// Mount the image with the provided digest at the target path.
     #[context("Mounting image '{name}' at path")]
-    pub fn mount_at(&self, name: &str, mountpoint: impl AsRef<Path>) -> Result<()> {
+    pub fn mount_at(
+        &self,
+        name: &str,
+        mountpoint: impl AsRef<Path>,
+        options: &MountOptions,
+    ) -> Result<()> {
         mount_at(
-            self.mount(name)?,
+            self.mount_with_options(name, options)?,
             CWD,
             &canonicalize(mountpoint).context("Canonicalizing mountpoint path")?,
         )
