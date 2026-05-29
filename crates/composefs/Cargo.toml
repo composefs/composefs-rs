@@ -14,10 +14,12 @@ version.workspace = true
 'pre-6.15' = ['tempfile']
 rhel9 = ['pre-6.15', 'composefs-ioctls/loop-device']
 test = ["tempfile"]
+varlink = ['dep:zlink-core']
 
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
 composefs-ioctls = { workspace = true }
+zlink-core = { workspace = true, optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 fn-error-context = "0.2"
 hex = { version = "0.4.0", default-features = false, features = ["std"] }

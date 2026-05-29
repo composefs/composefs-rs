@@ -54,6 +54,22 @@ use crate::ContentAndVerity;
 use crate::layer::is_tar_media_type;
 use crate::skopeo::{OCI_BLOB_CONTENT_TYPE, OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE};
 
+/// Error marker: an OCI reference (tag) does not exist.
+#[derive(Debug, thiserror::Error)]
+#[error("OCI reference not found: {name}")]
+pub struct OciRefNotFound {
+    /// The reference name that was not found.
+    pub name: String,
+}
+
+/// Error marker: an OCI manifest/image does not exist in the repository.
+#[derive(Debug, thiserror::Error)]
+#[error("OCI image not found: {digest}")]
+pub struct OciImageNotFound {
+    /// The manifest digest that was not found.
+    pub digest: String,
+}
+
 /// Data and named refs from a splitstream with external object storage.
 type ExternalData<ObjectID> = (Vec<u8>, HashMap<Box<str>, ObjectID>);
 
@@ -186,8 +202,14 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         let manifest_verity = if let Some(v) = verity {
             v.clone()
         } else {
-            repo.has_stream(&manifest_id)?
-                .context("Manifest not found")?
+            match repo.has_stream(&manifest_id)? {
+                Some(v) => v,
+                None => {
+                    return Err(anyhow::Error::new(OciImageNotFound {
+                        digest: manifest_digest.to_string(),
+                    }));
+                }
+            }
         };
 
         Ok(Self {
@@ -389,40 +411,6 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         )?;
         Ok(data)
     }
-
-    /// Returns the full inspect output as a JSON value.
-    ///
-    /// This includes the manifest, config, and referrers in a single JSON object.
-    /// The manifest and config are included as their original JSON structure.
-    pub fn inspect_json(&self, repo: &Repository<ObjectID>) -> Result<serde_json::Value> {
-        let manifest_json = self.read_manifest_json(repo)?;
-        let config_json = self.read_config_json(repo)?;
-        let referrers = list_referrers(repo, &self.manifest_digest)?;
-
-        let manifest_value: serde_json::Value = serde_json::from_slice(&manifest_json)?;
-        let config_value: serde_json::Value = serde_json::from_slice(&config_json)?;
-
-        let referrers_value: Vec<serde_json::Value> = referrers
-            .iter()
-            .map(|(digest, _verity)| serde_json::json!({ "digest": digest }))
-            .collect();
-
-        let mut result = serde_json::json!({
-            "manifest": manifest_value,
-            "config": config_value,
-            "referrers": referrers_value,
-        });
-
-        if let Some(ref erofs_id) = self.image_ref {
-            result["composefs_erofs"] = serde_json::json!(erofs_id.to_hex());
-        }
-
-        if let Some(ref boot_id) = self.boot_image_ref {
-            result["composefs_boot_erofs"] = serde_json::json!(boot_id.to_hex());
-        }
-
-        Ok(result)
-    }
 }
 
 // =============================================================================
@@ -476,8 +464,17 @@ pub fn resolve_ref<ObjectID: FsVerityHashValue>(
     let ref_path = format!("streams/refs/{}", oci_ref_path(name));
 
     // Read the symlink to get the manifest path
-    let target = readlinkat(repo.repo_fd(), &ref_path, vec![])
-        .with_context(|| format!("Reference {name} not found"))?;
+    let target = match readlinkat(repo.repo_fd(), &ref_path, vec![]) {
+        Ok(t) => t,
+        Err(Errno::NOENT) => {
+            return Err(anyhow::Error::new(OciRefNotFound {
+                name: name.to_string(),
+            }));
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("Reference {name} not found"));
+        }
+    };
 
     let target_str = target
         .to_str()

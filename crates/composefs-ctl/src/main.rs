@@ -25,6 +25,14 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     env_logger::init();
 
+    // If we were launched via systemd socket activation (e.g. `varlinkctl
+    // exec:cfsctl`, which passes the connected socket on fd 3 but no
+    // arguments), serve the varlink API directly. This must run before clap,
+    // since a bare activated invocation has no subcommand to parse.
+    if composefs_ctl::run_if_socket_activated().await? {
+        return Ok(());
+    }
+
     let args = App::parse();
     composefs_ctl::run_app(args).await
 }

@@ -442,7 +442,7 @@ fn privileged_test_cstor_bootable() -> Result<()> {
     // Verify the image is visible via oci images (OCI manifest tag was created)
     let ls_output = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci images --json").read()?;
     let images: serde_json::Value = serde_json::from_str(&ls_output)?;
-    let images_arr = images.as_array().expect("oci ls should return array");
+    let images_arr = images["images"].as_array().expect("oci ls images array");
     assert!(
         !images_arr.is_empty(),
         "oci ls should show at least one image after cstor pull"

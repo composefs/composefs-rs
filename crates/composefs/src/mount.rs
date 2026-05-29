@@ -63,6 +63,10 @@ impl Drop for FsHandle {
             match rustix::io::read(&self.fd, &mut buffer) {
                 Err(_) => return, // ENODATA, among others?
                 Ok(0) => return,
+                // Surface the kernel's fsopen/fsconfig diagnostic messages,
+                // which are only readable from this fd. We have no error
+                // channel from `drop`, so stderr is the only option.
+                #[allow(clippy::print_stderr)]
                 Ok(size) => eprintln!("{}", String::from_utf8(buffer[0..size].to_vec()).unwrap()),
             }
         }

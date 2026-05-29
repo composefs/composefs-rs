@@ -11,6 +11,10 @@
 //! - Importing from containers-storage with zero-copy reflinks (optional feature)
 
 #![forbid(unsafe_code)]
+// This is a library: emit diagnostics via the `log` crate (or return them),
+// never by writing to the process's stdout/stderr. Genuinely-intentional
+// exceptions carry a local `#[allow]` with justification. Test code is exempt.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 pub mod boot;
 #[cfg(feature = "containers-storage")]
@@ -54,7 +58,6 @@ use composefs::{
 };
 
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
-use crate::tar::get_entry;
 
 /// Named ref key for the EROFS image derived from this OCI config.
 pub const IMAGE_REF_KEY: &str = "composefs.image";
@@ -67,10 +70,10 @@ pub const BOOT_IMAGE_REF_KEY: &str = "composefs.image.boot";
 pub use boot::generate_boot_image;
 pub use boot::{boot_image, remove_boot_image};
 pub use oci_image::{
-    ImageInfo, LayerInfo, OCI_REF_PREFIX, OciFsckError, OciFsckResult, OciImage, SplitstreamInfo,
-    add_referrer, layer_dumpfile, layer_info, layer_tar, list_images, list_referrers, list_refs,
-    oci_fsck, oci_fsck_image, remove_referrer, remove_referrers_for_subject, resolve_ref,
-    tag_image, untag_image,
+    ImageInfo, LayerInfo, OCI_REF_PREFIX, OciFsckError, OciFsckResult, OciImage, OciImageNotFound,
+    OciRefNotFound, SplitstreamInfo, add_referrer, layer_dumpfile, layer_info, layer_tar,
+    list_images, list_referrers, list_refs, oci_fsck, oci_fsck_image, remove_referrer,
+    remove_referrers_for_subject, resolve_ref, tag_image, untag_image,
 };
 pub use progress::{ComponentId, NullReporter, ProgressEvent, ProgressReporter, SharedReporter};
 pub use skopeo::pull_image;
@@ -357,27 +360,6 @@ pub async fn import_layer<ObjectID: FsVerityHashValue>(
         .await?;
 
     Ok((object_id, stats))
-}
-
-/// Lists the contents of a container layer stored in the repository.
-///
-/// Reads the split stream for the named layer and prints each tar entry to stdout
-/// in composefs dumpfile format.
-pub fn ls_layer<ObjectID: FsVerityHashValue>(
-    repo: &Repository<ObjectID>,
-    diff_id: &OciDigest,
-) -> Result<()> {
-    let mut split_stream = repo.open_stream(
-        &layer_identifier(diff_id),
-        None,
-        Some(TAR_LAYER_CONTENT_TYPE),
-    )?;
-
-    while let Some(entry) = get_entry(&mut split_stream)? {
-        println!("{entry}");
-    }
-
-    Ok(())
 }
 
 /// Pull the target image, and add the provided tag. If this is a mountable

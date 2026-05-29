@@ -121,6 +121,14 @@ use crate::{
 /// The filename used for repository metadata.
 pub const REPO_METADATA_FILENAME: &str = "meta.json";
 
+/// Error marker indicating a named image/ref does not exist in the repository.
+#[derive(Debug, thiserror::Error)]
+#[error("image not found: {name}")]
+pub struct ImageNotFound {
+    /// The name/ref that was not found.
+    pub name: String,
+}
+
 /// Errors that can occur when opening a repository.
 #[derive(Debug, thiserror::Error)]
 pub enum RepositoryOpenError {
@@ -771,6 +779,11 @@ enum GCCategoryWalkMode {
 ///
 /// Returned by [`Repository::gc`] to report what was (or would be) removed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "varlink",
+    derive(serde::Serialize, serde::Deserialize, zlink_core::introspect::Type),
+    zlink(crate = "zlink_core")
+)]
 pub struct GcResult {
     /// Number of unreferenced objects removed (or that would be removed)
     pub objects_removed: u64,
@@ -874,16 +887,26 @@ pub enum FsckError {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsckResult {
-    pub(crate) has_metadata: bool,
-    pub(crate) objects_checked: u64,
-    pub(crate) objects_corrupted: u64,
-    pub(crate) streams_checked: u64,
-    pub(crate) streams_corrupted: u64,
-    pub(crate) images_checked: u64,
-    pub(crate) images_corrupted: u64,
-    pub(crate) broken_links: u64,
-    pub(crate) missing_objects: u64,
-    pub(crate) errors: Vec<FsckError>,
+    /// Whether the repository has a `meta.json` metadata file.
+    pub has_metadata: bool,
+    /// Number of objects whose fs-verity digests were verified.
+    pub objects_checked: u64,
+    /// Number of objects found to have a bad fs-verity digest.
+    pub objects_corrupted: u64,
+    /// Number of splitstreams verified.
+    pub streams_checked: u64,
+    /// Number of splitstreams with issues (bad header, missing refs, etc.).
+    pub streams_corrupted: u64,
+    /// Number of images verified.
+    pub images_checked: u64,
+    /// Number of images with issues.
+    pub images_corrupted: u64,
+    /// Number of broken symlinks found.
+    pub broken_links: u64,
+    /// Number of missing objects referenced by streams.
+    pub missing_objects: u64,
+    /// Structured descriptions of each error found.
+    pub errors: Vec<FsckError>,
 }
 
 impl FsckResult {
@@ -2230,9 +2253,17 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// enabled when mounting it.
     #[context("Opening image '{name}'")]
     pub fn open_image(&self, name: &str) -> Result<(OwnedFd, bool)> {
-        let image = self
-            .openat(&format!("images/{name}"), OFlags::RDONLY)
-            .with_context(|| format!("Opening ref 'images/{name}'"))?;
+        let image = match self.openat(&format!("images/{name}"), OFlags::RDONLY) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => {
+                return Err(anyhow::Error::new(ImageNotFound {
+                    name: name.to_string(),
+                }));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("Opening ref 'images/{name}'"));
+            }
+        };
 
         if name.contains("/") {
             return Ok((image, true));
@@ -2809,15 +2840,40 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// any repository contents.
     #[context("Running filesystem consistency check")]
     pub async fn fsck(&self) -> Result<FsckResult> {
+        self.fsck_inner(true).await
+    }
+
+    /// Run a metadata-only consistency check.
+    ///
+    /// This validates `meta.json` and the stream/image symlinks (including
+    /// splitstream structure and referenced-object existence) but skips the
+    /// expensive per-object fs-verity digest verification done by [`fsck`].
+    /// Useful for a fast structural check on large repositories.
+    ///
+    /// [`fsck`]: Self::fsck
+    pub async fn fsck_metadata_only(&self) -> Result<FsckResult> {
+        self.fsck_inner(false).await
+    }
+
+    /// Shared implementation for [`fsck`] and [`fsck_metadata_only`].
+    ///
+    /// When `check_objects` is false, the object fs-verity verification phase
+    /// is skipped (so `objects_checked` stays zero).
+    ///
+    /// [`fsck`]: Self::fsck
+    /// [`fsck_metadata_only`]: Self::fsck_metadata_only
+    async fn fsck_inner(&self, check_objects: bool) -> Result<FsckResult> {
         let mut result = FsckResult::default();
 
         // Phase 0: Validate meta.json if present
         self.fsck_metadata(&mut result);
 
         // Phase 1: Verify all objects (parallel across object subdirectories)
-        self.fsck_objects(&mut result)
-            .await
-            .context("Checking objects")?;
+        if check_objects {
+            self.fsck_objects(&mut result)
+                .await
+                .context("Checking objects")?;
+        }
 
         // Phase 2: Verify stream symlinks and splitstream integrity
         self.fsck_category("streams", &mut result)

@@ -57,6 +57,11 @@
 //! External chunks have no additional data after the prefix; the content is
 //! retrieved from the file descriptor array passed alongside the stream.
 
+// This is a library: emit diagnostics via the `log` crate (or return them),
+// never by writing to the process's stdout/stderr. Genuinely-intentional
+// exceptions carry a local `#[allow]` with justification. Test code is exempt.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 use std::io::{self, Read, Write};
 #[cfg(test)]
 use std::os::fd::AsFd;

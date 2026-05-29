@@ -45,6 +45,11 @@
 //! - No absolute paths are constructed during operations
 //! - SQLite database accessed via fd-relative path
 
+// This is a library: emit diagnostics via the `log` crate (or return them),
+// never by writing to the process's stdout/stderr. Genuinely-intentional
+// exceptions carry a local `#[allow]` with justification. Test code is exempt.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 // Core storage access
 pub mod config;
 pub mod error;
