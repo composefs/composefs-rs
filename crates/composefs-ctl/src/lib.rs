@@ -811,13 +811,22 @@ fn run_init(
     Ok(())
 }
 
-/// Open a repo, auto-upgrading old-format repos unless `--no-upgrade` was passed.
-pub fn open_repo<ObjectID>(args: &App) -> Result<Repository<ObjectID>>
+/// Open a repo at an explicit path, auto-upgrading old-format repos unless
+/// `no_upgrade` is set.
+///
+/// This is the parameterized core shared by [`open_repo`] (which derives the
+/// path and flags from [`App`]) and other callers that hold these values
+/// directly rather than as a parsed [`App`].
+pub(crate) fn open_repo_at<ObjectID>(
+    path: &Path,
+    insecure: bool,
+    require_verity: bool,
+    no_upgrade: bool,
+) -> Result<Repository<ObjectID>>
 where
     ObjectID: FsVerityHashValue,
 {
-    let path = resolve_repo_path(args)?;
-    let mut repo = if args.no_upgrade {
+    let mut repo = if no_upgrade {
         Repository::open_path(CWD, path)?
     } else {
         let (repo, _upgraded) = Repository::open_upgrade(CWD, path)?;
@@ -826,13 +835,22 @@ where
     // Hidden --insecure flag for backward compatibility; the default
     // now is to inherit the repo config, but if it's specified we
     // disable requiring verity even if the repo says to use it.
-    if args.insecure {
+    if insecure {
         repo.set_insecure();
     }
-    if args.require_verity {
+    if require_verity {
         repo.require_verity()?;
     }
     Ok(repo)
+}
+
+/// Open a repo, auto-upgrading old-format repos unless `--no-upgrade` was passed.
+pub fn open_repo<ObjectID>(args: &App) -> Result<Repository<ObjectID>>
+where
+    ObjectID: FsVerityHashValue,
+{
+    let path = resolve_repo_path(args)?;
+    open_repo_at(&path, args.insecure, args.require_verity, args.no_upgrade)
 }
 
 /// Resolve an [`OciReference`] to an [`OciImage`].
