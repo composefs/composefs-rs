@@ -1151,7 +1151,10 @@ fn build_test_filesystem(
     let bigfile_id = LeafId(fs.leaves.len());
     fs.leaves.push(Leaf {
         stat: leaf_stat(0o755, 0, 0, 1_700_000_007),
-        content: LeafContent::Regular(RegularFile::External(bigfile_hash, bigfile_data.len() as u64)),
+        content: LeafContent::Regular(RegularFile::External(
+            bigfile_hash,
+            bigfile_data.len() as u64,
+        )),
     });
 
     // leaf 8: /usr/lib/biglib.so  (external file, 800 bytes — different pattern)

@@ -1473,7 +1473,7 @@ where
                 if let Some(fuse_opts) = fuse {
                     #[cfg(feature = "fuse")]
                     {
-                        use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse};
+                        use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse_fd};
 
                         // Read the EROFS image from the repository's images/ directory.
                         let (image_fd, _verified) = repo.open_image(&erofs_id.to_hex())?;
@@ -1494,7 +1494,7 @@ where
                         // superblock so the connection stays alive while we serve.
                         let _mnt_fd = mnt_fd;
 
-                        serve_tree_fuse(
+                        serve_tree_fuse_fd(
                             dev_fuse,
                             Arc::new(filesystem),
                             Arc::clone(&repo),
@@ -1877,7 +1877,7 @@ where
             ref mountpoint,
             passthrough,
         } => {
-            use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse};
+            use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse_fd};
 
             let erofs_bytes = std::fs::read(image)
                 .with_context(|| format!("reading EROFS image {}", image.display()))?;
@@ -1893,7 +1893,7 @@ where
             // superblock so the connection stays alive while we serve.
             let _mnt_fd = mnt_fd;
 
-            serve_tree_fuse(
+            serve_tree_fuse_fd(
                 dev_fuse,
                 Arc::new(filesystem),
                 Arc::clone(&repo),

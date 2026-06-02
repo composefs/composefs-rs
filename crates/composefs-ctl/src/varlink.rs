@@ -478,7 +478,7 @@ fn run_mount<ObjectID: FsVerityHashValue>(
     Ok((MountReply { fd_index: 0 }, vec![mount_fd]))
 }
 
-#[cfg(feature = "oci")]
+#[cfg(all(feature = "oci", not(feature = "fuse")))]
 fn run_oci_mount<ObjectID: composefs::fsverity::FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     image: &str,
@@ -592,7 +592,7 @@ async fn run_fuse_serve<ObjectID: FsVerityHashValue>(
     wait: bool,
 ) -> std::result::Result<(), RepositoryError> {
     use composefs::erofs::reader::erofs_to_filesystem;
-    use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse};
+    use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse_fd};
 
     let erofs_bytes = std::fs::read(&image).map_err(|e| RepositoryError::InternalError {
         message: format!("reading EROFS image {image}: {e:#}"),
@@ -621,7 +621,7 @@ async fn run_fuse_serve<ObjectID: FsVerityHashValue>(
         // superblock so the connection stays alive while we serve.
         let _mnt_fd = mnt_fd;
         tokio::task::spawn_blocking(move || {
-            serve_tree_fuse(dev_fuse, fs, repo, FuseConfig { passthrough })
+            serve_tree_fuse_fd(dev_fuse, fs, repo, FuseConfig { passthrough })
         })
         .await
         .map_err(|e| RepositoryError::InternalError {
@@ -636,7 +636,7 @@ async fn run_fuse_serve<ObjectID: FsVerityHashValue>(
         // task is fully detached (errors are silently ignored).
         let _detached = tokio::task::spawn_blocking(move || {
             let _mnt_fd = mnt_fd;
-            serve_tree_fuse(dev_fuse, fs, repo, FuseConfig { passthrough })
+            serve_tree_fuse_fd(dev_fuse, fs, repo, FuseConfig { passthrough })
         });
         Ok(())
     }
@@ -752,7 +752,7 @@ async fn run_oci_fuse_mount<ObjectID: FsVerityHashValue>(
     wait: bool,
 ) -> std::result::Result<(), oci::OciError> {
     use composefs::erofs::reader::erofs_to_filesystem;
-    use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse};
+    use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse_fd};
 
     // Resolve the OCI image reference (tag or digest).
     let img = if image.starts_with("sha256:") || image.starts_with("sha512:") {
@@ -824,13 +824,14 @@ async fn run_oci_fuse_mount<ObjectID: FsVerityHashValue>(
             message: format!("attaching FUSE mount at {mountpoint}: {e:#}"),
         }
     })?;
+
     let fs = Arc::new(filesystem);
     if wait {
         // Hold mnt_fd alive for the session duration — it pins the FUSE
         // superblock so the connection stays alive while we serve.
         let _mnt_fd = mnt_fd;
         tokio::task::spawn_blocking(move || {
-            serve_tree_fuse(dev_fuse, fs, repo, FuseConfig { passthrough })
+            serve_tree_fuse_fd(dev_fuse, fs, repo, FuseConfig { passthrough })
         })
         .await
         .map_err(|e| oci::OciError::InternalError {
@@ -845,7 +846,7 @@ async fn run_oci_fuse_mount<ObjectID: FsVerityHashValue>(
         // task is fully detached (errors are silently ignored).
         let _detached = tokio::task::spawn_blocking(move || {
             let _mnt_fd = mnt_fd;
-            serve_tree_fuse(dev_fuse, fs, repo, FuseConfig { passthrough })
+            serve_tree_fuse_fd(dev_fuse, fs, repo, FuseConfig { passthrough })
         });
         Ok(())
     }
@@ -1243,7 +1244,7 @@ mod service_impl {
         CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, MountParams,
         MountReply, OpenRepo, OpenRepositoryReply, RepositoryError, run_compute_id, run_fsck,
         run_fuse_serve, run_gc, run_image_objects, run_init_repository, run_inspect,
-        run_list_images, run_mount, run_oci_fsck, run_oci_fuse_mount, run_oci_mount, run_tag,
+        run_list_images, run_mount, run_oci_fsck, run_oci_fuse_mount, run_tag,
         run_untag,
     };
     use composefs::fsverity::{Algorithm, Sha256HashValue, Sha512HashValue};
@@ -1614,9 +1615,10 @@ mod service_impl {
         parse_local_fetch, pull_stream,
     };
     use super::{
-        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, OpenRepo,
-        OpenRepositoryReply, RepositoryError, run_compute_id, run_fsck, run_gc, run_image_objects,
-        run_init_repository, run_inspect, run_list_images, run_oci_fsck, run_tag, run_untag,
+        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, MountParams,
+        MountReply, OpenRepo, OpenRepositoryReply, RepositoryError, run_compute_id, run_fsck,
+        run_gc, run_image_objects, run_init_repository, run_inspect, run_list_images, run_oci_fsck,
+        run_oci_mount, run_tag, run_untag,
     };
     use composefs::fsverity::{Algorithm, Sha256HashValue, Sha512HashValue};
 
