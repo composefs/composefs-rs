@@ -696,6 +696,60 @@ pub fn ensure_erofs_for_image(
     Ok(erofs_id)
 }
 
+/// Build an OCI layout directory on disk from dumpfile layer strings.
+///
+/// Each entry in `layers` is a dumpfile string (same format as
+/// [`create_multi_layer_image`] uses).  Returns a [`tempfile::TempDir`]
+/// containing a valid OCI layout that can be read by `oci-delta`,
+/// `import_oci_layout`, or any OCI-aware tool.
+#[cfg(test)]
+pub fn build_oci_layout(layers: &[&str]) -> tempfile::TempDir {
+    use cap_std_ext::cap_std;
+    use containers_image_proxy::oci_spec::image::{
+        ConfigBuilder, ImageConfigurationBuilder, PlatformBuilder, RootFsBuilder,
+    };
+    use std::io::Write;
+
+    let dir = tempfile::tempdir().expect("creating tempdir");
+    let cap_dir =
+        cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+    let ocidir = ocidir::OciDir::ensure(cap_dir).unwrap();
+
+    let mut manifest = ocidir.new_empty_manifest().unwrap().build().unwrap();
+    let mut config = ImageConfigurationBuilder::default()
+        .architecture("amd64")
+        .os("linux")
+        .rootfs(
+            RootFsBuilder::default()
+                .typ("layers")
+                .diff_ids(Vec::<String>::new())
+                .build()
+                .unwrap(),
+        )
+        .config(ConfigBuilder::default().build().unwrap())
+        .build()
+        .unwrap();
+
+    for dumpfile in layers {
+        let tar_data = dumpfile_to_tar(dumpfile);
+        let mut layer_writer = ocidir.create_gzip_layer(None).unwrap();
+        layer_writer.write_all(&tar_data).unwrap();
+        let layer = layer_writer.complete().unwrap();
+        ocidir.push_layer(&mut manifest, &mut config, layer, "layer", None);
+    }
+
+    let config_desc = ocidir.write_config(config).unwrap();
+    manifest.set_config(config_desc);
+    let platform = PlatformBuilder::default()
+        .architecture("amd64")
+        .os(containers_image_proxy::oci_spec::image::Os::default())
+        .build()
+        .unwrap();
+    ocidir.insert_manifest(manifest, None, platform).unwrap();
+
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

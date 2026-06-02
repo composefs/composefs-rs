@@ -91,6 +91,26 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
         .with_context(|| format!("Opening OCI layout directory {}", layout_path.display()))?;
     let ocidir = OciDir::open(dir).context("Opening OCI directory")?;
 
+    // Check for delta artifact before platform resolution (deltas lack
+    // platform info and would fail the platform filter). Only check
+    // single-manifest layouts since deltas are always single-manifest.
+    if let Ok(index) = ocidir.read_index()
+        && index.manifests().len() == 1
+    {
+        let desc = &index.manifests()[0];
+        let mut manifest_data = Vec::new();
+        ocidir.read_blob(desc)?.read_to_end(&mut manifest_data)?;
+        let manifest = containers_image_proxy::oci_spec::image::ImageManifest::from_reader(
+            &manifest_data[..],
+        )?;
+        if crate::delta::is_delta_artifact(&manifest) {
+            let blob_reader = Arc::new(OciDirBlobReader(ocidir));
+            let (result, stats) =
+                crate::delta::import_delta(repo, &manifest, blob_reader, &reporter, None).await?;
+            return Ok((result, stats));
+        }
+    }
+
     // Resolve the manifest, with fallback for images lacking platform annotations
     let resolved = resolve_manifest(&ocidir, layout_tag)?;
 
@@ -389,6 +409,26 @@ async fn import_layer_from_file<ObjectID: FsVerityHashValue>(
         transferred: layer_size,
     });
     Ok((object_id, layer_stats))
+}
+
+/// Blob reader backed by an OCI layout directory.
+struct OciDirBlobReader(OciDir);
+
+impl crate::delta::DeltaBlobReader for OciDirBlobReader {
+    fn open_blob(
+        &self,
+        digest: &OciDigest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<std::fs::File>> + Send + '_>>
+    {
+        let blob_path = format!("blobs/{}/{}", digest.algorithm(), digest.digest());
+        Box::pin(std::future::ready(
+            self.0
+                .dir()
+                .open(&blob_path)
+                .map(|f| f.into_std())
+                .with_context(|| format!("Opening blob {digest} from OCI layout")),
+        ))
+    }
 }
 
 #[cfg(test)]

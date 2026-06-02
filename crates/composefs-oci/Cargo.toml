@@ -26,6 +26,7 @@ bytes = { version = "1", default-features = false }
 composefs = { workspace = true }
 zlink-core = { workspace = true, optional = true }
 composefs-boot = { workspace = true, optional = true }
+flate2 = { version = "1.0", default-features = false, features = ["zlib"] }
 containers-image-proxy = { version = "0.10", default-features = false }
 cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.4.0", optional = true }
 hex = { version = "0.4.0", default-features = false }
@@ -41,6 +42,7 @@ tar-core = "0.1.0"
 tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 tracing = { version = "0.1", default-features = false }
+zstd = { version = "0.13.0", default-features = false }
 cap-std-ext = { workspace = true }
 ocidir = { workspace = true }
 
