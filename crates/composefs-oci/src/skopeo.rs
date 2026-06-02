@@ -455,6 +455,12 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         let manifest = containers_image_proxy::oci_spec::image::ImageManifest::from_reader(
             raw_manifest.as_slice(),
         )?;
+
+        // Delta artifact detection
+        if crate::delta::is_delta_artifact(&manifest) {
+            return self.pull_delta(&manifest).await;
+        }
+
         let config_descriptor = manifest.config();
         let layers = manifest.layers();
         let (config_digest, config_verity, layer_refs, stats) = self
@@ -498,6 +504,77 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             },
             stats,
         ))
+    }
+
+    /// Pull a delta artifact: blobs are fetched on demand during apply.
+    async fn pull_delta(
+        self: &Arc<Self>,
+        manifest: &containers_image_proxy::oci_spec::image::ImageManifest,
+    ) -> Result<(PullResult<ObjectID>, ImportStats)> {
+        self.reporter
+            .report(ProgressEvent::Message("Detected delta artifact...".into()));
+
+        let descriptors: std::collections::HashMap<_, _> =
+            crate::delta::delta_layer_descriptors(manifest)
+                .iter()
+                .map(|d| (d.digest().clone(), d.clone()))
+                .collect();
+
+        let blob_reader = Arc::new(ProxyBlobReader {
+            image_op: Arc::clone(self),
+            descriptors,
+        });
+
+        // Limit to 2 concurrent layers: download the next while applying the previous,
+        // but avoid fetching further ahead to keep local disk usage bounded.
+        crate::delta::import_delta(&self.repo, manifest, blob_reader, &self.reporter, Some(2)).await
+    }
+}
+
+/// Blob reader that fetches from a skopeo image proxy on demand.
+struct ProxyBlobReader<ObjectID: FsVerityHashValue> {
+    image_op: Arc<ImageOp<ObjectID>>,
+    descriptors:
+        std::collections::HashMap<OciDigest, containers_image_proxy::oci_spec::image::Descriptor>,
+}
+
+impl<ObjectID: FsVerityHashValue> crate::delta::DeltaBlobReader for ProxyBlobReader<ObjectID> {
+    fn open_blob(
+        &self,
+        digest: &OciDigest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<std::fs::File>> + Send + '_>>
+    {
+        let digest = digest.clone();
+        Box::pin(async move {
+            let desc = self
+                .descriptors
+                .get(&digest)
+                .with_context(|| format!("No descriptor for blob {digest}"))?;
+
+            let (reader, driver) = self
+                .image_op
+                .proxy
+                .get_blob(&self.image_op.img, &digest, desc.size())
+                .await?;
+
+            let tmpfile = self
+                .image_op
+                .repo
+                .create_object_tmpfile()
+                .context("Creating temp file for delta blob")?;
+            let copy_fut = async {
+                let mut async_dst = tokio::fs::File::from(std::fs::File::from(tmpfile));
+                tokio::io::copy(&mut reader.take(desc.size()), &mut async_dst).await?;
+                tokio::io::AsyncWriteExt::flush(&mut async_dst).await?;
+                let mut std_file = async_dst.into_std().await;
+                use std::io::Seek;
+                std_file.seek(std::io::SeekFrom::Start(0))?;
+                anyhow::Ok(std_file)
+            };
+            let (file_result, driver_result) = tokio::join!(copy_fut, driver);
+            let _: () = driver_result?;
+            file_result
+        })
     }
 }
 
