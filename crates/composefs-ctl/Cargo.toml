@@ -17,7 +17,8 @@ name = "cfsctl"
 path = "src/main.rs"
 
 [features]
-default = ['pre-6.15', 'oci', 'containers-storage', 'ostree']
+default = ['pre-6.15', 'oci', 'containers-storage', 'ostree', 'fuse']
+fuse = ['dep:composefs-fuse']
 http = ['composefs-http']
 oci = ['composefs-oci', 'composefs-oci/varlink']
 containers-storage = ['composefs-oci/containers-storage', 'cstorage']
@@ -32,6 +33,7 @@ clap = { version = "4.5.0", default-features = false, features = ["std", "help",
 comfy-table = { version = "7.1", default-features = false }
 composefs = { workspace = true, features = ["varlink"] }
 composefs-boot = { workspace = true }
+composefs-fuse = { path = "../composefs-fuse", optional = true }
 composefs-oci = { workspace = true, optional = true, features = ["boot"] }
 composefs-http = { workspace = true, optional = true }
 cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.7.0", features = ["userns-helper"], optional = true }

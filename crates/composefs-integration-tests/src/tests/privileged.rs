@@ -968,3 +968,383 @@ fn privileged_cstor_import_xfs_reflink() -> Result<()> {
     Ok(())
 }
 integration_test!(privileged_cstor_import_xfs_reflink);
+
+// ============================================================================
+// FUSE integration test
+// ============================================================================
+
+/// RAII guard that tears down a `cfsctl fuse-serve` subprocess and its FUSE
+/// mount, even if the test panics.
+///
+/// The subprocess owns the `/dev/fuse` fd and the `fsmount()` fd that pin the
+/// FUSE superblock. Killing it closes those fds, the kernel aborts the
+/// connection, then a lazy (`DETACH`) unmount removes the dead mount from
+/// the directory tree.
+struct MountGuard {
+    mountpoint: PathBuf,
+    child: Option<std::process::Child>,
+}
+
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = rustix::mount::unmount(&self.mountpoint, rustix::mount::UnmountFlags::DETACH);
+    }
+}
+
+/// Content for the external files used by [`build_test_filesystem`].
+///
+/// These are defined at module level so the FUSE content-read verification
+/// in [`privileged_fuse_dumpfile_roundtrip`] can reconstruct the same bytes
+/// without having to pass them out of `build_test_filesystem`.
+fn bigfile_content() -> Vec<u8> {
+    // 600 bytes of 'A' — well above MAX_INLINE_CONTENT (512)
+    vec![b'A'; 600]
+}
+
+fn biglib_content() -> Vec<u8> {
+    // 800 bytes cycling 0..=255 — different pattern, different hash
+    (0u8..=255).cycle().take(800).collect()
+}
+
+/// Build a synthetic [`FileSystem<Sha256HashValue>`] with diverse content:
+/// directories, inline regular files (≤64 bytes), external regular files
+/// (>512 bytes), symlinks, xattrs, hardlinks, a FIFO, and a character device.
+///
+/// The `repo` argument is used to store the external file objects and obtain
+/// their fsverity hashes; it must already be initialised and set insecure.
+fn build_test_filesystem(
+    repo: &Repository<Sha256HashValue>,
+) -> Result<composefs_oci::composefs::tree::FileSystem<Sha256HashValue>> {
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
+
+    use composefs_oci::composefs::generic_tree::{LeafId, Stat};
+    use composefs_oci::composefs::tree::{
+        Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile,
+    };
+
+    fn dir_stat(mode: u32, uid: u32, gid: u32, mtime: i64) -> Stat {
+        Stat {
+            st_mode: mode,
+            st_uid: uid,
+            st_gid: gid,
+            st_mtim_sec: mtime,
+            st_mtim_nsec: 0,
+            xattrs: BTreeMap::new(),
+        }
+    }
+
+    fn leaf_stat(mode: u32, uid: u32, gid: u32, mtime: i64) -> Stat {
+        Stat {
+            st_mode: mode,
+            st_uid: uid,
+            st_gid: gid,
+            st_mtim_sec: mtime,
+            st_mtim_nsec: 0,
+            xattrs: BTreeMap::new(),
+        }
+    }
+
+    fn leaf_stat_xattr(
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        mtime: i64,
+        xattrs: &[(&str, &[u8])],
+    ) -> Stat {
+        let mut map = BTreeMap::new();
+        for (k, v) in xattrs {
+            map.insert(OsStr::new(k).into(), Box::from(*v));
+        }
+        Stat {
+            st_mode: mode,
+            st_uid: uid,
+            st_gid: gid,
+            st_mtim_sec: mtime,
+            st_mtim_nsec: 0,
+            xattrs: map,
+        }
+    }
+
+    // Root directory stat (with an xattr)
+    let mut root_xattrs = BTreeMap::new();
+    root_xattrs.insert(
+        OsStr::new("security.selinux").into(),
+        Box::from(b"system_u:object_r:root_t:s0".as_ref()),
+    );
+    let root_stat = Stat {
+        st_mode: 0o755,
+        st_uid: 0,
+        st_gid: 0,
+        st_mtim_sec: 1_700_000_000,
+        st_mtim_nsec: 0,
+        xattrs: root_xattrs,
+    };
+
+    let mut fs = FileSystem::<Sha256HashValue>::new(root_stat);
+
+    // Insert leaves in a deterministic order so indices are predictable.
+
+    // leaf 0: /usr/bin/hello  (inline file with xattr)
+    let hello_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: leaf_stat_xattr(0o755, 0, 0, 1_700_000_001, &[("user.test", b"hello-value")]),
+        content: LeafContent::Regular(RegularFile::Inline(
+            b"hello world binary stub".as_ref().into(),
+        )),
+    });
+
+    // leaf 1: /usr/lib/readme.txt  (inline file)
+    let readme_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: leaf_stat(0o644, 0, 0, 1_700_000_002),
+        content: LeafContent::Regular(RegularFile::Inline(
+            b"readme text content\n".as_ref().into(),
+        )),
+    });
+
+    // leaf 2: /etc/hostname  (inline file)
+    let hostname_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: leaf_stat(0o644, 0, 0, 1_700_000_003),
+        content: LeafContent::Regular(RegularFile::Inline(b"integration-test\n".as_ref().into())),
+    });
+
+    // leaf 3: /usr/lib/os-release  (inline file, also target of symlink)
+    let os_release_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: leaf_stat(0o644, 0, 0, 1_700_000_004),
+        content: LeafContent::Regular(RegularFile::Inline(b"ID=test\nNAME=Test\n".as_ref().into())),
+    });
+
+    // leaf 4: /etc/os-release  (symlink → ../usr/lib/os-release)
+    let symlink_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: leaf_stat(0o777, 0, 0, 1_700_000_005),
+        content: LeafContent::Symlink(OsStr::new("../usr/lib/os-release").into()),
+    });
+
+    // leaf 5: /dev/null  (char device, major=1 minor=3 → rdev = makedev(1,3) = 259)
+    let devnull_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: leaf_stat(0o666, 0, 0, 0),
+        // rdev = major * 256 + minor for the erofs encoding used here
+        // Linux makedev(1,3) = (1 << 8) | 3 = 259
+        content: LeafContent::CharacterDevice(rustix::fs::makedev(1, 3)),
+    });
+
+    // leaf 6: /tmp/fifo  (named pipe)
+    let fifo_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: leaf_stat(0o644, 0, 0, 1_700_000_006),
+        content: LeafContent::Fifo,
+    });
+
+    // leaf 7: /usr/bin/bigfile  (external file, 600 bytes — above MAX_INLINE_CONTENT)
+    // Exercises the FUSE open()+read() path through Repository::open_object().
+    let bigfile_data = bigfile_content();
+    let bigfile_hash = repo.ensure_object(&bigfile_data)?;
+    let bigfile_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: leaf_stat(0o755, 0, 0, 1_700_000_007),
+        content: LeafContent::Regular(RegularFile::External(bigfile_hash, bigfile_data.len() as u64)),
+    });
+
+    // leaf 8: /usr/lib/biglib.so  (external file, 800 bytes — different pattern)
+    let biglib_data = biglib_content();
+    let biglib_hash = repo.ensure_object(&biglib_data)?;
+    let biglib_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: leaf_stat(0o755, 0, 0, 1_700_000_008),
+        content: LeafContent::Regular(RegularFile::External(biglib_hash, biglib_data.len() as u64)),
+    });
+
+    // Now build the directory tree.
+
+    // /usr/bin/
+    let mut usr_bin = Directory::<Sha256HashValue>::new(dir_stat(0o755, 0, 0, 1_700_000_010));
+    usr_bin.insert(OsStr::new("hello"), Inode::leaf(hello_id));
+    // hardlink: /usr/bin/hello2 → same leaf as /usr/bin/hello
+    usr_bin.insert(OsStr::new("hello2"), Inode::leaf(hello_id));
+    usr_bin.insert(OsStr::new("bigfile"), Inode::leaf(bigfile_id));
+
+    // /usr/lib/
+    let mut usr_lib = Directory::<Sha256HashValue>::new(dir_stat(0o755, 0, 0, 1_700_000_011));
+    usr_lib.insert(OsStr::new("readme.txt"), Inode::leaf(readme_id));
+    usr_lib.insert(OsStr::new("os-release"), Inode::leaf(os_release_id));
+    usr_lib.insert(OsStr::new("biglib.so"), Inode::leaf(biglib_id));
+
+    // /usr/
+    let mut usr = Directory::<Sha256HashValue>::new(dir_stat(0o755, 0, 0, 1_700_000_012));
+    usr.insert(OsStr::new("bin"), Inode::Directory(Box::new(usr_bin)));
+    usr.insert(OsStr::new("lib"), Inode::Directory(Box::new(usr_lib)));
+
+    // /etc/
+    let mut etc = Directory::<Sha256HashValue>::new(dir_stat(0o755, 0, 0, 1_700_000_013));
+    etc.insert(OsStr::new("hostname"), Inode::leaf(hostname_id));
+    etc.insert(OsStr::new("os-release"), Inode::leaf(symlink_id));
+
+    // /dev/
+    let mut dev = Directory::<Sha256HashValue>::new(dir_stat(0o755, 0, 0, 1_700_000_014));
+    dev.insert(OsStr::new("null"), Inode::leaf(devnull_id));
+
+    // /tmp/
+    let mut tmp_dir = Directory::<Sha256HashValue>::new(dir_stat(0o1777, 0, 0, 1_700_000_015));
+    tmp_dir.insert(OsStr::new("fifo"), Inode::leaf(fifo_id));
+
+    // Root
+    fs.root
+        .insert(OsStr::new("usr"), Inode::Directory(Box::new(usr)));
+    fs.root
+        .insert(OsStr::new("etc"), Inode::Directory(Box::new(etc)));
+    fs.root
+        .insert(OsStr::new("dev"), Inode::Directory(Box::new(dev)));
+    fs.root
+        .insert(OsStr::new("tmp"), Inode::Directory(Box::new(tmp_dir)));
+
+    Ok(fs)
+}
+
+/// Mount a composefs [`FileSystem`] via FUSE, generate a dumpfile from the
+/// FUSE mount using `cfsctl create-dumpfile`, and assert that it is
+/// byte-for-byte identical to the dumpfile produced directly by
+/// [`write_dumpfile`] on the same in-memory tree.
+///
+/// This validates that the FUSE implementation correctly reports every piece
+/// of metadata that the dumpfile format captures: modes, uid/gid, mtimes,
+/// xattrs, symlink targets, hardlink structure, and device numbers.
+fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::time::{Duration, Instant};
+
+    use composefs_oci::composefs::{
+        dumpfile::write_dumpfile,
+        erofs::{reader::erofs_to_filesystem, writer::{mkfs_erofs, ValidatedFileSystem}},
+        repository::{Repository, RepositoryConfig},
+    };
+
+    if require_privileged("privileged_fuse_dumpfile_roundtrip")?.is_some() {
+        return Ok(());
+    }
+
+    // 1. Temp dir: mountpoint, insecure SHA-256 repo, and EROFS image file.
+    let work_dir = tempfile::tempdir()?;
+    let mountpoint = work_dir.path().join("mnt");
+    let repo_path = work_dir.path().join("repo");
+    let image_path = work_dir.path().join("image.erofs");
+    std::fs::create_dir(&mountpoint)?;
+    std::fs::create_dir(&repo_path)?;
+
+    let repo_fd = rustix::fs::open(
+        &repo_path,
+        rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::RDONLY,
+        rustix::fs::Mode::empty(),
+    )?;
+    let (mut repo, _created) = Repository::<Sha256HashValue>::init_path(
+        &repo_fd,
+        ".",
+        RepositoryConfig::default().set_insecure(),
+    )?;
+    repo.set_insecure();
+
+    // 2. Build the synthetic tree, write external objects to the repo, and
+    //    round-trip through EROFS for canonical form.
+    let synthetic = build_test_filesystem(&repo)?;
+    let erofs_bytes = mkfs_erofs(&mut ValidatedFileSystem::new(synthetic)?);
+    std::fs::write(&image_path, &*erofs_bytes)?;
+    let canonical_fs = erofs_to_filesystem::<Sha256HashValue>(&erofs_bytes)?;
+
+    // 3. Expected dumpfile from the in-memory canonical tree.
+    let mut expected_buf = Vec::new();
+    write_dumpfile(&mut expected_buf, &canonical_fs)?;
+    let expected_dump = String::from_utf8(expected_buf)?;
+
+    // 4. Record the mountpoint's device number so we can detect when the
+    //    FUSE mount becomes visible (st_dev changes).
+    let pre_mount_dev = std::fs::metadata(&mountpoint)?.dev();
+
+    // 5. Spawn `cfsctl fuse-serve` in the background. It opens /dev/fuse,
+    //    mounts, attaches at <mountpoint>, and serves until killed.
+    let cfsctl_bin = cfsctl()?;
+    let child = std::process::Command::new(&cfsctl_bin)
+        .arg("--repo")
+        .arg(&repo_path)
+        .arg("fuse-serve")
+        .arg(&image_path)
+        .arg(&mountpoint)
+        .spawn()
+        .context("spawning cfsctl fuse-serve")?;
+
+    let mut guard = MountGuard {
+        mountpoint: mountpoint.clone(),
+        child: Some(child),
+    };
+
+    // 6. Poll until the mount is ready: st_dev of mountpoint changes once
+    //    the FUSE filesystem is attached. Bail if the child exits early.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(child) = guard.child.as_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            bail!("cfsctl fuse-serve exited before mount was ready: {status}");
+        }
+        if std::fs::metadata(&mountpoint)
+            .map(|m| m.dev())
+            .unwrap_or(pre_mount_dev)
+            != pre_mount_dev
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for FUSE mount");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 7. Verify external file content is served correctly.
+    let bigfile_actual = std::fs::read(mountpoint.join("usr/bin/bigfile"))
+        .context("reading bigfile from FUSE mount")?;
+    ensure!(
+        bigfile_actual == bigfile_content(),
+        "bigfile content mismatch: got {} bytes, expected {}",
+        bigfile_actual.len(),
+        bigfile_content().len(),
+    );
+    let biglib_actual = std::fs::read(mountpoint.join("usr/lib/biglib.so"))
+        .context("reading biglib.so from FUSE mount")?;
+    ensure!(
+        biglib_actual == biglib_content(),
+        "biglib.so content mismatch: got {} bytes, expected {}",
+        biglib_actual.len(),
+        biglib_content().len(),
+    );
+
+    // 8. Generate the actual dumpfile by walking the FUSE mount via cfsctl.
+    //    --no-propagate-usr-to-root preserves raw metadata; --repo points at
+    //    the SHA-256 repo so external-file digests match expected_dump.
+    let sh = Shell::new()?;
+    let mp = mountpoint.to_str().context("non-UTF-8 mountpoint")?;
+    let repo_arg = repo_path.to_str().context("non-UTF-8 repo path")?;
+    let actual_dump = cmd!(
+        sh,
+        "{cfsctl_bin} --repo {repo_arg} create-dumpfile --no-propagate-usr-to-root {mp}"
+    )
+    .read()?;
+
+    // 9. Tear down before asserting so a mismatch doesn't leak the mount.
+    drop(guard);
+
+    // 10. Compare with a readable diff on mismatch.
+    similar_asserts::assert_eq!(
+        expected_dump.trim_end_matches('\n'),
+        actual_dump.trim_end_matches('\n')
+    );
+
+    Ok(())
+}
+integration_test!(privileged_fuse_dumpfile_roundtrip);

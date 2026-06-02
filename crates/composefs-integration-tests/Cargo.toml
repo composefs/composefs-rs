@@ -43,13 +43,13 @@ composefs-ostree = { workspace = true }
 composefs-ctl = { workspace = true, features = ["oci"] }
 hex = "0.4"
 libtest-mimic = "0.8"
+similar-asserts = "1"
 linkme = "0.3"
 ocidir = { workspace = true }
 paste = "1"
 rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-similar-asserts = "1"
 tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

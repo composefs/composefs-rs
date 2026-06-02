@@ -573,6 +573,75 @@ fn run_init_repository(
     Ok(InitRepositoryReply { created })
 }
 
+/// Serve an EROFS image file over FUSE.
+///
+/// Reads the image at `image`, parses it as an EROFS composefs filesystem,
+/// opens `/dev/fuse`, attaches the mount at `mountpoint`, and — when
+/// `wait` is `true` — blocks until the FUSE session terminates.
+///
+/// When `wait` is `false`, the FUSE session is detached into a background
+/// `spawn_blocking` task and the function returns immediately once the
+/// mount is visible to the OS. The caller can tear down the mount with a
+/// plain `umount` — no need to hold the varlink connection open.
+#[cfg(feature = "fuse")]
+async fn run_fuse_serve<ObjectID: FsVerityHashValue>(
+    repo: Arc<Repository<ObjectID>>,
+    image: String,
+    mountpoint: String,
+    passthrough: bool,
+    wait: bool,
+) -> std::result::Result<(), RepositoryError> {
+    use composefs::erofs::reader::erofs_to_filesystem;
+    use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse};
+
+    let erofs_bytes = std::fs::read(&image).map_err(|e| RepositoryError::InternalError {
+        message: format!("reading EROFS image {image}: {e:#}"),
+    })?;
+    let filesystem = erofs_to_filesystem::<ObjectID>(&erofs_bytes).map_err(|e| {
+        RepositoryError::InternalError {
+            message: format!("parsing EROFS image: {e:#}"),
+        }
+    })?;
+
+    let dev_fuse = open_fuse().map_err(|e| RepositoryError::InternalError {
+        message: format!("opening /dev/fuse: {e:#}"),
+    })?;
+    let mnt_fd = mount_fuse(&dev_fuse).map_err(|e| RepositoryError::InternalError {
+        message: format!("mounting FUSE: {e:#}"),
+    })?;
+    composefs::mount::mount_at(&mnt_fd, CWD, &mountpoint).map_err(|e| {
+        RepositoryError::InternalError {
+            message: format!("attaching FUSE mount at {mountpoint}: {e:#}"),
+        }
+    })?;
+
+    let fs = Arc::new(filesystem);
+    if wait {
+        // Hold mnt_fd alive for the session duration — it pins the FUSE
+        // superblock so the connection stays alive while we serve.
+        let _mnt_fd = mnt_fd;
+        tokio::task::spawn_blocking(move || {
+            serve_tree_fuse(dev_fuse, fs, repo, FuseConfig { passthrough })
+        })
+        .await
+        .map_err(|e| RepositoryError::InternalError {
+            message: format!("FUSE task panicked: {e}"),
+        })?
+        .map_err(|e| RepositoryError::InternalError {
+            message: format!("FUSE session error: {e:#}"),
+        })
+    } else {
+        // Detach: move mnt_fd into the background task so it stays alive
+        // as long as the FUSE session runs.  Drop the JoinHandle so the
+        // task is fully detached (errors are silently ignored).
+        let _detached = tokio::task::spawn_blocking(move || {
+            let _mnt_fd = mnt_fd;
+            serve_tree_fuse(dev_fuse, fs, repo, FuseConfig { passthrough })
+        });
+        Ok(())
+    }
+}
+
 /// OCI helper functions backing the `org.composefs.Oci` interface, gated behind
 /// the `oci` feature.
 #[cfg(feature = "oci")]
@@ -665,6 +734,123 @@ async fn run_tag<ObjectID: FsVerityHashValue>(
     })
 }
 
+/// Serve an OCI image's composefs EROFS image over FUSE.
+///
+/// Resolves the OCI image reference, picks the regular or boot EROFS image
+/// depending on `bootable`, reads it from the repository, and serves it over
+/// FUSE at `mountpoint`. When `wait` is `true`, blocks until the session
+/// terminates. When `wait` is `false`, the FUSE session is detached into a
+/// background task and the function returns immediately once the mount is
+/// visible to the OS.
+#[cfg(all(feature = "oci", feature = "fuse"))]
+async fn run_oci_fuse_mount<ObjectID: FsVerityHashValue>(
+    repo: Arc<Repository<ObjectID>>,
+    image: String,
+    mountpoint: String,
+    bootable: bool,
+    passthrough: bool,
+    wait: bool,
+) -> std::result::Result<(), oci::OciError> {
+    use composefs::erofs::reader::erofs_to_filesystem;
+    use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse};
+
+    // Resolve the OCI image reference (tag or digest).
+    let img = if image.starts_with("sha256:") || image.starts_with("sha512:") {
+        let digest: composefs_oci::OciDigest =
+            image.parse().map_err(|e| oci::OciError::InternalError {
+                message: format!("invalid manifest digest: {e:#}"),
+            })?;
+        composefs_oci::oci_image::OciImage::open(&repo, &digest, None).map_err(|e| {
+            oci::OciError::InternalError {
+                message: format!("{e:#}"),
+            }
+        })?
+    } else {
+        composefs_oci::oci_image::OciImage::open_ref(&repo, &image).map_err(|e| {
+            if let Some(nf) = e.downcast_ref::<composefs_oci::OciRefNotFound>() {
+                oci::OciError::NoSuchImage {
+                    image: nf.name.clone(),
+                }
+            } else {
+                oci::OciError::InternalError {
+                    message: format!("{e:#}"),
+                }
+            }
+        })?
+    };
+
+    let erofs_id = if bootable {
+        img.boot_image_ref(repo.erofs_version())
+            .ok_or_else(|| oci::OciError::InternalError {
+                message: "No boot EROFS image linked — try pulling with --bootable".to_string(),
+            })?
+    } else {
+        img.image_ref(repo.erofs_version())
+            .ok_or_else(|| oci::OciError::InternalError {
+                message: "No composefs EROFS image linked — try re-pulling the image".to_string(),
+            })?
+    };
+
+    // Read the EROFS image bytes from the repository's images/ directory.
+    let (image_fd, _verified) =
+        repo.open_image(&erofs_id.to_hex())
+            .map_err(|e| oci::OciError::InternalError {
+                message: format!("opening EROFS image: {e:#}"),
+            })?;
+    let erofs_bytes = {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        std::fs::File::from(image_fd)
+            .read_to_end(&mut buf)
+            .map_err(|e| oci::OciError::InternalError {
+                message: format!("reading EROFS image: {e:#}"),
+            })?;
+        buf
+    };
+    let filesystem = erofs_to_filesystem::<ObjectID>(&erofs_bytes).map_err(|e| {
+        oci::OciError::InternalError {
+            message: format!("parsing EROFS image: {e:#}"),
+        }
+    })?;
+
+    let dev_fuse = open_fuse().map_err(|e| oci::OciError::InternalError {
+        message: format!("opening /dev/fuse: {e:#}"),
+    })?;
+    let mnt_fd = mount_fuse(&dev_fuse).map_err(|e| oci::OciError::InternalError {
+        message: format!("mounting FUSE: {e:#}"),
+    })?;
+    composefs::mount::mount_at(&mnt_fd, CWD, &mountpoint).map_err(|e| {
+        oci::OciError::InternalError {
+            message: format!("attaching FUSE mount at {mountpoint}: {e:#}"),
+        }
+    })?;
+    let fs = Arc::new(filesystem);
+    if wait {
+        // Hold mnt_fd alive for the session duration — it pins the FUSE
+        // superblock so the connection stays alive while we serve.
+        let _mnt_fd = mnt_fd;
+        tokio::task::spawn_blocking(move || {
+            serve_tree_fuse(dev_fuse, fs, repo, FuseConfig { passthrough })
+        })
+        .await
+        .map_err(|e| oci::OciError::InternalError {
+            message: format!("FUSE task panicked: {e}"),
+        })?
+        .map_err(|e| oci::OciError::InternalError {
+            message: format!("FUSE session error: {e:#}"),
+        })
+    } else {
+        // Detach: move mnt_fd into the background task so it stays alive
+        // as long as the FUSE session runs.  Drop the JoinHandle so the
+        // task is fully detached (errors are silently ignored).
+        let _detached = tokio::task::spawn_blocking(move || {
+            let _mnt_fd = mnt_fd;
+            serve_tree_fuse(dev_fuse, fs, repo, FuseConfig { passthrough })
+        });
+        Ok(())
+    }
+}
+
 /// Remove a tag.
 #[cfg(feature = "oci")]
 async fn run_untag<ObjectID: FsVerityHashValue>(
@@ -738,7 +924,159 @@ async fn run_compute_id<ObjectID: FsVerityHashValue>(
 // `interface = "org.composefs.Oci"` the macro keeps using it for subsequent
 // methods until changed. The Repository methods come first and inherit the
 // seeded `org.composefs.Repository` interface.
-#[cfg(not(feature = "oci"))]
+// Repository-only variants (no OCI), split further by the `fuse` feature.
+// The #[zlink::service] macro generates a dispatch enum keyed on the wire
+// method name, so methods cannot be individually cfg-gated inside one impl
+// block — the macro sees all methods at expansion time.  We therefore keep
+// separate impl blocks for each (oci, fuse) combination.
+
+#[cfg(all(not(feature = "oci"), feature = "fuse"))]
+mod service_impl {
+    #![allow(missing_docs)]
+
+    use super::{
+        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, OpenRepo,
+        OpenRepositoryReply, RepositoryError, run_fsck, run_fuse_serve, run_gc, run_image_objects,
+        run_init_repository,
+    };
+    use composefs::fsverity::{Algorithm, Sha256HashValue, Sha512HashValue};
+
+    #[zlink::service(
+        interface = "org.composefs.Repository",
+        vendor = "org.composefs",
+        product = "cfsctl",
+        version = env!("CARGO_PKG_VERSION"),
+        url = "https://github.com/composefs/composefs-rs"
+    )]
+    impl<Sock> CfsctlService {
+        /// Initialize a new repository at the given path, or verify that an
+        /// existing one matches the requested algorithm (idempotent).
+        ///
+        /// Creates the directory (and any parents) if they do not exist.
+        /// `algorithm` must be a valid fs-verity algorithm string such as
+        /// `"fsverity-sha512-12"` (the default) or `"fsverity-sha256-12"`.
+        /// When omitted the service default (`fsverity-sha512-12`) is used.
+        /// The `insecure` flag mirrors `cfsctl init --insecure`: when `true`,
+        /// fs-verity is not required on `meta.json`.
+        async fn init_repository(
+            &mut self,
+            path: String,
+            algorithm: Option<String>,
+            insecure: Option<bool>,
+        ) -> std::result::Result<InitRepositoryReply, RepositoryError> {
+            let algorithm: Algorithm = algorithm
+                .as_deref()
+                .unwrap_or("fsverity-sha512-12")
+                .parse()
+                .map_err(|e| RepositoryError::InvalidSpec {
+                    message: format!("invalid algorithm: {e}"),
+                })?;
+            let insecure = insecure.unwrap_or(self.open_opts.insecure);
+            run_init_repository(std::path::Path::new(&path), algorithm, insecure)
+        }
+
+        /// Open and validate a repository, returning an opaque handle.
+        ///
+        /// Exactly one of `path`, `user`, `system` must be set.
+        async fn open_repository(
+            &mut self,
+            path: Option<String>,
+            user: Option<bool>,
+            system: Option<bool>,
+            #[zlink(connection)] conn: &mut zlink::Connection<Sock>,
+        ) -> std::result::Result<OpenRepositoryReply, RepositoryError> {
+            let selected = Self::resolve_selector(path, user, system)?;
+            let handle = self.do_open(&selected, Some(conn.id()))?;
+            Ok(OpenRepositoryReply { handle })
+        }
+
+        /// Close a previously opened repository handle.
+        async fn close_repository(
+            &mut self,
+            handle: u64,
+        ) -> std::result::Result<(), RepositoryError> {
+            self.repos
+                .remove(&handle)
+                .map(|_| ())
+                .ok_or(RepositoryError::InvalidHandle { handle })
+        }
+
+        /// Check repository integrity and return the structured result.
+        ///
+        /// When `metadata_only` is true, the expensive per-object fs-verity
+        /// verification is skipped; only metadata and symlink structure are
+        /// checked.
+        async fn fsck(
+            &self,
+            handle: u64,
+            metadata_only: Option<bool>,
+        ) -> std::result::Result<FsckReply, RepositoryError> {
+            let metadata_only = metadata_only.unwrap_or(false);
+            let result = match self.lookup_repo(handle)? {
+                OpenRepo::Sha256(ref r) => run_fsck::<Sha256HashValue>(r, metadata_only).await,
+                OpenRepo::Sha512(ref r) => run_fsck::<Sha512HashValue>(r, metadata_only).await,
+            }?;
+            Ok(FsckReply::from(&result))
+        }
+
+        /// Run garbage collection (or a dry run) and return what was removed.
+        async fn gc(
+            &self,
+            handle: u64,
+            dry_run: bool,
+            roots: Vec<String>,
+        ) -> std::result::Result<GcReply, RepositoryError> {
+            match self.lookup_repo(handle)? {
+                OpenRepo::Sha256(ref r) => run_gc::<Sha256HashValue>(r, dry_run, roots).await,
+                OpenRepo::Sha512(ref r) => run_gc::<Sha512HashValue>(r, dry_run, roots).await,
+            }
+        }
+
+        /// List the objects referenced by a single image.
+        async fn image_objects(
+            &self,
+            handle: u64,
+            name: String,
+        ) -> std::result::Result<ImageObjectsReply, RepositoryError> {
+            match self.lookup_repo(handle)? {
+                OpenRepo::Sha256(ref r) => run_image_objects::<Sha256HashValue>(r, name).await,
+                OpenRepo::Sha512(ref r) => run_image_objects::<Sha512HashValue>(r, name).await,
+            }
+        }
+
+        /// Serve an EROFS composefs image file over FUSE.
+        ///
+        /// Opens the image at `image`, parses it as an EROFS composefs
+        /// filesystem, and serves it over FUSE at `mountpoint`. When `wait`
+        /// is `true` (the default), blocks until the FUSE session ends (the
+        /// mount is detached or the client drops the RPC connection). When
+        /// `wait` is `false`, the session is detached into a background task
+        /// and the RPC returns immediately once the mount is ready. The
+        /// `handle` selects the repository used to resolve external file
+        /// objects. When `passthrough` is `true`, the FUSE passthrough
+        /// feature is requested (Linux 6.9+; requires root).
+        async fn fuse_serve(
+            &self,
+            handle: u64,
+            image: String,
+            mountpoint: String,
+            passthrough: bool,
+            wait: Option<bool>,
+        ) -> std::result::Result<(), RepositoryError> {
+            let wait = wait.unwrap_or(true);
+            match self.lookup_repo(handle)? {
+                OpenRepo::Sha256(r) => {
+                    run_fuse_serve::<Sha256HashValue>(r, image, mountpoint, passthrough, wait).await
+                }
+                OpenRepo::Sha512(r) => {
+                    run_fuse_serve::<Sha512HashValue>(r, image, mountpoint, passthrough, wait).await
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(not(feature = "oci"), not(feature = "fuse")))]
 mod service_impl {
     #![allow(missing_docs)]
 
@@ -887,9 +1225,13 @@ mod service_impl {
 
 // Combined variant: hosts BOTH the `org.composefs.Repository` and
 // `org.composefs.Oci` interfaces from a single impl block on `CfsctlService`,
-// so one service answers both interfaces on one socket. See the comment above
-// for why this can't be cfg-gated method-by-method.
-#[cfg(feature = "oci")]
+// so one service answers both interfaces on one socket. The #[zlink::service]
+// macro generates a dispatch enum keyed on the wire method name, so methods
+// cannot be individually cfg-gated inside one impl block — the macro sees all
+// methods at expansion time. We therefore keep separate impl blocks for each
+// (oci, fuse) combination.
+
+#[cfg(all(feature = "oci", feature = "fuse"))]
 mod service_impl {
     #![allow(missing_docs)]
 
@@ -900,8 +1242,9 @@ mod service_impl {
     use super::{
         CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, MountParams,
         MountReply, OpenRepo, OpenRepositoryReply, RepositoryError, run_compute_id, run_fsck,
-        run_gc, run_image_objects, run_init_repository, run_inspect, run_list_images, run_mount,
-        run_oci_fsck, run_oci_mount, run_tag, run_untag,
+        run_fuse_serve, run_gc, run_image_objects, run_init_repository, run_inspect,
+        run_list_images, run_mount, run_oci_fsck, run_oci_fuse_mount, run_oci_mount, run_tag,
+        run_untag,
     };
     use composefs::fsverity::{Algorithm, Sha256HashValue, Sha512HashValue};
 
@@ -1041,11 +1384,348 @@ mod service_impl {
             }
         }
 
+        /// Serve an EROFS composefs image file over FUSE.
+        ///
+        /// Opens the image at `image`, parses it as an EROFS composefs
+        /// filesystem, and serves it over FUSE at `mountpoint`. When `wait`
+        /// is `true` (the default), blocks until the FUSE session ends (the
+        /// mount is detached or the client drops the RPC connection). When
+        /// `wait` is `false`, the session is detached into a background task
+        /// and the RPC returns immediately once the mount is ready. The
+        /// `handle` selects the repository used to resolve external file
+        /// objects. When `passthrough` is `true`, the FUSE passthrough
+        /// feature is requested (Linux 6.9+; requires root).
+        async fn fuse_serve(
+            &self,
+            handle: u64,
+            image: String,
+            mountpoint: String,
+            passthrough: bool,
+            wait: Option<bool>,
+        ) -> std::result::Result<(), RepositoryError> {
+            let wait = wait.unwrap_or(true);
+            match self.lookup_repo(handle)? {
+                OpenRepo::Sha256(r) => {
+                    run_fuse_serve::<Sha256HashValue>(r, image, mountpoint, passthrough, wait).await
+                }
+                OpenRepo::Sha512(r) => {
+                    run_fuse_serve::<Sha512HashValue>(r, image, mountpoint, passthrough, wait).await
+                }
+            }
+        }
+
         // --- org.composefs.Oci ---
         //
         // The first OCI method sets `interface = "org.composefs.Oci"`; the
         // macro then keeps that interface sticky for subsequent methods. Each
         // OCI method is still annotated explicitly for clarity.
+
+        /// List tagged OCI images in the repository.
+        ///
+        /// When `filter` is given, only images whose name contains that
+        /// substring are returned.
+        #[zlink(interface = "org.composefs.Oci")]
+        async fn list_images(
+            &self,
+            handle: u64,
+            filter: Option<String>,
+        ) -> std::result::Result<ListImagesReply, OciError> {
+            let images = match self.lookup_oci(handle)? {
+                OpenRepo::Sha256(ref r) => run_list_images::<Sha256HashValue>(r, filter).await,
+                OpenRepo::Sha512(ref r) => run_list_images::<Sha512HashValue>(r, filter).await,
+            }?;
+            Ok(ListImagesReply { images })
+        }
+
+        /// Run an OCI-aware consistency check on the repository.
+        ///
+        /// Renamed on the wire to `Check` so it does not collide with the
+        /// repository-level `Fsck` method (the dispatch enum keys on the wire
+        /// method name, which must be globally unique across both interfaces).
+        #[zlink(interface = "org.composefs.Oci", rename = "Check")]
+        async fn oci_fsck(
+            &self,
+            handle: u64,
+            image: Option<String>,
+        ) -> std::result::Result<OciFsckReply, OciError> {
+            match self.lookup_oci(handle)? {
+                OpenRepo::Sha256(ref r) => run_oci_fsck::<Sha256HashValue>(r, image).await,
+                OpenRepo::Sha512(ref r) => run_oci_fsck::<Sha512HashValue>(r, image).await,
+            }
+        }
+
+        /// Inspect a single OCI image.
+        #[zlink(interface = "org.composefs.Oci")]
+        async fn inspect(
+            &self,
+            handle: u64,
+            image: String,
+        ) -> std::result::Result<OciInspectReply, OciError> {
+            match self.lookup_oci(handle)? {
+                OpenRepo::Sha256(ref r) => run_inspect::<Sha256HashValue>(r, image).await,
+                OpenRepo::Sha512(ref r) => run_inspect::<Sha512HashValue>(r, image).await,
+            }
+        }
+
+        /// Tag a manifest digest with a name.
+        #[zlink(interface = "org.composefs.Oci")]
+        async fn tag(
+            &self,
+            handle: u64,
+            manifest_digest: String,
+            name: String,
+        ) -> std::result::Result<(), OciError> {
+            match self.lookup_oci(handle)? {
+                OpenRepo::Sha256(ref r) => {
+                    run_tag::<Sha256HashValue>(r, manifest_digest, name).await
+                }
+                OpenRepo::Sha512(ref r) => {
+                    run_tag::<Sha512HashValue>(r, manifest_digest, name).await
+                }
+            }
+        }
+
+        /// Remove a tag.
+        #[zlink(interface = "org.composefs.Oci")]
+        async fn untag(&self, handle: u64, name: String) -> std::result::Result<(), OciError> {
+            match self.lookup_oci(handle)? {
+                OpenRepo::Sha256(ref r) => run_untag::<Sha256HashValue>(r, name).await,
+                OpenRepo::Sha512(ref r) => run_untag::<Sha512HashValue>(r, name).await,
+            }
+        }
+
+        /// Compute the composefs image ID for an OCI image.
+        #[zlink(interface = "org.composefs.Oci")]
+        async fn compute_id(
+            &self,
+            handle: u64,
+            image: String,
+            verity: Option<String>,
+            bootable: bool,
+        ) -> std::result::Result<OciComputeIdReply, OciError> {
+            match self.lookup_oci(handle)? {
+                OpenRepo::Sha256(ref r) => {
+                    run_compute_id::<Sha256HashValue>(r, image, verity, bootable).await
+                }
+                OpenRepo::Sha512(ref r) => {
+                    run_compute_id::<Sha512HashValue>(r, image, verity, bootable).await
+                }
+            }
+        }
+
+        /// Mount a stored OCI image's composefs EROFS image over FUSE.
+        ///
+        /// Resolves `image` (a tag name or `sha256:`/`sha512:` manifest digest),
+        /// selects the regular or boot EROFS image depending on `bootable`,
+        /// and serves it over FUSE at `mountpoint`. When `wait` is `true`
+        /// (the default), blocks until the FUSE session ends (the mount is
+        /// detached or the client drops the RPC connection). When `wait` is
+        /// `false`, the session is detached into a background task and the
+        /// RPC returns immediately once the mount is ready — the caller can
+        /// tear it down with a plain `umount`. When `passthrough` is `true`,
+        /// the FUSE passthrough feature is requested (Linux 6.9+; requires root).
+        #[zlink(interface = "org.composefs.Oci")]
+        async fn oci_fuse_mount(
+            &self,
+            handle: u64,
+            image: String,
+            mountpoint: String,
+            bootable: bool,
+            passthrough: bool,
+            wait: Option<bool>,
+        ) -> std::result::Result<(), OciError> {
+            let wait = wait.unwrap_or(true);
+            match self.lookup_oci(handle)? {
+                OpenRepo::Sha256(r) => {
+                    run_oci_fuse_mount::<Sha256HashValue>(
+                        r,
+                        image,
+                        mountpoint,
+                        bootable,
+                        passthrough,
+                        wait,
+                    )
+                    .await
+                }
+                OpenRepo::Sha512(r) => {
+                    run_oci_fuse_mount::<Sha512HashValue>(
+                        r,
+                        image,
+                        mountpoint,
+                        bootable,
+                        passthrough,
+                        wait,
+                    )
+                    .await
+                }
+            }
+        }
+
+        /// Pull an OCI image into the repository, streaming progress.
+        ///
+        /// Emits zero or more intermediate [`PullProgress`] frames describing
+        /// fetch progress (only when `more` is true), followed by exactly one
+        /// terminal frame whose `completed` field is set, carrying the pull result.
+        #[zlink(interface = "org.composefs.Oci", more)]
+        #[allow(clippy::too_many_arguments)]
+        async fn pull(
+            &self,
+            more: bool,
+            handle: u64,
+            image: String,
+            name: Option<String>,
+            local_fetch: String,
+            storage_root: Option<String>,
+            bootable: bool,
+        ) -> impl zlink::futures_util::Stream<
+            Item = std::result::Result<zlink::Reply<PullProgress>, OciError>,
+        > + Send {
+            let lf = parse_local_fetch(&local_fetch);
+            let sr = storage_root.map(std::path::PathBuf::from);
+            // Resolve the handle synchronously and clone an owned Arc out so the
+            // returned stream owns everything it needs ('static). On a missing
+            // handle, yield a one-shot error stream (`pull_stream` and the
+            // error path share the same boxed-trait-object return type).
+            match self.repos.get(&handle).map(|entry| &entry.repo) {
+                Some(OpenRepo::Sha256(r)) => {
+                    pull_stream::<Sha256HashValue>(r.clone(), image, name, lf, sr, bootable, more)
+                }
+                Some(OpenRepo::Sha512(r)) => {
+                    pull_stream::<Sha512HashValue>(r.clone(), image, name, lf, sr, bootable, more)
+                }
+                None => {
+                    use zlink::futures_util::stream;
+                    Box::pin(stream::once(async move {
+                        Err(OciError::InvalidHandle { handle })
+                    }))
+                }
+            }
+        }
+    }
+}
+
+// OCI enabled, FUSE disabled: omit FuseServe and OciFuseMount methods.
+#[cfg(all(feature = "oci", not(feature = "fuse")))]
+mod service_impl {
+    #![allow(missing_docs)]
+
+    use super::oci::{
+        ListImagesReply, OciComputeIdReply, OciError, OciFsckReply, OciInspectReply, PullProgress,
+        parse_local_fetch, pull_stream,
+    };
+    use super::{
+        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, OpenRepo,
+        OpenRepositoryReply, RepositoryError, run_compute_id, run_fsck, run_gc, run_image_objects,
+        run_init_repository, run_inspect, run_list_images, run_oci_fsck, run_tag, run_untag,
+    };
+    use composefs::fsverity::{Algorithm, Sha256HashValue, Sha512HashValue};
+
+    #[zlink::service(
+        interface = "org.composefs.Repository",
+        vendor = "org.composefs",
+        product = "cfsctl",
+        version = env!("CARGO_PKG_VERSION"),
+        url = "https://github.com/composefs/composefs-rs"
+    )]
+    impl<Sock> CfsctlService {
+        // --- org.composefs.Repository ---
+
+        /// Initialize a new repository at the given path, or verify that an
+        /// existing one matches the requested algorithm (idempotent).
+        ///
+        /// Creates the directory (and any parents) if they do not exist.
+        /// `algorithm` must be a valid fs-verity algorithm string such as
+        /// `"fsverity-sha512-12"` (the default) or `"fsverity-sha256-12"`.
+        /// When omitted the service default (`fsverity-sha512-12`) is used.
+        /// The `insecure` flag mirrors `cfsctl init --insecure`: when `true`,
+        /// fs-verity is not required on `meta.json`.
+        async fn init_repository(
+            &mut self,
+            path: String,
+            algorithm: Option<String>,
+            insecure: Option<bool>,
+        ) -> std::result::Result<InitRepositoryReply, RepositoryError> {
+            let algorithm: Algorithm = algorithm
+                .as_deref()
+                .unwrap_or("fsverity-sha512-12")
+                .parse()
+                .map_err(|e| RepositoryError::InvalidSpec {
+                    message: format!("invalid algorithm: {e}"),
+                })?;
+            let insecure = insecure.unwrap_or(self.open_opts.insecure);
+            run_init_repository(std::path::Path::new(&path), algorithm, insecure)
+        }
+
+        /// Open and validate a repository, returning an opaque handle.
+        ///
+        /// Exactly one of `path`, `user`, `system` must be set.
+        async fn open_repository(
+            &mut self,
+            path: Option<String>,
+            user: Option<bool>,
+            system: Option<bool>,
+            #[zlink(connection)] conn: &mut zlink::Connection<Sock>,
+        ) -> std::result::Result<OpenRepositoryReply, RepositoryError> {
+            let selected = Self::resolve_selector(path, user, system)?;
+            let handle = self.do_open(&selected, Some(conn.id()))?;
+            Ok(OpenRepositoryReply { handle })
+        }
+
+        /// Close a previously opened repository handle.
+        async fn close_repository(
+            &mut self,
+            handle: u64,
+        ) -> std::result::Result<(), RepositoryError> {
+            self.repos
+                .remove(&handle)
+                .map(|_| ())
+                .ok_or(RepositoryError::InvalidHandle { handle })
+        }
+
+        /// Check repository integrity and return the structured result.
+        ///
+        /// When `metadata_only` is true, the expensive per-object fs-verity
+        /// verification is skipped; only metadata and symlink structure are
+        /// checked.
+        async fn fsck(
+            &self,
+            handle: u64,
+            metadata_only: Option<bool>,
+        ) -> std::result::Result<FsckReply, RepositoryError> {
+            let metadata_only = metadata_only.unwrap_or(false);
+            let result = match self.lookup_repo(handle)? {
+                OpenRepo::Sha256(ref r) => run_fsck::<Sha256HashValue>(r, metadata_only).await,
+                OpenRepo::Sha512(ref r) => run_fsck::<Sha512HashValue>(r, metadata_only).await,
+            }?;
+            Ok(FsckReply::from(&result))
+        }
+
+        /// Run garbage collection (or a dry run) and return what was removed.
+        async fn gc(
+            &self,
+            handle: u64,
+            dry_run: bool,
+            roots: Vec<String>,
+        ) -> std::result::Result<GcReply, RepositoryError> {
+            match self.lookup_repo(handle)? {
+                OpenRepo::Sha256(ref r) => run_gc::<Sha256HashValue>(r, dry_run, roots).await,
+                OpenRepo::Sha512(ref r) => run_gc::<Sha512HashValue>(r, dry_run, roots).await,
+            }
+        }
+
+        /// List the objects referenced by a single image.
+        async fn image_objects(
+            &self,
+            handle: u64,
+            name: String,
+        ) -> std::result::Result<ImageObjectsReply, RepositoryError> {
+            match self.lookup_repo(handle)? {
+                OpenRepo::Sha256(ref r) => run_image_objects::<Sha256HashValue>(r, name).await,
+                OpenRepo::Sha512(ref r) => run_image_objects::<Sha512HashValue>(r, name).await,
+            }
+        }
+
+        // --- org.composefs.Oci ---
 
         /// List tagged OCI images in the repository.
         ///
@@ -1161,10 +1841,6 @@ mod service_impl {
         > + Send {
             let lf = parse_local_fetch(&local_fetch);
             let sr = storage_root.map(std::path::PathBuf::from);
-            // Resolve the handle synchronously and clone an owned Arc out so the
-            // returned stream owns everything it needs ('static). On a missing
-            // handle, yield a one-shot error stream (`pull_stream` and the
-            // error path share the same boxed-trait-object return type).
             match self.repos.get(&handle).map(|entry| &entry.repo) {
                 Some(OpenRepo::Sha256(r)) => {
                     pull_stream::<Sha256HashValue>(r.clone(), image, name, lf, sr, bootable, more)
@@ -1870,7 +2546,71 @@ pub mod proxy {
     #[cfg(feature = "oci")]
     use zlink::futures_util::Stream;
 
-    /// Typed client for the `org.composefs.Repository` interface.
+    /// Typed client for the `org.composefs.Repository` interface (with FUSE support).
+    #[cfg(feature = "fuse")]
+    #[zlink::proxy(interface = "org.composefs.Repository")]
+    pub trait RepositoryProxy {
+        /// Initialize a new repository (or verify an existing one).
+        async fn init_repository(
+            &mut self,
+            path: &str,
+            algorithm: Option<&str>,
+            insecure: Option<bool>,
+        ) -> zlink::Result<Result<InitRepositoryReply, RepositoryError>>;
+
+        /// Open and validate a repository, returning an opaque handle.
+        async fn open_repository(
+            &mut self,
+            path: Option<&str>,
+            user: Option<bool>,
+            system: Option<bool>,
+        ) -> zlink::Result<Result<OpenRepositoryReply, RepositoryError>>;
+
+        /// Close a previously opened repository handle.
+        async fn close_repository(
+            &mut self,
+            handle: u64,
+        ) -> zlink::Result<Result<(), RepositoryError>>;
+
+        /// Check repository integrity.
+        async fn fsck(
+            &mut self,
+            handle: u64,
+            metadata_only: Option<bool>,
+        ) -> zlink::Result<Result<FsckReply, RepositoryError>>;
+
+        /// Run garbage collection (or a dry run).
+        async fn gc(
+            &mut self,
+            handle: u64,
+            dry_run: bool,
+            roots: Vec<String>,
+        ) -> zlink::Result<Result<GcReply, RepositoryError>>;
+
+        /// List the objects referenced by a single image.
+        async fn image_objects(
+            &mut self,
+            handle: u64,
+            name: &str,
+        ) -> zlink::Result<Result<ImageObjectsReply, RepositoryError>>;
+
+        /// Serve an EROFS composefs image file over FUSE.
+        ///
+        /// When `wait` is `None` or `Some(true)`, the call blocks until the
+        /// FUSE session ends. When `wait` is `Some(false)`, the server
+        /// detaches the session and returns immediately once the mount is ready.
+        async fn fuse_serve(
+            &mut self,
+            handle: u64,
+            image: &str,
+            mountpoint: &str,
+            passthrough: bool,
+            wait: Option<bool>,
+        ) -> zlink::Result<Result<(), RepositoryError>>;
+    }
+
+    /// Typed client for the `org.composefs.Repository` interface (without FUSE support).
+    #[cfg(not(feature = "fuse"))]
     #[zlink::proxy(interface = "org.composefs.Repository")]
     pub trait RepositoryProxy {
         /// Initialize a new repository (or verify an existing one).
@@ -1918,8 +2658,82 @@ pub mod proxy {
         ) -> zlink::Result<Result<ImageObjectsReply, RepositoryError>>;
     }
 
-    /// Typed client for the `org.composefs.Oci` interface.
-    #[cfg(feature = "oci")]
+    /// Typed client for the `org.composefs.Oci` interface (with FUSE support).
+    #[cfg(all(feature = "oci", feature = "fuse"))]
+    #[zlink::proxy(interface = "org.composefs.Oci")]
+    pub trait OciProxy {
+        /// List tagged OCI images.
+        async fn list_images(
+            &mut self,
+            handle: u64,
+            filter: Option<&str>,
+        ) -> zlink::Result<Result<ListImagesReply, OciError>>;
+
+        /// Run an OCI-aware consistency check (wire method `Check`).
+        #[zlink(rename = "Check")]
+        async fn oci_fsck(
+            &mut self,
+            handle: u64,
+            image: Option<&str>,
+        ) -> zlink::Result<Result<OciFsckReply, OciError>>;
+
+        /// Inspect a single OCI image.
+        async fn inspect(
+            &mut self,
+            handle: u64,
+            image: &str,
+        ) -> zlink::Result<Result<OciInspectReply, OciError>>;
+
+        /// Tag a manifest digest with a name.
+        async fn tag(
+            &mut self,
+            handle: u64,
+            manifest_digest: &str,
+            name: &str,
+        ) -> zlink::Result<Result<(), OciError>>;
+
+        /// Remove a tag.
+        async fn untag(&mut self, handle: u64, name: &str) -> zlink::Result<Result<(), OciError>>;
+
+        /// Compute the composefs image ID for an OCI image.
+        async fn compute_id(
+            &mut self,
+            handle: u64,
+            image: &str,
+            verity: Option<&str>,
+            bootable: bool,
+        ) -> zlink::Result<Result<OciComputeIdReply, OciError>>;
+
+        /// Mount a stored OCI image's composefs EROFS image over FUSE.
+        ///
+        /// When `wait` is `None` or `Some(true)`, the call blocks until the
+        /// FUSE session ends. When `wait` is `Some(false)`, the server
+        /// detaches the session and returns immediately once the mount is ready.
+        async fn oci_fuse_mount(
+            &mut self,
+            handle: u64,
+            image: &str,
+            mountpoint: &str,
+            bootable: bool,
+            passthrough: bool,
+            wait: Option<bool>,
+        ) -> zlink::Result<Result<(), OciError>>;
+
+        /// Pull an OCI image, streaming progress frames.
+        #[zlink(more, rename = "Pull")]
+        async fn pull(
+            &mut self,
+            handle: u64,
+            image: &str,
+            name: Option<&str>,
+            local_fetch: &str,
+            storage_root: Option<&str>,
+            bootable: bool,
+        ) -> zlink::Result<impl Stream<Item = zlink::Result<Result<PullProgress, OciError>>>>;
+    }
+
+    /// Typed client for the `org.composefs.Oci` interface (without FUSE support).
+    #[cfg(all(feature = "oci", not(feature = "fuse")))]
     #[zlink::proxy(interface = "org.composefs.Oci")]
     pub trait OciProxy {
         /// List tagged OCI images.
