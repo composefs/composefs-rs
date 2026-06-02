@@ -320,6 +320,33 @@ impl From<LocalFetchCli> for composefs_oci::LocalFetchOpt {
     }
 }
 
+/// Options accepted by `--fuse[=<opts>]` on `oci mount`.
+///
+/// Pass bare `--fuse` to FUSE-mount with defaults, or `--fuse=passthrough`
+/// to also enable kernel-bypass reads for external files.
+///
+/// Multiple options are comma-separated: `--fuse=passthrough,option2`
+/// (only `passthrough` is defined today).
+#[derive(Debug, Default, Clone)]
+struct FuseOptions {
+    passthrough: bool,
+}
+
+impl std::str::FromStr for FuseOptions {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut opts = FuseOptions::default();
+        for token in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            match token {
+                "passthrough" => opts.passthrough = true,
+                other => anyhow::bail!("unknown fuse option: {other:?} (known: passthrough)"),
+            }
+        }
+        Ok(opts)
+    }
+}
+
 /// Common options for operations using OCI config manifest streams that may transform the image rootfs
 #[cfg(feature = "oci")]
 #[derive(Debug, Parser)]
@@ -449,6 +476,17 @@ enum OciCommand {
         /// Mount read-write (requires --upperdir)
         #[arg(long, requires = "upperdir")]
         read_write: bool,
+        /// Serve the EROFS image over FUSE instead of using a kernel composefs mount.
+        /// Requires /dev/fuse and blocks until the mount is detached or the process
+        /// is killed. Does not require fs-verity on the backing store.
+        ///
+        /// Accepts an optional comma-separated list of options:
+        ///   --fuse              basic FUSE mount
+        ///   --fuse=passthrough  also enable kernel-bypass reads (Linux 6.9+, root, non-tmpfs)
+        #[cfg_attr(not(feature = "fuse"), arg(hide = true))]
+        #[arg(long, num_args = 0..=1, require_equals = false, value_name = "OPTS",
+              default_missing_value = "")]
+        fuse: Option<FuseOptions>,
     },
     /// Compute the composefs image ID of a stored OCI image's rootfs
     ///
@@ -585,6 +623,23 @@ enum Command {
         /// Mount read-write (requires --upperdir)
         #[arg(long, requires = "upperdir")]
         read_write: bool,
+    },
+    /// Serve an EROFS composefs image over FUSE at the given mountpoint.
+    ///
+    /// Reads the EROFS image, opens /dev/fuse, mounts and attaches the
+    /// FUSE filesystem at `<mountpoint>`, then blocks serving requests
+    /// until killed or unmounted. External file objects are resolved
+    /// via the repository given by `--repo`.
+    #[cfg(feature = "fuse")]
+    FuseServe {
+        /// Path to the EROFS composefs image file.
+        image: PathBuf,
+        /// Directory to attach the FUSE mount at (must already exist).
+        mountpoint: PathBuf,
+        /// Enable FUSE passthrough for external files (Linux 6.9+;
+        /// requires root and a non-tmpfs backing filesystem).
+        #[clap(long)]
+        passthrough: bool,
     },
     /// Read rootfs located at a path, add all files to the repo, then create the composefs image of the rootfs,
     /// commit it to the repo, and print its image object ID
@@ -1315,9 +1370,8 @@ where
                 ref upperdir,
                 ref workdir,
                 read_write,
+                fuse,
             } => {
-                let mount_options =
-                    get_mount_options(upperdir.as_deref(), workdir.as_deref(), read_write)?;
                 let img = if image.starts_with("sha256:") {
                     let digest: composefs_oci::OciDigest =
                         image.parse().context("Parsing manifest digest")?;
@@ -1340,7 +1394,50 @@ where
                         ),
                     }
                 };
-                repo.mount_at(&erofs_id.to_hex(), mountpoint.as_str(), &mount_options)?;
+                if let Some(fuse_opts) = fuse {
+                    #[cfg(feature = "fuse")]
+                    {
+                        use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse};
+
+                        // Read the EROFS image from the repository's images/ directory.
+                        let (image_fd, _verified) = repo.open_image(&erofs_id.to_hex())?;
+                        let erofs_bytes = {
+                            let mut buf = Vec::new();
+                            std::fs::File::from(image_fd).read_to_end(&mut buf)?;
+                            buf
+                        };
+                        let filesystem = erofs_to_filesystem::<ObjectID>(&erofs_bytes)
+                            .context("parsing EROFS image")?;
+
+                        let dev_fuse = open_fuse()?;
+                        let mnt_fd = mount_fuse(&dev_fuse)?;
+                        composefs::mount::mount_at(&mnt_fd, CWD, mountpoint.as_str())
+                            .with_context(|| format!("attaching FUSE mount at {mountpoint}"))?;
+
+                        // Hold mnt_fd alive for the session duration — it pins the FUSE
+                        // superblock so the connection stays alive while we serve.
+                        let _mnt_fd = mnt_fd;
+
+                        serve_tree_fuse(
+                            dev_fuse,
+                            Arc::new(filesystem),
+                            Arc::clone(&repo),
+                            FuseConfig {
+                                passthrough: fuse_opts.passthrough,
+                            },
+                        )
+                        .context("FUSE session error")?;
+                    }
+                    #[cfg(not(feature = "fuse"))]
+                    {
+                        let _ = fuse_opts;
+                        anyhow::bail!("cfsctl was built without FUSE support");
+                    }
+                } else {
+                    let mount_options =
+                        get_mount_options(upperdir.as_deref(), workdir.as_deref(), read_write)?;
+                    repo.mount_at(&erofs_id.to_hex(), mountpoint.as_str(), &mount_options)?;
+                }
             }
             OciCommand::ComputeId { config_opts } => {
                 let mut fs = load_filesystem_from_oci_image(&repo, config_opts)?;
@@ -1592,6 +1689,36 @@ where
             let mount_options =
                 get_mount_options(upperdir.as_deref(), workdir.as_deref(), read_write)?;
             repo.mount_at(&name, &mountpoint, &mount_options)?;
+        }
+        #[cfg(feature = "fuse")]
+        Command::FuseServe {
+            ref image,
+            ref mountpoint,
+            passthrough,
+        } => {
+            use composefs_fuse::{FuseConfig, mount_fuse, open_fuse, serve_tree_fuse};
+
+            let erofs_bytes = std::fs::read(image)
+                .with_context(|| format!("reading EROFS image {}", image.display()))?;
+            let filesystem =
+                erofs_to_filesystem::<ObjectID>(&erofs_bytes).context("parsing EROFS image")?;
+
+            let dev_fuse = open_fuse()?;
+            let mnt_fd = mount_fuse(&dev_fuse)?;
+            composefs::mount::mount_at(&mnt_fd, CWD, mountpoint)
+                .with_context(|| format!("attaching FUSE mount at {}", mountpoint.display()))?;
+
+            // Hold mnt_fd alive for the session duration — it pins the FUSE
+            // superblock so the connection stays alive while we serve.
+            let _mnt_fd = mnt_fd;
+
+            serve_tree_fuse(
+                dev_fuse,
+                Arc::new(filesystem),
+                Arc::clone(&repo),
+                FuseConfig { passthrough },
+            )
+            .context("FUSE session error")?;
         }
         Command::ImageObjects { name } => {
             let objects = repo.objects_for_image(&name)?;
