@@ -928,6 +928,11 @@ impl<ObjectID: FsVerityHashValue> SplitStreamReader<ObjectID> {
         self.named_refs
     }
 
+    /// Look up the digest of an external reference by index
+    pub fn lookup_external_ref(&self, idx: usize) -> Option<&ObjectID> {
+        self.object_refs.get(idx)
+    }
+
     fn ensure_chunk(
         &mut self,
         eof_ok: bool,

@@ -156,7 +156,10 @@ pub fn parse_sha256(string: impl AsRef<str>) -> Result<Sha256Digest> {
     Ok(value)
 }
 
-pub(crate) trait ErrnoFilter<T> {
+/// Utility for filtering ErrnoResult errors.
+pub trait ErrnoFilter<T> {
+    /// Parse a ErrnoResult<T> into ErrnoResult<Option<T>> where the option is
+    /// None if the errno was a specified errno (often used with ENOENT).
     fn filter_errno(self, ignored: Errno) -> ErrnoResult<Option<T>>;
 }
 
