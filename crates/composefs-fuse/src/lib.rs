@@ -1,205 +1,294 @@
-//! FUSE filesystem implementation for composefs trees.
+//! FUSE filesystem implementation for composefs EROFS images.
 //!
-//! This crate provides a userspace filesystem implementation that exposes composefs
-//! directory trees through FUSE. It supports read-only access to files, directories,
-//! symlinks, and extended attributes, with data served from a composefs repository.
+//! This crate serves a composefs EROFS image directly over FUSE without
+//! parsing the entire image into a high-level tree. FUSE inode numbers
+//! are EROFS NIDs, and all metadata is resolved on demand from the
+//! on-disk structures.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     ffi::OsStr,
     os::{
         fd::{AsFd, AsRawFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
+    path::Path,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
 use anyhow::Context;
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen,
-    Request, Session, SessionACL,
+    Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
+    MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEntry,
+    ReplyOpen, Request, Session, SessionACL,
 };
 use rustix::{
     buffer::spare_capacity,
-    fs::{Mode, OFlags, open},
-    io::{Errno, pread},
+    fs::{Mode, OFlags, open, openat},
+    io::pread,
     mount::{
         FsMountFlags, MountAttrFlags, fsconfig_create, fsconfig_set_flag, fsconfig_set_string,
         fsmount,
     },
 };
 
+use zerocopy::FromBytes as _;
+
 use composefs::{
-    fsverity::FsVerityHashValue,
-    generic_tree::LeafId,
+    erofs::{
+        format::{
+            self, DataLayout, FileType as ErofsFileType, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
+            S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, XATTR_PREFIXES,
+        },
+        reader::{DirectoryBlock, Image, InodeHeader, InodeOps, InodeType},
+    },
     mount::FsHandle,
-    repository::Repository,
-    tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
+    mountcompat::{overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount},
 };
 
 const TTL: Duration = Duration::from_secs(1_000_000);
 
-/// FUSE inode number. Assigned eagerly at mount time.
-///
-/// Inode 1 is the root directory, then all other nodes get sequential
-/// numbers from a depth-first walk. The numbering is an internal FUSE
-/// concern and not exposed in the public API.
-type Ino = u64;
-
-/// Precomputed inode number assignments for the entire filesystem tree.
-///
-/// Directories are identified by pointer (stable because the tree is
-/// borrowed immutably for the lifetime of the FUSE session). Leaves
-/// are identified by `LeafId`.
-#[derive(Debug)]
-struct InodeMap<ObjectID: FsVerityHashValue> {
-    /// Directory pointer → inode number.
-    dir_inos: HashMap<*const Directory<ObjectID>, Ino>,
-    /// LeafId → inode number. Indexed by `LeafId.0`.
-    /// Hardlinked leaves (same `LeafId`) naturally get the same ino.
-    leaf_inos: Vec<Ino>,
+/// Controls the overlay xattr namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum OverlayXattrMode {
+    /// Synthesize `user.overlay.*` xattrs (for unprivileged `userxattr` mounts).
+    #[default]
+    User,
+    /// Synthesize `trusted.overlay.*` xattrs (requires CAP_SYS_ADMIN).
+    Trusted,
 }
 
-impl<ObjectID: FsVerityHashValue> InodeMap<ObjectID> {
-    /// Walk the tree and assign sequential inode numbers.
-    fn build(fs: &FileSystem<ObjectID>) -> Self {
-        let mut next_ino: Ino = 1; // root = 1
-        let mut dir_inos = HashMap::new();
-        let mut leaf_inos = vec![0u64; fs.leaves.len()];
+/// EROFS node ID — byte offset / 32 into the inode region.
+///
+/// Distinct from fuser's [`INodeNo`] because FUSE requires inode 1 for the
+/// root directory, but the EROFS root NID (from `superblock.root_nid`) can
+/// be any value — including small values like 0 or 1.
+///
+/// To avoid collisions, non-root NIDs are mapped to FUSE inodes as
+/// `NID + 2` (since FUSE reserves ino 0 as invalid and ino 1 as the root).
+/// The root NID is always mapped to FUSE inode 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Nid(u64);
 
-        fn walk<O: FsVerityHashValue>(
-            dir: &Directory<O>,
-            next_ino: &mut Ino,
-            dir_inos: &mut HashMap<*const Directory<O>, Ino>,
-            leaf_inos: &mut [Ino],
-        ) {
-            let ino = *next_ino;
-            *next_ino += 1;
-            dir_inos.insert(dir as *const _, ino);
+impl std::fmt::Display for Nid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
-            for (_, inode) in dir.entries() {
-                match inode {
-                    Inode::Directory(subdir) => walk(subdir, next_ino, dir_inos, leaf_inos),
-                    Inode::Leaf(id, _) => {
-                        if leaf_inos[id.0] == 0 {
-                            leaf_inos[id.0] = *next_ino;
-                            *next_ino += 1;
-                        }
-                        // Hardlinks: same LeafId keeps the same ino.
+impl Nid {
+    fn to_fuse_ino(self, root_nid: Nid) -> INodeNo {
+        if self == root_nid {
+            INodeNo(1)
+        } else {
+            INodeNo(self.0 + 2)
+        }
+    }
+
+    fn from_fuse_ino(ino: INodeNo, root_nid: Nid) -> Option<Self> {
+        match ino.0 {
+            0 => None,
+            1 => Some(root_nid),
+            n => Some(Nid(n - 2)),
+        }
+    }
+}
+
+fn mode_to_filetype(mode: u16) -> FileType {
+    match mode & S_IFMT {
+        S_IFREG => FileType::RegularFile,
+        S_IFDIR => FileType::Directory,
+        S_IFCHR => FileType::CharDevice,
+        S_IFBLK => FileType::BlockDevice,
+        S_IFIFO => FileType::NamedPipe,
+        S_IFLNK => FileType::Symlink,
+        S_IFSOCK => FileType::Socket,
+        _ => FileType::RegularFile,
+    }
+}
+
+fn inode_rdev(inode: &InodeType) -> u32 {
+    let mode = inode.mode().0.get();
+    match mode & S_IFMT {
+        S_IFCHR | S_IFBLK => inode.u(),
+        _ => 0,
+    }
+}
+
+fn inode_fileattr(image: &Image, ino: INodeNo, inode: &InodeType) -> FileAttr {
+    let mode = inode.mode().0.get();
+    let mtime = match inode {
+        InodeType::Extended(i) => {
+            let secs = (i.header.mtime.get() as i64).max(0) as u64;
+            SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+        }
+        InodeType::Compact(_) => {
+            let secs = (image.sb.build_time.get() as i64).max(0) as u64;
+            SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+        }
+    };
+    let (uid, gid) = match inode {
+        InodeType::Extended(i) => (i.header.uid.get(), i.header.gid.get()),
+        InodeType::Compact(i) => (i.header.uid.get() as u32, i.header.gid.get() as u32),
+    };
+    let size = match mode & S_IFMT {
+        S_IFDIR => 0,
+        _ => inode.size(),
+    };
+
+    FileAttr {
+        ino,
+        size,
+        blocks: 1,
+        atime: mtime,
+        mtime,
+        ctime: mtime,
+        crtime: mtime,
+        kind: mode_to_filetype(mode),
+        perm: mode & 0o7777,
+        nlink: inode.nlink(),
+        uid,
+        gid,
+        rdev: inode_rdev(inode),
+        blksize: 4096,
+        flags: 0,
+    }
+}
+
+fn inode_fileattr_overlay(image: &Image, ino: INodeNo, inode: &InodeType) -> FileAttr {
+    let mut attr = inode_fileattr(image, ino, inode);
+    if is_whiteout(image, inode) {
+        attr.kind = FileType::RegularFile;
+        attr.size = 0;
+        attr.rdev = 0;
+    }
+    attr
+}
+
+/// Returns true if this inode carries the escaped whiteout xattr that tells
+/// overlayfs to treat it as a whiteout.  Used in overlay mode to adjust the
+/// file attributes (present as a regular file with size 0 instead of the
+/// underlying EROFS type).
+fn is_whiteout(image: &Image, inode: &InodeType) -> bool {
+    has_xattr(image, inode, b"trusted.overlay.overlay.whiteout")
+}
+
+/// Returns true if this inode is any kind of overlayfs whiteout in the raw
+/// EROFS lower layer.  This covers both native whiteouts (char device 0,0,
+/// including the 256 hex stubs the V1 writer adds to the root directory)
+/// and V1-escaped whiteouts (regular files with the escaped whiteout xattr).
+/// Used in non-overlay mode to hide these implementation details from the
+/// final mount.
+fn is_overlayfs_whiteout(image: &Image, inode: &InodeType) -> bool {
+    let mode = inode.mode().0.get();
+    if mode & S_IFMT == S_IFCHR && inode.u() == 0 {
+        return true;
+    }
+    has_xattr(image, inode, b"trusted.overlay.overlay.whiteout")
+}
+
+fn has_xattr(image: &Image, inode: &InodeType, name: &[u8]) -> bool {
+    find_raw_xattr(image, inode, name).is_some()
+}
+
+fn find_raw_xattr(image: &Image, inode: &InodeType, name: &[u8]) -> Option<Vec<u8>> {
+    let xattrs_section = inode.xattrs().ok()??;
+    for id in xattrs_section.shared().ok()? {
+        let xattr = image.shared_xattr(id.get()).ok()?;
+        if xattr_full_name(xattr) == name {
+            return Some(xattr.value().ok()?.to_vec());
+        }
+    }
+    for xattr_result in xattrs_section.local().ok()? {
+        let xattr = xattr_result.ok()?;
+        if xattr_full_name(xattr) == name {
+            return Some(xattr.value().ok()?.to_vec());
+        }
+    }
+    None
+}
+
+fn xattr_full_name(xattr: &composefs::erofs::reader::XAttr) -> Vec<u8> {
+    let idx = xattr.header.name_index as usize;
+    let prefix = if idx < XATTR_PREFIXES.len() {
+        XATTR_PREFIXES[idx]
+    } else {
+        b""
+    };
+    let suffix = xattr.suffix().unwrap_or(b"");
+    let mut name = Vec::with_capacity(prefix.len() + suffix.len());
+    name.extend_from_slice(prefix);
+    name.extend_from_slice(suffix);
+    name
+}
+
+const TRUSTED_OVERLAY_PREFIX: &[u8] = b"trusted.overlay.";
+const USER_OVERLAY_PREFIX: &[u8] = b"user.overlay.";
+const ESCAPED_OVERLAY_PREFIX: &[u8] = b"trusted.overlay.overlay.";
+
+fn is_overlayfs_internal_xattr(name: &[u8]) -> bool {
+    name.starts_with(TRUSTED_OVERLAY_PREFIX)
+}
+
+fn replace_prefix(name: &[u8], from: &[u8], to: &[u8]) -> Option<Vec<u8>> {
+    let rest = name.strip_prefix(from)?;
+    let mut out = Vec::with_capacity(to.len() + rest.len());
+    out.extend_from_slice(to);
+    out.extend_from_slice(rest);
+    Some(out)
+}
+
+fn unescape_xattr_name(name: &[u8]) -> Cow<'_, [u8]> {
+    match replace_prefix(name, ESCAPED_OVERLAY_PREFIX, TRUSTED_OVERLAY_PREFIX) {
+        Some(unescaped) => Cow::Owned(unescaped),
+        None => Cow::Borrowed(name),
+    }
+}
+
+fn rewrite_xattr_name_for_user(name: &[u8]) -> Option<Vec<u8>> {
+    replace_prefix(name, TRUSTED_OVERLAY_PREFIX, USER_OVERLAY_PREFIX)
+}
+
+/// Iterate directory entries across inline data and blocks.
+fn for_each_dir_entry<F>(image: &Image, inode: &InodeType, mut f: F) -> Result<(), fuser::Errno>
+where
+    F: FnMut(&composefs::erofs::reader::DirectoryEntry) -> std::ops::ControlFlow<()>,
+{
+    if let Some(inline) = inode.inline()
+        && let Ok(block) = DirectoryBlock::ref_from_bytes(inline)
+        && let Ok(entries) = block.entries()
+    {
+        for entry in entries.flatten() {
+            if entry.name == b"." || entry.name == b".." {
+                continue;
+            }
+            if f(&entry).is_break() {
+                return Ok(());
+            }
+        }
+    }
+    if let Ok(block_range) = image.inode_blocks(inode) {
+        for block_id in block_range {
+            if let Ok(block) = image.directory_block(block_id)
+                && let Ok(entries) = block.entries()
+            {
+                for entry in entries.flatten() {
+                    if entry.name == b"." || entry.name == b".." {
+                        continue;
+                    }
+                    if f(&entry).is_break() {
+                        return Ok(());
                     }
                 }
             }
         }
-
-        walk(&fs.root, &mut next_ino, &mut dir_inos, &mut leaf_inos);
-        InodeMap {
-            dir_inos,
-            leaf_inos,
-        }
     }
-
-    fn dir_ino(&self, dir: &Directory<ObjectID>) -> Ino {
-        self.dir_inos[&(dir as *const _)]
-    }
-
-    fn leaf_ino(&self, id: LeafId) -> Ino {
-        self.leaf_inos[id.0]
-    }
-
-    fn inode_ino(&self, inode: &Inode<ObjectID>) -> Ino {
-        match inode {
-            Inode::Directory(dir) => self.dir_ino(dir),
-            Inode::Leaf(id, _) => self.leaf_ino(*id),
-        }
-    }
-}
-
-/// A reference to a filesystem node, used for FUSE inode lookup.
-#[derive(Debug, Clone)]
-enum InodeRef<'a, ObjectID: FsVerityHashValue> {
-    Directory(&'a Directory<ObjectID>, Ino),
-    Leaf(LeafId, &'a Leaf<ObjectID>),
-}
-
-impl<'a, ObjectID: FsVerityHashValue> InodeRef<'a, ObjectID> {
-    fn nlink(&self, nlink_map: &[u32]) -> u32 {
-        (match self {
-            InodeRef::Directory(dir, ..) => {
-                2 + dir
-                    .inodes()
-                    .filter(|i| matches!(i, Inode::Directory(..)))
-                    .count()
-            }
-            InodeRef::Leaf(leaf_id, _) => nlink_map[leaf_id.0] as usize,
-        }) as u32
-    }
-
-    fn rdev(&self) -> u32 {
-        (match self {
-            InodeRef::Directory(..) => 0,
-            InodeRef::Leaf(_, leaf) => match &leaf.content {
-                LeafContent::BlockDevice(rdev) | LeafContent::CharacterDevice(rdev) => *rdev,
-                _ => 0,
-            },
-        }) as u32
-    }
-
-    fn kind(&self) -> FileType {
-        match self {
-            InodeRef::Directory(..) => FileType::Directory,
-            InodeRef::Leaf(_, leaf) => match leaf.content {
-                LeafContent::BlockDevice(..) => FileType::BlockDevice,
-                LeafContent::CharacterDevice(..) => FileType::CharDevice,
-                LeafContent::Fifo => FileType::NamedPipe,
-                LeafContent::Regular(..) => FileType::RegularFile,
-                LeafContent::Socket => FileType::Socket,
-                LeafContent::Symlink(..) => FileType::Symlink,
-            },
-        }
-    }
-
-    fn stat(&self) -> &'a Stat {
-        match self {
-            InodeRef::Directory(dir, ..) => &dir.stat,
-            InodeRef::Leaf(_, leaf) => &leaf.stat,
-        }
-    }
-
-    fn size(&self) -> u64 {
-        match self {
-            InodeRef::Directory(..) => 0,
-            InodeRef::Leaf(_, leaf) => match &leaf.content {
-                LeafContent::Regular(RegularFile::Inline(data)) => data.len() as u64,
-                LeafContent::Regular(RegularFile::External(.., size)) => *size,
-                _ => 0,
-            },
-        }
-    }
-
-    fn fileattr(&self, ino: Ino, nlink_map: &[u32]) -> FileAttr {
-        let stat = self.stat();
-        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtim_sec as u64);
-
-        FileAttr {
-            ino,
-            size: self.size(),
-            blocks: 1,
-            atime: mtime,
-            mtime,
-            ctime: mtime,
-            crtime: mtime,
-            kind: self.kind(),
-            perm: stat.st_mode as u16,
-            nlink: self.nlink(nlink_map),
-            uid: stat.st_uid,
-            gid: stat.st_gid,
-            rdev: self.rdev(),
-            blksize: 4096,
-            flags: 0,
-        }
-    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -208,281 +297,541 @@ enum OpenHandle {
     Data(Box<[u8]>),
 }
 
-#[derive(Debug)]
-struct TreeFuse<'a, ObjectID: FsVerityHashValue> {
-    repo: &'a Repository<ObjectID>,
-    fs: &'a FileSystem<ObjectID>,
-    inode_map: InodeMap<ObjectID>,
-    nlink_map: Vec<u32>,
-    inodes: HashMap<Ino, InodeRef<'a, ObjectID>>,
-    attrs: HashMap<Ino, FileAttr>,
+#[derive(Debug, Default)]
+struct FuseHandles {
     handles: HashMap<u64, OpenHandle>,
     next_fh: u64,
 }
 
-impl<'a, ObjectID: FsVerityHashValue> TreeFuse<'a, ObjectID> {
-    fn register_inode(&mut self, inode: &'a Inode<ObjectID>, parent: Ino) -> (Ino, FileType) {
-        let ino = self.inode_map.inode_ino(inode);
-        let iref = match inode {
-            Inode::Directory(dir) => InodeRef::Directory(dir, parent),
-            Inode::Leaf(leaf_id, _) => InodeRef::Leaf(*leaf_id, self.fs.leaf(*leaf_id)),
+#[derive(Debug)]
+struct ComposefsFuse {
+    image: Image<'static>,
+    objects_fd: Arc<OwnedFd>,
+    overlay_xattr: Option<OverlayXattrMode>,
+    handles: Mutex<FuseHandles>,
+}
+
+impl ComposefsFuse {
+    fn root_nid(&self) -> Nid {
+        Nid(self.image.sb.root_nid.get() as u64)
+    }
+
+    fn get_inode(&self, nid: Nid) -> Result<InodeType<'_>, fuser::Errno> {
+        self.image.inode(nid.0).map_err(|e| {
+            log::error!("inode({:?}): {e}", nid);
+            fuser::Errno::EIO
+        })
+    }
+
+    fn is_hidden(&self, nid: Nid) -> bool {
+        if self.overlay_xattr.is_some() {
+            return false;
+        }
+        if let Ok(inode) = self.get_inode(nid) {
+            is_overlayfs_whiteout(&self.image, &inode)
+        } else {
+            false
+        }
+    }
+
+    fn get_fileattr(&self, ino: INodeNo) -> Result<FileAttr, fuser::Errno> {
+        let nid = Nid::from_fuse_ino(ino, self.root_nid()).ok_or(fuser::Errno::EINVAL)?;
+        let inode = self.get_inode(nid)?;
+        if self.overlay_xattr.is_some() {
+            Ok(inode_fileattr_overlay(&self.image, ino, &inode))
+        } else {
+            Ok(inode_fileattr(&self.image, ino, &inode))
+        }
+    }
+
+    fn open_object_by_redirect(&self, inode: &InodeType) -> Result<OwnedFd, fuser::Errno> {
+        let redirect = find_raw_xattr(&self.image, inode, format::XATTR_OVERLAY_REDIRECT)
+            .ok_or(fuser::Errno::EIO)?;
+        let path = redirect.strip_prefix(b"/").unwrap_or(&redirect);
+        openat(
+            &*self.objects_fd,
+            OsStr::from_bytes(path),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|e| {
+            log::error!("open object {}: {e}", String::from_utf8_lossy(path));
+            fuser::Errno::EIO
+        })
+    }
+
+    fn collect_xattr_names(&self, inode: &InodeType) -> Vec<Vec<u8>> {
+        let mut names = Vec::new();
+        let Some(xattrs_section) = inode.xattrs().ok().flatten() else {
+            return names;
         };
-        let kind = iref.kind();
-        self.attrs.insert(ino, iref.fileattr(ino, &self.nlink_map));
-        self.inodes.insert(ino, iref);
-        (ino, kind)
+
+        let process_xattr = |names: &mut Vec<Vec<u8>>, raw_name: Vec<u8>| match self.overlay_xattr {
+            Some(OverlayXattrMode::User) => {
+                if let Some(rewritten) = rewrite_xattr_name_for_user(&raw_name) {
+                    names.push(rewritten);
+                } else {
+                    names.push(raw_name);
+                }
+            }
+            Some(OverlayXattrMode::Trusted) => {
+                names.push(raw_name);
+            }
+            None => {
+                if is_overlayfs_internal_xattr(&raw_name) {
+                    let unescaped = unescape_xattr_name(&raw_name);
+                    if unescaped != raw_name.as_slice() {
+                        names.push(unescaped.into_owned());
+                    }
+                } else {
+                    names.push(raw_name);
+                }
+            }
+        };
+
+        if let Ok(shared) = xattrs_section.shared() {
+            for id in shared {
+                if let Ok(xattr) = self.image.shared_xattr(id.get()) {
+                    process_xattr(&mut names, xattr_full_name(xattr));
+                }
+            }
+        }
+        if let Ok(local) = xattrs_section.local() {
+            for xattr in local.flatten() {
+                process_xattr(&mut names, xattr_full_name(xattr));
+            }
+        }
+        names
+    }
+
+    fn find_xattr_value(&self, inode: &InodeType, name: &[u8]) -> Option<Vec<u8>> {
+        let lookup_name: Cow<'_, [u8]> = match self.overlay_xattr {
+            Some(OverlayXattrMode::User) => {
+                match replace_prefix(name, USER_OVERLAY_PREFIX, TRUSTED_OVERLAY_PREFIX) {
+                    Some(trusted) => Cow::Owned(trusted),
+                    None => Cow::Borrowed(name),
+                }
+            }
+            Some(OverlayXattrMode::Trusted) => Cow::Borrowed(name),
+            None => {
+                if let Some(escaped) =
+                    replace_prefix(name, TRUSTED_OVERLAY_PREFIX, ESCAPED_OVERLAY_PREFIX)
+                    && let Some(val) = find_raw_xattr(&self.image, inode, &escaped)
+                {
+                    return Some(val);
+                }
+                if is_overlayfs_internal_xattr(name) {
+                    return None;
+                }
+                Cow::Borrowed(name)
+            }
+        };
+        find_raw_xattr(&self.image, inode, &lookup_name)
     }
 }
 
-impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<'_, ObjectID> {
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
+impl Filesystem for ComposefsFuse {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
     }
 
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        log::trace!("lookup {parent} {name:?}");
-        let Some(InodeRef::Directory(dir, ..)) = self.inodes.get(&parent) else {
-            log::error!("lookup({parent}, {name:?}) parent does not exist");
-            return reply.error(Errno::BADF.raw_os_error());
-        };
-        let dir = *dir;
+    fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
 
-        match dir.lookup(name) {
-            Some(inode) => {
-                let (ino, _) = self.register_inode(inode, parent);
-                reply.entry(&TTL, self.attrs.get(&ino).unwrap(), 0);
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let Some(parent_nid) = Nid::from_fuse_ino(parent, self.root_nid()) else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        log::trace!("lookup {parent_nid} {name:?}");
+
+        let Ok(parent_inode) = self.get_inode(parent_nid) else {
+            return reply.error(fuser::Errno::EBADF);
+        };
+
+        let name_bytes = name.as_bytes();
+        let mut found = None;
+        let _ = for_each_dir_entry(&self.image, &parent_inode, |entry| {
+            if entry.name == name_bytes {
+                found = Some(Nid(entry.nid()));
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
             }
-            None => reply.error(Errno::NOENT.raw_os_error()),
+        });
+
+        match found {
+            Some(child_nid) if !self.is_hidden(child_nid) => {
+                let child_fuse_ino = child_nid.to_fuse_ino(self.root_nid());
+                match self.get_fileattr(child_fuse_ino) {
+                    Ok(attrs) => reply.entry(&TTL, &attrs, Generation(0)),
+                    Err(e) => reply.error(e),
+                }
+            }
+            _ => reply.error(fuser::Errno::ENOENT),
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if let Some(attrs) = self.attrs.get(&ino) {
-            return reply.attr(&TTL, attrs);
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        match self.get_fileattr(ino) {
+            Ok(attrs) => reply.attr(&TTL, &attrs),
+            Err(e) => reply.error(e),
         }
-
-        let Some(iref) = self.inodes.get(&ino) else {
-            log::error!("getattr({ino}) inode does not exist");
-            return reply.error(Errno::BADF.raw_os_error());
-        };
-        let iref = iref.clone();
-
-        let attr = iref.fileattr(ino, &self.nlink_map);
-        self.attrs.insert(ino, attr);
-        reply.attr(&TTL, self.attrs.get(&ino).unwrap());
     }
 
-    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        let Some(InodeRef::Leaf(_, leaf)) = self.inodes.get(&ino) else {
-            return reply.error(Errno::INVAL.raw_os_error());
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
+            return reply.error(fuser::Errno::EINVAL);
         };
-
-        let LeafContent::Symlink(target) = &leaf.content else {
-            return reply.error(Errno::INVAL.raw_os_error());
+        let Ok(inode) = self.get_inode(nid) else {
+            return reply.error(fuser::Errno::EINVAL);
         };
-
-        reply.data(target.as_bytes());
+        match inode.inline() {
+            Some(data) => reply.data(data),
+            None => reply.error(fuser::Errno::EINVAL),
+        }
     }
 
-    fn opendir(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
-        reply.opened(0, 0);
+    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        mut offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let Some(InodeRef::Directory(dir, parent)) = self.inodes.get(&ino) else {
-            log::error!("readdir({ino}) inode is not a directory");
-            return reply.error(Errno::BADF.raw_os_error());
+        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
+            return reply.error(fuser::Errno::EINVAL);
         };
-        let (dir, parent) = (*dir, *parent);
+        let Ok(inode) = self.get_inode(nid) else {
+            return reply.error(fuser::Errno::EBADF);
+        };
 
-        if offset == 0 {
-            offset += 1;
-            if reply.add(ino, offset, FileType::Directory, ".") {
+        let mut cur_offset = offset;
+
+        if cur_offset == 0 {
+            cur_offset += 1;
+            if reply.add(ino, cur_offset, FileType::Directory, ".") {
                 return reply.ok();
             }
         }
 
-        if offset == 1 {
-            offset += 1;
-            if reply.add(parent, offset, FileType::Directory, "..") {
+        if cur_offset == 1 {
+            cur_offset += 1;
+            if reply.add(ino, cur_offset, FileType::Directory, "..") {
                 return reply.ok();
             }
         }
 
-        for (name, inode) in dir.sorted_entries().skip(offset as usize - 2) {
-            let (child_ino, kind) = self.register_inode(inode, ino);
+        let mut entry_idx: u64 = 2;
+        let _ = for_each_dir_entry(&self.image, &inode, |entry| {
+            let child_nid = Nid(entry.nid());
+            if self.is_hidden(child_nid) {
+                return std::ops::ControlFlow::Continue(());
+            }
+            if entry_idx < cur_offset {
+                entry_idx += 1;
+                return std::ops::ControlFlow::Continue(());
+            }
+            let child_fuse_ino = child_nid.to_fuse_ino(self.root_nid());
+            let kind = match ErofsFileType::from(entry.header.file_type) {
+                ErofsFileType::RegularFile => FileType::RegularFile,
+                ErofsFileType::Directory => FileType::Directory,
+                ErofsFileType::CharacterDevice => FileType::CharDevice,
+                ErofsFileType::BlockDevice => FileType::BlockDevice,
+                ErofsFileType::Fifo => FileType::NamedPipe,
+                ErofsFileType::Socket => FileType::Socket,
+                ErofsFileType::Symlink => FileType::Symlink,
+                ErofsFileType::Unknown => FileType::RegularFile,
+            };
+            entry_idx += 1;
+            if reply.add(
+                child_fuse_ino,
+                entry_idx,
+                kind,
+                OsStr::from_bytes(entry.name),
+            ) {
+                return std::ops::ControlFlow::Break(());
+            }
+            std::ops::ControlFlow::Continue(())
+        });
 
-            offset += 1;
-            if reply.add(child_ino, offset, kind, name) {
-                break;
+        reply.ok();
+    }
+
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let Ok(inode) = self.get_inode(nid) else {
+            return reply.error(fuser::Errno::EBADF);
+        };
+
+        let Ok(dir_attrs) = self.get_fileattr(ino) else {
+            return reply.error(fuser::Errno::EIO);
+        };
+
+        let mut cur_offset = offset;
+
+        if cur_offset == 0 {
+            cur_offset += 1;
+            if reply.add(ino, cur_offset, ".", &TTL, &dir_attrs, Generation(0)) {
+                return reply.ok();
             }
         }
+
+        if cur_offset == 1 {
+            cur_offset += 1;
+            if reply.add(ino, cur_offset, "..", &TTL, &dir_attrs, Generation(0)) {
+                return reply.ok();
+            }
+        }
+
+        let mut entry_idx: u64 = 2;
+        let _ = for_each_dir_entry(&self.image, &inode, |entry| {
+            let child_nid = Nid(entry.nid());
+            if self.is_hidden(child_nid) {
+                return std::ops::ControlFlow::Continue(());
+            }
+            if entry_idx < cur_offset {
+                entry_idx += 1;
+                return std::ops::ControlFlow::Continue(());
+            }
+            let child_ino = child_nid.to_fuse_ino(self.root_nid());
+            let child_attrs = match self.get_fileattr(child_ino) {
+                Ok(a) => a,
+                Err(_) => {
+                    entry_idx += 1;
+                    return std::ops::ControlFlow::Continue(());
+                }
+            };
+            entry_idx += 1;
+            if reply.add(
+                child_ino,
+                entry_idx,
+                OsStr::from_bytes(entry.name),
+                &TTL,
+                &child_attrs,
+                Generation(0),
+            ) {
+                return std::ops::ControlFlow::Break(());
+            }
+            std::ops::ControlFlow::Continue(())
+        });
 
         reply.ok();
     }
 
     fn releasedir(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _flags: i32,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
         reply: fuser::ReplyEmpty,
     ) {
         reply.ok();
     }
 
     fn getxattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         name: &OsStr,
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        let Some(iref) = self.inodes.get(&ino) else {
-            log::error!("getxattr({ino}, {name:?}, {size}) inode does not exist");
-            return reply.error(Errno::BADF.raw_os_error());
+        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let Ok(inode) = self.get_inode(nid) else {
+            return reply.error(fuser::Errno::EBADF);
         };
 
-        let xattrs = &iref.stat().xattrs;
-        let Some(value) = xattrs.get(name) else {
-            return reply.error(Errno::NODATA.raw_os_error());
-        };
-
-        if size == 0 {
-            return reply.size(value.len() as u32);
-        } else if value.len() > size as usize {
-            return reply.error(Errno::RANGE.raw_os_error());
+        match self.find_xattr_value(&inode, name.as_bytes()) {
+            Some(value) => {
+                if size == 0 {
+                    reply.size(value.len() as u32);
+                } else if value.len() > size as usize {
+                    reply.error(fuser::Errno::ERANGE);
+                } else {
+                    reply.data(&value);
+                }
+            }
+            None => reply.error(fuser::Errno::ENODATA),
         }
-
-        reply.data(value);
     }
 
-    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
-        let Some(iref) = self.inodes.get(&ino) else {
-            log::error!("listxattr({ino}, {size}) inode does not exist");
-            return reply.error(Errno::BADF.raw_os_error());
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: fuser::ReplyXattr) {
+        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        let Ok(inode) = self.get_inode(nid) else {
+            return reply.error(fuser::Errno::EBADF);
         };
 
-        let mut list = vec![];
-        for name in iref.stat().xattrs.keys() {
-            list.extend_from_slice(name.as_bytes());
+        let names = self.collect_xattr_names(&inode);
+        let mut list = Vec::new();
+        for name in &names {
+            list.extend_from_slice(name);
             list.push(b'\0');
         }
 
         if size == 0 {
-            return reply.size(list.len() as u32);
+            reply.size(list.len() as u32);
         } else if list.len() > size as usize {
-            return reply.error(Errno::RANGE.raw_os_error());
+            reply.error(fuser::Errno::ERANGE);
+        } else {
+            reply.data(&list);
         }
-
-        reply.data(&list);
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        log::trace!("open({ino})");
-        let Some(iref) = self.inodes.get(&ino) else {
-            log::error!("open({ino}) inode does not exist");
-            return reply.error(Errno::BADF.raw_os_error());
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
+            return reply.error(fuser::Errno::EINVAL);
+        };
+        log::trace!("open({nid})");
+
+        let Ok(inode) = self.get_inode(nid) else {
+            return reply.error(fuser::Errno::EBADF);
         };
 
-        let InodeRef::Leaf(_, leaf) = iref else {
-            log::error!("open({ino}) inode is a directory");
-            return reply.error(Errno::BADF.raw_os_error());
+        let Ok(layout) = inode.data_layout() else {
+            return reply.error(fuser::Errno::EIO);
         };
 
-        let handle = match &leaf.content {
-            LeafContent::Regular(RegularFile::External(id, ..)) => {
-                let Ok(fd) = self.repo.open_object(id) else {
-                    log::error!("open({ino}) open object failed");
-                    return reply.error(Errno::INVAL.raw_os_error());
-                };
-                OpenHandle::Fd(fd)
+        let handle = match layout {
+            DataLayout::FlatInline => match inode.inline() {
+                Some(data) => OpenHandle::Data(data.into()),
+                None => OpenHandle::Data(Box::new([])),
+            },
+            DataLayout::FlatPlain => {
+                if self.overlay_xattr.is_some() {
+                    return reply.error(errno_to_fuser(rustix::io::Errno::OPNOTSUPP));
+                }
+                match self.open_object_by_redirect(&inode) {
+                    Ok(fd) => OpenHandle::Fd(fd),
+                    Err(e) => return reply.error(e),
+                }
             }
-            LeafContent::Regular(RegularFile::Inline(data)) => OpenHandle::Data(data.clone()),
-            _ => {
-                log::error!("open({ino}) non-regular file");
-                return reply.error(Errno::BADF.raw_os_error());
+            DataLayout::ChunkBased => {
+                if self.overlay_xattr.is_some() {
+                    return reply.error(errno_to_fuser(rustix::io::Errno::OPNOTSUPP));
+                }
+                match self.open_object_by_redirect(&inode) {
+                    Ok(fd) => OpenHandle::Fd(fd),
+                    Err(e) => return reply.error(e),
+                }
             }
         };
 
-        let fh = self.next_fh;
-        self.next_fh += 1;
-        log::debug!("self.handles.insert({fh}, {handle:?})");
-        self.handles.insert(fh, handle);
-        reply.opened(fh, 0);
+        let mut state = self.handles.lock().expect("fuse handles mutex poisoned");
+        let fh = state.next_fh;
+        state.next_fh += 1;
+        state.handles.insert(fh, handle);
+        reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: fuser::ReplyData,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyData,
     ) {
-        match self.handles.get(&fh) {
+        let state = self.handles.lock().expect("fuse handles mutex poisoned");
+        match state.handles.get(&fh.0) {
             Some(OpenHandle::Fd(fd)) => {
                 let mut data = Vec::with_capacity(size as usize);
-                match pread(fd, spare_capacity(&mut data), offset as u64) {
+                match pread(fd, spare_capacity(&mut data), offset) {
                     Ok(_) => reply.data(&data),
-                    Err(errno) => reply.error(errno.raw_os_error()),
+                    Err(errno) => reply.error(errno_to_fuser(errno)),
                 }
             }
             Some(OpenHandle::Data(data)) => {
-                if offset as usize > data.len() {
-                    reply.data(b"");
-                } else {
-                    let mut data = &data[offset as usize..];
-                    if data.len() > size as usize {
-                        data = &data[..size as usize];
-                    }
-                    reply.data(data);
-                }
+                let start = (offset as usize).min(data.len());
+                let end = (start + size as usize).min(data.len());
+                reply.data(&data[start..end]);
             }
             None => {
-                log::error!("Handle doesn't exist: pread({fh}, {size}, {offset})");
-                reply.error(Errno::BADF.raw_os_error());
+                log::error!("read(fh={fh}): handle does not exist");
+                reply.error(fuser::Errno::EBADF);
             }
         }
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        match self.handles.remove(&fh) {
+        let mut state = self.handles.lock().expect("fuse handles mutex poisoned");
+        match state.handles.remove(&fh.0) {
             Some(_) => reply.ok(),
             None => {
-                log::error!("Handle doesn't exist: close({fh})");
-                reply.error(Errno::BADF.raw_os_error())
+                log::error!("release(fh={fh}): handle does not exist");
+                reply.error(fuser::Errno::EBADF);
             }
         }
     }
 }
 
-/// Opens /dev/fuse.
+fn errno_to_fuser(errno: rustix::io::Errno) -> fuser::Errno {
+    fuser::Errno::from(std::io::Error::from_raw_os_error(errno.raw_os_error()))
+}
+
+/// Check if an fd has fs-verity enabled, meaning its contents cannot change.
+fn is_safe_to_mmap(fd: &impl AsFd) -> bool {
+    composefs::fsverity::measure_verity_opt::<composefs::fsverity::Sha256HashValue>(fd)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// Load an EROFS image from a file descriptor.
 ///
-/// After you do this, you can mount it using mount_fuse() and then start serving requests using
-/// serve_tree_fuse().  You might want to do this in different threads, which is why these
-/// operations are defined separately.
+/// If the image has fs-verity enabled (contents guaranteed immutable),
+/// it is memory-mapped for zero-copy access. Otherwise it is read into
+/// an owned buffer.
+///
+/// Returns a `&'static [u8]` via `Box::leak` — the FUSE server process
+/// lives until unmount, so the leak is harmless.
+#[allow(unsafe_code)]
+fn load_image(fd: OwnedFd) -> anyhow::Result<&'static [u8]> {
+    if is_safe_to_mmap(&fd) {
+        let file = std::fs::File::from(fd);
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.context("mmap EROFS image")?;
+        let leaked: &'static memmap2::Mmap = Box::leak(Box::new(mmap));
+        Ok(leaked.as_ref())
+    } else {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        std::fs::File::from(fd)
+            .read_to_end(&mut buf)
+            .context("reading EROFS image")?;
+        Ok(Vec::leak(buf))
+    }
+}
+
+/// Opens /dev/fuse.
 pub fn open_fuse() -> anyhow::Result<OwnedFd> {
     open("/dev/fuse", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
         .context("Unable to open fuse device /dev/fuse")
@@ -497,10 +846,6 @@ pub struct FuseMountOptions {
 
 impl FuseMountOptions {
     /// Allow users other than the mounter to access the filesystem.
-    ///
-    /// Requires either CAP_SYS_ADMIN in the init user namespace or
-    /// `user_allow_other` in `/etc/fuse.conf`. Should be set to false
-    /// when mounting inside a user namespace.
     pub fn set_allow_other(&mut self, allow_other: bool) -> &mut Self {
         self.allow_other = allow_other;
         self
@@ -509,9 +854,11 @@ impl FuseMountOptions {
 
 /// Mounts a FUSE filesystem with the given /dev/fuse fd.
 ///
-/// This does the necessary dance of creating the mount object, given a /dev/fuse device node.  In
-/// order for this to be useful, you'll also need to call serve_tree_fuse() to actually satisfy the
-/// requests for data.
+/// Returns a detached FUSE mount fd. You'll need to call
+/// [`serve_fuse`] to actually satisfy the FUSE requests.
+///
+/// For overlay-lower mode, call [`mount_fuse_overlay`] *after* the FUSE
+/// server is running to layer an overlayfs on top.
 pub fn mount_fuse(dev_fuse: impl AsFd, options: &FuseMountOptions) -> anyhow::Result<OwnedFd> {
     let fusefs = FsHandle::open("fuse")?;
     fsconfig_set_flag(fusefs.as_fd(), "ro")?;
@@ -536,30 +883,77 @@ pub fn mount_fuse(dev_fuse: impl AsFd, options: &FuseMountOptions) -> anyhow::Re
     )?)
 }
 
-/// Serves a FUSE filesystem exposing the content of `filesystem`, backed by `repo`.
-///
-/// You should have called mount_fuse() on the dev_fuse fd to establish a mount point.
-pub fn serve_tree_fuse<'a, ObjectID: FsVerityHashValue>(
-    dev_fuse: OwnedFd,
-    filesystem: &'a FileSystem<ObjectID>,
-    repo: &'a Repository<ObjectID>,
-) -> std::io::Result<()> {
-    let inode_map = InodeMap::build(filesystem);
-    let nlink_map = filesystem.nlinks();
+/// Options controlling how the FUSE server behaves.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct ServeFuseOptions {
+    overlay_xattr: Option<OverlayXattrMode>,
+}
 
-    let root_ino = inode_map.dir_ino(&filesystem.root);
-    let root_ref = InodeRef::Directory(&filesystem.root, root_ino);
-    let root_attr = root_ref.fileattr(root_ino, &nlink_map);
+impl ServeFuseOptions {
+    /// Set the overlay xattr mode. When `Some`, the server presents overlay
+    /// xattrs and refuses to open external files. When `None` (the default),
+    /// the server follows redirects and serves file content from the
+    /// repository directly.
+    pub fn set_overlay_xattr(&mut self, mode: Option<OverlayXattrMode>) -> &mut Self {
+        self.overlay_xattr = mode;
+        self
+    }
+}
 
-    let tf = TreeFuse::<ObjectID> {
-        repo,
-        fs: filesystem,
-        inode_map,
-        nlink_map,
-        inodes: HashMap::from([(root_ino, root_ref)]),
-        attrs: HashMap::from([(root_ino, root_attr)]),
-        handles: Default::default(),
-        next_fh: 1,
+fn build_fuse(
+    image_fd: OwnedFd,
+    objects_fd: Arc<OwnedFd>,
+    options: &ServeFuseOptions,
+) -> std::io::Result<(ComposefsFuse, Config)> {
+    let image_bytes = load_image(image_fd).map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+    let image = Image::open(image_bytes).map_err(|e| std::io::Error::other(format!("{e}")))?;
+
+    let tf = ComposefsFuse {
+        image,
+        objects_fd,
+        overlay_xattr: options.overlay_xattr,
+        handles: Mutex::new(FuseHandles::default()),
     };
-    Session::from_fd(tf, dev_fuse, SessionACL::All).run()
+
+    Ok((tf, Config::default()))
+}
+
+/// Mounts and serves a FUSE filesystem at `mountpoint`.
+///
+/// Uses `Session::new` which handles `fusermount3` fallback for unprivileged
+/// callers. Blocks until the session ends.
+///
+/// If `ready_fd` is provided, a single byte is written after the mount is
+/// established but before serving starts.
+pub fn serve_fuse(
+    mountpoint: impl AsRef<Path>,
+    image_fd: OwnedFd,
+    objects_fd: Arc<OwnedFd>,
+    options: &ServeFuseOptions,
+    ready_fd: Option<OwnedFd>,
+) -> std::io::Result<()> {
+    let (tf, mut config) = build_fuse(image_fd, objects_fd, options)?;
+    config.mount_options = vec![MountOption::RO, MountOption::DefaultPermissions];
+    let session = Session::new(tf, mountpoint.as_ref(), &config)?;
+    if let Some(fd) = ready_fd {
+        let _ = rustix::io::write(&fd, b"r");
+    }
+    session.spawn()?.join()
+}
+
+/// Serves a FUSE filesystem over a pre-mounted `/dev/fuse` fd.
+///
+/// Use together with [`open_fuse`] and [`mount_fuse`] when you need control
+/// over the mount lifecycle. Blocks until the session ends.
+pub fn serve_fuse_fd(
+    dev_fuse: OwnedFd,
+    image_fd: OwnedFd,
+    objects_fd: Arc<OwnedFd>,
+    options: &ServeFuseOptions,
+) -> std::io::Result<()> {
+    let (tf, config) = build_fuse(image_fd, objects_fd, options)?;
+    Session::from_fd(tf, dev_fuse, SessionACL::All, config)?
+        .spawn()?
+        .join()
 }
