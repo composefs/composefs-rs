@@ -9,34 +9,26 @@
 use std::{
     collections::HashMap,
     ffi::OsStr,
+    num::NonZeroUsize,
     os::{
         fd::{AsFd, AsRawFd, OwnedFd},
         unix::ffi::OsStrExt,
     },
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
-use anyhow::Context;
 use fuser::{
-    Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request, Session,
-    SessionACL,
+    BackingId, Config, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
+    InitFlags, KernelConfig, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
+    ReplyDirectoryPlus, ReplyEntry, ReplyOpen, Request, Session, SessionACL,
 };
-use rustix::{
-    buffer::spare_capacity,
-    fs::{Mode, OFlags, open},
-    io::pread,
-    mount::{
-        FsMountFlags, MountAttrFlags, fsconfig_create, fsconfig_set_flag, fsconfig_set_string,
-        fsmount,
-    },
-};
+use rustix::{buffer::spare_capacity, io::pread};
 
 use composefs::{
     fsverity::FsVerityHashValue,
     generic_tree::LeafId,
-    mount::FsHandle,
     repository::Repository,
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
 };
@@ -136,7 +128,10 @@ fn leaf_size(leaf: &Leaf<impl FsVerityHashValue>) -> u64 {
 }
 
 fn stat_mtime(stat: &Stat) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(stat.st_mtim_sec as u64)
+    // Container image timestamps are virtually always post-epoch (positive),
+    // so we treat negative values as epoch rather than wrapping to the far future.
+    let secs = stat.st_mtim_sec.max(0) as u64;
+    SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
 }
 
 fn dir_fileattr(dir: &Directory<impl FsVerityHashValue>, ino: Ino, nlinks: u32) -> FileAttr {
@@ -295,10 +290,26 @@ fn build_inode_table<ObjectID: FsVerityHashValue>(fs: &FileSystem<ObjectID>) -> 
 }
 
 /// An open file handle: either a real fd (for external objects) or inline data.
-#[derive(Debug)]
+///
+/// Both variants are wrapped in `Arc` so that `read()` can clone the handle
+/// cheaply and drop the `FuseHandles` lock before issuing the actual I/O.
+/// Without this, all `pread` calls would be serialised on the single mutex.
+#[derive(Debug, Clone)]
 enum OpenHandle {
-    Fd(OwnedFd),
-    Data(Box<[u8]>),
+    /// An `OwnedFd` shared via `Arc` so threads can read concurrently.
+    Fd(Arc<OwnedFd>),
+    /// Immutable inline bytes, shared via `Arc` for cheap clone-and-read.
+    Data(Arc<[u8]>),
+    /// A FUSE passthrough backing id. The kernel reads directly from the
+    /// backing fd; userspace read() is never called for this handle.
+    /// Both fields must be kept alive until release(): the `OwnedFd` is the
+    /// file the kernel reads through, and dropping the `BackingId` sends
+    /// `FUSE_DEV_IOC_BACKING_CLOSE` to deregister it.
+    #[allow(dead_code)]
+    Passthrough {
+        backing_id: Arc<BackingId>,
+        fd: Arc<OwnedFd>,
+    },
 }
 
 /// Mutable runtime state: only tracks open file handles.
@@ -323,6 +334,11 @@ struct TreeFuse<ObjectID: FsVerityHashValue> {
     lookup: InodeLookup,
     /// Mutable handle state, protected for thread safety.
     handles: Mutex<FuseHandles>,
+    /// Whether the caller requested FUSE passthrough.  Only negotiated with the
+    /// kernel when this is true; always false until the caller opts in.
+    passthrough_requested: bool,
+    /// Whether FUSE passthrough was successfully negotiated with the kernel.
+    passthrough_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl<ObjectID: FsVerityHashValue> TreeFuse<ObjectID> {
@@ -332,6 +348,12 @@ impl<ObjectID: FsVerityHashValue> TreeFuse<ObjectID> {
     }
 
     /// Resolve a directory inode to a `&Directory` by walking the stored path.
+    ///
+    /// The path walk is O(depth × log(entries_per_dir)) which is acceptable for
+    /// typical container image trees (depth < 20). A future optimisation could
+    /// store a pre-built `Vec<*const Directory<O>>` indexed by `(ino-1)` for
+    /// O(1) resolution, but that would require either `unsafe` raw pointers or
+    /// a significant redesign of ownership.
     fn resolve_dir(&self, ino: Ino) -> Option<&Directory<ObjectID>> {
         let InodeData::Dir { path, .. } = self.get_data(ino)? else {
             return None;
@@ -379,8 +401,36 @@ impl<ObjectID: FsVerityHashValue> TreeFuse<ObjectID> {
 }
 
 impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<ObjectID> {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        if self.passthrough_requested
+            && config.capabilities().contains(InitFlags::FUSE_PASSTHROUGH)
+            && config.add_capabilities(InitFlags::FUSE_PASSTHROUGH).is_ok()
+        {
+            match config.set_max_stack_depth(2) {
+                Ok(_) => {
+                    self.passthrough_enabled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    log::debug!("FUSE passthrough enabled");
+                }
+                Err(current) => {
+                    log::warn!(
+                        "FUSE passthrough: set_max_stack_depth(2) failed \
+                         (current={current}), disabling passthrough"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
+    }
+
+    /// Forget is a no-op: the inode table is fully pre-built at mount time
+    /// and lives for the entire session, so there is nothing to free per-inode.
+    fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {
+        // nothing to do
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -507,6 +557,92 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<ObjectID> {
         reply.ok();
     }
 
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let ino = ino.0;
+        let Some(InodeData::Dir {
+            parent_ino,
+            path: dir_path,
+            attrs: dir_attrs,
+            ..
+        }) = self.get_data(ino)
+        else {
+            log::error!("readdirplus({ino}): inode is not a directory");
+            return reply.error(fuser::Errno::EBADF);
+        };
+        let parent_ino = *parent_ino;
+        let dir_path = dir_path.clone();
+        let dir_attrs = *dir_attrs;
+
+        let parent_attrs = self
+            .get_data(parent_ino)
+            .map(|d| *d.attrs())
+            .unwrap_or(dir_attrs);
+
+        let Some(dir) = self.resolve_dir(ino) else {
+            log::error!("readdirplus({ino}): failed to resolve directory");
+            return reply.error(fuser::Errno::EIO);
+        };
+
+        let mut cur_offset = offset;
+
+        if cur_offset == 0 {
+            cur_offset += 1;
+            if reply.add(
+                INodeNo(ino),
+                cur_offset,
+                ".",
+                &TTL,
+                &dir_attrs,
+                Generation(0),
+            ) {
+                return reply.ok();
+            }
+        }
+
+        if cur_offset == 1 {
+            cur_offset += 1;
+            if reply.add(
+                INodeNo(parent_ino),
+                cur_offset,
+                "..",
+                &TTL,
+                &parent_attrs,
+                Generation(0),
+            ) {
+                return reply.ok();
+            }
+        }
+
+        for (name, inode) in dir.sorted_entries().skip((cur_offset as usize) - 2) {
+            let child_path = child_path_from(&dir_path, name);
+            let Some(child_ino) = self.child_ino(inode, &child_path) else {
+                log::error!("readdirplus({ino}): child {name:?} not in inode table");
+                continue;
+            };
+            let child_attrs = self.inode_data[(child_ino as usize) - 1].attrs();
+            cur_offset += 1;
+            if reply.add(
+                INodeNo(child_ino),
+                cur_offset,
+                name,
+                &TTL,
+                child_attrs,
+                Generation(0),
+            ) {
+                break;
+            }
+        }
+
+        reply.ok();
+    }
+
     fn releasedir(
         &self,
         _req: &Request,
@@ -589,9 +725,53 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<ObjectID> {
                     log::error!("open({ino}): failed to open object");
                     return reply.error(fuser::Errno::EIO);
                 };
-                OpenHandle::Fd(fd)
+                // If passthrough is enabled, try to register the fd with the
+                // kernel so reads bypass the userspace path entirely.
+                if self
+                    .passthrough_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let fd = Arc::new(fd);
+                    match reply.open_backing(fd.as_fd()) {
+                        Ok(backing_id) => {
+                            let mut state =
+                                self.handles.lock().expect("fuse handles mutex poisoned");
+                            let fh = state.next_fh;
+                            state.next_fh += 1;
+                            let backing_id = Arc::new(backing_id);
+                            log::debug!("open({ino}): inserted passthrough handle {fh}");
+                            state.handles.insert(
+                                fh,
+                                OpenHandle::Passthrough {
+                                    backing_id: Arc::clone(&backing_id),
+                                    fd: Arc::clone(&fd),
+                                },
+                            );
+                            return reply.opened_passthrough(
+                                FileHandle(fh),
+                                FopenFlags::FOPEN_KEEP_CACHE,
+                                &backing_id,
+                            );
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "open({ino}): open_backing failed ({err}), disabling passthrough"
+                            );
+                            self.passthrough_enabled
+                                .store(false, std::sync::atomic::Ordering::Relaxed);
+                            // fall through to userspace-read path below
+                        }
+                    }
+                    // Fallback: unwrap Arc (only one reference at this point)
+                    let fd = Arc::try_unwrap(fd).expect("no other Arc refs");
+                    OpenHandle::Fd(Arc::new(fd))
+                } else {
+                    OpenHandle::Fd(Arc::new(fd))
+                }
             }
-            LeafContent::Regular(RegularFile::Inline(data)) => OpenHandle::Data(data.clone()),
+            LeafContent::Regular(RegularFile::Inline(data)) => {
+                OpenHandle::Data(Arc::from(data.as_ref()))
+            }
             _ => {
                 log::error!("open({ino}): not a regular file");
                 return reply.error(fuser::Errno::EBADF);
@@ -603,7 +783,9 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<ObjectID> {
         state.next_fh += 1;
         log::debug!("open({ino}): inserted handle {fh}");
         state.handles.insert(fh, handle);
-        reply.opened(FileHandle(fh), FopenFlags::empty());
+        // FOPEN_KEEP_CACHE tells the kernel it may reuse cached pages across
+        // open/close cycles. This is always safe for our read-only filesystem.
+        reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
     }
 
     fn read(
@@ -617,11 +799,17 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<ObjectID> {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let state = self.handles.lock().expect("fuse handles mutex poisoned");
-        match state.handles.get(&fh.0) {
+        // Clone the Arc handle so we can release the lock before doing I/O.
+        // Holding the mutex across pread() would serialise all concurrent reads
+        // onto a single lock, negating the benefit of multithreaded sessions.
+        let handle = {
+            let state = self.handles.lock().expect("fuse handles mutex poisoned");
+            state.handles.get(&fh.0).cloned()
+        };
+        match handle {
             Some(OpenHandle::Fd(fd)) => {
                 let mut data = Vec::with_capacity(size as usize);
-                match pread(fd, spare_capacity(&mut data), offset) {
+                match pread(&*fd, spare_capacity(&mut data), offset) {
                     Ok(_) => reply.data(&data),
                     Err(errno) => {
                         reply.error(errno_to_fuser(errno));
@@ -632,6 +820,12 @@ impl<ObjectID: FsVerityHashValue> Filesystem for TreeFuse<ObjectID> {
                 let start = (offset as usize).min(data.len());
                 let end = (start + size as usize).min(data.len());
                 reply.data(&data[start..end]);
+            }
+            Some(OpenHandle::Passthrough { .. }) => {
+                // The kernel should never call read() on a passthrough handle;
+                // it reads directly from the backing fd. Handle defensively.
+                log::error!("read(fh={fh}): unexpected read on passthrough handle");
+                reply.error(fuser::Errno::EBADF);
             }
             None => {
                 log::error!("read(fh={fh}): handle does not exist");
@@ -678,22 +872,49 @@ fn errno_to_fuser(errno: rustix::io::Errno) -> fuser::Errno {
     fuser::Errno::from(std::io::Error::from_raw_os_error(errno.raw_os_error()))
 }
 
-/// Opens /dev/fuse.
+/// Configuration for [`serve_tree_fuse`].
+#[derive(Debug, Default)]
+pub struct FuseConfig {
+    /// Enable FUSE passthrough for external files (Linux 6.9+, requires root
+    /// and a backing filesystem that supports passthrough reads).
+    ///
+    /// When true and the kernel supports `FUSE_PASSTHROUGH`, external file
+    /// reads are routed directly in-kernel to the repository object fds,
+    /// eliminating userspace context-switch overhead.
+    ///
+    /// Defaults to `false`. Set to `true` only when you know the backing
+    /// filesystem supports passthrough (e.g. ext4, xfs — not tmpfs).
+    pub passthrough: bool,
+}
+
+/// Opens `/dev/fuse`, returning the device fd.
 ///
-/// After you do this, you can mount it using [`mount_fuse`] and then start serving requests using
-/// [`serve_tree_fuse`]. You might want to do this in different threads, which is why these
-/// operations are defined separately.
+/// The returned fd should be passed to [`mount_fuse`] (to create a detached mount object
+/// via `fsopen`/`fsmount`) and then to [`serve_tree_fuse_fd`] to start serving requests.
+/// Splitting open/mount/serve into three steps lets callers attach the mount fd to an
+/// arbitrary path — or move it into a container namespace — between `mount_fuse` and
+/// `serve_tree_fuse_fd`.
 pub fn open_fuse() -> anyhow::Result<OwnedFd> {
+    use anyhow::Context as _;
+    use rustix::fs::{Mode, OFlags, open};
     open("/dev/fuse", OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
         .context("Unable to open fuse device /dev/fuse")
 }
 
-/// Mounts a FUSE filesystem with the given /dev/fuse fd.
+/// Creates a detached FUSE mount object for `dev_fuse` via the `fsopen`/`fsmount` API.
 ///
-/// This does the necessary dance of creating the mount object, given a /dev/fuse device node. In
-/// order for this to be useful, you'll also need to call [`serve_tree_fuse`] to actually satisfy
-/// the requests for data.
+/// Returns an unattached mount fd. The caller must use [`composefs::mount::mount_at`] (or
+/// `move_mount`) to attach it to a path before calling [`serve_tree_fuse_fd`].
+///
+/// This path requires `CAP_SYS_ADMIN` (Linux kernel ≥ 5.2). For unprivileged mounts,
+/// use the high-level [`serve_tree_fuse`] instead, which falls back to the `fusermount3`
+/// setuid helper automatically.
 pub fn mount_fuse(dev_fuse: impl AsFd) -> anyhow::Result<OwnedFd> {
+    use composefs::mount::FsHandle;
+    use rustix::mount::{
+        FsMountFlags, MountAttrFlags, fsconfig_create, fsconfig_set_flag, fsconfig_set_string,
+        fsmount,
+    };
     let fusefs = FsHandle::open("fuse")?;
     fsconfig_set_flag(fusefs.as_fd(), "ro")?;
     fsconfig_set_flag(fusefs.as_fd(), "default_permissions")?;
@@ -715,15 +936,16 @@ pub fn mount_fuse(dev_fuse: impl AsFd) -> anyhow::Result<OwnedFd> {
     )?)
 }
 
-/// Serves a FUSE filesystem exposing the content of `filesystem`, backed by `repo`.
+/// Build the `TreeFuse` filesystem object and the fuser `Config` from the given inputs.
 ///
-/// You should have called [`mount_fuse`] on the `dev_fuse` fd to establish a mount point.
-/// The function blocks until the FUSE session ends.
-pub fn serve_tree_fuse<ObjectID: FsVerityHashValue>(
-    dev_fuse: OwnedFd,
+/// This shared helper factors out the construction work that is common to both
+/// [`serve_tree_fuse`] (high-level, path-based) and [`serve_tree_fuse_fd`]
+/// (low-level, pre-mounted fd).
+fn build_fuse_session_parts<ObjectID: FsVerityHashValue>(
     filesystem: Arc<FileSystem<ObjectID>>,
     repo: Arc<Repository<ObjectID>>,
-) -> std::io::Result<()> {
+    config: FuseConfig,
+) -> (TreeFuse<ObjectID>, Config) {
     let InodeTable {
         data: inode_data,
         lookup,
@@ -735,8 +957,69 @@ pub fn serve_tree_fuse<ObjectID: FsVerityHashValue>(
         inode_data,
         lookup,
         handles: Mutex::new(FuseHandles::default()),
+        passthrough_requested: config.passthrough,
+        passthrough_enabled: std::sync::atomic::AtomicBool::new(false),
     };
-    Session::from_fd(tf, dev_fuse, SessionACL::All, Config::default())?
+
+    let n_threads: usize = std::thread::available_parallelism()
+        .unwrap_or(NonZeroUsize::new(1).unwrap())
+        .get();
+    let mut session_config = Config::default();
+    session_config.n_threads = Some(n_threads);
+    // clone_fd gives each worker thread its own /dev/fuse fd via FUSE_DEV_IOC_CLONE,
+    // avoiding per-request lock contention on the shared channel (Linux 4.5+).
+    session_config.clone_fd = true;
+
+    (tf, session_config)
+}
+
+/// Mounts and serves a FUSE filesystem exposing the content of `filesystem`, backed by `repo`.
+///
+/// Mounts at `mountpoint` and blocks until the session ends (i.e. until the mountpoint is
+/// unmounted). Uses `Session::new` which tries the new `fsopen`/`fsmount` kernel API first and
+/// automatically falls back to the `fusermount3` setuid helper, so unprivileged callers work
+/// without any extra setup.
+///
+/// FUSE passthrough I/O is opt-in via [`FuseConfig::passthrough`]. When enabled, the
+/// kernel reads object data directly from the backing fd, bypassing userspace entirely
+/// for external files. This requires root (`CAP_SYS_ADMIN`) **and** a backing filesystem
+/// that supports passthrough reads (e.g. ext4, xfs — not tmpfs).
+///
+/// Uses one worker thread per logical CPU with per-thread fd cloning
+/// (`FUSE_DEV_IOC_CLONE`) to avoid kernel channel-lock contention under load.
+/// This is safe because [`TreeFuse`] is `Send + Sync` and the filesystem is
+/// read-only.
+pub fn serve_tree_fuse<ObjectID: FsVerityHashValue>(
+    mountpoint: impl AsRef<Path>,
+    filesystem: Arc<FileSystem<ObjectID>>,
+    repo: Arc<Repository<ObjectID>>,
+    config: FuseConfig,
+) -> std::io::Result<()> {
+    let (tf, mut session_config) = build_fuse_session_parts(filesystem, repo, config);
+    session_config.mount_options = vec![MountOption::RO, MountOption::DefaultPermissions];
+    Session::new(tf, mountpoint.as_ref(), &session_config)?
+        .spawn()?
+        .join()
+}
+
+/// Serves a FUSE filesystem over a caller-supplied, pre-mounted `/dev/fuse` fd.
+///
+/// Use this together with [`open_fuse`] and [`mount_fuse`] when you need control over
+/// the mount lifecycle — for example, to attach the mount fd to a path inside a container
+/// namespace with `move_mount` before handing it to the FUSE server. The caller is
+/// responsible for attaching the mount fd (via [`composefs::mount::mount_at`]) before
+/// calling this function, and for keeping the mount fd alive for the duration of the
+/// session.
+///
+/// This function blocks until the FUSE session ends.
+pub fn serve_tree_fuse_fd<ObjectID: FsVerityHashValue>(
+    dev_fuse: OwnedFd,
+    filesystem: Arc<FileSystem<ObjectID>>,
+    repo: Arc<Repository<ObjectID>>,
+    config: FuseConfig,
+) -> std::io::Result<()> {
+    let (tf, session_config) = build_fuse_session_parts(filesystem, repo, config);
+    Session::from_fd(tf, dev_fuse, SessionACL::All, session_config)?
         .spawn()?
         .join()
 }
