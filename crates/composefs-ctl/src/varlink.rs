@@ -407,6 +407,125 @@ async fn run_image_objects<ObjectID: FsVerityHashValue>(
     Ok(ImageObjectsReply { object_ids })
 }
 
+/// Options for a `Mount` call. All fields are optional for forward
+/// compatibility — new mount options can be added without breaking the
+/// wire format.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, zlink::introspect::Type)]
+pub struct MountParams {
+    /// Whether to set up an overlayfs upper layer.
+    /// When true, the fd array must contain two fds: upperdir and workdir.
+    pub overlay: Option<bool>,
+    /// Whether to mount read-write (only meaningful with overlay).
+    pub read_write: Option<bool>,
+}
+
+impl MountParams {
+    /// Build [`MountOptions`] from these params, consuming the expected fds.
+    fn to_mount_options(
+        &self,
+        fds: Vec<std::os::fd::OwnedFd>,
+    ) -> std::result::Result<composefs::mount::MountOptions, RepositoryError> {
+        let overlay = self.overlay.unwrap_or(false);
+
+        let mut expected_fds = 0;
+        if overlay {
+            expected_fds += 2;
+        }
+
+        if fds.len() != expected_fds {
+            return Err(RepositoryError::InvalidSpec {
+                message: format!(
+                    "Mount expects {expected_fds} fds for the requested options, got {}",
+                    fds.len()
+                ),
+            });
+        }
+
+        let mut options = composefs::mount::MountOptions::default();
+        let mut fd_iter = fds.into_iter();
+        if overlay {
+            let upperdir = fd_iter.next().unwrap();
+            let workdir = fd_iter.next().unwrap();
+            options.set_overlay(upperdir, workdir);
+        }
+        options.set_read_write(self.read_write.unwrap_or(false));
+
+        Ok(options)
+    }
+}
+
+/// Reply for a `Mount` call — just an fd_index referencing the mount fd.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, zlink::introspect::Type)]
+pub struct MountReply {
+    /// Index into the fd vector of the detached mount file descriptor.
+    pub fd_index: u32,
+}
+
+fn run_mount<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    name: &str,
+    params: &MountParams,
+    fds: Vec<std::os::fd::OwnedFd>,
+) -> std::result::Result<(MountReply, Vec<std::os::fd::OwnedFd>), RepositoryError> {
+    let options = params.to_mount_options(fds)?;
+
+    let mount_fd =
+        repo.mount_with_options(name, &options)
+            .map_err(|e| RepositoryError::InternalError {
+                message: format!("{e:#}"),
+            })?;
+
+    Ok((MountReply { fd_index: 0 }, vec![mount_fd]))
+}
+
+#[cfg(feature = "oci")]
+fn run_oci_mount<ObjectID: composefs::fsverity::FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    image: &str,
+    bootable: bool,
+    params: &MountParams,
+    fds: Vec<std::os::fd::OwnedFd>,
+) -> std::result::Result<(MountReply, Vec<std::os::fd::OwnedFd>), oci::OciError> {
+    let img = if image.starts_with("sha256:") {
+        let digest: composefs_oci::OciDigest =
+            image.parse().map_err(|e| oci::OciError::InternalError {
+                message: format!("Invalid manifest digest: {e}"),
+            })?;
+        composefs_oci::OciImage::open(repo, &digest, None)
+    } else {
+        composefs_oci::OciImage::open_ref(repo, image)
+    }
+    .map_err(|e| oci::OciError::NoSuchImage {
+        image: format!("{image}: {e:#}"),
+    })?;
+
+    let erofs_id = if bootable {
+        img.boot_image_ref()
+    } else {
+        img.image_ref()
+    }
+    .ok_or_else(|| oci::OciError::InternalError {
+        message: if bootable {
+            "No boot EROFS image linked".into()
+        } else {
+            "No composefs EROFS image linked".into()
+        },
+    })?;
+
+    let options = params
+        .to_mount_options(fds)
+        .map_err(|e| oci::OciError::InternalError {
+            message: format!("{e:?}"),
+        })?;
+    let mount_fd = repo
+        .mount_with_options(&erofs_id.to_hex(), &options)
+        .map_err(|e| oci::OciError::InternalError {
+            message: format!("{e:#}"),
+        })?;
+
+    Ok((MountReply { fd_index: 0 }, vec![mount_fd]))
+}
+
 /// Initialize (or verify) a repository at `path` with the given algorithm.
 ///
 /// Creates parent directories if needed, then delegates to
@@ -624,9 +743,9 @@ mod service_impl {
     #![allow(missing_docs)]
 
     use super::{
-        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, OpenRepo,
-        OpenRepositoryReply, RepositoryError, run_fsck, run_gc, run_image_objects,
-        run_init_repository,
+        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, MountParams,
+        MountReply, OpenRepo, OpenRepositoryReply, RepositoryError, run_fsck, run_gc,
+        run_image_objects, run_init_repository, run_mount,
     };
     use composefs::fsverity::{Algorithm, Sha256HashValue, Sha512HashValue};
 
@@ -732,6 +851,37 @@ mod service_impl {
                 OpenRepo::Sha512(ref r) => run_image_objects::<Sha512HashValue>(r, name).await,
             }
         }
+
+        /// Create a detached mount of an image and return the mount fd.
+        ///
+        /// If overlay upper/work directories are needed, pass them as two fds
+        /// (upperdir, workdir) via SCM_RIGHTS. The returned fd is a detached
+        /// mount that the caller can attach with `move_mount()`.
+        #[zlink(return_fds)]
+        async fn mount(
+            &self,
+            handle: u64,
+            name: String,
+            options: MountParams,
+            #[zlink(fds)] fds: Vec<std::os::fd::OwnedFd>,
+        ) -> (
+            std::result::Result<MountReply, RepositoryError>,
+            Vec<std::os::fd::OwnedFd>,
+        ) {
+            let result = match self.lookup_repo(handle) {
+                Ok(OpenRepo::Sha256(ref r)) => {
+                    run_mount::<Sha256HashValue>(r, &name, &options, fds)
+                }
+                Ok(OpenRepo::Sha512(ref r)) => {
+                    run_mount::<Sha512HashValue>(r, &name, &options, fds)
+                }
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok((reply, fds)) => (Ok(reply), fds),
+                Err(e) => (Err(e), vec![]),
+            }
+        }
     }
 }
 
@@ -748,9 +898,10 @@ mod service_impl {
         parse_local_fetch, pull_stream,
     };
     use super::{
-        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, OpenRepo,
-        OpenRepositoryReply, RepositoryError, run_compute_id, run_fsck, run_gc, run_image_objects,
-        run_init_repository, run_inspect, run_list_images, run_oci_fsck, run_tag, run_untag,
+        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, MountParams,
+        MountReply, OpenRepo, OpenRepositoryReply, RepositoryError, run_compute_id, run_fsck,
+        run_gc, run_image_objects, run_init_repository, run_inspect, run_list_images, run_mount,
+        run_oci_fsck, run_oci_mount, run_tag, run_untag,
     };
     use composefs::fsverity::{Algorithm, Sha256HashValue, Sha512HashValue};
 
@@ -856,6 +1007,37 @@ mod service_impl {
             match self.lookup_repo(handle)? {
                 OpenRepo::Sha256(ref r) => run_image_objects::<Sha256HashValue>(r, name).await,
                 OpenRepo::Sha512(ref r) => run_image_objects::<Sha512HashValue>(r, name).await,
+            }
+        }
+
+        /// Create a detached mount of an image and return the mount fd.
+        ///
+        /// If overlay upper/work directories are needed, pass them as two fds
+        /// (upperdir, workdir) via SCM_RIGHTS. The returned fd is a detached
+        /// mount that the caller can attach with `move_mount()`.
+        #[zlink(return_fds)]
+        async fn mount(
+            &self,
+            handle: u64,
+            name: String,
+            options: MountParams,
+            #[zlink(fds)] fds: Vec<std::os::fd::OwnedFd>,
+        ) -> (
+            std::result::Result<MountReply, RepositoryError>,
+            Vec<std::os::fd::OwnedFd>,
+        ) {
+            let result = match self.lookup_repo(handle) {
+                Ok(OpenRepo::Sha256(ref r)) => {
+                    run_mount::<Sha256HashValue>(r, &name, &options, fds)
+                }
+                Ok(OpenRepo::Sha512(ref r)) => {
+                    run_mount::<Sha512HashValue>(r, &name, &options, fds)
+                }
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok((reply, fds)) => (Ok(reply), fds),
+                Err(e) => (Err(e), vec![]),
             }
         }
 
@@ -996,6 +1178,39 @@ mod service_impl {
                         Err(OciError::InvalidHandle { handle })
                     }))
                 }
+            }
+        }
+
+        /// Mount an OCI image and return the detached mount fd.
+        ///
+        /// Resolves the image by ref name or `sha256:` digest, finds its
+        /// EROFS image (or boot variant if `bootable` is true), and creates
+        /// a composefs mount. If `options.overlay` is true, the fd array
+        /// must contain upperdir and workdir fds.
+        #[zlink(interface = "org.composefs.Oci", return_fds)]
+        async fn oci_mount(
+            &self,
+            handle: u64,
+            image: String,
+            bootable: bool,
+            options: MountParams,
+            #[zlink(fds)] fds: Vec<std::os::fd::OwnedFd>,
+        ) -> (
+            std::result::Result<MountReply, OciError>,
+            Vec<std::os::fd::OwnedFd>,
+        ) {
+            let result = match self.lookup_oci(handle) {
+                Ok(OpenRepo::Sha256(ref r)) => {
+                    run_oci_mount::<Sha256HashValue>(r, &image, bootable, &options, fds)
+                }
+                Ok(OpenRepo::Sha512(ref r)) => {
+                    run_oci_mount::<Sha512HashValue>(r, &image, bootable, &options, fds)
+                }
+                Err(e) => Err(e),
+            };
+            match result {
+                Ok((reply, fds)) => (Ok(reply), fds),
+                Err(e) => (Err(e), vec![]),
             }
         }
     }
