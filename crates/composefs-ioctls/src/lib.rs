@@ -26,6 +26,9 @@
 
 pub mod fsverity;
 
+#[cfg(feature = "keyring")]
+pub mod keyring;
+
 #[cfg(feature = "loop-device")]
 pub mod loop_device;
 
