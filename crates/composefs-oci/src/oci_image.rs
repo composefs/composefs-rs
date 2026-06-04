@@ -50,9 +50,9 @@ use serde::Serialize;
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
-use crate::ContentAndVerity;
 use crate::layer::is_tar_media_type;
 use crate::skopeo::{OCI_BLOB_CONTENT_TYPE, OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE};
+use crate::{ContentAndVerity, sha256_content_digest};
 
 /// Error marker: an OCI reference (tag) does not exist.
 #[derive(Debug, thiserror::Error)]
@@ -680,6 +680,54 @@ pub(crate) fn rewrite_manifest<ObjectID: FsVerityHashValue, S: AsRef<str>>(
     let id = repo.write_stream(stream, &content_id, oci_ref.as_deref())?;
 
     Ok((manifest_digest.clone(), id))
+}
+
+/// Writes a manifest to the repository from raw JSON bytes.
+///
+/// Unlike [`write_manifest`], this preserves the exact JSON bytes from the
+/// original source, avoiding digest mismatches from re-serialization.
+pub fn write_manifest_raw<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    manifest_json: &[u8],
+    manifest_digest: &str,
+    config_verity: &ObjectID,
+    layer_verities: &HashMap<Box<str>, ObjectID>,
+    reference: Option<&str>,
+) -> Result<(String, ObjectID)> {
+    let digest: OciDigest = manifest_digest.parse().context("parsing manifest digest")?;
+    let content_id = manifest_identifier(&digest);
+
+    if let Some(verity) = repo.has_stream(&content_id)? {
+        if let Some(name) = reference {
+            tag_image(repo, &digest, name)?;
+        }
+        return Ok((manifest_digest.to_string(), verity));
+    }
+
+    let computed = sha256_content_digest(manifest_json);
+    ensure!(
+        digest == computed,
+        "Manifest digest mismatch: expected {digest}, got {computed}"
+    );
+
+    let manifest: ImageManifest =
+        serde_json::from_slice(manifest_json).context("parsing manifest JSON")?;
+
+    let mut stream = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE)?;
+
+    let config_key = format!("config:{}", manifest.config().digest());
+    stream.add_named_stream_ref(&config_key, config_verity);
+
+    for (diff_id, verity) in layer_verities {
+        stream.add_named_stream_ref(diff_id, verity);
+    }
+
+    stream.write_external(manifest_json)?;
+
+    let oci_ref = reference.map(oci_ref_path);
+    let id = repo.write_stream(stream, &content_id, oci_ref.as_deref())?;
+
+    Ok((manifest_digest.to_string(), id))
 }
 
 /// Checks if a manifest exists.

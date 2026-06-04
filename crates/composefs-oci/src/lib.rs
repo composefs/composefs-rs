@@ -26,6 +26,7 @@ pub mod oci_layout;
 /// Re-exported from [`composefs::progress`]; use that path directly in new code.
 pub mod progress;
 pub mod skopeo;
+pub mod splitfdstream;
 pub mod tar;
 
 /// Test utilities for building OCI images from dumpfile strings.
@@ -36,6 +37,10 @@ pub mod test_util;
 
 // Re-export the composefs crate for consumers who only need composefs-oci
 pub use composefs;
+
+pub use splitfdstream::{
+    CompleteImageImportResult, import_complete_image_from_splitfdstream, import_from_splitfdstream,
+};
 
 use std::io::Read;
 use std::{collections::HashMap, sync::Arc};
