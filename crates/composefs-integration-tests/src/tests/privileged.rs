@@ -17,7 +17,7 @@ use xshell::{Shell, cmd};
 use composefs_oci::composefs::fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue};
 use composefs_oci::composefs::repository::{Repository, RepositoryConfig};
 
-use crate::{cfsctl, integration_test};
+use crate::{cfsctl, create_test_rootfs, integration_test};
 
 /// Ensure we're running in a privileged environment, or re-exec this test inside a VM.
 ///
@@ -380,6 +380,137 @@ fn privileged_oci_pull_mount() -> Result<()> {
     Ok(())
 }
 integration_test!(privileged_oci_pull_mount);
+
+/// Test `cfsctl mount` with `--upperdir`/`--workdir`/`--read-write` flags.
+///
+/// Exercises three scenarios:
+/// 1. Upperdir present but no `--read-write` → mount stays read-only.
+/// 2. Upperdir + `--read-write` → writes land in the upper directory.
+/// 3. Plain mount (no upperdir) → baseline sanity check.
+fn privileged_mount_upper_layer() -> Result<()> {
+    if require_privileged("privileged_mount_upper_layer")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let verity_dir = VerityTempDir::new()?;
+    let repo_path = verity_dir.path().join("repo");
+    let repo_arg = repo_path.to_str().unwrap();
+
+    cmd!(sh, "{cfsctl} --insecure --repo {repo_arg} init").run()?;
+
+    let fixture_dir = tempfile::tempdir()?;
+    let rootfs = create_test_rootfs(fixture_dir.path())?;
+    let rootfs = rootfs.to_str().unwrap();
+
+    // Use a named ref so we can mount via "refs/upper-test" — the bare output
+    // of create-image is "algo:hex" but mount expects just the hex or a ref path.
+    cmd!(
+        sh,
+        "{cfsctl} --insecure --repo {repo_arg} create-image {rootfs} upper-test"
+    )
+    .run()?;
+    let image_name = "refs/upper-test";
+
+    // --- Scenario 1: upperdir without --read-write keeps the mount read-only ---
+    {
+        let upper1 = tempfile::tempdir()?;
+        let work1 = tempfile::tempdir()?;
+        let mp1 = tempfile::tempdir()?;
+        let upper1_path = upper1.path().to_str().unwrap();
+        let work1_path = work1.path().to_str().unwrap();
+        let mp1_path = mp1.path().to_str().unwrap();
+
+        cmd!(
+            sh,
+            "{cfsctl} --insecure --repo {repo_arg} mount {image_name} {mp1_path}
+             --upperdir {upper1_path} --workdir {work1_path}"
+        )
+        .run()?;
+
+        // The rootfs fixture has etc/hostname — verify the mount is populated.
+        let hostname = std::fs::read_to_string(mp1.path().join("etc/hostname"))?;
+        ensure!(
+            hostname == "integration-test\n",
+            "hostname mismatch in scenario 1: {hostname:?}"
+        );
+
+        // Without --read-write the mount must be read-only.
+        let write_result = std::fs::write(mp1.path().join("should_fail"), b"data");
+        ensure!(
+            write_result.is_err(),
+            "write to read-only overlayfs mount should fail"
+        );
+
+        cmd!(sh, "umount {mp1_path}").run()?;
+    }
+
+    // --- Scenario 2: upperdir + --read-write allows writes that persist in upperdir ---
+    {
+        let upper2 = tempfile::tempdir()?;
+        let work2 = tempfile::tempdir()?;
+        let mp2 = tempfile::tempdir()?;
+        let upper2_path = upper2.path().to_str().unwrap();
+        let work2_path = work2.path().to_str().unwrap();
+        let mp2_path = mp2.path().to_str().unwrap();
+
+        cmd!(
+            sh,
+            "{cfsctl} --insecure --repo {repo_arg} mount {image_name} {mp2_path}
+             --upperdir {upper2_path} --workdir {work2_path} --read-write"
+        )
+        .run()?;
+
+        // Write a new file through the mount.
+        let new_file = mp2.path().join("upper_test_file");
+        std::fs::write(&new_file, b"hello from upper")?;
+
+        // Read it back through the mount.
+        let content = std::fs::read(&new_file)?;
+        ensure!(
+            content == b"hello from upper",
+            "newly written file content mismatch"
+        );
+
+        cmd!(sh, "umount {mp2_path}").run()?;
+
+        // After unmount the file must be visible in the upperdir itself.
+        let upper_file = upper2.path().join("upper_test_file");
+        ensure!(
+            upper_file.exists(),
+            "written file should persist in upperdir after unmount"
+        );
+        let upper_content = std::fs::read(&upper_file)?;
+        ensure!(
+            upper_content == b"hello from upper",
+            "upperdir file content mismatch after unmount"
+        );
+    }
+
+    // --- Scenario 3: plain mount (no upperdir) still works as a baseline ---
+    {
+        let mp3 = tempfile::tempdir()?;
+        let mp3_path = mp3.path().to_str().unwrap();
+
+        cmd!(
+            sh,
+            "{cfsctl} --insecure --repo {repo_arg} mount {image_name} {mp3_path}"
+        )
+        .run()?;
+
+        // Check a known file rather than read_dir to avoid keeping a dirfd open.
+        ensure!(
+            mp3.path().join("etc/hostname").exists(),
+            "plain mount should expose etc/hostname from rootfs"
+        );
+
+        cmd!(sh, "umount {mp3_path}").run()?;
+    }
+
+    Ok(())
+}
+integration_test!(privileged_mount_upper_layer);
 
 /// Verify that `init` on a verity-capable filesystem enables verity on
 /// meta.json, and that `--require-verity` succeeds on such a repo.
