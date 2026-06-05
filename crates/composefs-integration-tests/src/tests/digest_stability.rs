@@ -21,11 +21,18 @@ struct ContainerImage {
     /// unavailable (e.g. a PR that adds a new mirror entry before it has been
     /// pushed).  Should be pinned by digest for reproducibility.
     upstream_ref: &'static str,
-    /// Expected composefs image ID without `--bootable`.
+    /// Expected composefs image ID without `--bootable` (V2/default EROFS).
     expected_id: &'static str,
-    /// Expected composefs image ID with `--bootable`, or `None` if the
-    /// image lacks /sysroot and doesn't support bootable transformation.
+    /// Expected composefs image ID with `--bootable` (V2/default EROFS), or
+    /// `None` if the image lacks /sysroot and doesn't support bootable
+    /// transformation.
     expected_bootable_id: Option<&'static str>,
+    /// Expected composefs image ID without `--bootable` using V1 EROFS writer.
+    expected_v1_id: &'static str,
+    /// Expected composefs image ID with `--bootable` using V1 EROFS writer, or
+    /// `None` if the image lacks /sysroot and doesn't support bootable
+    /// transformation.
+    expected_v1_bootable_id: Option<&'static str>,
 }
 
 // RHEL UBI 10.1, build 1772441712 (amd64).
@@ -39,6 +46,9 @@ const UBI10: ContainerImage = ContainerImage {
     expected_id: "ff8dad033a3e6015d63d6b00c16918da27bf96cc8ddd824e521549db01013227\
                   87c30a3f49e5716f8f6052d78b46308dfaaccf0dfc504d26fe58d468810c0b0e",
     expected_bootable_id: None,
+    expected_v1_id: "ece359ddb403598b193d856215289f870cb672f5e6e5e1626841a12d648bf9ee\
+                     dc337d386ca01bb207ec01f3251a69c598982a173155b723a50c642817d4bdcf",
+    expected_v1_bootable_id: None,
 };
 
 // centos-bootc stream10, pinned by manifest digest so the test is
@@ -54,6 +64,12 @@ const CENTOS_BOOTC: ContainerImage = ContainerImage {
     expected_bootable_id: Some(
         "79c840369bf1ef414d71731166967a01f6616039bc0e1d4c5353bed02e0d2bd9\
          4459e22407bb885f1d6ce44a04add35adf0d00ca8a23f90544a99a76fdadb65b",
+    ),
+    expected_v1_id: "6588e6ad260c57610f7c8cda080a8adc1ed8c0d21d9eb8b7c6cccaa5aa8a564c\
+                     727125c6b700da2048480f01b74926e13b48c131d5dda3245f14b80d88a297f9",
+    expected_v1_bootable_id: Some(
+        "a2beab402884373c4ac3301e370ea93061281e6f13f6556ae6f6bc062ad95fb7\
+         07046b325359605fe55654dc3d0f30d6093e1b9afcb602e3b25397c09868dbdd",
     ),
 };
 
@@ -73,6 +89,12 @@ const DEBIAN_BOOTC: ContainerImage = ContainerImage {
         "013ed0f7275cb635075107bde6394bc19cf4e09ff1189b283048282d31fa2043\
          875b076e44344b17d38ee7e3ba22557381c1626357edf349b978602970b73d49",
     ),
+    expected_v1_id: "48fdfe53e9dc1b600a5920c8ea224e5f442b0fb3109ecb0f9e3bec7e05a80c7f\
+                     ad5ed91cd517637e36fb5b544c2f00b4f530ac6ddcbe94e8eb4b51f03452e150",
+    expected_v1_bootable_id: Some(
+        "e48ed9c8cfe9b3b2bf121c779f7002eab0c332196b01b0b4441ac8de55a36c34\
+         b1fd61b040ceb61d434ad69b6ad2dba4df064b6fb1127d6637796c27f86483f1",
+    ),
 };
 
 // Ubuntu 26.04 (resolute), pinned by manifest digest.
@@ -89,6 +111,9 @@ const UBUNTU_RESOLUTE: ContainerImage = ContainerImage {
     expected_id: "150caabb982d7005db1a1d0480d57a95e84b160aa2b1159f9aae66e92ba07b36\
                   11ea38e1836eff923dc3a1a617c18494757be0f5e3db16cc7a522981b3f42d40",
     expected_bootable_id: None,
+    expected_v1_id: "595ada47acc169edb079f4d25efeee7d0212d53cbc1b9e723e9eee9043dcb2e1\
+                     0d9c6cdd7ec7f369cfad9e72db3c0dc1de7cbdbbdfbe12b23edc8650dcba03e7",
+    expected_v1_bootable_id: None,
 };
 
 /// All container images to test.
@@ -153,7 +178,7 @@ fn try_pull_image(
     bail!("could not find config digest in pull output:\n{output}")
 }
 
-/// Compute the composefs image ID for a pulled OCI image.
+/// Compute the composefs image ID for a pulled OCI image (default V2 EROFS).
 ///
 /// The `config_digest` should be a bare OCI digest (e.g. `sha256:abc...`);
 /// this function adds the `@` prefix required by the CLI.
@@ -181,11 +206,38 @@ fn compute_id(
     Ok(output.trim().to_string())
 }
 
+/// Compute the composefs image ID using the V1 EROFS writer.
+///
+/// `--erofs-version 1` is a global flag and must appear before the subcommand.
+fn compute_id_v1(
+    sh: &Shell,
+    cfsctl: &std::path::Path,
+    repo: &std::path::Path,
+    config_digest: &str,
+    bootable: bool,
+) -> Result<String> {
+    let at_digest = format!("@{config_digest}");
+    let output = if bootable {
+        cmd!(
+            sh,
+            "{cfsctl} --insecure --erofs-version 1 --repo {repo} oci compute-id --bootable {at_digest}"
+        )
+        .read()?
+    } else {
+        cmd!(
+            sh,
+            "{cfsctl} --insecure --erofs-version 1 --repo {repo} oci compute-id {at_digest}"
+        )
+        .read()?
+    };
+    Ok(output.trim().to_string())
+}
+
 /// Table-driven OCI container digest stability test.
 ///
 /// Pulls each pinned container image from a registry, computes the composefs
-/// image ID for both plain and `--bootable` transforms, and asserts they
-/// match the expected values.
+/// image ID for both plain and `--bootable` transforms using both the default
+/// (V2) and V1 EROFS writers, and asserts they match the expected values.
 ///
 /// Skipped when `COMPOSEFS_SKIP_NETWORK=1` is set.
 fn test_oci_container_digest_stability() -> Result<()> {
@@ -201,31 +253,37 @@ fn test_oci_container_digest_stability() -> Result<()> {
         eprintln!("--- {} ---", image.label);
         let repo_dir = tempfile::tempdir()?;
         let repo = repo_dir.path();
-        cmd!(sh, "{cfsctl} --repo {repo} init --insecure").read()?;
+        // Use V2 explicitly: compute_id() tests V2 (default) hashes; V1 is
+        // tested separately via compute_id_v1() with --erofs-version 1.
+        cmd!(
+            sh,
+            "{cfsctl} --repo {repo} init --insecure --erofs-version 2"
+        )
+        .read()?;
 
         eprintln!("Pulling {} (this may take a while)...", image.label);
         let config = pull_image(&sh, &cfsctl, repo, image, image.label)?;
 
-        // Plain (non-bootable) image ID
+        // V2 (default): plain image ID
         let plain_id = compute_id(&sh, &cfsctl, repo, &config, false)?;
-        eprintln!("{} composefs image ID: {plain_id}", image.label);
+        eprintln!("{} composefs V2 image ID: {plain_id}", image.label);
         assert_eq!(
             plain_id, image.expected_id,
-            "{}: composefs image ID changed — the EROFS writer or OCI \
+            "{}: composefs image ID changed — the EROFS V2 writer or OCI \
              pipeline produced different output for the same image",
             image.label,
         );
 
-        // Bootable image ID (only for images that support it)
+        // V2 (default): bootable image ID (only for images that support it)
         if let Some(expected_bootable) = image.expected_bootable_id {
             let bootable_id = compute_id(&sh, &cfsctl, repo, &config, true)?;
             eprintln!(
-                "{} composefs image ID (bootable): {bootable_id}",
+                "{} composefs V2 image ID (bootable): {bootable_id}",
                 image.label
             );
             assert_eq!(
                 bootable_id, expected_bootable,
-                "{}: bootable composefs image ID changed — the EROFS writer or \
+                "{}: bootable composefs image ID changed — the EROFS V2 writer or \
                  boot transform produced different output for the same image",
                 image.label,
             );
@@ -233,6 +291,45 @@ fn test_oci_container_digest_stability() -> Result<()> {
             assert_ne!(
                 plain_id, bootable_id,
                 "{}: plain and --bootable image IDs should differ \
+                 (bootable applies SELinux relabeling, empties /boot and /sysroot)",
+                image.label,
+            );
+        }
+
+        // V1: plain image ID
+        let v1_plain_id = compute_id_v1(&sh, &cfsctl, repo, &config, false)?;
+        eprintln!("{} composefs V1 image ID: {v1_plain_id}", image.label);
+        assert_eq!(
+            v1_plain_id, image.expected_v1_id,
+            "{}: composefs V1 image ID changed — the EROFS V1 writer or OCI \
+             pipeline produced different output for the same image",
+            image.label,
+        );
+
+        // V1 and V2 must produce different digests for the same image.
+        assert_ne!(
+            v1_plain_id, plain_id,
+            "{}: V1 and V2 EROFS image IDs should differ",
+            image.label,
+        );
+
+        // V1: bootable image ID (only for images that support it)
+        if let Some(expected_v1_bootable) = image.expected_v1_bootable_id {
+            let v1_bootable_id = compute_id_v1(&sh, &cfsctl, repo, &config, true)?;
+            eprintln!(
+                "{} composefs V1 image ID (bootable): {v1_bootable_id}",
+                image.label
+            );
+            assert_eq!(
+                v1_bootable_id, expected_v1_bootable,
+                "{}: bootable composefs V1 image ID changed — the EROFS V1 writer or \
+                 boot transform produced different output for the same image",
+                image.label,
+            );
+
+            assert_ne!(
+                v1_plain_id, v1_bootable_id,
+                "{}: plain and --bootable V1 image IDs should differ \
                  (bootable applies SELinux relabeling, empties /boot and /sysroot)",
                 image.label,
             );
