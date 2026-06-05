@@ -457,9 +457,17 @@ impl<ObjectID: FsVerityHashValue> UsrLibModulesVmlinuz<ObjectID> {
     ///
     /// # Returns
     ///
-    /// A Type1Entry with generated BLS configuration
-    pub fn into_type1(self, entry_id: Option<&str>) -> Type1Entry<ObjectID> {
+    /// A Type1Entry with generated BLS configuration, or an error if initramfs is missing.
+    pub fn into_type1(self, entry_id: Option<&str>) -> Result<Type1Entry<ObjectID>> {
         let id = entry_id.unwrap_or(&self.kver);
+
+        let initramfs = self.initramfs.ok_or_else(|| {
+            anyhow::anyhow!(
+                "kernel {} has no initramfs.img in /usr/lib/modules/{}",
+                self.kver,
+                self.kver
+            )
+        })?;
 
         let title = "todoOS";
         let version = "0-todo";
@@ -474,17 +482,14 @@ initrd /{id}/initramfs.img
 
         let filename = Box::from(format!("{id}.conf").as_ref());
 
-        Type1Entry {
+        Ok(Type1Entry {
             filename,
             entry,
             files: HashMap::from([
                 (Box::from(format!("/{id}/vmlinuz")), self.vmlinuz),
-                (
-                    Box::from(format!("/{id}/initramfs.img")),
-                    self.initramfs.unwrap(),
-                ),
+                (Box::from(format!("/{id}/initramfs.img")), initramfs),
             ]),
-        }
+        })
     }
 
     /// Loads all vmlinuz entries from /usr/lib/modules.
@@ -580,6 +585,48 @@ pub fn get_boot_resources<ObjectID: FsVerityHashValue>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use composefs::{fsverity::Sha256HashValue, tree::RegularFile};
+
+    fn fake_file() -> RegularFile<Sha256HashValue> {
+        RegularFile::Inline(Default::default())
+    }
+
+    #[test]
+    fn test_into_type1_with_initramfs() {
+        let entry = UsrLibModulesVmlinuz::<Sha256HashValue> {
+            kver: "6.9.0-arch1-1".into(),
+            vmlinuz: fake_file(),
+            initramfs: Some(fake_file()),
+            os_release: None,
+        };
+        let t1 = entry
+            .into_type1(None)
+            .expect("should succeed with initramfs");
+        let keys: Vec<&str> = t1.files.keys().map(|k| k.as_ref()).collect();
+        assert!(
+            keys.contains(&"/6.9.0-arch1-1/vmlinuz"),
+            "missing vmlinuz key, got: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"/6.9.0-arch1-1/initramfs.img"),
+            "missing initramfs key, got: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn test_into_type1_without_initramfs_returns_error() {
+        let entry = UsrLibModulesVmlinuz::<Sha256HashValue> {
+            kver: "6.9.0-arch1-1".into(),
+            vmlinuz: fake_file(),
+            initramfs: None,
+            os_release: None,
+        };
+        let err = entry.into_type1(None).unwrap_err();
+        assert!(
+            err.to_string().contains("no initramfs"),
+            "unexpected error message: {err}"
+        );
+    }
 
     #[test]
     fn test_bootloader_entry_file_new() {

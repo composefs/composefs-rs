@@ -164,7 +164,7 @@ pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
             write_t2_simple(t2, boot_partition, root_id, repo)?;
         }
         BootEntry::UsrLibModulesVmLinuz(entry) => {
-            let mut t1 = entry.into_type1(entry_id);
+            let mut t1 = entry.into_type1(entry_id)?;
             if let Some(name) = entry_id {
                 t1.relocate(boot_subdir, name);
             }
