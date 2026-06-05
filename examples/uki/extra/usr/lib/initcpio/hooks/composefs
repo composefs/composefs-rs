@@ -3,7 +3,11 @@
 run_latehook() {
     local composefs
 
-    composefs="$(getarg composefs)"
+    # composefs.digest= is the V1 EROFS karg; composefs= is the legacy V2 karg.
+    composefs="$(getarg composefs.digest)"
+    if [ -z "$composefs" ]; then
+        composefs="$(getarg composefs)"
+    fi
     if [ -z "$composefs" ]; then
         return 0
     fi

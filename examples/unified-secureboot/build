@@ -20,7 +20,7 @@ CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
 rm -rf tmp/efi tmp/sysroot/composefs/images
-${CFSCTL} init --algorithm=fsverity-sha256-12
+${CFSCTL} init --algorithm=fsverity-sha256-12 --erofs-version 1
 
 # See: https://wiki.archlinux.org/title/Unified_Extensible_Firmware_Interface/Secure_Boot
 # Alternative to generate keys for testing: `sbctl create-keys`

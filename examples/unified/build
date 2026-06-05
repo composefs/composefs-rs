@@ -20,7 +20,7 @@ CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
 rm -rf tmp/efi tmp/sysroot/composefs/images
-${CFSCTL} init --algorithm=fsverity-sha256-12
+${CFSCTL} init --algorithm=fsverity-sha256-12 --erofs-version 1
 
 # For debugging, add --no-cache to podman command
 mkdir -p tmp/internal-sysroot

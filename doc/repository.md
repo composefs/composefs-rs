@@ -69,7 +69,7 @@ created by `cfsctl init` and contains:
      - `v1_erofs` (read-only-compatible) — present on repositories whose
        EROFS image format is V1 (C-tool compatible: compact inodes, BFS
        ordering, whiteout table).  This is the single flag that encodes the
-       EROFS format version: present → V1, absent → V2 (the default).  Old
+        EROFS format version: present → V1, absent → V2.  Old
        tools that do not recognise this flag open the repository read-only
        rather than accidentally writing images in the wrong format.
 
@@ -85,12 +85,15 @@ images.  It controls the `v1_erofs` feature flag in `meta.json`:
 
 ```
 cfsctl init                          # default: V2 EROFS (composefs-rs native)
-cfsctl init --erofs-version v1       # V1 EROFS (C-tool compatible)
+cfsctl init --erofs-version 1        # V1 EROFS (C-tool compatible)
 ```
 
-**V2** (default) uses extended inodes, DFS ordering, and `composefs_version=2`
-in the EROFS superblock.  This is the composefs-rs native format and is what
-all repositories created before V1 support was added use.
+**V2** (the `cfsctl` default) uses extended inodes, DFS ordering, and
+`composefs_version=2` in the EROFS superblock.  This is the composefs-rs native
+format and is what all repositories created before V1 support was added use.
+Higher-level tools (e.g. bootc) may configure a repository with multiple format
+versions (V1 primary + V2 extra) so that images are usable on both RHEL9-era and
+newer kernels.
 
 **V1** uses compact inodes where possible, BFS ordering, and a whiteout stub
 table, producing output byte-for-byte identical to the C `mkcomposefs` tool.

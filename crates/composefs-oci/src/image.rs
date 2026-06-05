@@ -334,7 +334,11 @@ mod test {
     /// with `get_entry()`, and verify every entry type round-trips correctly.
     #[tokio::test]
     async fn test_build_baseimage_roundtrip() -> Result<()> {
-        use composefs::{INLINE_CONTENT_MAX_V0, repository::Repository, test::tempdir};
+        use composefs::{
+            INLINE_CONTENT_MAX_V0,
+            repository::{Repository, RepositoryConfig},
+            test::tempdir,
+        };
         use rustix::fs::CWD;
         use std::ffi::OsStr;
         use std::sync::Arc;
