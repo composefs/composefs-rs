@@ -41,7 +41,6 @@ ${PODMAN_BUILD} \
 
 BASE_ID="$(cat tmp/base.iid)"
 ${CFSCTL} oci pull containers-storage:"${BASE_ID}"
-
 # Compute the composefs kernel argument from the repo-side view of the base image.
 # Using oci compute-id --bootable gives the same digest that prepare-boot will use
 # when processing the final image (both go through transform_for_boot with the repo),
