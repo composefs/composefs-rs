@@ -216,7 +216,7 @@ fn run_with_args(args: Args) -> Result<()> {
     apply_transformations(&mut fs, &args)?;
 
     // Generate EROFS image
-    let image = mkfs_erofs_versioned(&mut ValidatedFileSystem::new(fs)?, format_version);
+    let image = mkfs_erofs_versioned(&ValidatedFileSystem::new(fs)?, format_version);
 
     // Write image (skipped when only the digest is requested)
     if !args.print_digest_only {

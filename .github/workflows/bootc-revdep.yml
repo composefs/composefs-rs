@@ -48,4 +48,4 @@ jobs:
           # Use bootc branch adapted to composefs-rs API changes
           # TODO: revert to main once bootc-dev/bootc merges these adaptations
           COMPOSEFS_BOOTC_REPO: https://github.com/cgwalters/bootc
-          COMPOSEFS_BOOTC_REF: adapt-composefs-rs-api
+          COMPOSEFS_BOOTC_REF: adapt-composefs-rs-v1-erofs-2

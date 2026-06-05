@@ -320,6 +320,15 @@ impl Algorithm {
     pub fn is_compatible<H: FsVerityHashValue>(&self) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(&H::ALGORITHM)
     }
+
+    /// The suffix used in V1 kernel cmdline karg values.
+    ///
+    /// Returns `"<hash>-<lg_blocksize>"`, e.g. `"sha256-12"` or `"sha512-12"`.
+    /// This is the part after `v1-` in the format descriptor (e.g. `v1-sha256-12` in
+    /// `composefs.digest=v1-sha256-12:<hex>`).
+    pub fn verity_suffix(&self) -> String {
+        format!("{}-{}", self.hash_name(), self.lg_blocksize())
+    }
 }
 
 impl FromStr for Algorithm {

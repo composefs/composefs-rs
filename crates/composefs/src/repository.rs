@@ -202,10 +202,10 @@ pub const REPO_FORMAT_VERSION: u32 = 1;
 /// - Unknown **incompatible** features cause the repository to be
 ///   rejected entirely.
 pub mod known_features {
-    /// The ro-compat feature flag for V1 EROFS repositories.
+    /// The ro-compat feature flag for V1-only EROFS repositories.
     ///
-    /// When present in `read_only_compatible`, the repository uses the V1
-    /// (C-tool compatible) EROFS format.  Old tools that don't recognize this
+    /// When present in `read_only_compatible`, the repository generates only V1
+    /// (C-tool compatible) EROFS images.  Old tools that don't recognize this
     /// flag will open the repository as read-only, preventing accidental V2
     /// image writes into a V1 repo.
     pub const V1_EROFS: &str = "v1_erofs";
@@ -334,8 +334,7 @@ impl RepoMetadata {
     ///
     /// Uses `erofs_formats.default` when the field was explicitly set (i.e. is
     /// not the serde default of `single(V2)`).  For old repos that predate the
-    /// `erofs_formats` field, falls back to deriving the version from the
-    /// `"v1_erofs"` ro_compat flag:
+    /// `erofs_formats` field, falls back to the `"v1_erofs"` ro_compat flag:
     ///
     /// - `"v1_erofs"` present → [`FormatVersion::V1`]
     /// - absent → [`FormatVersion::V2`]
@@ -347,8 +346,8 @@ impl RepoMetadata {
     ///
     /// If `erofs_formats` was explicitly set in `meta.json` (i.e. it is not the
     /// serde default `single(V2)`), it is returned as-is.  Otherwise the config
-    /// is derived from the legacy `"v1_erofs"` feature flag for backward
-    /// compatibility with repos created before this field existed.
+    /// is derived from the legacy `"v1_erofs"` ro_compat flag for backward
+    /// compatibility with repos created before the `erofs_formats` field existed.
     pub fn format_config(&self) -> FormatConfig {
         let default_config = FormatConfig::default();
         if self.erofs_formats != default_config {
@@ -385,7 +384,7 @@ impl RepoMetadata {
 
     /// Build metadata with the correct feature flags for the given [`FormatConfig`].
     ///
-    /// The primary format version is encoded in two places for compatibility:
+    /// The on-disk encoding uses a feature flag for compatibility:
     /// - `erofs_formats` field: stores the full [`FormatConfig`] directly.
     /// - `"v1_erofs"` ro_compat flag: present when the primary version is V1,
     ///   so that older tools that don't know `erofs_formats` open the repository
@@ -609,7 +608,7 @@ pub fn system_path() -> PathBuf {
 ///
 /// Delegates to [`RepoMetadata::format_config`], which prefers the explicit
 /// `erofs_formats` field when present and falls back to the legacy `"v1_erofs"`
-/// flag for backward compatibility.
+/// ro_compat flag for backward compatibility.
 fn repo_format_config_from_meta(meta: &RepoMetadata) -> FormatConfig {
     meta.format_config()
 }
@@ -1430,9 +1429,8 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 }
 
                 // Use `new` (no `v1_erofs` flag) for legacy repos
-                // that pre-date the format-set feature.  No feature flags → V2 + BOTH, which
-                // is correct: old repos may contain images of any version and should not be
-                // artificially restricted.
+                // that pre-date the FormatConfig feature.  No feature flags → V2-only,
+                // which is correct: old repos used V2 exclusively.
                 let meta = RepoMetadata::new(algorithm);
                 write_repo_metadata(&repo_fd, &meta, has_verity)?;
 
@@ -4287,7 +4285,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id = repo.ensure_object(&obj2)?;
 
-        let mut fs = make_test_fs(&obj2_id, obj2_size);
+        let fs = make_test_fs(&obj2_id, obj2_size);
         let image1 = fs.commit_image(&repo, None)?;
         let image1_path = format!("images/{}", image1.to_hex());
 
@@ -4330,7 +4328,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id = repo.ensure_object(&obj2)?;
 
-        let mut fs = make_test_fs(&obj2_id, obj2_size);
+        let fs = make_test_fs(&obj2_id, obj2_size);
         let image1 = fs.commit_image(&repo, None)?;
         let image1_path = format!("images/{}", image1.to_hex());
 
@@ -4379,7 +4377,7 @@ mod tests {
         let obj1_id = repo.ensure_object(&obj1)?;
         let obj2_id = repo.ensure_object(&obj2)?;
 
-        let mut fs = make_test_fs(&obj2_id, obj2_size);
+        let fs = make_test_fs(&obj2_id, obj2_size);
         let image1 = fs.commit_image(&repo, Some("ref-name"))?;
         let image1_path = format!("images/{}", image1.to_hex());
 
@@ -4456,11 +4454,11 @@ mod tests {
         let obj3_id = repo.ensure_object(&obj3)?;
         let obj4_id = repo.ensure_object(&obj4)?;
 
-        let mut fs = make_test_fs_with_two_files(&obj2_id, obj2_size, &obj3_id, obj3_size);
+        let fs = make_test_fs_with_two_files(&obj2_id, obj2_size, &obj3_id, obj3_size);
         let image1 = fs.commit_image(&repo, None)?;
         let image1_path = format!("images/{}", image1.to_hex());
 
-        let mut fs = make_test_fs_with_two_files(&obj2_id, obj2_size, &obj4_id, obj4_size);
+        let fs = make_test_fs_with_two_files(&obj2_id, obj2_size, &obj4_id, obj4_size);
         let image2 = fs.commit_image(&repo, None)?;
         let image2_path = format!("images/{}", image2.to_hex());
 
@@ -4908,7 +4906,7 @@ mod tests {
         let obj = generate_test_data(obj_size, 0xBB);
         let obj_id = repo.ensure_object(&obj)?;
 
-        let mut fs = make_test_fs(&obj_id, obj_size);
+        let fs = make_test_fs(&obj_id, obj_size);
         let image_id = fs.commit_image(&repo, None)?;
         repo.sync()?;
 
@@ -5053,7 +5051,7 @@ mod tests {
         let obj = generate_test_data(obj_size, 0xCC);
         let obj_id = repo.ensure_object(&obj)?;
 
-        let mut fs = make_test_fs(&obj_id, obj_size);
+        let fs = make_test_fs(&obj_id, obj_size);
         let image_id = fs.commit_image(&repo, None)?;
         repo.sync()?;
 
@@ -5100,7 +5098,7 @@ mod tests {
         let obj = generate_test_data(obj_size, 0xDD);
         let obj_id = repo.ensure_object(&obj)?;
 
-        let mut fs = make_test_fs(&obj_id, obj_size);
+        let fs = make_test_fs(&obj_id, obj_size);
         let image_id = fs.commit_image(&repo, None)?;
         repo.sync()?;
 
@@ -5690,7 +5688,7 @@ mod tests {
         Ok(())
     }
 
-    // ---- FormatSet / v1_erofs feature flag tests ----
+    // ---- v1_erofs feature flag tests ----
     //
     // The `v1_erofs` ro_compat flag is the single on-disk signal for V1 EROFS.
     // It is derived from `erofs_formats.default`; the `extra` list is not
@@ -5715,7 +5713,6 @@ mod tests {
 
     #[test]
     fn test_v1_erofs_flag_absent_for_v2_repos() {
-        // V2 primary → v1_erofs absent
         let meta = RepoMetadata::new_with_formats(
             Algorithm::SHA256,
             &FormatConfig::single(FormatVersion::V2),
@@ -5727,6 +5724,11 @@ mod tests {
                 .contains(&known_features::V1_EROFS.to_string()),
             "V2 repo must NOT set v1_erofs in ro_compat, got: {:?}",
             meta.features.read_only_compatible
+        );
+        assert!(
+            meta.features.incompatible.is_empty(),
+            "V2 repo must have no incompat flags, got: {:?}",
+            meta.features.incompatible
         );
         assert_eq!(meta.erofs_version(), FormatVersion::V2);
     }
@@ -5794,13 +5796,22 @@ mod tests {
         let (repo, was_new) = Repository::<Sha256HashValue>::init_path(CWD, &path, config)?;
         assert!(was_new);
         assert_eq!(repo.erofs_version(), FormatVersion::V2);
+        assert_eq!(
+            repo.default_format_config(),
+            FormatConfig::single(FormatVersion::V2)
+        );
         assert!(
             !repo
                 .metadata()
                 .features
                 .read_only_compatible
                 .contains(&known_features::V1_EROFS.to_string()),
-            "v1_erofs must NOT be in ro_compat for V2 repos"
+            "v1_erofs must NOT be in ro_compat for V2-only repos"
+        );
+        assert!(
+            repo.metadata().features.incompatible.is_empty(),
+            "V2-only repo must have no incompat flags, got: {:?}",
+            repo.metadata().features.incompatible
         );
         Ok(())
     }
@@ -5836,7 +5847,7 @@ mod tests {
             st_mtim_nsec: 0,
             xattrs: Default::default(),
         };
-        let mut fs: FileSystem<Sha256HashValue> = FileSystem::new(root_stat);
+        let fs: FileSystem<Sha256HashValue> = FileSystem::new(root_stat);
 
         // commit_images now reads the FormatConfig from the repository itself.
         let map = fs.commit_images(&repo, Some("myref"))?;
