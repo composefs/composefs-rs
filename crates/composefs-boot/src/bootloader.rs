@@ -19,7 +19,7 @@ use composefs::{
     tree::{DirectoryRef, FileSystem, ImageError, Inode, LeafContent, RegularFile},
 };
 
-use crate::cmdline::{make_cmdline_composefs, split_cmdline};
+use crate::cmdline::split_cmdline;
 
 /// Strips the key (if it matches) plus the following whitespace from a single line in a "Type #1
 /// Boot Loader Specification Entry" file.
@@ -139,11 +139,15 @@ impl BootLoaderEntryFile {
         self.lines.push(format!("options {arg}"));
     }
 
-    /// Adjusts the kernel command-line arguments by adding a composefs= parameter (if appropriate)
-    /// and adding additional arguments, as requested.
-    pub fn adjust_cmdline(&mut self, composefs: Option<&str>, insecure: bool, extra: &[&str]) {
-        if let Some(id) = composefs {
-            self.add_cmdline(&make_cmdline_composefs(id, insecure));
+    /// Adjusts the kernel command-line arguments by adding a composefs karg (if provided)
+    /// and adding additional arguments.
+    ///
+    /// `karg` should be a complete kernel argument string such as
+    /// `"composefs.digest=v1-sha256-12:abc123"` or `"composefs=abc123"` as produced by
+    /// [`composefs_boot::cmdline::ComposefsCmdline::to_cmdline_arg`].
+    pub fn adjust_cmdline(&mut self, karg: Option<&str>, extra: &[&str]) {
+        if let Some(k) = karg {
+            self.add_cmdline(k);
         }
 
         for item in extra {
@@ -776,7 +780,7 @@ mod tests {
     #[test]
     fn test_adjust_cmdline_with_composefs() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\nlinux /vmlinuz\n");
-        entry.adjust_cmdline(Some("abc123"), false, &["quiet", "splash"]);
+        entry.adjust_cmdline(Some("composefs=abc123"), &["quiet", "splash"]);
 
         assert_eq!(entry.lines.len(), 3);
         assert_eq!(entry.lines[2], "options composefs=abc123 quiet splash");
@@ -785,17 +789,16 @@ mod tests {
     #[test]
     fn test_adjust_cmdline_with_composefs_insecure() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\nlinux /vmlinuz\n");
-        entry.adjust_cmdline(Some("abc123"), true, &[]);
+        entry.adjust_cmdline(Some("composefs=?abc123"), &[]);
 
         assert_eq!(entry.lines.len(), 3);
-        // Assuming make_cmdline_composefs adds digest=off for insecure mode
-        assert!(entry.lines[2].contains("abc123"));
+        assert_eq!(entry.lines[2], "options composefs=?abc123");
     }
 
     #[test]
     fn test_adjust_cmdline_no_composefs() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\nlinux /vmlinuz\n");
-        entry.adjust_cmdline(None, false, &["quiet", "splash"]);
+        entry.adjust_cmdline(None, &["quiet", "splash"]);
 
         assert_eq!(entry.lines.len(), 3);
         assert_eq!(entry.lines[2], "options quiet splash");
@@ -804,7 +807,7 @@ mod tests {
     #[test]
     fn test_adjust_cmdline_existing_options() {
         let mut entry = BootLoaderEntryFile::new("title Test Entry\noptions root=/dev/sda1\n");
-        entry.adjust_cmdline(Some("abc123"), false, &["quiet"]);
+        entry.adjust_cmdline(Some("composefs=abc123"), &["quiet"]);
 
         assert_eq!(entry.lines.len(), 2);
         assert!(entry.lines[1].contains("root=/dev/sda1"));

@@ -41,13 +41,13 @@ ${PODMAN_BUILD} \
 
 BASE_ID="$(cat tmp/base.iid)"
 ${CFSCTL} oci pull containers-storage:"${BASE_ID}"
-BASE_IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "@${BASE_ID}")"
+BASE_KARG="$(${CFSCTL} oci composefs-digest-karg "@${BASE_ID}")"
 
 ${PODMAN_BUILD} \
     --iidfile=tmp/final.iid \
     --build-context=base="container-image://${BASE_ID}" \
-    --build-arg=COMPOSEFS_FSVERITY="${BASE_IMAGE_FSVERITY}" \
-    --label=containers.composefs.fsverity="${BASE_IMAGE_FSVERITY}" \
+    --build-arg=COMPOSEFS_KARG="${BASE_KARG}" \
+    --label=containers.composefs.karg="${BASE_KARG}" \
     -f "${containerfile}" \
     .
 

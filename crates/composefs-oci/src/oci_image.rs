@@ -48,7 +48,11 @@ use rustix::fs::{AtFlags, Dir, Mode, OFlags, openat, readlinkat, unlinkat};
 use rustix::io::Errno;
 use serde::Serialize;
 
-use composefs::{fsverity::FsVerityHashValue, repository::Repository};
+use composefs::{
+    erofs::format::{FormatEpoch, FormatVersion},
+    fsverity::FsVerityHashValue,
+    repository::Repository,
+};
 
 use crate::ContentAndVerity;
 use crate::layer::is_tar_media_type;
@@ -123,10 +127,14 @@ pub struct OciImage<ObjectID: FsVerityHashValue> {
     config: Option<ImageConfiguration>,
     /// Map from layer diff_id to its fs-verity object ID
     layer_refs: HashMap<Box<str>, ObjectID>,
-    /// The EROFS image ObjectID linked to this config, if any
+    /// The V2 EROFS image ObjectID linked to this config, if any
     image_ref: Option<ObjectID>,
-    /// The boot EROFS image ObjectID linked to this config, if any
+    /// The V1 EROFS image ObjectID linked to this config, if any
+    image_ref_v1: Option<ObjectID>,
+    /// The V2 boot EROFS image ObjectID linked to this config, if any
     boot_image_ref: Option<ObjectID>,
+    /// The V1 boot EROFS image ObjectID linked to this config, if any
+    boot_image_ref_v1: Option<ObjectID>,
     /// The fs-verity ID of the manifest splitstream
     manifest_verity: ObjectID,
 }
@@ -195,9 +203,11 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             }
         };
 
-        // Strip the EROFS image ref from layer_refs (it's not a layer)
+        // Strip the EROFS image refs from layer_refs (they're not layers)
         let image_ref = layer_refs.remove(crate::IMAGE_REF_KEY);
+        let image_ref_v1 = layer_refs.remove(crate::IMAGE_REF_KEY_V1);
         let boot_image_ref = layer_refs.remove(crate::BOOT_IMAGE_REF_KEY);
+        let boot_image_ref_v1 = layer_refs.remove(crate::BOOT_IMAGE_REF_KEY_V1);
 
         let manifest_verity = if let Some(v) = verity {
             v.clone()
@@ -220,7 +230,9 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             config,
             layer_refs,
             image_ref,
+            image_ref_v1,
             boot_image_ref,
+            boot_image_ref_v1,
             manifest_verity,
         })
     }
@@ -271,14 +283,47 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         &self.layer_refs
     }
 
-    /// Returns the EROFS image ObjectID linked to this config, if any.
-    pub fn image_ref(&self) -> Option<&ObjectID> {
+    /// Returns the EROFS image ObjectID for `version`, if present.
+    ///
+    /// Maps `version` to its on-disk storage slot via [`FormatVersion::epoch`]:
+    /// epoch1 (V0/V1) resolves the V1 ref; epoch2 (V2) resolves the V2 ref.
+    /// No fallback — returns `None` if that specific format was not generated.
+    pub fn image_ref(&self, version: FormatVersion) -> Option<&ObjectID> {
+        match version.epoch() {
+            FormatEpoch::Epoch1 => self.image_ref_v1.as_ref(),
+            FormatEpoch::Epoch2 => self.image_ref.as_ref(),
+        }
+    }
+
+    /// Returns the V2 EROFS image ObjectID linked to this config, if any.
+    pub fn image_ref_v2(&self) -> Option<&ObjectID> {
         self.image_ref.as_ref()
     }
 
-    /// Returns the boot EROFS image ObjectID linked to this config, if any.
-    pub fn boot_image_ref(&self) -> Option<&ObjectID> {
+    /// Returns the V1 EROFS image ObjectID linked to this config, if any.
+    pub fn image_ref_v1(&self) -> Option<&ObjectID> {
+        self.image_ref_v1.as_ref()
+    }
+
+    /// Returns the boot EROFS image ObjectID for `version`, if present.
+    ///
+    /// Maps `version` to its on-disk storage slot via [`FormatVersion::epoch`].
+    /// No fallback — returns `None` if that specific format was not generated.
+    pub fn boot_image_ref(&self, version: FormatVersion) -> Option<&ObjectID> {
+        match version.epoch() {
+            FormatEpoch::Epoch1 => self.boot_image_ref_v1.as_ref(),
+            FormatEpoch::Epoch2 => self.boot_image_ref.as_ref(),
+        }
+    }
+
+    /// Returns the V2 boot EROFS image ObjectID linked to this config, if any.
+    pub fn boot_image_ref_v2(&self) -> Option<&ObjectID> {
         self.boot_image_ref.as_ref()
+    }
+
+    /// Returns the V1 boot EROFS image ObjectID linked to this config, if any.
+    pub fn boot_image_ref_v1(&self) -> Option<&ObjectID> {
+        self.boot_image_ref_v1.as_ref()
     }
 
     /// Returns the image architecture (empty string for artifacts).
@@ -410,6 +455,40 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             Some(OCI_CONFIG_CONTENT_TYPE),
         )?;
         Ok(data)
+    }
+
+    /// Returns the full inspect output as a JSON value.
+    ///
+    /// This includes the manifest, config, and referrers in a single JSON object.
+    /// The manifest and config are included as their original JSON structure.
+    pub fn inspect_json(&self, repo: &Repository<ObjectID>) -> Result<serde_json::Value> {
+        let manifest_json = self.read_manifest_json(repo)?;
+        let config_json = self.read_config_json(repo)?;
+        let referrers = list_referrers(repo, &self.manifest_digest)?;
+
+        let manifest_value: serde_json::Value = serde_json::from_slice(&manifest_json)?;
+        let config_value: serde_json::Value = serde_json::from_slice(&config_json)?;
+
+        let referrers_value: Vec<serde_json::Value> = referrers
+            .iter()
+            .map(|(digest, _verity)| serde_json::json!({ "digest": digest }))
+            .collect();
+
+        let mut result = serde_json::json!({
+            "manifest": manifest_value,
+            "config": config_value,
+            "referrers": referrers_value,
+        });
+
+        if let Some(erofs_id) = self.image_ref(repo.erofs_version()) {
+            result["composefs_erofs"] = serde_json::json!(erofs_id.to_hex());
+        }
+
+        if let Some(boot_id) = self.boot_image_ref(repo.erofs_version()) {
+            result["composefs_boot_erofs"] = serde_json::json!(boot_id.to_hex());
+        }
+
+        Ok(result)
     }
 }
 

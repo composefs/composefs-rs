@@ -15,7 +15,8 @@
 
 [Unit]
 DefaultDependencies=no
-ConditionKernelCommandLine=composefs
+ConditionKernelCommandLine=|composefs
+ConditionKernelCommandLine=|composefs.digest
 ConditionPathExists=/etc/initrd-release
 After=sysroot.mount
 Requires=sysroot.mount

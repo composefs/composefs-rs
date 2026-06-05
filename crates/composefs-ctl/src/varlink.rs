@@ -500,9 +500,9 @@ fn run_oci_mount<ObjectID: composefs::fsverity::FsVerityHashValue>(
     })?;
 
     let erofs_id = if bootable {
-        img.boot_image_ref()
+        img.boot_image_ref(repo.erofs_version())
     } else {
-        img.image_ref()
+        img.image_ref(repo.erofs_version())
     }
     .ok_or_else(|| oci::OciError::InternalError {
         message: if bootable {
@@ -1427,8 +1427,10 @@ pub mod oci {
                 manifest,
                 config,
                 referrers,
-                composefs_erofs: img.image_ref().map(|id| id.to_hex()),
-                composefs_boot_erofs: img.boot_image_ref().map(|id| id.to_hex()),
+                composefs_erofs: img.image_ref(repo.erofs_version()).map(|id| id.to_hex()),
+                composefs_boot_erofs: img
+                    .boot_image_ref(repo.erofs_version())
+                    .map(|id| id.to_hex()),
             })
         }
     }

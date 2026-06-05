@@ -6,16 +6,16 @@ and referenced by their fs-verity digest. The EROFS image itself carries only me
 directory entries, extended attributes, and chunk index entries that point to the external files.
 
 composefs-rs supports two EROFS format versions. V1 is byte-for-byte compatible with the C
-`mkcomposefs` tool. V2 is the composefs-rs native default and drops several V1 constraints
-that exist only for C compatibility. New repositories use V2 unless `--erofs-version v1` is
-passed to `cfsctl init`.
+`mkcomposefs` tool. V2 is the composefs-rs native format and drops several V1 constraints
+that exist only for C compatibility.
 
-However, V2 is not mountable by RHEL9 era EROFS, and a goal is to transition to V1 by default
-for maximum compatibility.
+`cfsctl init` defaults to V2; pass `--erofs-version 1` to select V1. Higher-level tools
+such as bootc initialize repositories with multiple formats enabled (V1 primary) so that images
+can be booted on RHEL9-era kernels that require the `composefs.digest=` karg.
 
 ## Format V1
 
-V1 is selected with `cfsctl init --erofs-version v1`. The `v1_erofs` ro-compat feature flag
+V1 is selected with `cfsctl init --erofs-version 1`. The `v1_erofs` ro-compat feature flag
 is written to `meta.json` so that tools without V1 support open the repository read-only.
 
 **`composefs_version` field values in V1:**
@@ -48,7 +48,7 @@ serialized differently. The stub entries in the whiteout table are not escaped.
 
 ## Format V2 — Created in composefs-rs
 
-V2 is the default for all repositories created without `--erofs-version v1`.
+V2 is the default for repositories created with `cfsctl init` without `--erofs-version 1`.
 
 **`composefs_version` field:** Always `2` (the constant `COMPOSEFS_VERSION`).
 
@@ -69,7 +69,7 @@ The format is fixed at repository initialization time and cannot be changed afte
 
 ```
 cfsctl init                    # V2 (default)
-cfsctl init --erofs-version v1 # V1 (C-tool compatible)
+cfsctl init --erofs-version 1  # V1 (C-tool compatible)
 ```
 
 The format is recorded in `meta.json` as the `v1_erofs` ro-compat feature flag: present
