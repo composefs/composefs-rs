@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail, ensure};
 use bytes::{Bytes, BytesMut};
 use rustix::fs::makedev;
 use tar_core::{
-    EntryType, HEADER_SIZE,
+    EntryType, HEADER_SIZE, PaxExtensions,
     parse::{ParseEvent, Parser},
 };
 use tokio::{
@@ -41,6 +41,39 @@ use composefs::{
 };
 
 use crate::ImportStats;
+
+/// Extract sub-second nanoseconds from PAX extension mtime.
+///
+/// PAX mtime values have the form `"<sec>.<frac>"` where `<frac>` is a
+/// decimal fraction of a second with up to 9 significant digits.
+/// `tar-core` keeps only the integer part in `ParsedEntry::mtime`; we read
+/// the fractional part from the raw PAX bytes ourselves.
+///
+/// Returns 0 if there is no PAX mtime, the value has no fractional part,
+/// or the value cannot be parsed.
+fn pax_mtime_nsec(pax: &[u8]) -> u32 {
+    for ext in PaxExtensions::new(pax).flatten() {
+        if ext.key_bytes() == b"mtime" {
+            let Ok(value) = ext.value() else { return 0 };
+            // Split on '.': "1234567890.123456789" → frac = "123456789"
+            let Some(frac) = value.split_once('.').map(|(_, f)| f) else {
+                return 0;
+            };
+            // Truncate or pad to exactly 9 digits (nanosecond precision)
+            let frac = if frac.len() >= 9 {
+                &frac[..9]
+            } else {
+                // fewer than 9 digits: treat as leading digits, e.g. "5" → 500_000_000
+                return frac
+                    .parse::<u32>()
+                    .ok()
+                    .map_or(0, |v| v * 10u32.pow(9 - frac.len() as u32));
+            };
+            return frac.parse::<u32>().unwrap_or(0);
+        }
+    }
+    0
+}
 
 /// Receive data from channel, write to tmpfile, compute verity, and store object.
 ///
@@ -456,7 +489,7 @@ pub fn get_entry<ObjectID: FsVerityHashValue>(
                             st_gid: entry.gid as u32,
                             st_mode: entry.mode,
                             st_mtim_sec: entry.mtime as i64,
-                            st_mtim_nsec: 0,
+                            st_mtim_nsec: entry.pax.map_or(0, pax_mtime_nsec),
                             xattrs,
                         },
                         item,
@@ -542,6 +575,46 @@ mod tests {
             entries.push(entry);
         }
         Ok(entries)
+    }
+
+    #[test]
+    fn test_pax_mtime_nsec_parsing() {
+        // Standard 9-digit fractional part
+        // "30 mtime=1234567890.123456789\n": "mtime=1234567890.123456789\n" = 27 bytes, "30 " = 3 → total 30
+        let pax = b"30 mtime=1234567890.123456789\n";
+        assert_eq!(pax_mtime_nsec(pax), 123_456_789, "9-digit fraction");
+
+        // Fewer than 9 digits: "5" → 500_000_000 ns
+        // "mtime=1234567890.5\n" = 19 bytes, "22 " = 3 → total 22
+        let pax = b"22 mtime=1234567890.5\n";
+        assert_eq!(pax_mtime_nsec(pax), 500_000_000, "1-digit fraction");
+
+        // Exactly 9 digits (no truncation needed)
+        // "mtime=1234567890.000000001\n" = 27 bytes, "30 " = 3 → total 30
+        let pax = b"30 mtime=1234567890.000000001\n";
+        assert_eq!(pax_mtime_nsec(pax), 1, "trailing single non-zero digit");
+
+        // More than 9 digits (truncate to 9)
+        // "mtime=1234567890.1234567899\n" = 28 bytes, "31 " = 3 → total 31
+        let pax = b"31 mtime=1234567890.1234567899\n";
+        assert_eq!(
+            pax_mtime_nsec(pax),
+            123_456_789,
+            "10-digit fraction truncated"
+        );
+
+        // No fractional part
+        // "mtime=1234567890\n" = 17 bytes, "20 " = 3 → total 20
+        let pax = b"20 mtime=1234567890\n";
+        assert_eq!(pax_mtime_nsec(pax), 0, "no fractional part");
+
+        // No mtime key
+        // "path=foo.txt\n" = 13 bytes, "16 " = 3 → total 16
+        let pax = b"16 path=foo.txt\n";
+        assert_eq!(pax_mtime_nsec(pax), 0, "no mtime key");
+
+        // Empty PAX data
+        assert_eq!(pax_mtime_nsec(b""), 0, "empty pax");
     }
 
     #[test]
