@@ -1,8 +1,8 @@
 //! Integration tests for the `cfsctl` varlink RPC API.
 //!
 //! These drive the service the same way an external consumer would: they spawn
-//! `cfsctl varlink --address <socket>` (or `cfsctl oci varlink ...`) as a
-//! separate process and talk to it over the Unix socket.
+//! `cfsctl` as a separate process via systemd socket-activation and talk to it
+//! over a pre-bound Unix socket.
 //!
 //! ## Two clients, on purpose
 //!
@@ -28,9 +28,9 @@
 //! typed error variant. Avoid converting the whole suite to either side.
 //!
 //! A single service answers both the `org.composefs.Repository` and
-//! `org.composefs.Oci` interfaces on one socket, so the `repository()` and
-//! `oci()` spawn helpers below differ only in which CLI subcommand starts the
-//! (identical) combined service.
+//! `org.composefs.Oci` interfaces on one socket. The `repository()` and
+//! `oci()` spawn helpers are retained for historical reasons — both now use
+//! socket activation and serve the identical combined interface set.
 //!
 //! ## Handle-based API
 //!
@@ -43,7 +43,6 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use composefs_ctl::varlink::oci::{OciError, OciInspectReply, PullProgress};
@@ -79,31 +78,24 @@ impl Drop for VarlinkService {
 }
 
 impl VarlinkService {
-    /// Spawn `cfsctl <service_args...> --address <sock>`, wait for the socket to
-    /// appear, then open `repo` via `OpenRepository` and cache its handle.
+    /// Spawn `cfsctl` via systemd socket-activation with a pre-bound listening
+    /// socket, then open `repo` via `OpenRepository` and cache its handle.
+    ///
+    /// The socket is already listening before the child starts, so no polling
+    /// is needed — the child reaches the socket via the inherited fd 3. The
+    /// socket path also exists on disk, so `varlinkctl` (which connects by
+    /// path) works unchanged.
     ///
     /// The varlink service opens no repository at startup, so the test repo is
     /// opened explicitly here; the returned handle is auto-injected into
     /// subsequent calls. The repository's insecure mode is auto-detected from
     /// its metadata, so no open flags are needed.
-    fn spawn(repo: &Path, service_args: &[&str]) -> Result<Self> {
-        let cfsctl = cfsctl()?;
-        let socket_dir = tempfile::tempdir()?;
-        let socket = socket_dir.path().join("varlink.sock");
-
-        let mut cmd = Command::new(&cfsctl);
-        cmd.args(service_args);
-        cmd.arg("--address").arg(&socket);
-        let child = cmd.spawn().context("spawning cfsctl varlink server")?;
-
-        // Wait (briefly) for the service to bind the socket.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !socket.exists() {
-            if Instant::now() > deadline {
-                bail!("timed out waiting for varlink socket {}", socket.display());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    ///
+    /// Socket activation serves the full combined interface set
+    /// (`org.composefs.Repository` + `org.composefs.Oci`) regardless of which
+    /// of the historical CLI entry points would have been used.
+    fn spawn(repo: &Path) -> Result<Self> {
+        let (child, socket_dir, socket) = crate::spawn_activated_cfsctl()?;
 
         let handle = Self::open_repository(&socket, repo)?;
 
@@ -154,16 +146,19 @@ impl VarlinkService {
             .context("OpenRepository reply missing numeric 'handle'")
     }
 
-    /// Spawn the combined service via the top-level `varlink` subcommand.
+    /// Spawn the combined service (historically the `varlink` subcommand entry
+    /// point). Both `repository` and `oci` now use socket activation, which
+    /// serves the full combined interface set on one socket.
     fn repository(repo: &Path) -> Result<Self> {
-        Self::spawn(repo, &["varlink"])
+        Self::spawn(repo)
     }
 
-    /// Spawn the combined service via the `oci varlink` subcommand. Serves the
-    /// same interfaces as [`Self::repository`]; kept to exercise both CLI entry
-    /// points.
+    /// Spawn the combined service (historically the `oci varlink` subcommand
+    /// entry point). Kept so tests that call this entry point continue to
+    /// exercise a real service spawn; identical to [`Self::repository`] under
+    /// socket activation.
     fn oci(repo: &Path) -> Result<Self> {
-        Self::spawn(repo, &["oci", "varlink"])
+        Self::spawn(repo)
     }
 
     fn socket_str(&self) -> String {
