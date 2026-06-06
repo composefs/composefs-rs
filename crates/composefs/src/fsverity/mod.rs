@@ -5,6 +5,7 @@
 //! verity, and hash value types for SHA-256 and SHA-512.
 
 mod digest;
+pub mod formatted_digest;
 mod hashvalue;
 mod ioctl;
 
@@ -77,6 +78,19 @@ pub fn compute_verity<H: FsVerityHashValue>(data: &[u8]) -> H {
 /// currently hardcoded to 4096.  Salt is not supported.
 pub fn enable_verity_raw<H: FsVerityHashValue>(fd: impl AsFd) -> Result<(), EnableVerityError> {
     ioctl::fs_ioc_enable_verity::<H>(fd)
+}
+
+/// Enable fs-verity on the given file, optionally with a PKCS#7 signature.
+///
+/// Like `enable_verity_raw`, but accepts an optional DER-encoded PKCS#7 detached
+/// signature over the [`formatted_digest::format_fsverity_digest`] structure. If
+/// provided, the kernel will verify it against the `.fs-verity` keyring before
+/// enabling verity.
+pub fn enable_verity_raw_with_sig<H: FsVerityHashValue>(
+    fd: impl AsFd,
+    signature: Option<&[u8]>,
+) -> Result<(), EnableVerityError> {
+    ioctl::fs_ioc_enable_verity_with_sig::<H>(fd, signature)
 }
 
 /// Enable fs-verity on the given file, retrying if file is opened for writing.
@@ -297,6 +311,10 @@ pub fn ensure_verity_equal(
         })
     }
 }
+
+// Re-export keyring from composefs-ioctls where the unsafe code lives
+#[cfg(feature = "keyring")]
+pub use composefs_ioctls::keyring::{KeyringError, inject_fsverity_cert};
 
 #[cfg(test)]
 mod tests {
