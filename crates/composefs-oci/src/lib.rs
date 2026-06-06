@@ -26,6 +26,10 @@ pub mod oci_image;
 pub mod oci_layout;
 /// Re-exported from [`composefs::progress`]; use that path directly in new code.
 pub mod progress;
+#[cfg(feature = "oci-client")]
+pub mod referrers;
+pub mod signature;
+pub mod signing;
 pub mod skopeo;
 pub mod tar;
 
@@ -50,11 +54,17 @@ pub use composefs;
 use std::io::Read;
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 /// OCI content-addressable digest type (e.g. `sha256:abcd...`).
 ///
 /// Re-exported from `oci-spec` for convenience.
 pub use containers_image_proxy::oci_spec::image::Digest as OciDigest;
+
+/// Re-export OCI image spec types for downstream consumers.
+pub use containers_image_proxy::oci_spec::image::{
+    Descriptor as OciDescriptor, DescriptorBuilder as OciDescriptorBuilder,
+    ImageConfiguration as OciImageConfiguration, MediaType as OciMediaType,
+};
 
 use containers_image_proxy::ImageProxyConfig;
 use containers_image_proxy::oci_spec::image::ImageConfiguration;
@@ -69,6 +79,7 @@ use composefs::{
 };
 
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
+use crate::tar::get_entry;
 
 /// Named ref key for the V2 EROFS image derived from this OCI config.
 pub const IMAGE_REF_KEY: &str = "composefs.image";
@@ -85,14 +96,22 @@ pub const BOOT_IMAGE_REF_KEY_V1: &str = "composefs.image.boot.v1";
 // Re-export key types for convenience
 #[cfg(feature = "boot")]
 pub use boot::generate_boot_image;
-pub use boot::{boot_image, remove_boot_image};
+pub use boot::{BOOT_IMAGE_REF_NAME, boot_image, remove_boot_image};
+pub use image::{
+    compute_merged_digest, compute_per_layer_digests, generate_merged_image,
+    generate_per_layer_images,
+};
 pub use oci_image::{
     ImageInfo, LayerInfo, OCI_REF_PREFIX, OciFsckError, OciFsckResult, OciImage, OciImageNotFound,
-    OciRefNotFound, SplitstreamInfo, add_referrer, layer_dumpfile, layer_info, layer_tar,
-    list_images, list_referrers, list_refs, oci_fsck, oci_fsck_image, remove_referrer,
-    remove_referrers_for_subject, resolve_ref, tag_image, untag_image,
+    OciRefNotFound, SplitstreamInfo, add_referrer, export_image_to_oci_layout,
+    export_referrers_to_oci_layout, layer_dumpfile, layer_info, layer_tar, list_images,
+    list_referrers, list_refs, oci_fsck, oci_fsck_image, remove_referrer,
+    remove_referrers_for_subject, resolve_ref, seal_image, tag_image, untag_image,
 };
 pub use progress::{ComponentId, NullReporter, ProgressEvent, ProgressReporter, SharedReporter};
+pub use signature::{
+    NoSignatureArtifacts, SignatureVerificationFailed, sign_image, verify_image_signatures,
+};
 pub use skopeo::pull_image;
 
 /// Statistics from an image import operation.
@@ -491,6 +510,31 @@ pub(crate) fn extract_diff_ids(
     }
 }
 
+/// Lists the contents of a container layer stored in the repository.
+///
+/// Reads the split stream for the named layer and writes each tar entry to
+/// `out` in composefs dumpfile format.
+///
+/// This is a library function, so it takes an explicit writer rather than
+/// printing to stdout; callers (e.g. the CLI) pass `std::io::stdout()`.
+pub fn ls_layer<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    diff_id: &OciDigest,
+    mut out: impl std::io::Write,
+) -> Result<()> {
+    let mut split_stream = repo.open_stream(
+        &layer_identifier(diff_id),
+        None,
+        Some(TAR_LAYER_CONTENT_TYPE),
+    )?;
+
+    while let Some(entry) = get_entry(&mut split_stream)? {
+        writeln!(out, "{entry}")?;
+    }
+
+    Ok(())
+}
+
 /// Opens and parses a container configuration.
 ///
 /// Reads the OCI image configuration from the repository and returns an [`OpenConfig`]
@@ -742,6 +786,42 @@ pub fn write_config_raw<ObjectID: FsVerityHashValue>(
     Ok((config_digest, id))
 }
 
+/// Adds a composefs sealing annotation (the fs-verity digest of the merged
+/// composefs filesystem) to the given OCI image config.
+///
+/// This is the core of the "seal" operation: it computes the composefs
+/// image ID for the merged filesystem and stores it as the
+/// `containers.composefs.fsverity` label on the config.
+fn seal<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    config_name: &OciDigest,
+    config_verity: Option<&ObjectID>,
+) -> Result<ContentAndVerity<ObjectID>> {
+    let OpenConfig {
+        mut config,
+        layer_refs,
+        image_ref,
+        image_ref_v1,
+        boot_image_ref,
+        boot_image_ref_v1,
+    } = open_config(repo, config_name, config_verity)?;
+    let mut myconfig = config.config().clone().unwrap_or_default();
+    let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
+    let mut fs = crate::image::create_filesystem(repo, config_name, config_verity)?;
+    let id = fs.compute_image_id(FormatVersion::V1);
+    labels.insert("containers.composefs.fsverity".to_string(), id.to_hex());
+    config.set_config(Some(myconfig));
+    write_config(
+        repo,
+        &config,
+        layer_refs,
+        image_ref.as_ref(),
+        image_ref_v1.as_ref(),
+        boot_image_ref.as_ref(),
+        boot_image_ref_v1.as_ref(),
+    )
+}
+
 /// Ensures a composefs EROFS image exists for the given OCI container image,
 /// linking it to the config splitstream so GC keeps it alive through the tag chain.
 ///
@@ -896,6 +976,36 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
     )?;
 
     Ok(Some(boot_erofs_id))
+}
+
+/// Mounts a sealed container filesystem at the specified mountpoint.
+///
+/// Looks up the composefs fs-verity digest stored in the image config's
+/// `containers.composefs.fsverity` label (set by `seal_image`), and
+/// uses it to mount the composefs overlay.
+pub fn mount<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    name: &str,
+    mountpoint: &str,
+    verity: Option<&ObjectID>,
+) -> Result<()> {
+    // Try to resolve tag names first. If name is a tag, open via the OCI
+    // image referencing path; otherwise fall back to direct config lookup
+    // for backward compatibility with raw config digests.
+    let config = if let Ok(img) = oci_image::OciImage::open_ref(repo, name) {
+        open_config(repo, img.config_digest(), None)?
+    } else {
+        let name_digest: OciDigest = name.parse().context("parsing config name as OCI digest")?;
+        open_config(repo, &name_digest, verity)?
+    };
+
+    let Some(id) = config
+        .config
+        .get_config_annotation("containers.composefs.fsverity")
+    else {
+        bail!("Can only mount sealed containers");
+    };
+    repo.mount_at(id, mountpoint, &composefs::mount::MountOptions::default())
 }
 
 #[cfg(test)]
