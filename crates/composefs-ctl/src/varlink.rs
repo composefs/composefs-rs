@@ -2412,10 +2412,14 @@ pub mod oci {
                 })?;
 
             let boot_image = if bootable {
-                let id = composefs_oci::generate_boot_image(&repo, &result.manifest_digest, None)
-                    .map_err(|e| OciError::InternalError {
-                        message: format!("{e:#}"),
-                    })?;
+                let id = composefs_oci::generate_boot_image(
+                    &repo,
+                    &result.manifest_digest,
+                    name.as_deref(),
+                )
+                .map_err(|e| OciError::InternalError {
+                    message: format!("{e:#}"),
+                })?;
                 Some(id.to_hex())
             } else {
                 None
