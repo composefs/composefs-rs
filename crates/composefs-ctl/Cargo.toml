@@ -23,7 +23,7 @@ http = ['composefs-http']
 oci = ['composefs-oci', 'composefs-oci/varlink']
 containers-storage = ['composefs-oci/containers-storage', 'cstorage']
 ostree = ['composefs-ostree']
-rhel9 = ['composefs/rhel9']
+rhel9 = ['composefs/rhel9', 'composefs/keyring']
 'pre-6.15' = ['composefs/pre-6.15']
 
 [dependencies]
@@ -31,9 +31,10 @@ anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
 clap = { version = "4.5.0", default-features = false, features = ["std", "help", "usage", "derive", "wrap_help"] }
 comfy-table = { version = "7.1", default-features = false }
-composefs = { workspace = true, features = ["varlink"] }
+composefs = { workspace = true, features = ["varlink", "keyring"] }
 composefs-boot = { workspace = true }
 composefs-fuse = { path = "../composefs-fuse", optional = true }
+composefs-ioctls = { workspace = true, features = ["keyring"] }
 composefs-oci = { workspace = true, optional = true, features = ["boot"] }
 composefs-http = { workspace = true, optional = true }
 cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.7.0", features = ["userns-helper"], optional = true }
@@ -43,7 +44,8 @@ hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.17.0", default-features = false }
 libsystemd = { version = "0.7" }
 log = { version = "0.4", default-features = false }
-rustix = { version = "1.0.0", default-features = false, features = ["fs", "process"] }
+oci-spec = { version = "0.9", default-features = false, features = ["image", "runtime"] }
+rustix = { version = "1.0.0", default-features = false, features = ["fs", "mount", "process"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tokio = { version = "1.24.2", default-features = false, features = ["io-std", "io-util", "net", "rt", "sync"] }
