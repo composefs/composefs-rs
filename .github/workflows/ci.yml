@@ -93,6 +93,11 @@ jobs:
     name: Integration tests (${{ matrix.name }})
     needs: smoke
     runs-on: ubuntu-24.04
+    # Generous ceiling: nextest kills individual tests at 20 min
+    # (terminate-after = 1 × period = 1200s in .config/nextest.toml), so
+    # this job-level limit only fires if the build step or the test runner
+    # itself hangs.  90 min is well above any realistic run time.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

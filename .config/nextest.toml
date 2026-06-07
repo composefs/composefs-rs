@@ -22,8 +22,12 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 # Profile for integration tests — run with limited parallelism due to QEMU/KVM resources
 [profile.integration]
 test-threads = 2
-# 20 minutes for VM tests on slow CI runners
-slow-timeout = { period = "1200s", terminate-after = 60 }
+# 20 minutes per test; kill after 1 period to surface hangs quickly.
+# terminate-after = 1 means a test gets exactly 20 min before nextest force-kills it,
+# which is generous for VM boot + test execution on the slowest GHA runners.
+# With terminate-after = 60 (the old value) a single hung test could consume
+# 1200 × 60 = 72000 s (20 h), burning through the 6 h GHA job limit silently.
+slow-timeout = { period = "1200s", terminate-after = 1 }
 fail-fast = false
 failure-output = "immediate"
 success-output = "never"
@@ -44,3 +48,10 @@ store-failure-output = true
 [[profile.integration.overrides]]
 filter = 'test(/^privileged_/)'
 threads-required = 2
+
+# privileged_fast_suite consolidates multiple sub-tests into a single VM boot,
+# so it needs a longer timeout than the default 20-minute single-test budget.
+# 45 minutes covers one VM boot + 10 sequential sub-tests on the slowest TCG runner.
+[[profile.integration.overrides]]
+filter = 'test(/^privileged_fast_suite/)'
+slow-timeout = { period = "2700s", terminate-after = 1 }
