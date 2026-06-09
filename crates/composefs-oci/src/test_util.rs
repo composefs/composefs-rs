@@ -84,7 +84,7 @@ fn append_with_xattrs<W: std::io::Write>(
 ///
 /// External files (`Item::Regular` with no inline content) get
 /// deterministic pseudo-random data from a seeded RNG (keyed on file size).
-fn dumpfile_to_tar(dumpfile: &str) -> Vec<u8> {
+pub fn dumpfile_to_tar(dumpfile: &str) -> Vec<u8> {
     let mut builder = ::tar::Builder::new(vec![]);
 
     for line in dumpfile.lines() {
@@ -208,7 +208,7 @@ pub struct TestImage {
 /// For each layer: parses the dumpfile, builds tar bytes, imports via
 /// [`import_layer`](crate::import_layer), then assembles a proper OCI
 /// config and manifest referencing all layers in order.
-async fn create_multi_layer_image(
+pub async fn create_multi_layer_image(
     repo: &Arc<Repository<Sha256HashValue>>,
     tag: Option<&str>,
     layers: &[&str],
@@ -545,6 +545,26 @@ const LAYER_VAR_LOG: &str = "\
 /var/log/.keepdir 0 100644 1 0 0 0 0.0 - - -
 ";
 
+/// A minimal `/etc/selinux` policy layer suitable for testing SELinux labeling.
+///
+/// Contains:
+/// - `/etc/selinux/config` selecting the `targeted` policy
+/// - `/etc/selinux/targeted/contexts/files/file_contexts` with a small but
+///   representative set of rules covering `/`, `/usr`, `/etc`, `/boot`, and
+///   `/var` subtrees
+///
+/// All entries are inline so no object store is needed.
+pub const LAYER_SELINUX: &str = "\
+/ 0 40755 2 0 0 0 0.0 - - -
+/etc 0 40755 2 0 0 0 0.0 - - -
+/etc/selinux 0 40755 2 0 0 0 0.0 - - -
+/etc/selinux/config 39 100644 1 0 0 0 0.0 - SELINUX=enforcing\\nSELINUXTYPE=targeted\\n -
+/etc/selinux/targeted 0 40755 2 0 0 0 0.0 - - -
+/etc/selinux/targeted/contexts 0 40755 2 0 0 0 0.0 - - -
+/etc/selinux/targeted/contexts/files 0 40755 2 0 0 0 0.0 - - -
+/etc/selinux/targeted/contexts/files/file_contexts 190 100644 1 0 0 0 0.0 - /(/.*)?\\tsystem_u:object_r:root_t:s0\\n/usr(/.*)?\\tsystem_u:object_r:usr_t:s0\\n/etc(/.*)?\\tsystem_u:object_r:etc_t:s0\\n/boot(/.*)?\\tsystem_u:object_r:boot_t:s0\\n/var(/.*)?\\tsystem_u:object_r:var_t:s0\\n -
+";
+
 /// Base image layers: a busybox-like app image (5 layers).
 const BASE_LAYERS: &[&str] = &[
     LAYER_ROOT_STRUCTURE,
@@ -568,39 +588,164 @@ const SHARED_SYSTEM_LAYERS: &[&str] = &[
     LAYER_VAR_LOG,
 ];
 
-/// Build the full layer list for a bootable image at the given version.
-fn bootable_layers(version: u32) -> Vec<&'static str> {
-    let (kernel, initramfs, modules, uki) = match version {
-        1 => (
-            LAYER_KERNEL_V1,
-            LAYER_INITRAMFS_V1,
-            LAYER_KERNEL_MODULES_V1,
-            LAYER_UKI_V1,
-        ),
-        2 => (
-            LAYER_KERNEL_V2,
-            LAYER_INITRAMFS_V2,
-            LAYER_KERNEL_MODULES_V2,
-            LAYER_UKI_V2,
-        ),
-        _ => panic!("unsupported test image version: {version}"),
-    };
+// ---------------------------------------------------------------------------
+// Builder API
+// ---------------------------------------------------------------------------
 
-    let mut layers = Vec::with_capacity(20);
-    // Layers 1-5: base userspace (shared across versions)
-    layers.extend_from_slice(BASE_LAYERS);
-    // Layers 6-7: boot directory structure (shared)
-    layers.push(LAYER_BOOT_DIRS);
-    layers.push(LAYER_KERNEL_MODULES_DIR);
-    // Layers 8-11: version-specific boot content
-    layers.push(kernel);
-    layers.push(initramfs);
-    layers.push(modules);
-    layers.push(uki);
-    // Layers 12-20: shared system content
-    layers.extend_from_slice(SHARED_SYSTEM_LAYERS);
-    layers
+/// Flags controlling optional OS features in a test image.
+#[derive(Debug, Clone, Default)]
+pub struct OsFeatures {
+    pub selinux: bool,
 }
+
+/// Which kernel/UKI content to embed in a bootable image.
+#[derive(Debug, Clone, Copy)]
+pub enum KernelVersion {
+    V1,
+    V2,
+}
+
+/// The high-level shape of the test OS image.
+#[derive(Debug, Clone, Copy)]
+pub enum OsProfile {
+    /// Minimal busybox-like userspace, no kernel (was `create_base_image`).
+    Minimal,
+    /// Full bootable image with kernel, initramfs, and UKI.
+    Bootable { version: KernelVersion },
+}
+
+/// Builder for a test OS image.
+///
+/// Compose a test image from a profile, optional feature flags, and any number
+/// of extra dumpfile layers injected on top via [`OsImage::with_layer`]:
+///
+/// ```rust,ignore
+/// let img = OsImage::bootable(KernelVersion::V1)
+///     .with_selinux()
+///     .with_layer("/usr/lib/os-release 0 100644 1 0 0 0 0.0 - ID=myos\\n -")
+///     .build_oci(repo, Some("test:v1"))
+///     .await;
+/// ```
+#[derive(Debug, Clone)]
+pub struct OsImage {
+    pub profile: OsProfile,
+    pub features: OsFeatures,
+    /// Extra dumpfile layers appended after the profile layers and feature layers.
+    extra_layers: Vec<String>,
+}
+
+impl OsImage {
+    /// Minimal busybox-like image with no kernel.
+    pub fn minimal() -> Self {
+        Self {
+            profile: OsProfile::Minimal,
+            features: OsFeatures::default(),
+            extra_layers: Vec::new(),
+        }
+    }
+
+    /// Full bootable image for the given kernel version.
+    pub fn bootable(version: KernelVersion) -> Self {
+        Self {
+            profile: OsProfile::Bootable { version },
+            features: OsFeatures::default(),
+            extra_layers: Vec::new(),
+        }
+    }
+
+    /// Add the SELinux policy layer.
+    pub fn with_selinux(mut self) -> Self {
+        self.features.selinux = true;
+        self
+    }
+
+    /// Append an extra dumpfile layer on top of all profile and feature layers.
+    ///
+    /// `dumpfile` is a composefs dumpfile string — the same format used by the
+    /// `LAYER_*` constants in this module.  Entries in later layers override
+    /// earlier ones, exactly as OCI layer stacking works.
+    ///
+    /// This is the primary extension point for callers that need to inject
+    /// specific files (e.g. `/usr/lib/os-release`, `/etc/passwd`, or custom
+    /// application content) without having to assemble a full image from scratch.
+    pub fn with_layer(mut self, dumpfile: impl Into<String>) -> Self {
+        self.extra_layers.push(dumpfile.into());
+        self
+    }
+
+    /// Assemble the ordered list of dumpfile layer strings for this image.
+    fn layer_strings(&self) -> Vec<std::borrow::Cow<'static, str>> {
+        let mut layers: Vec<std::borrow::Cow<'static, str>> = match self.profile {
+            OsProfile::Minimal => BASE_LAYERS.iter().map(|s| (*s).into()).collect(),
+            OsProfile::Bootable { version } => {
+                let (kernel, initramfs, modules, uki) = match version {
+                    KernelVersion::V1 => (
+                        LAYER_KERNEL_V1,
+                        LAYER_INITRAMFS_V1,
+                        LAYER_KERNEL_MODULES_V1,
+                        LAYER_UKI_V1,
+                    ),
+                    KernelVersion::V2 => (
+                        LAYER_KERNEL_V2,
+                        LAYER_INITRAMFS_V2,
+                        LAYER_KERNEL_MODULES_V2,
+                        LAYER_UKI_V2,
+                    ),
+                };
+                let mut v: Vec<std::borrow::Cow<'static, str>> =
+                    Vec::with_capacity(BASE_LAYERS.len() + 11);
+                // Layers 1-5: base userspace (shared across versions)
+                v.extend(BASE_LAYERS.iter().map(|s| (*s).into()));
+                // Layers 6-7: boot directory structure (shared)
+                v.push(LAYER_BOOT_DIRS.into());
+                v.push(LAYER_KERNEL_MODULES_DIR.into());
+                // Layers 8-11: version-specific boot content
+                v.push(kernel.into());
+                v.push(initramfs.into());
+                v.push(modules.into());
+                v.push(uki.into());
+                // Layers 12-20: shared system content
+                v.extend(SHARED_SYSTEM_LAYERS.iter().map(|s| (*s).into()));
+                v
+            }
+        };
+        if self.features.selinux {
+            layers.push(LAYER_SELINUX.into());
+        }
+        layers.extend(self.extra_layers.iter().cloned().map(Into::into));
+        layers
+    }
+
+    /// Build the OCI image in `repo` with optional `tag`.
+    pub async fn build_oci(
+        &self,
+        repo: &Arc<Repository<Sha256HashValue>>,
+        tag: Option<&str>,
+    ) -> TestImage {
+        let layers = self.layer_strings();
+        let layer_refs: Vec<&str> = layers.iter().map(|s| s.as_ref()).collect();
+        create_multi_layer_image(repo, tag, &layer_refs).await
+    }
+
+    /// Build a merged [`composefs::tree::FileSystem`] by importing all layers
+    /// into the given repository and then assembling the filesystem tree.
+    ///
+    /// This is useful for unit tests that need a `FileSystem` to pass to
+    /// [`composefs_boot::BootOps::transform_for_boot`] without going through
+    /// a full OCI pull.
+    pub async fn build_filesystem(
+        &self,
+        repo: &Arc<Repository<Sha256HashValue>>,
+    ) -> composefs::tree::FileSystem<Sha256HashValue> {
+        let img = self.build_oci(repo, None).await;
+        crate::image::create_filesystem(repo, &img.config_digest, None)
+            .expect("valid test filesystem")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backward-compatible free functions
+// ---------------------------------------------------------------------------
 
 /// Create a base (non-bootable) test OCI image with 5 layers.
 ///
@@ -611,7 +756,7 @@ pub async fn create_base_image(
     repo: &Arc<Repository<Sha256HashValue>>,
     tag: Option<&str>,
 ) -> TestImage {
-    create_multi_layer_image(repo, tag, BASE_LAYERS).await
+    OsImage::minimal().build_oci(repo, tag).await
 }
 
 /// Create a bootable test OCI image with 20 layers.
@@ -629,8 +774,12 @@ pub async fn create_bootable_image(
     tag: Option<&str>,
     version: u32,
 ) -> TestImage {
-    let layers = bootable_layers(version);
-    create_multi_layer_image(repo, tag, &layers).await
+    let kv = match version {
+        1 => KernelVersion::V1,
+        2 => KernelVersion::V2,
+        _ => panic!("unsupported test image version: {version}"),
+    };
+    OsImage::bootable(kv).build_oci(repo, tag).await
 }
 
 /// Create a base test OCI image in a repository at the given path.
@@ -792,6 +941,74 @@ mod tests {
         let img = create_bootable_image(repo, Some("boot:v1"), 1).await;
         assert!(img.manifest_digest.to_string().starts_with("sha256:"));
         assert!(img.config_digest.to_string().starts_with("sha256:"));
+    }
+
+    #[tokio::test]
+    async fn test_os_image_builder_selinux() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let img = OsImage::bootable(KernelVersion::V1)
+            .with_selinux()
+            .build_oci(repo, Some("selinux:v1"))
+            .await;
+        assert!(
+            img.manifest_digest.to_string().starts_with("sha256:"),
+            "manifest_digest should start with sha256:"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_os_image_with_layer() {
+        use std::ffi::OsStr;
+
+        // Inject a custom /usr/lib/os-release on top of the minimal image.
+        let os_release = "/usr/lib/os-release 0 100644 1 0 0 0 0.0 - ID=myos\\nVERSION_ID=42\\n -";
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+        let fs = OsImage::minimal()
+            .with_layer(os_release)
+            .build_filesystem(repo)
+            .await;
+
+        // Verify the injected file is present and readable.
+        let root = fs.as_dir();
+        let usr_lib = root
+            .get_directory_ref("usr/lib".as_ref())
+            .expect("usr/lib exists");
+        let file = usr_lib
+            .get_file_opt(OsStr::new("os-release"))
+            .expect("lookup succeeded")
+            .expect("os-release present");
+        let content = match file {
+            composefs::tree::RegularFile::Inline(data) => data.clone(),
+            _ => panic!("expected inline file"),
+        };
+        assert_eq!(&*content, b"ID=myos\nVERSION_ID=42\n");
+    }
+
+    #[tokio::test]
+    async fn test_build_filesystem_bootable() {
+        // build_filesystem on a bootable image should produce /boot and /sysroot dirs.
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+        let fs = OsImage::bootable(KernelVersion::V1)
+            .build_filesystem(repo)
+            .await;
+        let root = fs.as_dir();
+        assert!(
+            root.get_directory_ref("boot".as_ref()).is_ok(),
+            "/boot should exist"
+        );
+        assert!(
+            root.get_directory_ref("sysroot".as_ref()).is_ok(),
+            "/sysroot should exist"
+        );
+        assert!(
+            root.get_directory_ref("usr/lib/modules/6.1.0".as_ref())
+                .is_ok(),
+            "/usr/lib/modules/6.1.0 should exist"
+        );
     }
 
     /// v1 and v2 share userspace layers but differ in kernel/UKI.
