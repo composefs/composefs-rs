@@ -443,8 +443,12 @@ fn finalize_import<ObjectID: FsVerityHashValue>(
 
     // Generate the composefs EROFS image and tag the manifest.
     // Skip if the image already has an EROFS ref (idempotent re-import).
-    let existing_erofs =
-        crate::composefs_erofs_for_manifest(repo, &manifest_digest, Some(&manifest_verity))?;
+    let existing_erofs = crate::composefs_erofs_for_manifest(
+        repo,
+        &manifest_digest,
+        Some(&manifest_verity),
+        repo.erofs_version(),
+    )?;
     if existing_erofs.is_none() {
         let erofs = crate::ensure_oci_composefs_erofs(
             repo,

@@ -9,9 +9,9 @@
 #    changes may be made vs. the base image.  This is best-accomplished with a
 #    multi-stage build.
 #
-#  - during the build stages following 'base', the `COMPOSEFS_FSVERITY` build
-#    arg will be set to the fsverity digest of the container image.  This should
-#    be baked into the UKI.
+#  - during the build stages following 'base', the `COMPOSEFS_KARG` build
+#    arg will be set to the composefs kernel argument string (e.g.
+#    composefs.digest=<hex>).  This should be baked into the UKI.
 
 FROM fedora:43 AS base
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
@@ -55,12 +55,12 @@ RUN <<EOF
 EOF
 
 FROM base AS kernel
-ARG COMPOSEFS_FSVERITY
+ARG COMPOSEFS_KARG
 RUN --mount=type=cache,target=/var/cache/libdnf5 <<EOF
     set -eux
 
     mkdir -p /etc/kernel /etc/dracut.conf.d
-    echo "composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
+    echo "${COMPOSEFS_KARG} rw" > /etc/kernel/cmdline
 
     kernel-install add-all
 EOF

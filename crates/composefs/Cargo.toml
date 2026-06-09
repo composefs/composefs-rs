@@ -13,6 +13,7 @@ version.workspace = true
 [features]
 'pre-6.15' = ['tempfile']
 rhel9 = ['pre-6.15', 'composefs-ioctls/loop-device']
+keyring = ['composefs-ioctls/keyring']
 test = ["tempfile"]
 varlink = ['dep:zlink-core']
 

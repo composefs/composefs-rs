@@ -670,7 +670,7 @@ pub fn create_test_bootable_oci_image(
     let rt = tokio::runtime::Runtime::new()?;
     let img = rt.block_on(create_bootable_image(&repo, Some(tag), 1));
     ensure_erofs_for_image(&repo, tag)?;
-    crate::boot::generate_boot_image(&repo, &img.manifest_digest)?;
+    crate::boot::generate_boot_image(&repo, &img.manifest_digest, Some(tag))?;
     Ok(())
 }
 
