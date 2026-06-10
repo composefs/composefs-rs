@@ -488,16 +488,37 @@ pub fn open_fuse() -> anyhow::Result<OwnedFd> {
         .context("Unable to open fuse device /dev/fuse")
 }
 
+/// Options controlling how a FUSE filesystem is mounted.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct FuseMountOptions {
+    allow_other: bool,
+}
+
+impl FuseMountOptions {
+    /// Allow users other than the mounter to access the filesystem.
+    ///
+    /// Requires either CAP_SYS_ADMIN in the init user namespace or
+    /// `user_allow_other` in `/etc/fuse.conf`. Should be set to false
+    /// when mounting inside a user namespace.
+    pub fn set_allow_other(&mut self, allow_other: bool) -> &mut Self {
+        self.allow_other = allow_other;
+        self
+    }
+}
+
 /// Mounts a FUSE filesystem with the given /dev/fuse fd.
 ///
 /// This does the necessary dance of creating the mount object, given a /dev/fuse device node.  In
 /// order for this to be useful, you'll also need to call serve_tree_fuse() to actually satisfy the
 /// requests for data.
-pub fn mount_fuse(dev_fuse: impl AsFd) -> anyhow::Result<OwnedFd> {
+pub fn mount_fuse(dev_fuse: impl AsFd, options: &FuseMountOptions) -> anyhow::Result<OwnedFd> {
     let fusefs = FsHandle::open("fuse")?;
     fsconfig_set_flag(fusefs.as_fd(), "ro")?;
     fsconfig_set_flag(fusefs.as_fd(), "default_permissions")?;
-    fsconfig_set_flag(fusefs.as_fd(), "allow_other")?;
+    if options.allow_other {
+        fsconfig_set_flag(fusefs.as_fd(), "allow_other")?;
+    }
     fsconfig_set_string(fusefs.as_fd(), "source", "composefs-fuse")?;
     fsconfig_set_string(fusefs.as_fd(), "rootmode", "040555")?;
     fsconfig_set_string(fusefs.as_fd(), "user_id", "0")?;
