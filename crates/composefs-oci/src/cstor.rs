@@ -14,7 +14,7 @@
 //!
 //! When importing from containers-storage, we:
 //! 1. Open the storage and locate the image
-//! 2. For each layer, iterate through the tar-split metadata
+//! 2. For each layer, stream it via the `org.composefs.Oci` zlink service
 //! 3. For large files (> INLINE_CONTENT_MAX_V0), reflink directly to objects/
 //! 4. For small files, embed inline in the splitstream
 //! 5. Handle overlay whiteouts properly
@@ -38,7 +38,6 @@
 //! println!("Stats: {:?}", stats);
 //! ```
 
-use std::os::unix::fs::FileExt;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
@@ -46,29 +45,25 @@ use anyhow::{Context, Result};
 use base64::Engine;
 
 use composefs::{
-    INLINE_CONTENT_MAX_V0,
     fsverity::FsVerityHashValue,
-    repository::{ImportContext, ObjectStoreMethod, Repository},
+    repository::{ImportContext, Repository},
 };
 
 use cstorage::{
-    Image, Layer, ProxiedTarSplitItem, Storage, StorageProxy, TarSplitFdStream, TarSplitItem,
-    can_bypass_file_permissions,
+    CstorLayerService, Image, Layer, Storage, StorageProxy, can_bypass_file_permissions,
+    spawn_cstor_in_process,
 };
+
+use crate::varlink_types::{GetLayerParams, OciProxy as _, StorageLocator};
 
 // Re-export init_if_helper for consumers that need userns helper support
 pub use cstorage::init_if_helper;
 
-use crate::oci_image::manifest_identifier;
 use crate::progress::{ComponentId, ProgressEvent, ProgressUnit, SharedReporter};
-use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
-use crate::{ContentAndVerity, ImportStats, OciDigest, config_identifier, layer_identifier};
+use crate::{ContentAndVerity, ImportStats, OciDigest, layer_identifier};
 
 /// Full result of a cstor import: manifest and config digests + verities.
 type CstorImportResult<ObjectID> = (ContentAndVerity<ObjectID>, ContentAndVerity<ObjectID>);
-
-/// Zero padding buffer for tar block alignment (512 bytes max needed).
-const ZERO_PADDING: [u8; 512] = [0u8; 512];
 
 /// Import a container image from containers-storage into the composefs repository.
 ///
@@ -102,29 +97,23 @@ pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
 ) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
     // Check if we can access files directly or need a proxy
     if can_bypass_file_permissions() {
-        // Direct access - use blocking implementation
-        let repo = Arc::clone(repo);
-        let image_id = image_id.to_owned();
-        let reference = reference.map(|s| s.to_owned());
+        // Direct access via in-process CstorLayerService.
         let storage_root = storage_root.map(|p| p.to_path_buf());
         let additional_image_stores: Vec<std::path::PathBuf> = additional_image_stores
             .iter()
             .map(|p| p.to_path_buf())
             .collect();
 
-        tokio::task::spawn_blocking(move || {
-            import_from_containers_storage_direct(
-                &repo,
-                &image_id,
-                reference.as_deref(),
-                zerocopy,
-                storage_root.as_deref(),
-                &additional_image_stores,
-                reporter,
-            )
-        })
+        import_from_containers_storage_direct(
+            repo,
+            image_id,
+            reference,
+            zerocopy,
+            storage_root.as_deref(),
+            &additional_image_stores,
+            reporter,
+        )
         .await
-        .context("spawn_blocking failed")?
     } else {
         // The proxied (rootless) path uses a userns helper process that does
         // its own storage discovery.  Explicit storage paths are not yet
@@ -138,11 +127,137 @@ pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
     }
 }
 
-/// Direct (privileged) implementation of containers-storage import.
+/// Resolved image metadata needed by the async layer-import loop.
+struct ResolvedImageLayers {
+    /// The `Image` handle (for finalize_import).
+    image: Image,
+    /// Per-layer: (storage_root_path_string, storage_layer_id, diff_id).
+    layers: Vec<(String, String, OciDigest)>,
+}
+
+/// Synchronous helper: open stores, find image, resolve layer IDs + diff_ids.
 ///
-/// All file I/O operations in this function are blocking, so it must be called
-/// from a blocking context (e.g., via `spawn_blocking`).
-fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
+/// Runs entirely in blocking context.  We open the stores with explicit paths
+/// so that we can pass the path string to the `CstorLayerService` per layer.
+fn resolve_image_layers(
+    image_id: &str,
+    storage_root: Option<std::path::PathBuf>,
+    additional_image_stores: Vec<std::path::PathBuf>,
+) -> Result<ResolvedImageLayers> {
+    // Build an ordered list of store root paths to search. An explicit
+    // `storage_root` skips auto-discovery; the additional image stores are
+    // appended after the primary store(s) in either case.
+    let mut store_paths: Vec<String> = match &storage_root {
+        Some(root) => vec![root.to_string_lossy().into_owned()],
+        None => storage_search_paths(),
+    };
+    for p in &additional_image_stores {
+        store_paths.push(p.to_string_lossy().into_owned());
+    }
+
+    // Open all stores.
+    let mut stores: Vec<(String, Storage)> = Vec::with_capacity(store_paths.len());
+    let mut open_errors: Vec<String> = Vec::new();
+    for path in &store_paths {
+        match Storage::open(path) {
+            Ok(s) => stores.push((path.clone(), s)),
+            Err(e) => open_errors.push(format!("{path}: {e:#}")),
+        }
+    }
+    if stores.is_empty() {
+        anyhow::bail!(
+            "Could not open any containers-storage root: {}",
+            open_errors.join("; ")
+        );
+    }
+
+    // Search all stores for the image.
+    let image = stores
+        .iter()
+        .find_map(|(_path, s)| {
+            Image::open(s, image_id)
+                .or_else(|_| s.find_image_by_name(image_id))
+                .ok()
+        })
+        .with_context(|| format!("Failed to find image {image_id} in any storage"))?;
+
+    // storage_layer_ids() takes &[Storage]; collect owned Storage values by
+    // re-opening the already-open stores (cheap: just another fd dup via cap-std).
+    // We re-open so that storage_layer_ids can have an owned &[Storage] slice.
+    let storage_vec: Vec<Storage> = stores
+        .iter()
+        .map(|(path, _s)| Storage::open(path))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("Failed to re-open stores for storage_layer_ids")?;
+    let storage_layer_ids = image
+        .storage_layer_ids(&storage_vec)
+        .context("Failed to get storage layer IDs from image")?;
+
+    // Get the config to access diff_ids.
+    let config = image.config().context("Failed to read image config")?;
+    let diff_ids: Vec<OciDigest> = config
+        .rootfs()
+        .diff_ids()
+        .iter()
+        .map(|s| s.parse::<OciDigest>().context("parsing diff_id"))
+        .collect::<Result<_>>()?;
+
+    anyhow::ensure!(
+        storage_layer_ids.len() == diff_ids.len(),
+        "Layer count mismatch: {} layers in storage, {} diff_ids in config",
+        storage_layer_ids.len(),
+        diff_ids.len()
+    );
+
+    // For each layer, find which store path it lives in.
+    let mut layers = Vec::with_capacity(storage_layer_ids.len());
+    for (storage_layer_id, diff_id) in storage_layer_ids.into_iter().zip(diff_ids) {
+        let store_path = stores
+            .iter()
+            .find_map(|(path, s)| Layer::open(s, &storage_layer_id).ok().map(|_| path.clone()))
+            .with_context(|| format!("Could not find store containing layer {storage_layer_id}"))?;
+        layers.push((store_path, storage_layer_id, diff_id));
+    }
+
+    Ok(ResolvedImageLayers { image, layers })
+}
+
+/// Return the ordered list of storage root path strings to search, mirroring
+/// `Storage::discover_all()` internals so we can pair each store with a path.
+fn storage_search_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+
+    if let Ok(root) = std::env::var("CONTAINERS_STORAGE_ROOT") {
+        paths.push(root);
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            paths.push(format!("{xdg}/containers/storage"));
+        }
+        paths.push(format!("{home}/.local/share/containers/storage"));
+    }
+
+    paths.push("/var/lib/containers/storage".to_string());
+
+    if let Ok(opts) = std::env::var("STORAGE_OPTS") {
+        for item in opts.split(',') {
+            let item = item.trim();
+            if let Some(p) = item.strip_prefix("additionalimagestore=") {
+                paths.push(p.to_string());
+            }
+        }
+    }
+
+    paths
+}
+
+/// Direct (privileged) async implementation of containers-storage import.
+///
+/// Layer discovery is done synchronously via `spawn_blocking`, then each
+/// layer is imported asynchronously through the in-process `CstorLayerService`
+/// (`org.composefs.Oci` zlink interface).
+async fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     image_id: &str,
     reference: Option<&str>,
@@ -154,75 +269,26 @@ fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
     let mut stats = ImportStats::default();
     let mut ctx = ImportContext::default();
 
-    // Build the list of stores to search.  When an explicit root is given,
-    // skip auto-discovery entirely; otherwise discover from the standard
-    // locations and $STORAGE_OPTS.
-    let mut stores = if let Some(root) = storage_root {
-        vec![
-            Storage::open(root)
-                .with_context(|| format!("Failed to open storage root at {}", root.display()))?,
-        ]
-    } else {
-        // Auto-discover; tolerate failure only if extra stores are provided.
-        match Storage::discover_all() {
-            Ok(s) => s,
-            Err(e) if !additional_image_stores.is_empty() => {
-                tracing::warn!(
-                    "containers-storage auto-discovery failed ({e:#}), \
-                     using additional image stores only"
-                );
-                Vec::new()
-            }
-            Err(e) => return Err(e).context("Failed to discover containers-storage"),
-        }
-    };
-    for path in additional_image_stores {
-        stores.push(Storage::open(path).with_context(|| {
-            format!(
-                "Failed to open additional image store at {}",
-                path.display()
-            )
-        })?);
-    }
+    // Resolve image layers synchronously (filesystem + JSON work).
+    let image_id_owned = image_id.to_owned();
+    let storage_root_owned = storage_root.map(|p| p.to_path_buf());
+    let additional_owned: Vec<std::path::PathBuf> = additional_image_stores.to_vec();
+    let resolved = tokio::task::spawn_blocking(move || {
+        resolve_image_layers(&image_id_owned, storage_root_owned, additional_owned)
+    })
+    .await
+    .context("spawn_blocking(resolve_image_layers) failed")??;
 
-    // Search all stores for the image (primary first, then additional image stores)
-    let (_image_store, image) = stores
-        .iter()
-        .find_map(|s| {
-            Image::open(s, image_id)
-                .or_else(|_| s.find_image_by_name(image_id))
-                .ok()
-                .map(|img| (s, img))
-        })
-        .with_context(|| format!("Failed to find image {image_id} in any storage"))?;
+    stats.layers = resolved.layers.len() as u64;
 
-    // Get the storage layer IDs — layers may span stores (e.g. base layers
-    // in an additional image store, new layers in the primary)
-    let storage_layer_ids = image
-        .storage_layer_ids(&stores)
-        .context("Failed to get storage layer IDs from image")?;
+    // Spawn the in-process CstorLayerService server (synchronous call, no .await).
+    // `server` keeps the server's dedicated thread alive for the whole layer loop;
+    // it is shut down explicitly after the layer loop.
+    let (mut client, server) =
+        spawn_cstor_in_process(CstorLayerService).context("Failed to spawn CstorLayerService")?;
 
-    // Get the config to access diff_ids
-    let config = image.config().context("Failed to read image config")?;
-    let diff_ids: Vec<OciDigest> = config
-        .rootfs()
-        .diff_ids()
-        .iter()
-        .map(|s| s.parse::<OciDigest>().context("parsing diff_id"))
-        .collect::<Result<_>>()?;
-
-    // Ensure layer count matches
-    anyhow::ensure!(
-        storage_layer_ids.len() == diff_ids.len(),
-        "Layer count mismatch: {} layers in storage, {} diff_ids in config",
-        storage_layer_ids.len(),
-        diff_ids.len()
-    );
-
-    stats.layers = storage_layer_ids.len() as u64;
-
-    let mut layer_refs = Vec::with_capacity(storage_layer_ids.len());
-    for (storage_layer_id, diff_id) in storage_layer_ids.iter().zip(diff_ids.iter()) {
+    let mut layer_refs = Vec::with_capacity(resolved.layers.len());
+    for (store_path, storage_layer_id, diff_id) in &resolved.layers {
         let content_id = layer_identifier(diff_id);
         let id = ComponentId::from(diff_id.to_string());
 
@@ -236,102 +302,10 @@ fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
                 total: None,
                 unit: ProgressUnit::Bytes,
             });
-            let (layer_store, layer) = stores
-                .iter()
-                .find_map(|s| Layer::open(s, storage_layer_id).ok().map(|l| (s, l)))
-                .with_context(|| format!("Failed to open layer {}", storage_layer_id))?;
-            let (verity, layer_stats) =
-                import_layer_direct(repo, layer_store, &layer, diff_id, zerocopy, &mut ctx)?;
-            let bytes = layer_stats.new_bytes();
-            stats.merge(&layer_stats);
-            reporter.report(ProgressEvent::Done {
-                id,
-                transferred: bytes,
-            });
-            verity
-        };
-
-        layer_refs.push((diff_id.clone(), layer_verity));
-    }
-
-    reporter.report(ProgressEvent::Message("Layers imported".to_string()));
-    finalize_import(repo, &image, &layer_refs, reference, &reporter, stats)
-}
-
-/// Proxied (rootless) implementation of containers-storage import.
-///
-/// This spawns a helper process via `podman unshare` that can read all files
-/// in containers-storage, and communicates with it via Unix socket + fd passing.
-async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    image_id: &str,
-    reference: Option<&str>,
-    zerocopy: bool,
-    reporter: SharedReporter,
-) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
-    let mut stats = ImportStats::default();
-    let mut ctx = ImportContext::default();
-
-    // Spawn the proxy helper
-    let mut proxy = StorageProxy::spawn()
-        .await
-        .context("Failed to spawn userns helper")?
-        .context("Expected proxy but got None")?;
-
-    // Discover storage paths (primary + additional from $STORAGE_OPTS)
-    let storage_paths = discover_storage_paths()?;
-
-    // Search all storage paths for the image
-    let mut image_info = None;
-    let mut found_storage_path = String::new();
-    for path in &storage_paths {
-        match proxy.get_image(path, image_id).await {
-            Ok(info) => {
-                found_storage_path = path.clone();
-                image_info = Some(info);
-                break;
-            }
-            Err(_) => continue,
-        }
-    }
-    let image_info =
-        image_info.with_context(|| format!("Failed to find image {} in any storage", image_id))?;
-    let storage_path = found_storage_path;
-
-    // Ensure layer count matches
-    anyhow::ensure!(
-        image_info.storage_layer_ids.len() == image_info.layer_diff_ids.len(),
-        "Layer count mismatch: {} layers in storage, {} diff_ids in config",
-        image_info.storage_layer_ids.len(),
-        image_info.layer_diff_ids.len()
-    );
-
-    stats.layers = image_info.storage_layer_ids.len() as u64;
-
-    let mut layer_refs = Vec::with_capacity(image_info.storage_layer_ids.len());
-
-    for (storage_layer_id, diff_id) in image_info
-        .storage_layer_ids
-        .iter()
-        .zip(image_info.layer_diff_ids.iter())
-    {
-        let content_id = layer_identifier(diff_id);
-        let id = ComponentId::from(diff_id.to_string());
-
-        let layer_verity = if let Some(existing) = repo.has_stream(&content_id)? {
-            reporter.report(ProgressEvent::Skipped { id });
-            stats.layers_already_present += 1;
-            existing
-        } else {
-            reporter.report(ProgressEvent::Started {
-                id: id.clone(),
-                total: None,
-                unit: ProgressUnit::Bytes,
-            });
-            let (verity, layer_stats) = import_layer_proxied(
+            let (verity, layer_stats) = import_layer_via_transfer(
                 repo,
-                &mut proxy,
-                &storage_path,
+                &mut client,
+                store_path,
                 storage_layer_id,
                 diff_id,
                 zerocopy,
@@ -350,30 +324,238 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
         layer_refs.push((diff_id.clone(), layer_verity));
     }
 
+    // Drop the client so the server connection closes, then shut the server
+    // down.  The server's `run()` never returns on its own (the in-process
+    // listener pends forever after the first connection), so `shutdown` sends an
+    // explicit stop signal and reaps the thread on a blocking task — the latter
+    // is important so we don't park the caller's reactor, which must stay live
+    // to deliver that very stop signal to the server thread.
+    drop(client);
+    server.shutdown().await;
+
     reporter.report(ProgressEvent::Message("Layers imported".to_string()));
 
-    // Config and manifest metadata don't have restrictive file permissions,
-    // so we can read them directly without the proxy.
-    let stores = Storage::discover_all().context("Failed to discover containers-storage")?;
-    let (_, image) = stores
-        .iter()
-        .find_map(|s| Image::open(s, &image_info.id).ok().map(|img| (s, img)))
-        .with_context(|| format!("Failed to open image {}", image_info.id))?;
+    // finalize_import does blocking repo work; run it on spawn_blocking.
+    let repo2 = Arc::clone(repo);
+    let image = resolved.image;
+    let reference_owned = reference.map(|s| s.to_owned());
+    let reporter2 = reporter.clone();
+    tokio::task::spawn_blocking(move || {
+        finalize_import(
+            &repo2,
+            &image,
+            &layer_refs,
+            reference_owned.as_deref(),
+            &reporter2,
+            stats,
+        )
+    })
+    .await
+    .context("spawn_blocking(finalize_import) failed")?
+}
 
-    // Shutdown the proxy before the blocking finalization
-    proxy.shutdown().await.context("Failed to shutdown proxy")?;
+/// Import a single layer via the in-process `org.composefs.Oci` zlink service.
+///
+/// Calls `get_layer(0, GetLayerParams{storage:Some(StorageLocator{...})})`,
+/// collects all frames, then drains the `splitdirfdstream` pipe in a
+/// `spawn_blocking` closure while the server-side producer fills the pipe
+/// concurrently on its own thread.
+async fn import_layer_via_transfer<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    client: &mut zlink::unix::Connection,
+    storage_path: &str,
+    storage_layer_id: &str,
+    diff_id: &OciDigest,
+    zerocopy: bool,
+    ctx: &mut ImportContext,
+) -> Result<(ObjectID, ImportStats)> {
+    // Call get_layer with the storage locator (handle=0; cstor service ignores it).
+    let params = GetLayerParams {
+        diff_id: None,
+        storage: Some(StorageLocator {
+            storage_path: storage_path.to_owned(),
+            layer_id: storage_layer_id.to_owned(),
+        }),
+    };
+    let stream = client
+        .get_layer(0, params)
+        .await
+        .with_context(|| format!("Oci.GetLayer RPC failed for {storage_layer_id}"))?;
 
-    finalize_import(repo, &image, &layer_refs, reference, &reporter, stats)
+    // Collect all frames.  Each frame carries a batch of FDs; concatenate them
+    // in arrival order to reconstruct the full logical FD array:
+    //   index 0             : pipe read end
+    //   index 1..=dir_count : dirfds region (sparse — may include dummy slots)
+    //   index dir_count+1.. : opaque lifetime FDs (keepalive + optional extras)
+    let mut fds: Vec<OwnedFd> = Vec::new();
+    let mut reply_opt: Option<crate::varlink_types::GetLayerReply> = None;
+    {
+        use zlink::futures_util::StreamExt as _;
+        let mut stream = std::pin::pin!(stream);
+        while let Some(item) = stream.next().await {
+            let (result, frame_fds) =
+                item.with_context(|| format!("Oci.GetLayer stream error for {storage_layer_id}"))?;
+            let frame_reply = result.map_err(|e| anyhow::anyhow!("Oci.GetLayer error: {e:?}"))?;
+            reply_opt = Some(frame_reply);
+            fds.extend(frame_fds);
+        }
+    }
+    let reply = reply_opt.ok_or_else(|| anyhow::anyhow!("Oci.GetLayer yielded no frames"))?;
+
+    // At minimum: 1 pipe fd + dir_count slots + 1 keepalive fd.
+    anyhow::ensure!(
+        fds.len() >= reply.dir_count as usize + 2,
+        "Oci.GetLayer: expected at least {} fds (1 pipe + {} dirfd slots + 1 keepalive), got {}",
+        2 + reply.dir_count,
+        reply.dir_count,
+        fds.len()
+    );
+
+    // Split into: pipe_read | dir_fds[dir_count] | lifetime_fds...
+    let mut it = fds.into_iter();
+    let pipe_read: OwnedFd = it.next().expect("checked above: fds.len() >= 1");
+    let dir_fds: Vec<OwnedFd> = it.by_ref().take(reply.dir_count as usize).collect();
+    // Opaque lifetime tokens — hold open until drain completes, then drop to
+    // signal the server's producer that we are done consuming the layer.
+    let lifetime_fds: Vec<OwnedFd> = it.collect();
+
+    // Drain the pipe in a blocking task (producer runs concurrently on the
+    // server's spawn_blocking thread).  ImportContext is threaded through.
+    let repo_clone = Arc::clone(repo);
+    let diff_id_owned = diff_id.clone();
+    let ctx_moved = std::mem::take(ctx);
+
+    let (verity, layer_stats, ctx_returned) = tokio::task::spawn_blocking(move || {
+        // Hold all lifetime FDs for the full duration of the drain.
+        let _lifetime_fds = lifetime_fds;
+        crate::layer_sync::drain_splitdirfdstream(
+            repo_clone,
+            pipe_read,
+            dir_fds,
+            &diff_id_owned,
+            zerocopy,
+            ctx_moved,
+        )
+    })
+    .await
+    .context("spawn_blocking(drain_splitdirfdstream) failed")??;
+
+    *ctx = ctx_returned;
+
+    Ok((verity, layer_stats))
+}
+
+/// Proxied (rootless) implementation of containers-storage import.
+///
+/// Mirrors `import_from_containers_storage_direct` exactly, but acquires the
+/// `org.composefs.Oci` zlink client from the userns helper subprocess instead
+/// of an in-process server.  Metadata resolution (layer IDs, diff_ids, config)
+/// runs in `spawn_blocking` using the same `resolve_image_layers` path as the
+/// direct path, so the two paths remain behaviorally identical.
+///
+/// Note: explicit `storage_root` / `additional_image_stores` are not supported
+/// here; the caller (`import_from_containers_storage`) already guards against
+/// that and bails before reaching this function.
+async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    image_id: &str,
+    reference: Option<&str>,
+    zerocopy: bool,
+    reporter: SharedReporter,
+) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
+    let mut stats = ImportStats::default();
+    let mut ctx = ImportContext::default();
+
+    // Resolve image layers synchronously (filesystem + JSON work).
+    // Pass None / empty for storage_root / additional: the caller already
+    // rejected those for rootless mode, so this is always auto-discovery.
+    let image_id_owned = image_id.to_owned();
+    let resolved =
+        tokio::task::spawn_blocking(move || resolve_image_layers(&image_id_owned, None, vec![]))
+            .await
+            .context("spawn_blocking(resolve_image_layers) failed")??;
+
+    stats.layers = resolved.layers.len() as u64;
+
+    // Spawn the userns helper; it serves the org.composefs.Oci zlink service
+    // (CstorLayerService) over a Unix socket.  We drive it through
+    // `proxy.connection()` exactly as the direct path drives the in-process client.
+    let mut proxy = StorageProxy::spawn()
+        .await
+        .context("spawn userns helper")?
+        .context("expected helper but got None (can_bypass_file_permissions returned true?)")?;
+
+    let mut layer_refs = Vec::with_capacity(resolved.layers.len());
+    for (store_path, storage_layer_id, diff_id) in &resolved.layers {
+        let content_id = layer_identifier(diff_id);
+        let id = ComponentId::from(diff_id.to_string());
+
+        let layer_verity = if let Some(existing) = repo.has_stream(&content_id)? {
+            reporter.report(ProgressEvent::Skipped { id });
+            stats.layers_already_present += 1;
+            existing
+        } else {
+            reporter.report(ProgressEvent::Started {
+                id: id.clone(),
+                total: None,
+                unit: ProgressUnit::Bytes,
+            });
+            let (verity, layer_stats) = import_layer_via_transfer(
+                repo,
+                proxy.connection(),
+                store_path,
+                storage_layer_id,
+                diff_id,
+                zerocopy,
+                &mut ctx,
+            )
+            .await?;
+            let bytes = layer_stats.new_bytes();
+            stats.merge(&layer_stats);
+            reporter.report(ProgressEvent::Done {
+                id,
+                transferred: bytes,
+            });
+            verity
+        };
+
+        layer_refs.push((diff_id.clone(), layer_verity));
+    }
+
+    // Shut down the helper before finalize_import: finalize reads config and
+    // manifest JSON directly (no restrictive permissions), so the helper is
+    // no longer needed.
+    proxy.shutdown().await.context("shutdown userns helper")?;
+
+    reporter.report(ProgressEvent::Message("Layers imported".to_string()));
+
+    // finalize_import does blocking repo work; run it on spawn_blocking,
+    // mirroring _direct exactly.
+    let repo2 = Arc::clone(repo);
+    let image = resolved.image;
+    let reference_owned = reference.map(|s| s.to_owned());
+    let reporter2 = reporter.clone();
+    tokio::task::spawn_blocking(move || {
+        finalize_import(
+            &repo2,
+            &image,
+            &layer_refs,
+            reference_owned.as_deref(),
+            &reporter2,
+            stats,
+        )
+    })
+    .await
+    .context("spawn_blocking(finalize_import) failed")?
 }
 
 /// Create config + manifest splitstreams, generate the EROFS image, and tag.
 ///
 /// This is the shared finalization step for both direct and proxied import
 /// paths. By this point all layers are already imported; this function:
-/// 1. Creates the config splitstream with layer references
-/// 2. Creates the manifest splitstream
-/// 3. Generates the composefs EROFS image and links it to the config
-/// 4. Tags the manifest if a reference was provided
+/// 1. Reads config JSON and manifest JSON from the containers-storage `Image`
+/// 2. Delegates to [`crate::layer_sync::finalize_oci_image`] for the repo work
+/// 3. Re-attaches the `ImportStats` for the caller
 fn finalize_import<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     image: &Image,
@@ -388,321 +570,32 @@ fn finalize_import<ObjectID: FsVerityHashValue>(
     let config_json = image
         .read_metadata(&encoded_key)
         .context("Failed to read config bytes")?;
-    let config_digest = crate::sha256_content_digest(&config_json);
-    let content_id = config_identifier(&config_digest);
 
-    let config_verity = if let Some(existing) = repo.has_stream(&content_id)? {
-        reporter.report(ProgressEvent::Message(format!(
-            "Already have config {config_digest}"
-        )));
-        existing
-    } else {
-        reporter.report(ProgressEvent::Message(format!(
-            "Creating config splitstream {config_digest}"
-        )));
-        let mut writer = repo.create_stream(OCI_CONFIG_CONTENT_TYPE)?;
+    reporter.report(ProgressEvent::Message(format!(
+        "Read config ({} bytes)",
+        config_json.len()
+    )));
 
-        for (diff_id, verity) in layer_refs {
-            let key: &str = diff_id.as_ref();
-            writer.add_named_stream_ref(key, verity);
-        }
-
-        writer.write_external(&config_json)?;
-        repo.write_stream(writer, &content_id, None)?
-    };
-
-    // Create the manifest splitstream (matching the skopeo path)
+    // Read the raw manifest JSON bytes
     let manifest_json = image
         .read_manifest_raw()
         .context("Failed to read manifest bytes")?;
-    let manifest_digest = crate::sha256_content_digest(&manifest_json);
 
-    let manifest_content_id = manifest_identifier(&manifest_digest);
-    let manifest_verity = if let Some(existing) = repo.has_stream(&manifest_content_id)? {
-        reporter.report(ProgressEvent::Message(format!(
-            "Already have manifest {manifest_digest}"
-        )));
-        existing
-    } else {
-        reporter.report(ProgressEvent::Message(format!(
-            "Creating manifest splitstream {manifest_digest}"
-        )));
-        let mut writer = repo.create_stream(OCI_MANIFEST_CONTENT_TYPE)?;
+    reporter.report(ProgressEvent::Message(format!(
+        "Read manifest ({} bytes)",
+        manifest_json.len()
+    )));
 
-        let config_ref_key = format!("config:{config_digest}");
-        writer.add_named_stream_ref(&config_ref_key, &config_verity);
+    let result = crate::layer_sync::finalize_oci_image(
+        repo,
+        &manifest_json,
+        &config_json,
+        layer_refs,
+        reference,
+    )
+    .context("finalize_oci_image")?;
 
-        for (diff_id, verity) in layer_refs {
-            let key: &str = diff_id.as_ref();
-            writer.add_named_stream_ref(key, verity);
-        }
-
-        writer.write_external(&manifest_json)?;
-        repo.write_stream(writer, &manifest_content_id, None)?
-    };
-
-    // Generate the composefs EROFS image and tag the manifest.
-    // Skip if the image already has an EROFS ref (idempotent re-import).
-    let existing_erofs =
-        crate::composefs_erofs_for_manifest(repo, &manifest_digest, Some(&manifest_verity))?;
-    if existing_erofs.is_none() {
-        let erofs = crate::ensure_oci_composefs_erofs(
-            repo,
-            &manifest_digest,
-            Some(&manifest_verity),
-            reference,
-        )?;
-        if erofs.is_none() {
-            // Not a container image (unlikely for cstor, but handle consistently)
-            if let Some(name) = reference {
-                crate::oci_image::tag_image(repo, &manifest_digest, name)?;
-            }
-        }
-    } else if let Some(name) = reference {
-        crate::oci_image::tag_image(repo, &manifest_digest, name)?;
-    }
-
-    // Re-read verities: ensure_oci_composefs_erofs rewrites config and
-    // manifest splitstreams (adding the EROFS ref), so the verities captured
-    // above may be stale.
-    let config_verity = repo
-        .has_stream(&content_id)?
-        .context("config splitstream missing after finalization")?;
-    let manifest_verity = repo
-        .has_stream(&manifest_content_id)?
-        .context("manifest splitstream missing after finalization")?;
-
-    Ok((
-        (
-            (manifest_digest, manifest_verity),
-            (config_digest, config_verity),
-        ),
-        stats,
-    ))
-}
-
-/// Import a single layer directly (privileged mode).
-fn import_layer_direct<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    storage: &Storage,
-    layer: &Layer,
-    diff_id: &OciDigest,
-    zerocopy: bool,
-    ctx: &mut ImportContext,
-) -> Result<(ObjectID, ImportStats)> {
-    let mut stats = ImportStats::default();
-    let mut inline_buf = Vec::new();
-
-    let mut stream = TarSplitFdStream::new(storage, layer)
-        .with_context(|| format!("Failed to create tar-split stream for layer {}", layer.id()))?;
-
-    let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE)?;
-    let content_id = layer_identifier(diff_id);
-
-    // Track padding from previous file - tar-split bundles padding with the NEXT
-    // file's header in Segment entries, but we need to write padding immediately
-    // after file content (like tar.rs does) for consistent splitstream output.
-    let mut prev_file_padding: usize = 0;
-
-    while let Some(item) = stream.next()? {
-        match item {
-            TarSplitItem::Segment(bytes) => {
-                // Skip the leading padding bytes (we already wrote them after prev file)
-                let header_bytes = &bytes[prev_file_padding..];
-                stats.bytes_inlined += header_bytes.len() as u64;
-                writer.write_inline(header_bytes);
-                prev_file_padding = 0;
-            }
-            TarSplitItem::FileContent { fd, size, name } => {
-                process_file_content(
-                    repo,
-                    &mut writer,
-                    &mut stats,
-                    ctx,
-                    fd,
-                    size,
-                    &name,
-                    zerocopy,
-                    &mut inline_buf,
-                )?;
-
-                // Write padding inline immediately after file content
-                let padding_size = (size as usize).next_multiple_of(512) - size as usize;
-                if padding_size > 0 {
-                    stats.bytes_inlined += padding_size as u64;
-                    writer.write_inline(&ZERO_PADDING[..padding_size]);
-                }
-                prev_file_padding = padding_size;
-            }
-        }
-    }
-
-    // Write the stream with the content identifier
-    let verity = repo.write_stream(writer, &content_id, None)?;
-    Ok((verity, stats))
-}
-
-/// Import a single layer via the proxy (rootless mode).
-async fn import_layer_proxied<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    proxy: &mut StorageProxy,
-    storage_path: &str,
-    layer_id: &str,
-    diff_id: &OciDigest,
-    zerocopy: bool,
-    ctx: &mut ImportContext,
-) -> Result<(ObjectID, ImportStats)> {
-    let mut stats = ImportStats::default();
-    let mut inline_buf = Vec::new();
-
-    let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE)?;
-    let content_id = layer_identifier(diff_id);
-
-    // Track padding from previous file - tar-split bundles padding with the NEXT
-    // file's header in Segment entries, but we need to write padding immediately
-    // after file content (like tar.rs does) for consistent splitstream output.
-    let mut prev_file_padding: usize = 0;
-
-    // Stream the layer via the proxy
-    let mut stream = proxy
-        .stream_layer(storage_path, layer_id)
-        .await
-        .with_context(|| format!("Failed to start streaming layer {}", layer_id))?;
-
-    while let Some(item) = stream
-        .next()
-        .await
-        .with_context(|| format!("Failed to receive stream item for layer {}", layer_id))?
-    {
-        match item {
-            ProxiedTarSplitItem::Segment(bytes) => {
-                // Skip the leading padding bytes (we already wrote them after prev file)
-                let header_bytes = &bytes[prev_file_padding..];
-                stats.bytes_inlined += header_bytes.len() as u64;
-                writer.write_inline(header_bytes);
-                prev_file_padding = 0;
-            }
-            ProxiedTarSplitItem::FileContent { fd, size, name } => {
-                process_file_content(
-                    repo,
-                    &mut writer,
-                    &mut stats,
-                    ctx,
-                    fd,
-                    size,
-                    &name,
-                    zerocopy,
-                    &mut inline_buf,
-                )?;
-
-                // Write padding inline immediately after file content
-                let padding_size = (size as usize).next_multiple_of(512) - size as usize;
-                if padding_size > 0 {
-                    stats.bytes_inlined += padding_size as u64;
-                    writer.write_inline(&ZERO_PADDING[..padding_size]);
-                }
-                prev_file_padding = padding_size;
-            }
-        }
-    }
-
-    // Write the stream with the content identifier
-    let verity = repo.write_stream(writer, &content_id, None)?;
-    Ok((verity, stats))
-}
-
-/// Process file content (shared between direct and proxied modes).
-#[allow(clippy::too_many_arguments)]
-fn process_file_content<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    writer: &mut composefs::splitstream::SplitStreamWriter<ObjectID>,
-    stats: &mut ImportStats,
-    ctx: &mut ImportContext,
-    fd: OwnedFd,
-    size: u64,
-    name: &str,
-    zerocopy: bool,
-    inline_buf: &mut Vec<u8>,
-) -> Result<()> {
-    // Convert fd to File for operations
-    let file = std::fs::File::from(fd);
-
-    if size as usize > INLINE_CONTENT_MAX_V0 {
-        // Large file: store as external object
-        let (object_id, method) = if zerocopy {
-            repo.ensure_object_from_file_zerocopy(&file, size, ctx)
-        } else {
-            repo.ensure_object_from_file(&file, size, ctx)
-        }
-        .with_context(|| format!("Failed to store object for {}", name))?;
-
-        match method {
-            ObjectStoreMethod::Reflinked => {
-                stats.objects_reflinked += 1;
-                stats.bytes_reflinked += size;
-            }
-            ObjectStoreMethod::Hardlinked => {
-                stats.objects_hardlinked += 1;
-                stats.bytes_hardlinked += size;
-            }
-            ObjectStoreMethod::Copied => {
-                stats.objects_copied += 1;
-                stats.bytes_copied += size;
-            }
-            ObjectStoreMethod::AlreadyPresent => {
-                stats.objects_already_present += 1;
-            }
-        }
-
-        writer.add_external_size(size);
-        writer.write_reference(object_id)?;
-    } else {
-        // Small file: read and embed inline (reuse buffer across calls)
-        inline_buf.resize(size as usize, 0);
-        file.read_exact_at(inline_buf, 0)?;
-        stats.bytes_inlined += size;
-        writer.write_inline(inline_buf);
-    }
-
-    Ok(())
-}
-
-/// Discover storage paths: the primary store plus any additional image stores
-/// from `$STORAGE_OPTS`.
-fn discover_storage_paths() -> Result<Vec<String>> {
-    let mut paths = Vec::new();
-
-    // Try user storage first (rootless podman)
-    if let Ok(home) = std::env::var("HOME") {
-        let user_path = format!("{}/.local/share/containers/storage", home);
-        if std::path::Path::new(&user_path).exists() {
-            paths.push(user_path);
-        }
-    }
-
-    // Fall back to system storage
-    let system_path = "/var/lib/containers/storage";
-    if std::path::Path::new(system_path).exists() {
-        paths.push(system_path.to_string());
-    }
-
-    // Also check $STORAGE_OPTS for additional image stores
-    if let Ok(opts) = std::env::var("STORAGE_OPTS") {
-        for item in opts.split(',') {
-            let item = item.trim();
-            if let Some(path) = item.strip_prefix("additionalimagestore=")
-                && std::path::Path::new(path).exists()
-            {
-                paths.push(path.to_string());
-            }
-        }
-    }
-
-    anyhow::ensure!(
-        !paths.is_empty(),
-        "Could not find containers-storage at standard locations"
-    );
-    Ok(paths)
+    Ok((result, stats))
 }
 
 /// Check if an image reference uses the containers-storage transport.

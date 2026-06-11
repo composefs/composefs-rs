@@ -194,6 +194,146 @@ pub fn dumpfile_to_tar(dumpfile: &str) -> Vec<u8> {
     builder.into_inner().unwrap()
 }
 
+// ============================================================================
+// Low-level tar/config/manifest builders (used by layer_sync tests and
+// integration tests that need to synthesize OCI images from scratch)
+// ============================================================================
+
+/// Build a minimal OCI-compatible tar layer with standard directory entries
+/// and a single regular file whose `payload_size` bytes of content are
+/// deterministic (byte `i` is `(i % 251) as u8`).
+///
+/// The archive contains:
+/// - `./`  — root directory
+/// - `./usr/`  — usr directory
+/// - `./usr/share/`  — usr/share directory
+/// - `./usr/share/data_<payload_size>` — regular file with `payload_size` bytes
+///
+/// Using `payload_size > 64` (the inline threshold) will produce an external
+/// object when the layer is imported into a repository.
+pub fn build_oci_tar_layer(payload_size: usize) -> Vec<u8> {
+    let mut builder = ::tar::Builder::new(vec![]);
+
+    // Root directory.
+    let mut root_hdr = ::tar::Header::new_ustar();
+    root_hdr.set_entry_type(::tar::EntryType::Directory);
+    root_hdr.set_uid(0);
+    root_hdr.set_gid(0);
+    root_hdr.set_mode(0o755);
+    root_hdr.set_size(0);
+    builder
+        .append_data(&mut root_hdr, "./", std::io::empty())
+        .unwrap();
+
+    // usr/ directory.
+    let mut usr_hdr = ::tar::Header::new_ustar();
+    usr_hdr.set_entry_type(::tar::EntryType::Directory);
+    usr_hdr.set_uid(0);
+    usr_hdr.set_gid(0);
+    usr_hdr.set_mode(0o755);
+    usr_hdr.set_size(0);
+    builder
+        .append_data(&mut usr_hdr, "./usr/", std::io::empty())
+        .unwrap();
+
+    // usr/share/ directory.
+    let mut share_hdr = ::tar::Header::new_ustar();
+    share_hdr.set_entry_type(::tar::EntryType::Directory);
+    share_hdr.set_uid(0);
+    share_hdr.set_gid(0);
+    share_hdr.set_mode(0o755);
+    share_hdr.set_size(0);
+    builder
+        .append_data(&mut share_hdr, "./usr/share/", std::io::empty())
+        .unwrap();
+
+    // A data file with deterministic content.
+    let content: Vec<u8> = (0..payload_size).map(|i| (i % 251) as u8).collect();
+    let mut file_hdr = ::tar::Header::new_ustar();
+    file_hdr.set_entry_type(::tar::EntryType::Regular);
+    file_hdr.set_uid(0);
+    file_hdr.set_gid(0);
+    file_hdr.set_mode(0o644);
+    file_hdr.set_size(payload_size as u64);
+    builder
+        .append_data(
+            &mut file_hdr,
+            format!("./usr/share/data_{payload_size}"),
+            content.as_slice(),
+        )
+        .unwrap();
+
+    builder.into_inner().unwrap()
+}
+
+/// Build a minimal valid OCI `ImageConfiguration` JSON whose
+/// `rootfs.diff_ids` list matches `diff_ids`.
+///
+/// The produced JSON is recognized as a container image
+/// (`MediaType::ImageConfig`) so that `finalize_oci_image` / `OciImage::open`
+/// will generate a composefs EROFS from it.
+pub fn make_config_json(diff_ids: &[String]) -> Vec<u8> {
+    let rootfs = RootFsBuilder::default()
+        .typ("layers")
+        .diff_ids(diff_ids.to_vec())
+        .build()
+        .unwrap();
+
+    let cfg = ConfigBuilder::default().build().unwrap();
+
+    let config = ImageConfigurationBuilder::default()
+        .architecture("amd64")
+        .os("linux")
+        .rootfs(rootfs)
+        .config(cfg)
+        .build()
+        .unwrap();
+
+    config.to_string().unwrap().into_bytes()
+}
+
+/// Build a minimal valid OCI `ImageManifest` JSON that references
+/// `config_digest` as the config and has one layer descriptor per entry in
+/// `diff_ids`.
+///
+/// The layer descriptors use the diff_id as the compressed digest (valid for
+/// splitstream tests where no real compressed transport is used).
+pub fn make_manifest_json(
+    config_json: &[u8],
+    config_digest_str: &str,
+    diff_ids: &[String],
+) -> Vec<u8> {
+    let config_digest: OciDigest = config_digest_str.parse().unwrap();
+    let config_desc = DescriptorBuilder::default()
+        .media_type(MediaType::ImageConfig)
+        .digest(config_digest)
+        .size(config_json.len() as u64)
+        .build()
+        .unwrap();
+
+    let layer_descs: Vec<_> = diff_ids
+        .iter()
+        .map(|d| {
+            DescriptorBuilder::default()
+                .media_type(MediaType::ImageLayerGzip)
+                .digest(d.parse::<OciDigest>().unwrap())
+                .size(1u64)
+                .build()
+                .unwrap()
+        })
+        .collect();
+
+    let manifest = ImageManifestBuilder::default()
+        .schema_version(2u32)
+        .media_type(MediaType::ImageManifest)
+        .config(config_desc)
+        .layers(layer_descs)
+        .build()
+        .unwrap();
+
+    manifest.to_string().unwrap().into_bytes()
+}
+
 /// Return value from image creation helpers.
 #[allow(dead_code)]
 pub struct TestImage {

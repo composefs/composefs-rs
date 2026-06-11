@@ -261,7 +261,7 @@ impl From<ErofsVersion> for composefs::erofs::format::FormatVersion {
 /// start with `@`.
 #[cfg(feature = "oci")]
 #[derive(Debug, Clone)]
-pub(crate) enum OciReference {
+pub enum OciReference {
     /// A content-addressable digest such as `sha256:abcdef…`.
     Digest(composefs_oci::OciDigest),
     /// A named ref resolved through the repository's ref tree, typically
@@ -373,6 +373,31 @@ enum OciCommand {
         /// import path with zero-copy reflink/hardlink support.
         #[arg(long, value_enum, default_value_t = LocalFetchCli::Disabled)]
         local_fetch: LocalFetchCli,
+    },
+    /// Copy an OCI image (and its layers) from this repository into another
+    /// composefs repository, reflinking object data when possible.
+    ///
+    /// The source repository is selected by the global `--repo`/`--user`/
+    /// `--system` flags. The destination is `--to`. Both repositories must use
+    /// the same hash algorithm.
+    ///
+    /// Pass `--zerocopy` to attempt reflink (then hardlink) instead of copying
+    /// object data.  This requires both repositories to be on the same
+    /// filesystem and the caller to have `CAP_DAC_READ_SEARCH` (i.e. root).
+    /// Without `--zerocopy`, objects are always copied, which is safe on any
+    /// filesystem.
+    Copy {
+        /// Image to copy (tag name or `@digest`).
+        image: OciReference,
+        /// Path to the destination composefs repository.
+        #[clap(long)]
+        to: PathBuf,
+        /// Tag to assign to the image in the destination repository.
+        #[clap(long)]
+        name: Option<String>,
+        /// Use reflink/hardlink zero-copy transfer (requires same filesystem and root).
+        #[clap(long)]
+        zerocopy: bool,
     },
     /// List all tagged OCI images in the repository
     #[clap(name = "images")]
@@ -840,12 +865,18 @@ pub async fn run_if_socket_activated() -> Result<bool> {
     if std::env::args_os().len() != 1 {
         return Ok(false);
     }
-    let Some(listener) = crate::varlink::try_activated_listener()? else {
-        return Ok(false);
-    };
     let service = crate::varlink::CfsctlService::activated();
-    crate::varlink::serve_activated(service, listener).await?;
-    Ok(true)
+    match crate::varlink::try_activated_listener()? {
+        Some(crate::varlink::ActivatedSocket::Connected(l)) => {
+            crate::varlink::serve_activated(service, l).await?;
+            Ok(true)
+        }
+        Some(crate::varlink::ActivatedSocket::Listening(listener)) => {
+            crate::varlink::serve_on_listener(service, listener).await?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// Top-level dispatch: handle init specially, otherwise open repo and run.
@@ -1043,6 +1074,150 @@ where
         repo.set_erofs_version(version.into());
     }
     Ok(repo)
+}
+
+/// Copy an OCI image (and all its layers) from one repository to another.
+///
+/// The source and destination may use different fs-verity hash algorithms
+/// (`SrcID` vs `DestID`): the splitdirfdstream carries only raw bytes and
+/// algorithm-independent OCI content digests, and the destination re-computes
+/// each object's fs-verity digest under its own algorithm on import.
+///
+/// When `zerocopy` is `true` the destination attempts reflink/hardlink
+/// (no data copy). This requires both repos to reside on the **same
+/// filesystem** (same `st_dev`), and hardlink additionally requires matching
+/// hash algorithms (fs-verity is enabled in-place on the shared inode).
+/// If `zerocopy` is `true` but the algorithms differ, this function returns
+/// an error up front rather than silently falling back.
+///
+/// Returns accumulated [`composefs_oci::ImportStats`] across all transferred
+/// layers.
+#[cfg(feature = "oci")]
+pub async fn copy_image<SrcID: FsVerityHashValue, DestID: FsVerityHashValue>(
+    src: &Arc<Repository<SrcID>>,
+    dest: &Arc<Repository<DestID>>,
+    image: &OciReference,
+    name: Option<&str>,
+    zerocopy: bool,
+) -> Result<composefs_oci::ImportStats> {
+    use std::fs::File;
+    use std::os::fd::AsFd as _;
+
+    use composefs_oci::ImportStats;
+    use composefs_oci::layer_content_id;
+    use composefs_oci::layer_sync::{
+        drain_splitdirfdstream_verified, produce_layer_splitdirfdstream,
+    };
+
+    // Zerocopy (hardlink) requires the same fs-verity algorithm on both sides
+    // because it enables verity in-place on the shared source inode.
+    if zerocopy && std::any::TypeId::of::<SrcID>() != std::any::TypeId::of::<DestID>() {
+        anyhow::bail!(
+            "--zerocopy requires matching hash algorithms; \
+             source uses {:?} but destination uses {:?}",
+            SrcID::ALGORITHM,
+            DestID::ALGORITHM,
+        );
+    }
+
+    let img = resolve_oci_image(src, image)?;
+    let manifest_json = img.read_manifest_json(src)?;
+    let config_json = img.read_config_json(src)?;
+
+    // Parse the ordered diff_ids from the config by opening the config object.
+    let open_cfg = composefs_oci::open_config(src, img.config_digest(), Some(img.config_verity()))
+        .context("opening config to read diff_ids")?;
+    let diff_id_strs: Vec<String> = open_cfg.config.rootfs().diff_ids().to_vec();
+
+    let mut layer_refs: Vec<(composefs_oci::OciDigest, DestID)> = Vec::new();
+    let mut total_stats = ImportStats {
+        layers: diff_id_strs.len() as u64,
+        ..Default::default()
+    };
+
+    for diff_id_str in &diff_id_strs {
+        let diff_id: composefs_oci::OciDigest = diff_id_str
+            .parse()
+            .with_context(|| format!("parsing diff_id {diff_id_str}"))?;
+        let content_id = layer_content_id(&diff_id);
+
+        // Skip layers that are already present in the destination.
+        if let Some(dest_verity) = dest.has_stream(&content_id)? {
+            layer_refs.push((diff_id, dest_verity));
+            total_stats.layers_already_present += 1;
+            continue;
+        }
+
+        // Layer must exist in the source.
+        let src_verity = src
+            .has_stream(&content_id)?
+            .with_context(|| format!("source repository is missing layer {diff_id}"))?;
+
+        // Create a CLOEXEC pipe for the splitdirfdstream.
+        let (pipe_read, pipe_write) =
+            rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).context("pipe")?;
+
+        // Dup the source objects directory fd for use by the consumer.
+        let src_objects_fd = src.objects_dir().context("src objects_dir")?;
+        let objects_dup = rustix::io::dup(src_objects_fd.as_fd()).context("dup objects_dir")?;
+
+        // Producer thread: write the splitdirfdstream to the pipe.
+        // Uses SrcID — reads from the source repo's object store.
+        // The single objects dir is passed directly at index 0 (no sparse layout).
+        let src_clone = Arc::clone(src);
+        let produce_handle = std::thread::spawn(move || {
+            let wf = File::from(pipe_write);
+            produce_layer_splitdirfdstream(&src_clone, &src_verity, 0, wf)
+        });
+
+        // Drain thread: read the splitdirfdstream and import into dest.
+        // Uses DestID — writes to the destination repo's object store,
+        // re-computing fs-verity digests under DestID's algorithm.
+        let dest_clone = Arc::clone(dest);
+        let diff_id_clone = diff_id.clone();
+        let drain_handle = tokio::task::spawn_blocking(move || {
+            drain_splitdirfdstream_verified(
+                dest_clone,
+                pipe_read,
+                vec![objects_dup],
+                &diff_id_clone,
+                zerocopy,
+                composefs::repository::ImportContext::default(),
+            )
+        });
+
+        // Await both sides. Surface the drain result FIRST: a verification
+        // failure (DiffIdMismatch) is the more informative diagnostic, and a
+        // producer that died mid-stream typically manifests as a drain error
+        // anyway. Only if the drain succeeded do we check the producer join.
+        let drain_result = drain_handle.await.context("drain task panicked")?;
+        let (dest_verity, layer_stats, _ctx) =
+            drain_result.map_err(|e| anyhow::anyhow!("layer copy failed for {diff_id}: {e}"))?;
+
+        // The drain succeeded, so the producer must have written a complete,
+        // valid stream; still join it to catch a late error/panic.
+        if let Err(e) = produce_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("producer panicked"))?
+        {
+            return Err(e.context("splitdirfdstream producer failed"));
+        }
+
+        total_stats.merge(&layer_stats);
+        layer_refs.push((diff_id, dest_verity));
+    }
+
+    // Finalize: write manifest + config splitstreams, generate EROFS, tag.
+    composefs_oci::layer_sync::finalize_oci_image(
+        dest,
+        &manifest_json,
+        &config_json,
+        &layer_refs,
+        name,
+    )
+    .context("finalize_oci_image")?;
+
+    Ok(total_stats)
 }
 
 /// Resolve an [`OciReference`] to an [`OciImage`].
@@ -1324,6 +1499,83 @@ where
                     let image_verity =
                         composefs_oci::generate_boot_image(&repo, &result.manifest_digest)?;
                     println!("Boot image: {}", image_verity.to_hex());
+                }
+            }
+            OciCommand::Copy {
+                ref image,
+                ref to,
+                ref name,
+                zerocopy,
+            } => {
+                // Detect the destination's hash algorithm independently.
+                // Cross-algorithm copy is supported (the splitdirfdstream
+                // carries only algorithm-independent data and the destination
+                // re-digests every object under its own algorithm). The one
+                // exception is --zerocopy (hardlink), which enables fs-verity
+                // in-place on the shared source inode and therefore requires
+                // matching algorithms.
+                let dest_hash = resolve_hash_type(to, args.hash, !args.no_upgrade)
+                    .with_context(|| format!("opening destination repository {}", to.display()))?;
+
+                // Helper: open dest, run copy_image, print results.
+                #[allow(clippy::too_many_arguments)]
+                async fn do_copy<SrcID, DestID>(
+                    src: &Arc<Repository<SrcID>>,
+                    to: &Path,
+                    image: &OciReference,
+                    name: Option<&str>,
+                    zerocopy: bool,
+                    insecure: bool,
+                    require_verity: bool,
+                    no_upgrade: bool,
+                ) -> Result<()>
+                where
+                    SrcID: FsVerityHashValue,
+                    DestID: FsVerityHashValue,
+                {
+                    let dest = open_repo_at::<DestID>(to, insecure, require_verity, no_upgrade)
+                        .with_context(|| {
+                            format!("opening destination repository {}", to.display())
+                        })?;
+                    let dest = Arc::new(dest);
+                    let stats = copy_image(src, &dest, image, name, zerocopy).await?;
+                    let tag_info = if let Some(n) = name {
+                        format!(", tagged as {n}")
+                    } else {
+                        String::new()
+                    };
+                    println!("Copied image {image} to {}{tag_info}", to.display());
+                    println!("Transfer: {stats}");
+                    Ok(())
+                }
+
+                match dest_hash {
+                    HashType::Sha256 => {
+                        do_copy::<ObjectID, Sha256HashValue>(
+                            &repo,
+                            to,
+                            image,
+                            name.as_deref(),
+                            zerocopy,
+                            args.insecure,
+                            args.require_verity,
+                            args.no_upgrade,
+                        )
+                        .await?;
+                    }
+                    HashType::Sha512 => {
+                        do_copy::<ObjectID, Sha512HashValue>(
+                            &repo,
+                            to,
+                            image,
+                            name.as_deref(),
+                            zerocopy,
+                            args.insecure,
+                            args.require_verity,
+                            args.no_upgrade,
+                        )
+                        .await?;
+                    }
                 }
             }
             OciCommand::ListImages { json } => {

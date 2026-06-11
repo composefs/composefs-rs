@@ -1,0 +1,32 @@
+[package]
+name = "composefs-splitdirfdstream"
+description = "Binary format for serializing data with external dirfd-relative file references"
+keywords = ["splitdirfdstream", "fd", "serialization"]
+
+edition.workspace = true
+license.workspace = true
+# Crate-local README (the inherited workspace value resolves to the workspace
+# root README, not this crate's).
+readme = "README.md"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+## Enable `spawn_self_reaping_producer` (requires tokio).
+tokio = ["dep:tokio"]
+
+[dependencies]
+rand = { version = "0.10.0", default-features = false, features = ["alloc"] }
+rand_pcg = { version = "0.10.0", default-features = false }
+rustix = { version = "1.0.0", default-features = false, features = ["fs", "pipe", "std"] }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.0", default-features = false }
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = { version = "3.8.0", default-features = false }
+
+[lints]
+workspace = true
