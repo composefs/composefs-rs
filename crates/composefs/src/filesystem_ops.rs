@@ -34,12 +34,12 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
     #[context("Committing filesystem as EROFS images")]
     pub fn commit_images(
-        &mut self,
+        &self,
         repository: &Repository<ObjectID>,
         image_name: Option<&str>,
     ) -> Result<HashMap<FormatVersion, ObjectID>> {
         // Validate once before writing any version.
-        // add_overlay_whiteouts() for V1 is called inside mkfs_erofs_inner.
+        // add_overlay_whiteouts() for V1 is called inside mkfs_erofs_inner (on a clone).
         validate_filesystem(self)?;
         let formats = repository.format_config();
         let mut result = HashMap::new();
@@ -70,7 +70,7 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
     #[context("Committing filesystem as EROFS image")]
     pub fn commit_image(
-        &mut self,
+        &self,
         repository: &Repository<ObjectID>,
         image_name: Option<&str>,
     ) -> Result<ObjectID> {
@@ -88,7 +88,7 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
     ///
     /// Note: Callers should ensure root metadata is set before calling this,
     /// typically via `copy_root_metadata_from_usr()` or `set_root_stat()`.
-    pub fn compute_image_id(&mut self, version: FormatVersion) -> ObjectID {
+    pub fn compute_image_id(&self, version: FormatVersion) -> ObjectID {
         // Callers are responsible for ensuring the tree is valid before calling this.
         // In practice this is always called on freshly-built trees that don't have
         // invalid constructs like hardlinked whiteouts.

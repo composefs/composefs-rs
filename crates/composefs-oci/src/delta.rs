@@ -704,8 +704,15 @@ pub(crate) async fn import_delta<ObjectID: FsVerityHashValue>(
         .map(|(diff_id, verity)| (diff_id.to_string().into_boxed_str(), verity.clone()))
         .collect();
 
-    let (_, config_verity) =
-        crate::write_config_raw(repo, &parsed.target_config_raw, refs_map, None, None)?;
+    let (_, config_verity) = crate::write_config_raw(
+        repo,
+        &parsed.target_config_raw,
+        refs_map,
+        None,
+        None,
+        None,
+        None,
+    )?;
 
     // Write manifest splitstream (using raw bytes to preserve original JSON)
     let layer_verities: Vec<_> = layer_refs

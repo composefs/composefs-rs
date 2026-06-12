@@ -602,7 +602,7 @@ impl<T> Directory<T> {
 /// Leaf nodes (non-directory files) are stored in a flat `Vec` and referenced
 /// by [`LeafId`] indices from the directory tree. This design is `Send + Sync`,
 /// supports hardlinks via shared `LeafId`, and avoids reference counting.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileSystem<T> {
     /// The root directory of the filesystem.
     pub root: Directory<T>,

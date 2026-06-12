@@ -31,7 +31,7 @@ CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
 rm -rf tmp/efi tmp/sysroot/composefs/images
-${CFSCTL} init --algorithm=fsverity-sha256-12
+${CFSCTL} init --algorithm=fsverity-sha256-12 --erofs-version 1
 
 ${PODMAN_BUILD} \
     --iidfile=tmp/base.iid \
@@ -41,13 +41,18 @@ ${PODMAN_BUILD} \
 
 BASE_ID="$(cat tmp/base.iid)"
 ${CFSCTL} oci pull containers-storage:"${BASE_ID}"
-BASE_IMAGE_FSVERITY="$(${CFSCTL} oci compute-id --bootable "@${BASE_ID}")"
+
+# Compute the composefs kernel argument from the repo-side view of the base image.
+# Using oci compute-id --bootable gives the same digest that prepare-boot will use
+# when processing the final image (both go through transform_for_boot with the repo),
+# so the karg baked into the UKI will match what prepare-boot validates.
+BASE_BOOTABLE_ID="$(${CFSCTL} oci compute-id --bootable "@${BASE_ID}")"
+BASE_KARG="composefs.digest=v1-sha256-12:${BASE_BOOTABLE_ID}"
 
 ${PODMAN_BUILD} \
     --iidfile=tmp/final.iid \
     --build-context=base="container-image://${BASE_ID}" \
-    --build-arg=COMPOSEFS_FSVERITY="${BASE_IMAGE_FSVERITY}" \
-    --label=containers.composefs.fsverity="${BASE_IMAGE_FSVERITY}" \
+    --build-arg=COMPOSEFS_KARG="${BASE_KARG}" \
     -f "${containerfile}" \
     .
 

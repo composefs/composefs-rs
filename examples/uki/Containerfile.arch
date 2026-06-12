@@ -30,10 +30,10 @@ RUN <<EOF
 EOF
 
 FROM base AS kernel
-ARG COMPOSEFS_FSVERITY
+ARG COMPOSEFS_KARG
 RUN <<EOF
     set -eux
-    echo "root=/dev/vda2 composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
+    echo "root=/dev/vda2 ${COMPOSEFS_KARG} rw" > /etc/kernel/cmdline
     mkinitcpio -p linux
 EOF
 

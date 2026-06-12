@@ -33,7 +33,7 @@ pub fn boot_image<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     manifest_digest: &OciDigest,
 ) -> Result<Option<ObjectID>> {
-    crate::composefs_boot_erofs_for_manifest(repo, manifest_digest, None)
+    crate::composefs_boot_erofs_for_manifest(repo, manifest_digest, None, repo.erofs_version())
 }
 
 /// Remove the bootable EROFS image reference (idempotent).
@@ -49,7 +49,7 @@ pub fn remove_boot_image<ObjectID: FsVerityHashValue>(
         anyhow::bail!("not a container image");
     }
 
-    if img.boot_image_ref().is_none() {
+    if img.boot_image_ref(repo.erofs_version()).is_none() {
         return Ok(());
     }
 
@@ -60,8 +60,10 @@ pub fn remove_boot_image<ObjectID: FsVerityHashValue>(
         repo,
         &config_json,
         img.layer_refs().clone(),
-        img.image_ref(),
-        None, // no boot image
+        img.image_ref_v2(), // preserve existing V2 image ref
+        img.image_ref_v1(), // preserve existing V1 image ref
+        None,               // no boot image (V2)
+        None,               // no boot image (V1)
     )?;
 
     let manifest_json = img.read_manifest_json(repo)?;
@@ -86,7 +88,6 @@ pub fn remove_boot_image<ObjectID: FsVerityHashValue>(
 #[cfg(all(test, feature = "boot"))]
 mod test {
     use super::*;
-    use composefs::erofs::format::FormatVersion;
     use composefs::fsverity::Sha256HashValue;
     use composefs::test::TestRepo;
     use composefs_boot::bootloader::get_boot_resources;
@@ -119,11 +120,13 @@ mod test {
 
         // Open by tag since manifest was rewritten
         let oci = OciImage::open_ref(repo, "myapp:v1").unwrap();
-        assert_eq!(oci.boot_image_ref(), Some(&image_verity));
+        assert_eq!(
+            oci.boot_image_ref(repo.erofs_version()),
+            Some(&image_verity)
+        );
 
-        let mut plain_image =
-            crate::image::create_filesystem(repo, &img.config_digest, None).unwrap();
-        let plain_verity = plain_image.compute_image_id(FormatVersion::V2);
+        let plain_image = crate::image::create_filesystem(repo, &img.config_digest, None).unwrap();
+        let plain_verity = plain_image.compute_image_id(repo.erofs_version());
         assert_ne!(
             image_verity, plain_verity,
             "boot-transformed image should differ from non-transformed image"
@@ -198,7 +201,10 @@ mod test {
         assert_eq!(gc.streams_pruned, 0);
 
         let oci = OciImage::open_ref(repo, "myapp:v1").unwrap();
-        assert_eq!(oci.boot_image_ref(), Some(&image_verity));
+        assert_eq!(
+            oci.boot_image_ref(repo.erofs_version()),
+            Some(&image_verity)
+        );
     }
 
     #[tokio::test]
@@ -238,7 +244,7 @@ mod test {
 
         let oci = OciImage::open_ref(repo, "myapp:v1").unwrap();
         assert!(oci.is_container_image());
-        assert!(oci.boot_image_ref().is_none());
+        assert!(oci.boot_image_ref(repo.erofs_version()).is_none());
     }
 
     /// Boot EROFS differs from plain EROFS and contains the expected boot entries.
@@ -269,8 +275,7 @@ mod test {
                 "tag={tag}: expected Type2 entry"
             );
 
-            let mut plain_fs =
-                crate::image::create_filesystem(repo, &img.config_digest, None).unwrap();
+            let plain_fs = crate::image::create_filesystem(repo, &img.config_digest, None).unwrap();
             let plain_verity = plain_fs.commit_image(repo, None).unwrap();
             assert_ne!(boot_verity, plain_verity, "tag={tag}");
         }

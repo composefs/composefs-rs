@@ -44,11 +44,10 @@ FROM base AS kernel
 RUN --mount=type=bind,from=base,target=/mnt/base <<EOF
     set -eux
 
-    cfsctl init --algorithm=fsverity-sha256-12 /tmp/sysroot/composefs
-    COMPOSEFS_FSVERITY="$(cfsctl --repo /tmp/sysroot/composefs compute-id --bootable /mnt/base)"
+    COMPOSEFS_KARG="$(cfsctl --hash sha256 --erofs-version 1 compute-karg /mnt/base)"
 
     mkdir -p /etc/kernel /etc/dracut.conf.d
-    echo "composefs=${COMPOSEFS_FSVERITY} rw" > /etc/kernel/cmdline
+    echo "${COMPOSEFS_KARG} rw" > /etc/kernel/cmdline
 EOF
 RUN --mount=type=cache,target=/var/cache/libdnf5 \
     --mount=type=secret,id=key \

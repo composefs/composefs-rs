@@ -1876,11 +1876,9 @@ fn prepare_erofs_inodes<'a, ObjectID: FsVerityHashValue>(
 /// 2. Second pass writes the actual image data
 ///
 /// Returns the complete EROFS image as a byte array.
-pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(
-    fs: &mut ValidatedFileSystem<ObjectID>,
-) -> Box<[u8]> {
+pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(fs: &ValidatedFileSystem<ObjectID>) -> Box<[u8]> {
     mkfs_erofs_inner(
-        &mut fs.0,
+        &fs.0,
         format::FormatVersion::default(),
         #[cfg(test)]
         None,
@@ -1892,14 +1890,30 @@ pub fn mkfs_erofs<ObjectID: FsVerityHashValue>(
 /// Runs a layout pass (first pass) followed by an emit pass (second pass).
 /// When `faults` is `Some`, decisions are recorded during the first pass and
 /// replayed during the second so both passes make identical choices.
+///
+/// Takes an immutable reference to the filesystem.  For Epoch1 (V0/V1) formats,
+/// whiteout stubs are added to a temporary clone so the caller's tree is never
+/// mutated.
 pub(crate) fn mkfs_erofs_inner<ObjectID: FsVerityHashValue>(
-    fs: &mut tree::FileSystem<ObjectID>,
+    fs: &tree::FileSystem<ObjectID>,
     version: format::FormatVersion,
     #[cfg(test)] faults: Option<WriterFaults>,
 ) -> Box<[u8]> {
-    if version.epoch() == FormatEpoch::Epoch1 {
-        fs.add_overlay_whiteouts();
-    }
+    // For Epoch1 (V0/V1) formats, whiteout stubs must be present during image
+    // generation.  Clone the tree and add stubs to the clone so the caller's
+    // filesystem is never mutated.
+    let fs_with_whiteouts;
+    let fs = if version.epoch() == FormatEpoch::Epoch1 {
+        fs_with_whiteouts = {
+            let mut cloned = fs.clone();
+            cloned.add_overlay_whiteouts();
+            cloned
+        };
+        &fs_with_whiteouts
+    } else {
+        fs
+    };
+
     let (inodes, xattrs, min_mtime, header_flags, composefs_version) =
         prepare_erofs_inodes(fs, version);
 
@@ -1945,11 +1959,11 @@ pub(crate) fn mkfs_erofs_inner<ObjectID: FsVerityHashValue>(
 ///
 /// Returns the complete EROFS image as a byte array.
 pub fn mkfs_erofs_versioned<ObjectID: FsVerityHashValue>(
-    fs: &mut ValidatedFileSystem<ObjectID>,
+    fs: &ValidatedFileSystem<ObjectID>,
     version: format::FormatVersion,
 ) -> Box<[u8]> {
     mkfs_erofs_inner(
-        &mut fs.0,
+        &fs.0,
         version,
         #[cfg(test)]
         None,
@@ -1962,11 +1976,11 @@ pub fn mkfs_erofs_versioned<ObjectID: FsVerityHashValue>(
 /// Pass `WriterFaults::new(seed)` with the desired rates set.
 #[cfg(test)]
 pub(crate) fn mkfs_erofs_with_faults<ObjectID: FsVerityHashValue>(
-    fs: &mut ValidatedFileSystem<ObjectID>,
+    fs: &ValidatedFileSystem<ObjectID>,
     version: format::FormatVersion,
     faults: WriterFaults,
 ) -> Box<[u8]> {
-    mkfs_erofs_inner(&mut fs.0, version, Some(faults))
+    mkfs_erofs_inner(&fs.0, version, Some(faults))
 }
 
 #[cfg(test)]
@@ -1992,5 +2006,67 @@ mod tests {
         assert_eq!(compute_chunk_format(1 << 20), 8, "size=1<<20");
         // size=(1<<20)+1: ilog2(1<<20)+1=21 → result 9
         assert_eq!(compute_chunk_format((1 << 20) + 1), 9, "size=(1<<20)+1");
+    }
+
+    /// Generating a V2 image after a V1 image from the same `FileSystem` must
+    /// produce the same bytes as generating V2 alone.
+    ///
+    /// This is the regression test for the bug where `add_overlay_whiteouts()`
+    /// permanently mutated the tree during V1 generation, leaving 256 whiteout
+    /// stub entries in the root that then polluted the subsequent V2 image.
+    #[test]
+    fn test_v2_digest_unaffected_by_prior_v1_generation() {
+        use crate::{
+            dumpfile::dumpfile_to_filesystem,
+            erofs::{
+                format::FormatVersion,
+                writer::{ValidatedFileSystem, mkfs_erofs_inner},
+            },
+            fsverity::Sha256HashValue,
+        };
+
+        // A modest filesystem with a couple of entries to make the image non-trivial.
+        // Format: path size mode nlink uid gid rdev mtime payload content digest
+        let dumpfile = concat!(
+            "/ 0 40755 2 0 0 0 1000.0 - - -\n",
+            "/usr 0 40755 2 0 0 0 1000.0 - - -\n",
+            "/usr/lib 0 40755 2 0 0 0 1000.0 - - -\n",
+            "/usr/lib/libfoo.so 5 100644 1 0 0 0 1000.0 - hello -\n",
+        );
+
+        // Build V2-alone image first (before any V1 has touched the tree).
+        let fs_v2_only = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let v2_alone = mkfs_erofs_inner(
+            &ValidatedFileSystem::new(fs_v2_only).unwrap().0,
+            FormatVersion::V2,
+            None,
+        );
+
+        // Now build V1 then V2 from the same filesystem.
+        let fs_both = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
+        let inner = ValidatedFileSystem::new(fs_both).unwrap().0;
+        let root_entries_before = inner.root.entries.len();
+        let leaves_before = inner.leaves.len();
+
+        let _v1 = mkfs_erofs_inner(&inner, FormatVersion::V1, None);
+
+        // After V1 generation the tree must be unchanged (clone-based, immutable).
+        assert_eq!(
+            inner.root.entries.len(),
+            root_entries_before,
+            "V1 generation unexpectedly modified the root directory"
+        );
+        assert_eq!(
+            inner.leaves.len(),
+            leaves_before,
+            "V1 generation unexpectedly modified the leaves table"
+        );
+
+        let v2_after_v1 = mkfs_erofs_inner(&inner, FormatVersion::V2, None);
+
+        assert_eq!(
+            v2_alone, v2_after_v1,
+            "V2 image differs depending on whether V1 was generated first"
+        );
     }
 }
