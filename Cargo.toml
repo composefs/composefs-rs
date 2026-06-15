@@ -24,7 +24,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/containers/composefs-rs"
 rust-version = "1.88.0"
-version = "0.4.0"
+version = "0.7.0"
 
 [workspace.lints.rust]
 missing_docs = "deny"
@@ -32,12 +32,12 @@ missing_debug_implementations = "deny"
 unsafe_code = "deny" # https://github.com/containers/composefs-rs/issues/123
 
 [workspace.dependencies]
-composefs = { version = "0.4.0", path = "crates/composefs", default-features = false }
-composefs-ctl = { version = "0.4.0", path = "crates/composefs-ctl", default-features = false }
-composefs-ioctls = { version = "0.4.0", path = "crates/composefs-ioctls", default-features = false }
-composefs-oci = { version = "0.4.0", path = "crates/composefs-oci", default-features = false }
-composefs-boot = { version = "0.4.0", path = "crates/composefs-boot", default-features = false }
-composefs-http = { version = "0.4.0", path = "crates/composefs-http", default-features = false }
+composefs = { version = "0.7.0", path = "crates/composefs", default-features = false }
+composefs-ctl = { version = "0.7.0", path = "crates/composefs-ctl", default-features = false }
+composefs-ioctls = { version = "0.7.0", path = "crates/composefs-ioctls", default-features = false }
+composefs-oci = { version = "0.7.0", path = "crates/composefs-oci", default-features = false }
+composefs-boot = { version = "0.7.0", path = "crates/composefs-boot", default-features = false }
+composefs-http = { version = "0.7.0", path = "crates/composefs-http", default-features = false }
 cap-std-ext = "5.1.2"
 ocidir = "0.7.2"
 
