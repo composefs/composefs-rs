@@ -85,10 +85,6 @@ patch: clone
     # bootc has workspace.lints.rust.missing_docs = "deny" but composefs-rs has undocumented items
     sed -i 's/missing_docs = "deny"/missing_docs = "allow"/' Cargo.toml
 
-    # Cargo.lock will be updated on the next build/check.
-    # We intentionally don't run `cargo update` here because it rewrites
-    # the workspace dependency line in Cargo.toml (replacing git+rev with path).
-
     # Update the rev comment in the [patch] section so Cargo.toml actually
     # changes when composefs-rs moves to a new commit.  Since the file is
     # part of the podman build context this busts the layer cache.
