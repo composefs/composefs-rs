@@ -67,7 +67,7 @@ pub(crate) trait DeltaBlobReader: Send + Sync {
     fn open_blob(
         &self,
         desc: &Descriptor,
-    ) -> Pin<Box<dyn Future<Output = Result<File>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Read + Send>>> + Send + '_>>;
 }
 
 /// Check whether an OCI manifest is a delta artifact.
@@ -326,7 +326,10 @@ fn tar_patch_apply<ObjectID: FsVerityHashValue>(
 
 /// Reconstruct a single layer's uncompressed tar from a delta blob.
 /// Returns a seeked-to-start temp file with diff_id already verified.
-fn decompress_layer(reader: File, media_type: &MediaType) -> Result<Box<dyn Read + Send>> {
+fn decompress_layer(
+    reader: impl Read + Send + 'static,
+    media_type: &MediaType,
+) -> Result<Box<dyn Read + Send>> {
     let buf = BufReader::new(reader);
     match media_type {
         MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => Ok(Box::new(buf)),
@@ -343,7 +346,7 @@ fn decompress_layer(reader: File, media_type: &MediaType) -> Result<Box<dyn Read
 fn reconstruct_layer<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     source_image: &Arc<SourceImage<ObjectID>>,
-    blob_file: File,
+    blob_reader: impl Read + Send + 'static,
     media_type: &MediaType,
     expected_diff_id: &OciDigest,
 ) -> Result<File> {
@@ -362,9 +365,9 @@ fn reconstruct_layer<ObjectID: FsVerityHashValue>(
             inner: &mut tmpfile,
             hasher: &mut hasher,
         };
-        tar_patch_apply(blob_file, &mut data_source, &mut hashing_writer)?;
+        tar_patch_apply(blob_reader, &mut data_source, &mut hashing_writer)?;
     } else {
-        let mut decoder = decompress_layer(blob_file, media_type)?;
+        let mut decoder = decompress_layer(blob_reader, media_type)?;
         let mut hashing_writer = HashingWriter {
             inner: &mut tmpfile,
             hasher: &mut hasher,

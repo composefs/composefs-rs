@@ -534,7 +534,7 @@ impl<ObjectID: FsVerityHashValue> crate::delta::DeltaBlobReader for ProxyBlobRea
         &self,
         desc: &Descriptor,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<std::fs::File>> + Send + '_>,
+        Box<dyn std::future::Future<Output = Result<Box<dyn std::io::Read + Send>>> + Send + '_>,
     > {
         let desc = desc.clone();
         Box::pin(async move {
@@ -556,7 +556,7 @@ impl<ObjectID: FsVerityHashValue> crate::delta::DeltaBlobReader for ProxyBlobRea
                 let mut std_file = async_dst.into_std().await;
                 use std::io::Seek;
                 std_file.seek(std::io::SeekFrom::Start(0))?;
-                anyhow::Ok(std_file)
+                anyhow::Ok(Box::new(std_file) as Box<dyn std::io::Read + Send>)
             };
             let (file_result, driver_result) = tokio::join!(copy_fut, driver);
             let _: () = driver_result?;
@@ -588,8 +588,10 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
     let image_ref =
         ImageReference::try_from(imgref).context("Parsing image reference transport")?;
 
-    // Fast path: read local OCI layout directories directly without skopeo
-    let (result, stats) = if image_ref.transport == Transport::OciDir {
+    // Fast path: read local OCI layout directories and archives directly without skopeo
+    let (result, stats) = if image_ref.transport == Transport::OciDir
+        || image_ref.transport == Transport::OciArchive
+    {
         let (path_str, layout_tag) = crate::oci_layout::parse_oci_layout_ref(&image_ref.name);
         let layout_path = std::path::Path::new(path_str);
         crate::oci_layout::import_oci_layout(repo, layout_path, layout_tag, reporter).await?
