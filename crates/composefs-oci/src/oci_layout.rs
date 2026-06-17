@@ -418,9 +418,10 @@ struct OciDirBlobReader(OciDir);
 impl crate::delta::DeltaBlobReader for OciDirBlobReader {
     fn open_blob(
         &self,
-        digest: &OciDigest,
+        desc: &Descriptor,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<std::fs::File>> + Send + '_>>
     {
+        let digest = desc.digest();
         let blob_path = format!("blobs/{}/{}", digest.algorithm(), digest.digest());
         Box::pin(std::future::ready(
             self.0

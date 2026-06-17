@@ -514,15 +514,8 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         self.reporter
             .report(ProgressEvent::Message("Detected delta artifact...".into()));
 
-        let descriptors: std::collections::HashMap<_, _> =
-            crate::delta::delta_layer_descriptors(manifest)
-                .iter()
-                .map(|d| (d.digest().clone(), d.clone()))
-                .collect();
-
         let blob_reader = Arc::new(ProxyBlobReader {
             image_op: Arc::clone(self),
-            descriptors,
         });
 
         // Limit to 2 concurrent layers: download the next while applying the previous,
@@ -534,27 +527,21 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
 /// Blob reader that fetches from a skopeo image proxy on demand.
 struct ProxyBlobReader<ObjectID: FsVerityHashValue> {
     image_op: Arc<ImageOp<ObjectID>>,
-    descriptors:
-        std::collections::HashMap<OciDigest, containers_image_proxy::oci_spec::image::Descriptor>,
 }
 
 impl<ObjectID: FsVerityHashValue> crate::delta::DeltaBlobReader for ProxyBlobReader<ObjectID> {
     fn open_blob(
         &self,
-        digest: &OciDigest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<std::fs::File>> + Send + '_>>
-    {
-        let digest = digest.clone();
+        desc: &Descriptor,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<std::fs::File>> + Send + '_>,
+    > {
+        let desc = desc.clone();
         Box::pin(async move {
-            let desc = self
-                .descriptors
-                .get(&digest)
-                .with_context(|| format!("No descriptor for blob {digest}"))?;
-
             let (reader, driver) = self
                 .image_op
                 .proxy
-                .get_blob(&self.image_op.img, &digest, desc.size())
+                .get_blob(&self.image_op.img, desc.digest(), desc.size())
                 .await?;
 
             let tmpfile = self
