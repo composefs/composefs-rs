@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use cap_std_ext::cap_std;
 use containers_image_proxy::oci_spec::image::{Descriptor, Digest as OciDigest, MediaType};
 use fn_error_context::context;
+use ocidir::prelude::*;
 use ocidir::{OciDir, ResolvedManifest};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
