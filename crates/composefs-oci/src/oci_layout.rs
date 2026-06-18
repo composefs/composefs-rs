@@ -19,7 +19,6 @@ use std::io::Read;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll};
 use std::thread::available_parallelism;
 
 use anyhow::{Context, Result};
@@ -30,8 +29,10 @@ use containers_image_proxy::oci_spec::image::{
 use fn_error_context::context;
 use ocidir::prelude::*;
 use ocidir::{OciArchive, OciDir, ResolvedManifest};
+use tokio::io::DuplexStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio_util::io::SyncIoBridge;
 use tracing::debug;
 
 use composefs::fsverity::FsVerityHashValue;
@@ -48,83 +49,15 @@ use crate::skopeo::PullResult;
 
 const READ_BUF_SIZE: usize = 128 * 1024;
 
-/// Adapts a synchronous `Read` into a `tokio::io::AsyncRead` by dispatching
-/// reads to [`tokio::task::spawn_blocking`], similar to `tokio::fs::File`.
-struct BlockingReader {
-    reader: Option<Box<dyn Read + Send>>,
-    pending:
-        Option<tokio::task::JoinHandle<(Box<dyn Read + Send>, std::io::Result<usize>, Vec<u8>)>>,
-    buf: Vec<u8>,
-    pos: usize,
-}
-
-impl BlockingReader {
-    fn new(reader: Box<dyn Read + Send>) -> Self {
-        Self {
-            reader: Some(reader),
-            pending: None,
-            buf: Vec::new(),
-            pos: 0,
-        }
-    }
-}
-
-impl tokio::io::AsyncRead for BlockingReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        // Drain buffered data first.
-        if self.pos < self.buf.len() {
-            let remaining = &self.buf[self.pos..];
-            let n = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..n]);
-            self.pos += n;
-            return Poll::Ready(Ok(()));
-        }
-
-        // Poll an in-flight blocking read.
-        if let Some(handle) = &mut self.pending {
-            let (reader, result, data) = match Pin::new(handle).poll(cx) {
-                Poll::Ready(Ok(v)) => v,
-                Poll::Ready(Err(e)) => {
-                    self.pending = None;
-                    return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
-                }
-                Poll::Pending => return Poll::Pending,
-            };
-            self.pending = None;
-            self.reader = Some(reader);
-            match result {
-                Ok(n) => {
-                    self.buf = data;
-                    self.buf.truncate(n);
-                    self.pos = 0;
-                    if n == 0 {
-                        return Poll::Ready(Ok(()));
-                    }
-                    let copy = n.min(buf.remaining());
-                    buf.put_slice(&self.buf[..copy]);
-                    self.pos = copy;
-                    return Poll::Ready(Ok(()));
-                }
-                Err(e) => return Poll::Ready(Err(e)),
-            }
-        }
-
-        // Spawn a new blocking read, reusing the existing buffer.
-        let mut reader = self.reader.take().expect("reader taken without pending");
-        let mut data = std::mem::take(&mut self.buf);
-        let handle = tokio::task::spawn_blocking(move || {
-            data.resize(READ_BUF_SIZE, 0);
-            let result = reader.read(&mut data);
-            (reader, result, data)
-        });
-        self.pending = Some(handle);
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    }
+/// Adapts a synchronous `Read` into a [`tokio::io::AsyncRead`] by copying data
+/// through a [`tokio::io::duplex`] channel from a single blocking thread.
+fn blocking_reader(mut reader: Box<dyn Read + Send>) -> DuplexStream {
+    let (async_read, async_write) = tokio::io::duplex(READ_BUF_SIZE);
+    tokio::task::spawn_blocking(move || {
+        let mut writer = SyncIoBridge::new(async_write);
+        std::io::copy(&mut reader, &mut writer)
+    });
+    async_read
 }
 
 /// Check if an OCI layout contains a single delta artifact manifest.
@@ -463,7 +396,7 @@ async fn import_layer_from_blob<ObjectID: FsVerityHashValue>(
     // The watch channel provides backpressure: if the renderer is slow, intermediate
     // byte counts are coalesced rather than queued, keeping the I/O path non-blocking.
     let (async_file, progress_driver) = ProgressRead::new(
-        BlockingReader::new(layer_reader),
+        blocking_reader(layer_reader),
         Arc::clone(reporter),
         id.clone(),
         Some(layer_size),
