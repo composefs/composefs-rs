@@ -49,9 +49,12 @@ use crate::skopeo::PullResult;
 
 const READ_BUF_SIZE: usize = 128 * 1024;
 
+/// A boxed synchronous byte reader that can be sent across threads.
+pub(crate) type OciBlobReader = Box<dyn Read + Send>;
+
 /// Adapts a synchronous `Read` into a [`tokio::io::AsyncRead`] by copying data
 /// through a [`tokio::io::duplex`] channel from a single blocking thread.
-fn blocking_reader(mut reader: Box<dyn Read + Send>) -> DuplexStream {
+fn blocking_reader(mut reader: OciBlobReader) -> DuplexStream {
     let (async_read, async_write) = tokio::io::duplex(READ_BUF_SIZE);
     tokio::task::spawn_blocking(move || {
         let mut writer = SyncIoBridge::new(async_write);
@@ -301,7 +304,7 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue, T: OciRead + Send
         let permit = Arc::clone(&sem).acquire_owned().await?;
         let reporter = Arc::clone(reporter);
 
-        let layer_reader: Box<dyn Read + Send> = Box::new(
+        let layer_reader: OciBlobReader = Box::new(
             oci.read_blob(descriptor)
                 .with_context(|| format!("Opening layer blob {}", descriptor.digest()))?,
         );
@@ -368,7 +371,7 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue, T: OciRead + Send
 async fn import_layer_from_blob<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     diff_id: &OciDigest,
-    layer_reader: Box<dyn Read + Send>,
+    layer_reader: OciBlobReader,
     media_type: &MediaType,
     layer_size: u64,
     reporter: &SharedReporter,
@@ -460,11 +463,11 @@ impl<T: OciRead + Send + Sync> crate::delta::DeltaBlobReader for OwnedBlobReader
     fn open_blob(
         &self,
         desc: &Descriptor,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<Box<dyn Read + Send>>> + Send + '_>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<OciBlobReader>> + Send + '_>> {
         let result = self
             .0
             .read_blob(desc)
-            .map(|r| Box::new(r) as Box<dyn Read + Send>)
+            .map(|r| Box::new(r) as OciBlobReader)
             .with_context(|| format!("Reading blob {}", desc.digest()));
         Box::pin(std::future::ready(result))
     }

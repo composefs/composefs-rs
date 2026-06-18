@@ -29,6 +29,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::oci_image;
+use crate::oci_layout::OciBlobReader;
 use crate::progress::{ComponentId, ProgressEvent, ProgressUnit, SharedReporter};
 use crate::skopeo::PullResult;
 use crate::{ImportStats, layer_identifier};
@@ -67,7 +68,7 @@ pub(crate) trait DeltaBlobReader: Send + Sync {
     fn open_blob(
         &self,
         desc: &Descriptor,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Read + Send>>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<OciBlobReader>> + Send + '_>>;
 }
 
 /// Check whether an OCI manifest is a delta artifact.
@@ -329,7 +330,7 @@ fn tar_patch_apply<ObjectID: FsVerityHashValue>(
 fn decompress_layer(
     reader: impl Read + Send + 'static,
     media_type: &MediaType,
-) -> Result<Box<dyn Read + Send>> {
+) -> Result<OciBlobReader> {
     let buf = BufReader::new(reader);
     match media_type {
         MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => Ok(Box::new(buf)),
