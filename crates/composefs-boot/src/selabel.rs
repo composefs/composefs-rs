@@ -3,7 +3,7 @@
 //! This module implements SELinux policy parsing and file labeling functionality.
 //! It reads SELinux policy files (file_contexts, file_contexts.subs, etc.) and applies
 //! appropriate security.selinux extended attributes to filesystem nodes. The implementation
-//! uses regex automata for efficient pattern matching against file paths and types.
+//! uses pcre2 for compatibility with selinux regex (same library selinux uses)
 
 use std::{
     collections::HashMap,
@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use fn_error_context::context;
-use regex_automata::{Anchored, Input, hybrid::dfa, util::syntax};
+use pcre2::bytes::Regex;
 use rustix::{
     fd::AsFd,
     fs::{Mode, OFlags, openat},
@@ -35,25 +35,6 @@ use composefs::{
 /// When reading from mounted filesystems, this xattr often contains build-host labels
 /// that should be stripped or regenerated based on the target system's policy.
 pub const XATTR_SECURITY_SELINUX: &str = "security.selinux";
-
-/* We build the entire SELinux policy into a single "lazy DFA" such that:
- *
- *  - the input string is the filename plus a single character representing the type of the file,
- *    using the 'file type' codes listed in selabel_file(5): 'b', 'c', 'd', 'p', 'l', 's', and '-'
- *
- *  - the output pattern ID is the index of the selected context
- *
- * The 'subs' mapping is handled as a hash table.  We consult it each time we enter a directory and
- * perform the substitution a single time at that point instead of doing it for each contained
- * file.
- *
- * We could maybe add a string table to deduplicate contexts to save memory (as they are often
- * repeated).  It's not an order-of-magnitude kind of gain, though, and it would increase code
- * complexity, and slightly decrease efficiency.
- *
- * Note: we are not 100% compatible with PCRE here, so it's theoretically possible that someone
- * could write a policy that we can't properly handle...
- */
 
 #[context("Processing SELinux substitutions file")]
 fn process_subs_file(file: impl Read, aliases: &mut HashMap<OsString, OsString>) -> Result<()> {
@@ -122,8 +103,7 @@ fn process_spec_file(
 
 struct Policy {
     aliases: HashMap<OsString, OsString>,
-    dfa: dfa::DFA,
-    cache: dfa::Cache,
+    regexes: Vec<Regex>,
     contexts: Vec<String>,
 }
 
@@ -188,29 +168,18 @@ impl Policy {
             }
         }
 
-        // The DFA matches the first-found.  We want to match the last-found.
+        // We want to match the last-found.
         regexps.reverse();
         contexts.reverse();
 
-        let mut builder = dfa::Builder::new();
-        builder.syntax(
-            syntax::Config::new()
-                .unicode(false)
-                .utf8(false)
-                .line_terminator(0),
-        );
-        builder.configure(
-            dfa::Config::new()
-                .cache_capacity(10_000_000)
-                .skip_cache_capacity_check(true),
-        );
-        let dfa = builder.build_many(&regexps)?;
-        let cache = dfa.create_cache();
+        let mut compiled = Vec::with_capacity(regexps.len());
+        for r in &regexps {
+            compiled.push(Regex::new(r).with_context(|| format!("Compiling PCRE2 regex: {r}"))?);
+        }
 
         Ok(Policy {
             aliases,
-            dfa,
-            cache,
+            regexes: compiled,
             contexts,
         })
     }
@@ -219,22 +188,16 @@ impl Policy {
         self.aliases.get(filename).map(|x| x.as_os_str())
     }
 
-    // mut because it touches the cache
-    pub fn lookup(&mut self, filename: &OsStr, ifmt: u8) -> Option<&str> {
+    pub fn lookup(&self, filename: &OsStr, ifmt: u8) -> Option<&str> {
         let key = &[filename.as_bytes(), &[ifmt]].concat();
-        let input = Input::new(&key).anchored(Anchored::Yes);
 
-        match self
-            .dfa
-            .try_search_fwd(&mut self.cache, &input)
-            .expect("regex troubles")
-        {
-            Some(halfmatch) => match self.contexts[halfmatch.pattern()].as_str() {
-                "<<none>>" => None,
-                ctx => Some(ctx),
-            },
-            None => None,
+        for (i, re) in self.regexes.iter().enumerate() {
+            if re.is_match(key).unwrap_or(false) {
+                let ctx = self.contexts[i].as_str();
+                return (ctx != "<<none>>").then_some(ctx);
+            }
         }
+        None
     }
 }
 
