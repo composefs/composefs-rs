@@ -17,16 +17,22 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::thread::available_parallelism;
 
 use anyhow::{Context, Result};
 use cap_std_ext::cap_std;
-use containers_image_proxy::oci_spec::image::{Descriptor, Digest as OciDigest, MediaType};
+use containers_image_proxy::oci_spec::image::{
+    Descriptor, Digest as OciDigest, ImageManifest, MediaType,
+};
 use fn_error_context::context;
-use ocidir::{OciDir, ResolvedManifest};
+use ocidir::prelude::*;
+use ocidir::{OciArchive, OciDir, ResolvedManifest};
+use tokio::io::DuplexStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio_util::io::SyncIoBridge;
 use tracing::debug;
 
 use composefs::fsverity::FsVerityHashValue;
@@ -40,6 +46,37 @@ use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE};
 use crate::{ImportStats, config_identifier, layer_identifier};
 
 use crate::skopeo::PullResult;
+
+const READ_BUF_SIZE: usize = 128 * 1024;
+
+/// A boxed synchronous byte reader that can be sent across threads.
+pub(crate) type OciBlobReader = Box<dyn Read + Send>;
+
+/// Adapts a synchronous `Read` into a [`tokio::io::AsyncRead`] by copying data
+/// through a [`tokio::io::duplex`] channel from a single blocking thread.
+fn blocking_reader(mut reader: OciBlobReader) -> DuplexStream {
+    let (async_read, async_write) = tokio::io::duplex(READ_BUF_SIZE);
+    tokio::task::spawn_blocking(move || {
+        let mut writer = SyncIoBridge::new(async_write);
+        std::io::copy(&mut reader, &mut writer)
+    });
+    async_read
+}
+
+/// Check if an OCI layout contains a single delta artifact manifest.
+fn detect_delta_manifest(oci: &impl OciRead) -> Result<Option<ImageManifest>> {
+    let index = oci.read_index()?;
+    if index.manifests().len() == 1 {
+        let desc = &index.manifests()[0];
+        let mut manifest_data = Vec::new();
+        oci.read_blob(desc)?.read_to_end(&mut manifest_data)?;
+        let manifest = ImageManifest::from_reader(&manifest_data[..])?;
+        if crate::delta::is_delta_artifact(&manifest) {
+            return Ok(Some(manifest));
+        }
+    }
+    Ok(None)
+}
 
 /// Parse an OCI layout reference like "/path/to/dir:tag" or "/path/to/dir".
 ///
@@ -63,13 +100,15 @@ pub(crate) fn parse_oci_layout_ref(imgref: &str) -> (&str, Option<&str>) {
 }
 
 /// Resolve a manifest from an OCI layout directory for the current platform.
-fn resolve_manifest(ocidir: &OciDir, tag: Option<&str>) -> Result<ResolvedManifest> {
-    ocidir
-        .open_image_this_platform(tag)
+fn resolve_manifest<T: OciRead + Send + Sync>(
+    oci: &T,
+    tag: Option<&str>,
+) -> Result<ResolvedManifest> {
+    oci.open_image_this_platform(tag)
         .context("Resolving manifest for platform")
 }
 
-/// Import an image from a local OCI layout directory.
+/// Import an image from a local OCI layout directory or archive.
 ///
 /// This is the fast path for `oci:` transport references. It reads the OCI
 /// layout directly without going through skopeo. Progress events are emitted
@@ -86,33 +125,40 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
     // a clear "not writable" error rather than a misleading source-open error.
     repo.ensure_writable()?;
 
-    // Open the OCI layout directory
-    let dir = cap_std::fs::Dir::open_ambient_dir(layout_path, cap_std::ambient_authority())
-        .with_context(|| format!("Opening OCI layout directory {}", layout_path.display()))?;
-    let ocidir = OciDir::open(dir).context("Opening OCI directory")?;
-
-    // Check for delta artifact before platform resolution (deltas lack
-    // platform info and would fail the platform filter). Only check
-    // single-manifest layouts since deltas are always single-manifest.
-    if let Ok(index) = ocidir.read_index()
-        && index.manifests().len() == 1
-    {
-        let desc = &index.manifests()[0];
-        let mut manifest_data = Vec::new();
-        ocidir.read_blob(desc)?.read_to_end(&mut manifest_data)?;
-        let manifest = containers_image_proxy::oci_spec::image::ImageManifest::from_reader(
-            &manifest_data[..],
-        )?;
-        if crate::delta::is_delta_artifact(&manifest) {
-            let blob_reader = Arc::new(OciDirBlobReader(ocidir));
+    // Open the OCI layout directory or archive
+    if layout_path.is_file() {
+        let oci = OciArchive::open(layout_path)
+            .with_context(|| format!("Opening OCI archive {}", layout_path.display()))?;
+        if let Some(manifest) = detect_delta_manifest(&oci)? {
+            let blob_reader = Arc::new(OwnedBlobReader(oci));
             let (result, stats) =
                 crate::delta::import_delta(repo, &manifest, blob_reader, &reporter, None).await?;
             return Ok((result, stats));
         }
+        import_oci_image(repo, &oci, layout_tag, reporter).await
+    } else {
+        let dir = cap_std::fs::Dir::open_ambient_dir(layout_path, cap_std::ambient_authority())
+            .with_context(|| format!("Opening OCI layout directory {}", layout_path.display()))?;
+        let oci = OciDir::open(dir).context("Opening OCI directory")?;
+        if let Some(manifest) = detect_delta_manifest(&oci)? {
+            let blob_reader = Arc::new(OwnedBlobReader(oci));
+            let (result, stats) =
+                crate::delta::import_delta(repo, &manifest, blob_reader, &reporter, None).await?;
+            return Ok((result, stats));
+        }
+        import_oci_image(repo, &oci, layout_tag, reporter).await
     }
+}
 
+/// Generic import from any [`OciRead`] backend (non-delta path).
+async fn import_oci_image<ObjectID: FsVerityHashValue, T: OciRead + Send + Sync>(
+    repo: &Arc<Repository<ObjectID>>,
+    oci: &T,
+    tag: Option<&str>,
+    reporter: SharedReporter,
+) -> Result<(PullResult<ObjectID>, ImportStats)> {
     // Resolve the manifest, with fallback for images lacking platform annotations
-    let resolved = resolve_manifest(&ocidir, layout_tag)?;
+    let resolved = resolve_manifest(oci, tag)?;
 
     let manifest = resolved.manifest;
     let manifest_descriptor = &resolved.manifest_descriptor;
@@ -126,7 +172,7 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
         layers.len()
     )));
     let (config_digest, config_verity, layer_refs, stats) =
-        import_config_and_layers(repo, &ocidir, layers, config_descriptor, &reporter)
+        import_config_and_layers(repo, oci, layers, config_descriptor, &reporter)
             .await
             .with_context(|| format!("Failed to import config {}", config_descriptor.digest()))?;
 
@@ -151,8 +197,7 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
         }
 
         let mut raw_manifest = Vec::with_capacity(manifest_descriptor.size() as usize);
-        ocidir
-            .read_blob(manifest_descriptor)
+        oci.read_blob(manifest_descriptor)
             .context("Reading raw manifest bytes")?
             .read_to_end(&mut raw_manifest)?;
         splitstream.write_external(&raw_manifest)?;
@@ -175,14 +220,14 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
 /// Returns (config_digest, config_verity, layer_refs, stats).
 /// `layer_refs` is an ordered Vec of (diff_id, verity) pairs preserving the
 /// order from the config (or manifest for artifacts).
-async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
+async fn import_config_and_layers<ObjectID: FsVerityHashValue, T: OciRead + Send + Sync>(
     repo: &Arc<Repository<ObjectID>>,
-    ocidir: &OciDir,
+    oci: &T,
     manifest_layers: &[Descriptor],
     config_descriptor: &Descriptor,
     reporter: &SharedReporter,
 ) -> Result<(OciDigest, ObjectID, Vec<(OciDigest, ObjectID)>, ImportStats)> {
-    let config_digest: OciDigest = config_descriptor.digest().clone();
+    let config_digest = config_descriptor.digest().clone();
     let content_id = config_identifier(&config_digest);
 
     if let Some(config_id) = repo.has_stream(&content_id)? {
@@ -236,8 +281,7 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
     // and parse diff_ids from the same buffer via as_slice().
     debug!("Reading config {config_digest}");
     let mut raw_config = Vec::with_capacity(config_descriptor.size() as usize);
-    ocidir
-        .read_blob(config_descriptor)
+    oci.read_blob(config_descriptor)
         .context("Reading config blob")?
         .read_to_end(&mut raw_config)?;
     let diff_ids = crate::extract_diff_ids(
@@ -260,19 +304,20 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
         let permit = Arc::clone(&sem).acquire_owned().await?;
         let reporter = Arc::clone(reporter);
 
-        let layer_file = ocidir
-            .read_blob(descriptor)
-            .with_context(|| format!("Opening layer blob {}", descriptor.digest()))?;
+        let layer_reader: OciBlobReader = Box::new(
+            oci.read_blob(descriptor)
+                .with_context(|| format!("Opening layer blob {}", descriptor.digest()))?,
+        );
 
         let media_type = descriptor.media_type().clone();
         let layer_size = descriptor.size();
 
         layer_tasks.spawn(async move {
             let _permit = permit;
-            let (verity, layer_stats) = import_layer_from_file(
+            let (verity, layer_stats) = import_layer_from_blob(
                 &repo,
                 &diff_id,
-                layer_file,
+                layer_reader,
                 &media_type,
                 layer_size,
                 &reporter,
@@ -320,13 +365,13 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
     Ok((config_digest, config_id, layer_refs, stats))
 }
 
-/// Import a single layer by streaming from a file handle.
+/// Import a single layer by streaming from a blob reader.
 ///
 /// Emits `Started`/`Done` (or `Skipped`) progress events via `reporter`.
-async fn import_layer_from_file<ObjectID: FsVerityHashValue>(
+async fn import_layer_from_blob<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     diff_id: &OciDigest,
-    layer_file: std::fs::File,
+    layer_reader: OciBlobReader,
     media_type: &MediaType,
     layer_size: u64,
     reporter: &SharedReporter,
@@ -354,7 +399,7 @@ async fn import_layer_from_file<ObjectID: FsVerityHashValue>(
     // The watch channel provides backpressure: if the renderer is slow, intermediate
     // byte counts are coalesced rather than queued, keeping the I/O path non-blocking.
     let (async_file, progress_driver) = ProgressRead::new(
-        tokio::fs::File::from_std(layer_file),
+        blocking_reader(layer_reader),
         Arc::clone(reporter),
         id.clone(),
         Some(layer_size),
@@ -411,23 +456,20 @@ async fn import_layer_from_file<ObjectID: FsVerityHashValue>(
     Ok((object_id, layer_stats))
 }
 
-/// Blob reader backed by an OCI layout directory.
-struct OciDirBlobReader(OciDir);
+/// Blob reader that owns an [`OciRead`] backend, for use with delta imports.
+struct OwnedBlobReader<T: OciRead + Send + Sync>(T);
 
-impl crate::delta::DeltaBlobReader for OciDirBlobReader {
+impl<T: OciRead + Send + Sync> crate::delta::DeltaBlobReader for OwnedBlobReader<T> {
     fn open_blob(
         &self,
-        digest: &OciDigest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<std::fs::File>> + Send + '_>>
-    {
-        let blob_path = format!("blobs/{}/{}", digest.algorithm(), digest.digest());
-        Box::pin(std::future::ready(
-            self.0
-                .dir()
-                .open(&blob_path)
-                .map(|f| f.into_std())
-                .with_context(|| format!("Opening blob {digest} from OCI layout")),
-        ))
+        desc: &Descriptor,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<OciBlobReader>> + Send + '_>> {
+        let result = self
+            .0
+            .read_blob(desc)
+            .map(|r| Box::new(r) as OciBlobReader)
+            .with_context(|| format!("Reading blob {}", desc.digest()));
+        Box::pin(std::future::ready(result))
     }
 }
 
@@ -469,7 +511,7 @@ mod tests {
     async fn test_wrong_platform_rejected() {
         use cap_std_ext::cap_std;
         use composefs::fsverity::Sha256HashValue;
-        use containers_image_proxy::oci_spec::image::{
+        use ocidir::oci_spec::image::{
             Arch, ConfigBuilder, ImageConfigurationBuilder, Os, PlatformBuilder, RootFsBuilder,
         };
 

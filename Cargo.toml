@@ -39,7 +39,8 @@ composefs-oci = { version = "0.4.0", path = "crates/composefs-oci", default-feat
 composefs-boot = { version = "0.4.0", path = "crates/composefs-boot", default-features = false }
 composefs-http = { version = "0.4.0", path = "crates/composefs-http", default-features = false }
 cap-std-ext = "5.1.2"
-ocidir = "0.7.2"
+containers-image-proxy = { git = "https://github.com/containers/containers-image-proxy-rs", rev = "e339fc1c", default-features = false }
+ocidir = { git = "https://github.com/containers/ocidir-rs", rev = "e137648a" }
 
 # JSON-RPC with FD passing for userns helper
 jsonrpc-fdpass = { version = "0.1.0", default-features = false }
