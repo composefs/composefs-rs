@@ -3,7 +3,8 @@
 //! This module implements SELinux policy parsing and file labeling functionality.
 //! It reads SELinux policy files (file_contexts, file_contexts.subs, etc.) and applies
 //! appropriate security.selinux extended attributes to filesystem nodes. The implementation
-//! uses pcre2 for compatibility with selinux regex (same library selinux uses)
+//! uses a hybrid approach: a regex-automata lazy DFA for patterns the Rust regex
+//! engine supports, with pcre2 fallback for PCRE2-specific features (e.g. lookarounds).
 
 use std::{
     collections::HashMap,
@@ -17,6 +18,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use fn_error_context::context;
 use pcre2::bytes::Regex;
+use regex_automata::{Anchored, Input, hybrid::dfa, util::syntax};
 use rustix::{
     fd::AsFd,
     fs::{Mode, OFlags, openat},
@@ -101,10 +103,228 @@ fn process_spec_file(
     Ok(())
 }
 
+/* We try to compile all reversed SELinux regex patterns into a single
+ * regex-automata lazy DFA.  If any pattern uses PCRE2-only features
+ * (e.g. lookarounds), the all-at-once build fails and we fall back to
+ * per-pattern classification: a syntax parse identifies the incompatible
+ * patterns, which become individual PCRE2 fallbacks while everything else
+ * goes into one big DFA.
+ *
+ * Lookup searches the DFA for the best (lowest-index) match, then checks
+ * PCRE2 fallbacks that might have even higher priority.  Since fallbacks
+ * are sorted by index we stop as soon as we pass the DFA result.
+ *
+ * The input to the matcher is the filename plus a single file-type
+ * character using the codes from selabel_file(5): 'b','c','d','p','l','s','-'.
+ */
+
+/// Strategy for compiling SELinux regex patterns into matchers.
+/// Only used in tests to compare the three approaches; production
+/// code always uses `Hybrid`.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchStrategy {
+    /// Single regex-automata lazy DFA over all patterns.
+    /// Fastest lookup but fails on patterns with PCRE2 features.
+    Dfa,
+    /// Individual PCRE2 regexes with first-match linear scan.
+    Pcre,
+    /// DFA for all compatible patterns + PCRE2 fallback for the rest.
+    Hybrid,
+}
+
+/// Lazy DFA state for the bulk of the patterns.
+struct DfaState {
+    dfa: dfa::DFA,
+    cache: dfa::Cache,
+    /// Maps DFA pattern ID → global context index.
+    context_map: Vec<usize>,
+}
+
+/// A single PCRE2 pattern that couldn't be compiled into the DFA
+/// (e.g. because it uses lookarounds).
+struct PcreFallback {
+    /// Global context index (position in the reversed pattern list).
+    index: usize,
+    regex: Regex,
+}
+
+/// Compiled regex matcher for SELinux file_contexts patterns.
+///
+/// Holds one lazy DFA covering all DFA-compatible patterns plus individual
+/// PCRE2 regexes for patterns that need lookarounds.  Lookup searches both
+/// and returns the lowest-index (= highest-priority) match.
+struct Matcher {
+    /// DFA covering all DFA-compatible patterns, if any.
+    dfa: Option<DfaState>,
+    /// PCRE2 patterns sorted by global index (ascending priority).
+    pcre_fallbacks: Vec<PcreFallback>,
+}
+
 struct Policy {
     aliases: HashMap<OsString, OsString>,
-    regexes: Vec<Regex>,
+    matcher: Matcher,
+    /// Context strings, indexed by reversed position (0 = highest priority).
     contexts: Vec<String>,
+}
+
+/// Syntax configuration shared between the DFA builder and the pattern
+/// compatibility check.  Patterns that fail to parse with this config
+/// need PCRE2 (e.g. because they use lookarounds).
+fn dfa_syntax_config() -> syntax::Config {
+    syntax::Config::new()
+        .unicode(false)
+        .utf8(false)
+        .line_terminator(0)
+}
+
+fn make_dfa_builder() -> dfa::Builder {
+    let mut builder = dfa::Builder::new();
+    builder.syntax(dfa_syntax_config());
+    builder.configure(
+        dfa::Config::new()
+            .cache_capacity(10_000_000)
+            .skip_cache_capacity_check(true),
+    );
+    builder
+}
+
+/// Check whether a pattern can be compiled by the regex-automata engine.
+/// This is a pure syntax parse — much cheaper than building a DFA.
+fn is_dfa_compatible(syntax_config: &syntax::Config, pattern: &str) -> bool {
+    syntax::parse_with(pattern, syntax_config).is_ok()
+}
+
+impl Matcher {
+    /// Build a compiled matcher from pre-parsed (and reversed) regexp patterns.
+    ///
+    /// Tries to compile all patterns into a single lazy DFA.  If that fails
+    /// (e.g. some patterns use PCRE2 lookarounds), falls back to per-pattern
+    /// classification: compatible patterns go into one DFA, the rest become
+    /// individual PCRE2 regexes.
+    fn build(regexps: &[String]) -> Result<Self> {
+        let builder = make_dfa_builder();
+        match builder.build_many(regexps) {
+            Ok(dfa) => {
+                let cache = dfa.create_cache();
+                Ok(Matcher {
+                    dfa: Some(DfaState {
+                        dfa,
+                        cache,
+                        context_map: (0..regexps.len()).collect(),
+                    }),
+                    pcre_fallbacks: vec![],
+                })
+            }
+            Err(_) => Self::build_partitioned(&builder, regexps),
+        }
+    }
+
+    /// Build a matcher using a specific strategy (for test comparisons).
+    #[cfg(test)]
+    fn build_with_strategy(strategy: MatchStrategy, regexps: &[String]) -> Result<Self> {
+        match strategy {
+            MatchStrategy::Hybrid => Self::build(regexps),
+            MatchStrategy::Dfa => {
+                let dfa = make_dfa_builder().build_many(regexps)?;
+                let cache = dfa.create_cache();
+                Ok(Matcher {
+                    dfa: Some(DfaState {
+                        dfa,
+                        cache,
+                        context_map: (0..regexps.len()).collect(),
+                    }),
+                    pcre_fallbacks: vec![],
+                })
+            }
+            MatchStrategy::Pcre => {
+                let mut fallbacks = Vec::with_capacity(regexps.len());
+                for (i, r) in regexps.iter().enumerate() {
+                    fallbacks.push(PcreFallback {
+                        index: i,
+                        regex: Regex::new(r)
+                            .with_context(|| format!("Compiling PCRE2 regex: {r}"))?,
+                    });
+                }
+                Ok(Matcher {
+                    dfa: None,
+                    pcre_fallbacks: fallbacks,
+                })
+            }
+        }
+    }
+
+    /// Partition patterns: DFA-compatible ones go into one big DFA,
+    /// the rest become individual PCRE2 fallbacks.
+    ///
+    /// Uses a syntax-level parse to classify each pattern, which is much
+    /// cheaper than building a DFA per pattern.
+    fn build_partitioned(builder: &dfa::Builder, regexps: &[String]) -> Result<Self> {
+        let syntax_config = dfa_syntax_config();
+        let mut dfa_indices = Vec::new();
+        let mut dfa_patterns = Vec::new();
+        let mut pcre_fallbacks = Vec::new();
+
+        for (i, pattern) in regexps.iter().enumerate() {
+            if is_dfa_compatible(&syntax_config, pattern) {
+                dfa_indices.push(i);
+                dfa_patterns.push(pattern.as_str());
+            } else {
+                pcre_fallbacks.push(PcreFallback {
+                    index: i,
+                    regex: Regex::new(pattern)
+                        .with_context(|| format!("Compiling PCRE2 regex: {pattern}"))?,
+                });
+            }
+        }
+
+        let dfa_state = if dfa_patterns.is_empty() {
+            None
+        } else {
+            let dfa = builder.build_many(&dfa_patterns)?;
+            let cache = dfa.create_cache();
+            Some(DfaState {
+                dfa,
+                cache,
+                context_map: dfa_indices,
+            })
+        };
+
+        Ok(Matcher {
+            dfa: dfa_state,
+            pcre_fallbacks,
+        })
+    }
+
+    /// Look up a key (filename + file-type byte) and return the matching
+    /// context index, or `None` if no pattern matched.
+    ///
+    /// When both a DFA pattern and a PCRE2 fallback match, the one with
+    /// the lower index (= higher priority) wins.
+    fn lookup(&mut self, key: &[u8]) -> Option<usize> {
+        // Search the DFA for the lowest-index match among DFA patterns.
+        let dfa_idx = self.dfa.as_mut().and_then(|d| {
+            let input = Input::new(key).anchored(Anchored::Yes);
+            d.dfa
+                .try_search_fwd(&mut d.cache, &input)
+                .expect("DFA search error")
+                .map(|hm| d.context_map[hm.pattern().as_usize()])
+        });
+
+        // Scan PCRE2 fallbacks that could beat the DFA match (lower index).
+        // They're sorted by index, so we stop as soon as one matches or
+        // we pass the DFA result.
+        for fb in &self.pcre_fallbacks {
+            if dfa_idx.is_some_and(|d| fb.index >= d) {
+                break;
+            }
+            if fb.regex.is_match(key).unwrap_or(false) {
+                return Some(fb.index);
+            }
+        }
+
+        dfa_idx
+    }
 }
 
 /// Open a file in the composefs store, handling inline vs external files.
@@ -172,14 +392,11 @@ impl Policy {
         regexps.reverse();
         contexts.reverse();
 
-        let mut compiled = Vec::with_capacity(regexps.len());
-        for r in &regexps {
-            compiled.push(Regex::new(r).with_context(|| format!("Compiling PCRE2 regex: {r}"))?);
-        }
+        let matcher = Matcher::build(&regexps)?;
 
         Ok(Policy {
             aliases,
-            regexes: compiled,
+            matcher,
             contexts,
         })
     }
@@ -188,16 +405,13 @@ impl Policy {
         self.aliases.get(filename).map(|x| x.as_os_str())
     }
 
-    pub fn lookup(&self, filename: &OsStr, ifmt: u8) -> Option<&str> {
-        let key = &[filename.as_bytes(), &[ifmt]].concat();
-
-        for (i, re) in self.regexes.iter().enumerate() {
-            if re.is_match(key).unwrap_or(false) {
-                let ctx = self.contexts[i].as_str();
-                return (ctx != "<<none>>").then_some(ctx);
-            }
-        }
-        None
+    // mut because it touches the DFA cache
+    pub fn lookup(&mut self, filename: &OsStr, ifmt: u8) -> Option<&str> {
+        let key = [filename.as_bytes(), &[ifmt]].concat();
+        self.matcher.lookup(&key).and_then(|idx| {
+            let ctx = self.contexts[idx].as_str();
+            (ctx != "<<none>>").then_some(ctx)
+        })
     }
 }
 
@@ -1014,6 +1228,72 @@ mod tests {
         assert_no_hardlinks(&fs);
     }
 
+    /// Verify that a positive lookahead (PCRE2-only feature) in file_contexts
+    /// forces the affected chunk to fall back to pcre2 and still labels correctly.
+    #[test]
+    fn selabel_pcre2_positive_lookahead() {
+        let file_contexts = indoc! {b"
+            /(/.*)?		system_u:object_r:default_t:s0
+            /opt(/.*)?		system_u:object_r:opt_t:s0
+            /opt/(?=protected).*		system_u:object_r:protected_t:s0
+        "};
+
+        let fs_entries = "\
+/opt 0 40755 2 0 0 0 0.0 - - -
+/opt/protected_data 5 100644 1 0 0 0 0.0 - hello -
+/opt/other_file 5 100644 1 0 0 0 0.0 - world -
+";
+        let mut fs = build_fs_with_selinux(file_contexts, &[], fs_entries);
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(selabel(&mut fs, &test_repo.repo).unwrap());
+
+        // Lookahead matches: "protected_data" starts with "protected"
+        assert_eq!(
+            get_label(&fs, "/opt/protected_data").unwrap(),
+            "system_u:object_r:protected_t:s0"
+        );
+        // Lookahead does not match: falls through to /opt(/.*)?
+        assert_eq!(
+            get_label(&fs, "/opt/other_file").unwrap(),
+            "system_u:object_r:opt_t:s0"
+        );
+    }
+
+    /// Verify that a negative lookahead (PCRE2-only feature) correctly excludes
+    /// paths from matching while still labeling non-excluded paths.
+    #[test]
+    fn selabel_pcre2_negative_lookahead() {
+        // The negative lookahead (?!backup) excludes filenames starting with "backup".
+        let file_contexts = indoc! {b"
+            /(/.*)?		system_u:object_r:default_t:s0
+            /srv(/.*)?		system_u:object_r:srv_t:s0
+            /srv/(?!backup).*		system_u:object_r:srv_public_t:s0
+        "};
+
+        let fs_entries = "\
+/srv 0 40755 2 0 0 0 0.0 - - -
+/srv/website 5 100644 1 0 0 0 0.0 - hello -
+/srv/backup_2024 5 100644 1 0 0 0 0.0 - world -
+";
+        let mut fs = build_fs_with_selinux(file_contexts, &[], fs_entries);
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+
+        assert!(selabel(&mut fs, &test_repo.repo).unwrap());
+
+        // Negative lookahead succeeds: "website" doesn't start with "backup"
+        assert_eq!(
+            get_label(&fs, "/srv/website").unwrap(),
+            "system_u:object_r:srv_public_t:s0"
+        );
+        // Negative lookahead fails: "backup_2024" starts with "backup",
+        // so the pattern doesn't match; falls through to /srv(/.*)?
+        assert_eq!(
+            get_label(&fs, "/srv/backup_2024").unwrap(),
+            "system_u:object_r:srv_t:s0"
+        );
+    }
+
     /// Verify that selabel() overwrites pre-existing labels with the policy's
     /// labels, rather than accumulating or skipping them.
     #[test]
@@ -1045,5 +1325,304 @@ mod tests {
             get_label(&fs, "/usr/lib/readme.txt").unwrap(),
             "system_u:object_r:usr_t:s0"
         );
+    }
+
+    /// Verify that all three match strategies produce identical results
+    /// for a representative set of patterns and paths.
+    #[test]
+    fn matcher_strategies_agree() {
+        let file_contexts = indoc! {b"
+            /\t\tsystem_u:object_r:root_t:s0
+            /usr\t\tsystem_u:object_r:usr_t:s0
+            /usr/bin(/.*)?\t\tsystem_u:object_r:bin_t:s0
+            /etc(/.*)?\t\tsystem_u:object_r:etc_t:s0
+            /var(/.*)?  -d  system_u:object_r:var_dir_t:s0
+            /var(/.*)?  --  system_u:object_r:var_file_t:s0
+            /tmp(/.*)?  <<none>>
+        "};
+
+        let mut regexps = vec![];
+        let mut contexts = vec![];
+        process_spec_file(file_contexts.as_slice(), &mut regexps, &mut contexts).unwrap();
+        regexps.reverse();
+        contexts.reverse();
+
+        let mut matchers: Vec<(MatchStrategy, Matcher)> = [
+            MatchStrategy::Dfa,
+            MatchStrategy::Pcre,
+            MatchStrategy::Hybrid,
+        ]
+        .into_iter()
+        .map(|s| (s, Matcher::build_with_strategy(s, &regexps).unwrap()))
+        .collect();
+
+        // Paths to test, paired with the file-type byte.
+        let test_cases: &[(&[u8], u8)] = &[
+            (b"/", b'd'),
+            (b"/usr", b'd'),
+            (b"/usr/bin", b'd'),
+            (b"/usr/bin/hello", b'-'),
+            (b"/etc", b'd'),
+            (b"/etc/hostname", b'-'),
+            (b"/var", b'd'),
+            (b"/var/log", b'd'),
+            (b"/var/spool/mail", b'-'),
+            (b"/tmp", b'd'),
+            (b"/tmp/scratch", b'-'),
+            (b"/nonexistent", b'-'),
+        ];
+
+        // Collect results from first strategy, then assert all others match.
+        let expected: Vec<_> = {
+            let (_, m) = &mut matchers[0];
+            test_cases
+                .iter()
+                .map(|(path, ifmt)| {
+                    let key = [*path, &[*ifmt]].concat();
+                    m.lookup(&key)
+                })
+                .collect()
+        };
+
+        for (strategy, m) in &mut matchers[1..] {
+            for (i, (path, ifmt)) in test_cases.iter().enumerate() {
+                let key = [*path, &[*ifmt]].concat();
+                let result = m.lookup(&key);
+                assert_eq!(
+                    result,
+                    expected[i],
+                    "{strategy:?} disagrees with {:?} on path {:?} (ifmt={ifmt:?}): \
+                     got {result:?}, expected {:?}",
+                    MatchStrategy::Dfa,
+                    String::from_utf8_lossy(path),
+                    expected[i],
+                );
+            }
+        }
+    }
+
+    /// Verify that hybrid lookup with PCRE2 lookaround patterns interleaved
+    /// among DFA patterns produces the same results as pure PCRE2, and that
+    /// the priority interleaving is correct (a PCRE2 pattern at a lower index
+    /// must beat a DFA match at a higher index, and vice versa).
+    #[test]
+    fn hybrid_lookaround_priority() {
+        // Patterns are listed in file_contexts order (low-to-high priority).
+        // After reversing, index 0 = highest priority.
+        //
+        // We mix in negative-lookahead patterns (PCRE2-only) at various
+        // positions so the hybrid matcher must correctly interleave DFA
+        // and PCRE2 results.
+        let patterns: &[(&str, &str)] = &[
+            // Low priority (will be at high indices after reverse)
+            (r"/(.*)?", "system_u:object_r:default_t:s0"),
+            (r"/usr(.*)?", "system_u:object_r:usr_t:s0"),
+            // PCRE2-only: lookahead (mid priority)
+            (r"/usr/bin/(?!bad).*", "system_u:object_r:bin_ok_t:s0"),
+            // DFA-compatible (mid priority, higher than above)
+            (r"/usr/bin/good", "system_u:object_r:bin_good_t:s0"),
+            // PCRE2-only: lookahead (high priority)
+            (r"/etc/(?!shadow).*", "system_u:object_r:etc_public_t:s0"),
+            // DFA-compatible (highest priority)
+            (r"/etc/hostname", "system_u:object_r:hostname_t:s0"),
+        ];
+
+        let mut regexps: Vec<String> = patterns
+            .iter()
+            .map(|(re, _)| format!("^({re}).$"))
+            .collect();
+        let mut contexts: Vec<String> = patterns.iter().map(|(_, ctx)| ctx.to_string()).collect();
+        regexps.reverse();
+        contexts.reverse();
+
+        let mut pcre = Matcher::build_with_strategy(MatchStrategy::Pcre, &regexps).unwrap();
+        let mut hybrid = Matcher::build_with_strategy(MatchStrategy::Hybrid, &regexps).unwrap();
+
+        let test_cases: &[(&[u8], u8, &str)] = &[
+            // /etc/hostname: DFA pattern at index 0 (highest priority) wins.
+            (b"/etc/hostname", b'-', "system_u:object_r:hostname_t:s0"),
+            // /etc/passwd: PCRE2 lookahead at index 1 matches (not "shadow").
+            (b"/etc/passwd", b'-', "system_u:object_r:etc_public_t:s0"),
+            // /etc/shadow: PCRE2 lookahead at index 1 does NOT match,
+            // falls through to DFA default_t.
+            (b"/etc/shadow", b'-', "system_u:object_r:default_t:s0"),
+            // /usr/bin/good: DFA pattern at index 2 wins over PCRE2 at index 3.
+            (b"/usr/bin/good", b'-', "system_u:object_r:bin_good_t:s0"),
+            // /usr/bin/hello: PCRE2 lookahead at index 3 matches (not "bad").
+            (b"/usr/bin/hello", b'-', "system_u:object_r:bin_ok_t:s0"),
+            // /usr/bin/bad: PCRE2 lookahead at index 3 does NOT match,
+            // falls through to DFA usr_t.
+            (b"/usr/bin/bad", b'-', "system_u:object_r:usr_t:s0"),
+        ];
+
+        for (path, ifmt, expected) in test_cases {
+            let key = [*path, &[*ifmt]].concat();
+            let path_str = String::from_utf8_lossy(path);
+
+            let pcre_idx = pcre.lookup(&key);
+            let hybrid_idx = hybrid.lookup(&key);
+
+            assert_eq!(
+                pcre_idx, hybrid_idx,
+                "hybrid disagrees with pcre2 on {path_str}: \
+                 pcre2={pcre_idx:?} hybrid={hybrid_idx:?}"
+            );
+
+            let label = pcre_idx.map(|i| contexts[i].as_str());
+            assert_eq!(
+                label,
+                Some(*expected),
+                "{path_str}: expected {expected}, got {label:?}"
+            );
+        }
+    }
+
+    mod proptest_matcher {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::strategy::ValueTree;
+
+        /// A path segment: 1–8 lowercase ASCII characters.
+        fn path_segment() -> impl Strategy<Value = String> {
+            "[a-z][a-z0-9_]{0,7}"
+        }
+
+        /// An absolute directory path with 1–4 segments.
+        fn dir_path() -> impl Strategy<Value = String> {
+            proptest::collection::vec(path_segment(), 1..=4)
+                .prop_map(|segs| format!("/{}", segs.join("/")))
+        }
+
+        /// A filename (no slashes).
+        fn filename() -> impl Strategy<Value = String> {
+            "[a-z][a-z0-9_.]{0,11}"
+        }
+
+        /// One SELinux-like pattern+context, in pre-`process_spec_file` format
+        /// (i.e. the anchored `^(...).$` regex).
+        #[derive(Debug, Clone)]
+        enum PatternKind {
+            /// Exact file: `^(/dir/file).$`
+            Exact(String),
+            /// Directory wildcard: `^(/dir(/.*)?).$`
+            DirWild(String),
+            /// Negative lookahead (PCRE2-only): `^(/dir/(?!name).*).$`
+            Lookahead(String, String),
+        }
+
+        fn pattern_kind() -> impl Strategy<Value = PatternKind> {
+            prop_oneof![
+                8 => (dir_path(), filename()).prop_map(|(d, f)| PatternKind::Exact(
+                    format!("{d}/{f}")
+                )),
+                4 => dir_path().prop_map(PatternKind::DirWild),
+                1 => (dir_path(), filename()).prop_map(|(d, f)| PatternKind::Lookahead(d, f)),
+            ]
+        }
+
+        impl PatternKind {
+            fn to_regexp(&self) -> String {
+                match self {
+                    PatternKind::Exact(path) => format!("^({path}).$"),
+                    PatternKind::DirWild(dir) => format!("^({dir}(/.*)?).$"),
+                    PatternKind::Lookahead(dir, excluded) => {
+                        format!("^({dir}/(?!{excluded}).*).$")
+                    }
+                }
+            }
+
+            fn context(&self, idx: usize) -> String {
+                format!("system_u:object_r:rule{idx}_t:s0")
+            }
+        }
+
+        /// Generate test paths that have a chance of matching the patterns.
+        fn test_path(dirs: &[String]) -> impl Strategy<Value = Vec<u8>> + '_ {
+            let ifmt = prop_oneof![Just(b'-'), Just(b'd'), Just(b'l'),];
+
+            let path = prop_oneof![
+                // Path under one of the generated directories.
+                (proptest::sample::select(dirs.to_vec()), filename())
+                    .prop_map(|(d, f)| format!("{d}/{f}")),
+                // Just a directory itself.
+                proptest::sample::select(dirs.to_vec()),
+                // Random path unlikely to match anything specific.
+                dir_path(),
+            ];
+
+            (path, ifmt).prop_map(|(p, i)| [p.as_bytes(), &[i]].concat())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(20))]
+
+            /// Property: for any generated set of patterns (including some
+            /// with lookarounds) and paths, PCRE2 and Hybrid matchers must
+            /// produce identical lookup results.
+            #[test]
+            fn hybrid_matches_pcre2(
+                patterns in proptest::collection::vec(pattern_kind(), 20..=200),
+                path_count in 50..=200usize,
+            ) {
+                // Build regexp + context lists.
+                let mut regexps = Vec::new();
+                let mut contexts = Vec::new();
+
+                // Catch-all at lowest priority.
+                regexps.push("^(/(.*)?).$$".to_string());
+                contexts.push("system_u:object_r:default_t:s0".to_string());
+
+                for (i, pat) in patterns.iter().enumerate() {
+                    regexps.push(pat.to_regexp());
+                    contexts.push(pat.context(i));
+                }
+
+                regexps.reverse();
+                contexts.reverse();
+
+                let mut pcre = Matcher::build_with_strategy(
+                    MatchStrategy::Pcre, &regexps,
+                ).unwrap();
+                let mut hybrid = Matcher::build(&regexps).unwrap();
+
+                // Collect directory paths used in patterns for targeted path generation.
+                let dirs: Vec<String> = patterns.iter().filter_map(|p| match p {
+                    PatternKind::Exact(path) => {
+                        path.rsplit_once('/').map(|(d, _)| d.to_string())
+                    }
+                    PatternKind::DirWild(d) | PatternKind::Lookahead(d, _) => {
+                        Some(d.clone())
+                    }
+                }).collect();
+
+                // Ensure we have at least one directory for sampling.
+                let dirs = if dirs.is_empty() {
+                    vec!["/fallback".to_string()]
+                } else {
+                    dirs
+                };
+
+                let path_strategy = proptest::collection::vec(
+                    test_path(&dirs), path_count,
+                );
+                let mut runner = proptest::test_runner::TestRunner::new(
+                    ProptestConfig::default(),
+                );
+                let paths = path_strategy
+                    .new_tree(&mut runner)
+                    .unwrap()
+                    .current();
+
+                for key in &paths {
+                    let pcre_result = pcre.lookup(key);
+                    let hybrid_result = hybrid.lookup(key);
+                    prop_assert_eq!(
+                        pcre_result, hybrid_result,
+                        "disagreement on {:?}",
+                        String::from_utf8_lossy(key),
+                    );
+                }
+            }
+        }
     }
 }

@@ -16,6 +16,7 @@ fn-error-context = "0.2"
 composefs = { workspace = true }
 hex = { version = "0.4.0", default-features = false, features = ["std"] }
 pcre2 = "0.2.11"
+regex-automata = { version = "0.4.4", default-features = false, features = ["hybrid", "std", "syntax"] }
 rustix = { version = "1.0.0", default-features = false, features = ["fs", "std"] }
 thiserror = { version = "2.0.0", default-features = false }
 zerocopy = { version = "0.8.0", default-features = false, features = ["derive"] }
@@ -23,6 +24,7 @@ zerocopy = { version = "0.8.0", default-features = false, features = ["derive"] 
 [dev-dependencies]
 composefs = { workspace = true, features = ["test"] }
 indoc = "2"
+proptest = "1"
 similar-asserts = "1.7.0"
 
 [lints]
