@@ -1072,9 +1072,8 @@ impl<'img> Image<'img> {
 /// C composefs v1.0.8 converts char-device-rdev-0 entries to regular files
 /// on write (whiteout escaping).  The reader must reverse this.
 fn is_escaped_v1_whiteout(img: &Image, inode: &InodeType) -> anyhow::Result<bool> {
-    // Only relevant for regular files
-    let mode = inode.mode().0.get();
-    if mode & S_IFMT != S_IFREG {
+    let file_type = inode.mode().0.get() & S_IFMT;
+    if file_type != S_IFREG {
         return Ok(false);
     }
 
@@ -1327,17 +1326,22 @@ pub struct ObjectCollector<ObjectID: FsVerityHashValue> {
 
 impl<ObjectID: FsVerityHashValue> ObjectCollector<ObjectID> {
     fn visit_xattr(&mut self, attr: &XAttr) -> Result<(), ErofsReaderError> {
-        // This is the index of "trusted".  See XATTR_PREFIXES in format.rs.
         if attr.header.name_index != 4 {
             return Ok(());
         }
-        if attr.suffix()? != b"overlay.metacopy" {
-            return Ok(());
-        }
-        if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()?)
-            && value.valid()
-        {
-            self.objects.insert(value.digest);
+        let suffix = attr.suffix()?;
+        if suffix == b"overlay.metacopy" {
+            if let Ok(value) = OverlayMetacopy::read_from_bytes(attr.value()?)
+                && value.valid()
+            {
+                self.objects.insert(value.digest);
+            }
+        } else if suffix == b"overlay.redirect" {
+            let value = attr.value()?;
+            let path = value.strip_prefix(b"/").unwrap_or(value);
+            if let Ok(id) = ObjectID::from_object_pathname(path) {
+                self.objects.insert(id);
+            }
         }
         Ok(())
     }
@@ -1586,6 +1590,50 @@ fn extract_metacopy_digest<ObjectID: FsVerityHashValue>(
     Ok(None)
 }
 
+/// Try to extract the object ID from a redirect xattr (`trusted.overlay.redirect`).
+///
+/// The redirect value is a path like `/55/90e94b...` from which we parse
+/// the object ID.  Returns `None` if no redirect xattr is present.
+fn extract_redirect_object_id<ObjectID: FsVerityHashValue>(
+    img: &Image,
+    inode: &InodeType,
+) -> anyhow::Result<Option<ObjectID>> {
+    let Some(xattrs_section) = inode.xattrs()? else {
+        return Ok(None);
+    };
+
+    for id in xattrs_section.shared()? {
+        let xattr = img.shared_xattr(id.get())?;
+        if let Some(obj) = check_redirect_xattr(xattr)? {
+            return Ok(Some(obj));
+        }
+    }
+    for xattr in xattrs_section.local()? {
+        let xattr = xattr?;
+        if let Some(obj) = check_redirect_xattr(xattr)? {
+            return Ok(Some(obj));
+        }
+    }
+    Ok(None)
+}
+
+fn check_redirect_xattr<ObjectID: FsVerityHashValue>(
+    xattr: &XAttr,
+) -> anyhow::Result<Option<ObjectID>> {
+    if xattr.header.name_index != 4 {
+        return Ok(None);
+    }
+    if xattr.suffix()? != b"overlay.redirect" {
+        return Ok(None);
+    }
+    let value = xattr.value()?;
+    let path = value.strip_prefix(b"/").unwrap_or(value);
+    match ObjectID::from_object_pathname(path) {
+        Ok(id) => Ok(Some(id)),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Check if a single xattr is a valid overlay.metacopy and return the digest.
 ///
 /// When `strict` is true, a `trusted.overlay.metacopy` xattr that cannot be
@@ -1604,6 +1652,9 @@ fn check_metacopy_xattr<ObjectID: FsVerityHashValue>(
     }
     // At this point we know the xattr is named trusted.overlay.metacopy.
     let value_bytes = xattr.value()?;
+    if value_bytes.is_empty() {
+        return Ok(None);
+    }
     let value = match OverlayMetacopy::<ObjectID>::read_from_bytes(value_bytes) {
         Ok(v) => v,
         Err(_) if strict => {
@@ -1823,54 +1874,72 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
             let mode = child_inode.mode().0.get();
             let file_type = mode & S_IFMT;
 
-            let content = match file_type {
-                S_IFREG => {
-                    // V1 images escape whiteouts (char dev rdev=0) to regular files.
-                    // The is_escaped_whiteout flag was computed above (before the
-                    // root-dir skip check), so reuse it here.
-                    if is_escaped_whiteout {
-                        tree::LeafContent::CharacterDevice(0)
-                    } else if let Some(digest) =
-                        extract_metacopy_digest::<ObjectID>(img, &child_inode)?
-                    {
-                        tree::LeafContent::Regular(tree::RegularFile::External(
-                            digest,
-                            child_inode.size(),
-                        ))
-                    } else {
-                        if img.composefs_restricted {
-                            let size = child_inode.size();
-                            if size > MAX_INLINE_CONTENT as u64 {
-                                anyhow::bail!(
-                                    "inline regular file {:?} has size {} \
+            // V1 images escape whiteouts (char dev rdev=0) to regular files.
+            // The is_escaped_whiteout flag was computed above (before the
+            // root-dir skip check), so check it before the file-type match.
+            let content = if is_escaped_whiteout {
+                tree::LeafContent::CharacterDevice(0)
+            } else {
+                match file_type {
+                    S_IFREG => {
+                        if let Some(digest) =
+                            extract_metacopy_digest::<ObjectID>(img, &child_inode)?
+                        {
+                            tree::LeafContent::Regular(tree::RegularFile::External(
+                                digest,
+                                child_inode.size(),
+                            ))
+                        } else if let Some(id) =
+                            extract_redirect_object_id::<ObjectID>(img, &child_inode)?
+                        {
+                            tree::LeafContent::Regular(tree::RegularFile::ExternalNoVerity(
+                                id,
+                                child_inode.size(),
+                            ))
+                        } else if child_inode.data_layout()? == DataLayout::ChunkBased {
+                            tree::LeafContent::Regular(tree::RegularFile::Sparse(
+                                child_inode.size(),
+                            ))
+                        } else {
+                            if img.composefs_restricted
+                                && img.header.composefs_version == COMPOSEFS_VERSION
+                            {
+                                let size = child_inode.size();
+                                if size > MAX_INLINE_CONTENT as u64 {
+                                    anyhow::bail!(
+                                        "inline regular file {:?} has size {} \
                                      (max {MAX_INLINE_CONTENT})",
-                                    name,
-                                    size,
-                                );
+                                        name,
+                                        size,
+                                    );
+                                }
                             }
+                            let data = extract_all_file_data(img, &child_inode)?;
+                            tree::LeafContent::Regular(tree::RegularFile::Inline(data.into()))
                         }
-                        let data = extract_all_file_data(img, &child_inode)?;
-                        tree::LeafContent::Regular(tree::RegularFile::Inline(data.into()))
                     }
-                }
-                S_IFLNK => {
-                    let target_data = child_inode.inline().unwrap_or(&[]);
-                    if target_data.len() > crate::SYMLINK_MAX {
-                        anyhow::bail!(
-                            "symlink target for {:?} is {} bytes (max {})",
-                            name,
-                            target_data.len(),
-                            crate::SYMLINK_MAX,
-                        );
+                    S_IFLNK => {
+                        let target_data = extract_all_file_data(img, &child_inode)?;
+                        if img.composefs_restricted
+                            && img.header.composefs_version == COMPOSEFS_VERSION
+                            && target_data.len() > crate::SYMLINK_MAX
+                        {
+                            anyhow::bail!(
+                                "symlink target for {:?} is {} bytes (max {})",
+                                name,
+                                target_data.len(),
+                                crate::SYMLINK_MAX,
+                            );
+                        }
+                        let target = OsStr::from_bytes(&target_data);
+                        tree::LeafContent::Symlink(Box::from(target))
                     }
-                    let target = OsStr::from_bytes(target_data);
-                    tree::LeafContent::Symlink(Box::from(target))
+                    S_IFBLK => tree::LeafContent::BlockDevice(child_inode.u() as u64),
+                    S_IFCHR => tree::LeafContent::CharacterDevice(child_inode.u() as u64),
+                    S_IFIFO => tree::LeafContent::Fifo,
+                    S_IFSOCK => tree::LeafContent::Socket,
+                    _ => anyhow::bail!("unknown file type {:#o} for {:?}", file_type, name),
                 }
-                S_IFBLK => tree::LeafContent::BlockDevice(child_inode.u() as u64),
-                S_IFCHR => tree::LeafContent::CharacterDevice(child_inode.u() as u64),
-                S_IFIFO => tree::LeafContent::Fifo,
-                S_IFSOCK => tree::LeafContent::Socket,
-                _ => anyhow::bail!("unknown file type {:#o} for {:?}", file_type, name),
             };
 
             // Hardlinked whiteouts are semantically invalid: a whiteout represents the
@@ -3405,9 +3474,20 @@ mod tests {
                     let dumpfile = String::from_utf8(dumpfile_bytes).unwrap();
 
                     let c_image = c_mkcomposefs_from_dumpfile(&dumpfile);
+                    // C mkcomposefs defaults to --max-version=1, auto-bumping
+                    // from V0 to V1 when whiteouts (chardev rdev=0) are present.
+                    let has_whiteout = fs_rs
+                        .leaves
+                        .iter()
+                        .any(|leaf| matches!(leaf.content, tree::LeafContent::CharacterDevice(0)));
+                    let version = if has_whiteout {
+                        FormatVersion::V1
+                    } else {
+                        FormatVersion::V0
+                    };
                     let rust_image = mkfs_erofs_versioned(
                         &mut ValidatedFileSystem::new(fs_rs).unwrap(),
-                        FormatVersion::V0,
+                        version,
                     );
 
                     if c_image != rust_image.as_ref() {

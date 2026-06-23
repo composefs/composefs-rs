@@ -17,7 +17,15 @@ pub enum RegularFile<ObjectID: FsVerityHashValue> {
     /// File stored externally, referenced by fsverity hash and size.
     ///
     /// The tuple contains (fsverity hash, file size in bytes).
+    /// The fsverity digest is embedded in the overlay metacopy xattr.
     External(ObjectID, u64),
+    /// Like `External`, but without embedding the fsverity digest in the
+    /// overlay metacopy xattr.  Used by the C API when the caller set a
+    /// content-address payload but did not explicitly set a verified digest.
+    ExternalNoVerity(ObjectID, u64),
+    /// File with declared size but no content or external reference.
+    /// Produces ChunkBased layout with null chunk indices.
+    Sparse(u64),
 }
 
 // Re-export generic types. Note that we don't need to re-write

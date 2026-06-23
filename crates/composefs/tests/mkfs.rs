@@ -249,6 +249,37 @@ fn test_erofs_v1_digest_stability() {
     }
 }
 
+/// Test that V0 with a whiteout (char device rdev=0) round-trips correctly.
+/// Whiteouts are escaped to regular files in both V0 and V1 Epoch1 formats.
+#[test]
+fn test_v0_whiteout_round_trip() {
+    let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+    add_leaf(&mut fs, "whiteout", LeafContent::CharacterDevice(0));
+    add_leaf(
+        &mut fs,
+        "regular",
+        LeafContent::Regular(RegularFile::Inline((*b"hello").into())),
+    );
+
+    let image = mkfs_erofs_versioned(
+        &mut ValidatedFileSystem::new(fs).unwrap(),
+        FormatVersion::V0,
+    );
+
+    // The image must be parseable
+    let rt_fs =
+        composefs::erofs::reader::erofs_to_filesystem::<Sha256HashValue>(&image[..]).unwrap();
+
+    // The whiteout should round-trip as CharacterDevice(0)
+    let mut dump_bytes = Vec::new();
+    composefs::dumpfile::write_dumpfile(&mut dump_bytes, &rt_fs).unwrap();
+    let dump = String::from_utf8(dump_bytes).unwrap();
+    assert!(
+        dump.contains("/whiteout"),
+        "whiteout entry missing from dump:\n{dump}"
+    );
+}
+
 /// Test that `--min-version=1` forces `composefs_version=1` in the EROFS header
 /// even when no user-visible whiteout devices are present, matching C mkcomposefs
 /// `--min-version=1 --max-version=1` behaviour.

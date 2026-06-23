@@ -83,6 +83,8 @@ pub enum Item<'p> {
     RegularInline {
         /// Number of links
         nlink: u32,
+        /// Size from dump entry (may differ from content length for sparse files)
+        size: u64,
         /// Inline content
         content: Cow<'p, [u8]>,
     },
@@ -449,7 +451,11 @@ impl<'p> Entry<'p> {
                         if fsverity_digest.is_some() {
                             anyhow::bail!("Inline file cannot have fsverity digest");
                         }
-                        Item::RegularInline { nlink, content }
+                        Item::RegularInline {
+                            nlink,
+                            size,
+                            content,
+                        }
                     }
                 }
                 FileType::Symlink => {
@@ -525,7 +531,7 @@ impl Item<'_> {
     pub(crate) fn size(&self) -> u64 {
         match self {
             Item::Regular { size, .. } => *size,
-            Item::RegularInline { content, .. } => content.len() as u64,
+            Item::RegularInline { size, .. } => *size,
             // Directories always report 0; the spec says size is ignored.
             Item::Directory { .. } => 0,
             _ => 0,

@@ -1264,8 +1264,8 @@ fn dump_file_impl(
                     let leaf = fs.leaf(*leaf_id);
                     match &leaf.content {
                         Regular(f) => match f {
-                            Inline(..) => println!("{} inline", file_path.display()),
-                            External(id, _) => {
+                            Inline(..) | Sparse(..) => println!("{} inline", file_path.display()),
+                            External(id, _) | ExternalNoVerity(id, _) => {
                                 println!("{} {}", file_path.display(), id.to_object_pathname());
                             }
                         },

@@ -420,6 +420,13 @@ struct Directory<'a> {
 struct Leaf<'a, ObjectID: FsVerityHashValue> {
     content: &'a tree::LeafContent<ObjectID>,
     nlink: usize,
+    /// Epoch1 only: number of full data blocks for inline content.
+    /// Matches C mkcomposefs which splits large inline files into data blocks
+    /// plus an optional inline tail. Zero for V2 or small files.
+    n_data_blocks: u32,
+    /// Epoch1 only: size of the inline tail. When the tail exceeds half a block,
+    /// it's promoted to a full data block (n_data_blocks++) and tail becomes 0.
+    inline_tail_size: usize,
 }
 
 #[derive(Debug)]
@@ -644,7 +651,7 @@ impl<'a> Directory<'a> {
 /// 2. Clamp to at least BLOCK_BITS (12)
 /// 3. Clamp to at most BLOCK_BITS + 31 (max representable)
 /// 4. Return chunkbits - BLOCK_BITS
-fn compute_chunk_format(file_size: u64) -> u32 {
+fn compute_chunk_bitsize(file_size: u64) -> u32 {
     const BLOCK_BITS: u32 = format::BLOCK_BITS as u32;
     const CHUNK_FORMAT_BLKBITS_MASK: u32 = 0x001F; // 31
 
@@ -667,27 +674,54 @@ fn compute_chunk_format(file_size: u64) -> u32 {
         chunkbits = CHUNK_FORMAT_BLKBITS_MASK + BLOCK_BITS;
     }
 
-    chunkbits - BLOCK_BITS
+    chunkbits
+}
+
+fn compute_chunk_format(file_size: u64) -> u32 {
+    compute_chunk_bitsize(file_size) - format::BLOCK_BITS as u32
+}
+
+fn compute_chunk_count(file_size: u64) -> u32 {
+    let chunkbits = compute_chunk_bitsize(file_size);
+    let chunksize = 1u64 << chunkbits;
+    file_size.div_ceil(chunksize) as u32
 }
 
 impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
-    fn inode_meta(&self, version: format::FormatVersion) -> InodeMeta {
+    fn inode_meta(&self, version: format::FormatVersion, block_offset: usize) -> InodeMeta {
         let (layout, i_u, size) = match &self.content {
             tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => {
                 if data.is_empty() {
                     (format::DataLayout::FlatPlain, 0, data.len() as u64)
+                } else if self.n_data_blocks > 0 {
+                    let blkaddr = (block_offset / format::BLOCK_SIZE as usize) as u32;
+                    if self.inline_tail_size > 0 {
+                        (format::DataLayout::FlatInline, blkaddr, data.len() as u64)
+                    } else {
+                        (format::DataLayout::FlatPlain, blkaddr, data.len() as u64)
+                    }
                 } else {
                     (format::DataLayout::FlatInline, 0, data.len() as u64)
                 }
             }
-            tree::LeafContent::Regular(tree::RegularFile::External(.., size)) => {
-                // V1: compute chunk format from file size
-                // V2: hardcode 31 (origin/main behavior)
+            tree::LeafContent::Regular(
+                tree::RegularFile::External(.., size)
+                | tree::RegularFile::ExternalNoVerity(.., size)
+                | tree::RegularFile::Sparse(size),
+            ) => {
                 let chunk_format = match version.epoch() {
+                    // Epoch1: compute chunk format from file size
                     FormatEpoch::Epoch1 => compute_chunk_format(*size),
+                    // Epoch2: hardcode 31 (single-chunk layout)
                     FormatEpoch::Epoch2 => 31,
                 };
-                (format::DataLayout::ChunkBased, chunk_format, *size)
+                let i_u = if self.n_data_blocks > 0 {
+                    let blkaddr = (block_offset / format::BLOCK_SIZE as usize) as u32;
+                    (blkaddr & 0xFFFF0000) | chunk_format
+                } else {
+                    chunk_format
+                };
+                (format::DataLayout::ChunkBased, i_u, *size)
             }
             tree::LeafContent::CharacterDevice(rdev) | tree::LeafContent::BlockDevice(rdev) => {
                 let rdev32: u32 = (*rdev)
@@ -699,13 +733,12 @@ impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
                 (format::DataLayout::FlatPlain, 0, 0)
             }
             tree::LeafContent::Symlink(target) => {
-                assert!(
-                    target.len() <= crate::SYMLINK_MAX,
-                    "symlink target is {} bytes (max {})",
-                    target.len(),
-                    crate::SYMLINK_MAX,
-                );
-                (format::DataLayout::FlatInline, 0, target.len() as u64)
+                if self.n_data_blocks > 0 {
+                    let blkaddr = (block_offset / format::BLOCK_SIZE as usize) as u32;
+                    (format::DataLayout::FlatPlain, blkaddr, target.len() as u64)
+                } else {
+                    (format::DataLayout::FlatInline, 0, target.len() as u64)
+                }
             }
         };
         InodeMeta {
@@ -717,16 +750,72 @@ impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
     }
 
     fn write_inline(&self, output: &mut impl Output) {
-        output.write(match self.content {
-            tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => data,
-            tree::LeafContent::Regular(tree::RegularFile::External(..)) => b"\xff\xff\xff\xff", // null chunk
-            tree::LeafContent::Symlink(target) => target.as_bytes(),
-            _ => &[],
-        });
+        match self.content {
+            tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => {
+                let tail_start = data.len() - self.inline_tail_size;
+                output.write(&data[tail_start..]);
+            }
+            tree::LeafContent::Regular(
+                tree::RegularFile::External(..)
+                | tree::RegularFile::ExternalNoVerity(..)
+                | tree::RegularFile::Sparse(..),
+            ) => {
+                let n_chunks = self.inline_tail_size / 4;
+                for _ in 0..n_chunks {
+                    output.write(b"\xff\xff\xff\xff");
+                }
+            }
+            tree::LeafContent::Symlink(target) if self.n_data_blocks == 0 => {
+                output.write(target.as_bytes());
+            }
+            _ => {}
+        }
+    }
+
+    fn write_data_blocks(&self, output: &mut impl Output) {
+        if self.n_data_blocks > 0 {
+            let block_size = format::BLOCK_SIZE as usize;
+            match self.content {
+                tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => {
+                    for i in 0..self.n_data_blocks as usize {
+                        let start = i * block_size;
+                        let end = (start + block_size).min(data.len());
+                        if start < data.len() {
+                            output.write(&data[start..end]);
+                        }
+                        output.pad(block_size);
+                    }
+                }
+                tree::LeafContent::Symlink(target) => {
+                    let data = target.as_bytes();
+                    let len = data.len().min(block_size);
+                    output.write(&data[..len]);
+                    output.pad(block_size);
+                }
+                tree::LeafContent::Regular(
+                    tree::RegularFile::External(..)
+                    | tree::RegularFile::ExternalNoVerity(..)
+                    | tree::RegularFile::Sparse(..),
+                ) => {
+                    const LCFS_MAX_NONINLINE_CHUNKS: usize = 1024;
+                    for _ in 0..LCFS_MAX_NONINLINE_CHUNKS {
+                        output.write(b"\xff\xff\xff\xff");
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
 impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
+    fn chunk_inline_tail_size(&self) -> usize {
+        match &self.content {
+            InodeContent::Leaf(leaf) => leaf.inline_tail_size,
+            _ => 0,
+        }
+    }
+
     fn file_type(&self) -> format::FileType {
         // V1 whiteout escaping: char device (rdev=0) entries are written as regular files
         // to match C mkcomposefs v1.0.8 behavior.
@@ -744,6 +833,10 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
                 tree::LeafContent::Symlink(..) => format::FileType::Symlink,
             },
         }
+    }
+
+    fn inode_mode(&self) -> format::ModeField {
+        self.file_type() | self.stat.st_mode
     }
 
     /// Check if this inode can use compact format (32 bytes instead of 64).
@@ -879,7 +972,7 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
         let min_mtime = ctx.min_mtime;
         let meta = match &self.content {
             InodeContent::Directory(dir) => dir.inode_meta(output.get_block_start(idx)),
-            InodeContent::Leaf(leaf) => leaf.inode_meta(version),
+            InodeContent::Leaf(leaf) => leaf.inode_meta(version, output.get_block_start(idx)),
         };
         let InodeMeta {
             layout,
@@ -902,6 +995,59 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
 
         // We need to make sure the inline part doesn't overlap a block boundary
         output.pad(INODE_SLOT_SIZE);
+
+        // Epoch1 promoted symlinks: target was moved to a data block but we
+        // still need to pad the inode start to a block boundary, matching C
+        // compute_erofs_inode_padding_for_tail which uses the original
+        // (pre-promotion) total_size for the block-crossing check.
+        let is_promoted_symlink = version.epoch() == FormatEpoch::Epoch1
+            && matches!(self.file_type(), format::FileType::Symlink)
+            && matches!(layout, format::DataLayout::FlatPlain);
+        if is_promoted_symlink {
+            let block_size = u64::from(format::BLOCK_SIZE);
+            let current_pos: u64 = output.len().try_into().unwrap();
+            let original_total_size = (inode_header_size + xattr_size) as u64 + size;
+            let pos_block = current_pos / block_size;
+            let end_block = (current_pos + original_total_size - 1) / block_size;
+            if pos_block != end_block
+                && let Some(pad_size) = bytes_to_block_boundary(current_pos)
+            {
+                output.write_zeros(pad_size as usize);
+            }
+        }
+
+        // Promoted ChunkBased: chunk indices moved to data block, pad inode
+        // start to block boundary (matching C compute_erofs_inode_padding_for_tail).
+        let is_promoted_chunk_based = version.epoch() == FormatEpoch::Epoch1
+            && matches!(layout, format::DataLayout::ChunkBased)
+            && self.chunk_inline_tail_size() == 0
+            && matches!(&self.content, InodeContent::Leaf(leaf) if leaf.n_data_blocks > 0);
+        if is_promoted_chunk_based {
+            let current_pos: u64 = output.len().try_into().unwrap();
+            if let Some(pad_size) = bytes_to_block_boundary(current_pos) {
+                output.write_zeros(pad_size as usize);
+            }
+        }
+
+        // ChunkBased inodes in Epoch1 have inline chunk index data that
+        // needs the same non-symlink tail padding as FlatInline data.
+        if version.epoch() == FormatEpoch::Epoch1
+            && matches!(layout, format::DataLayout::ChunkBased)
+            && self.chunk_inline_tail_size() > 0
+        {
+            let current_pos: u64 = output.len().try_into().unwrap();
+            let non_tail_size = (inode_header_size + xattr_size) as u64;
+            let tail_size = self.chunk_inline_tail_size() as u64;
+            let inline_start = current_pos + non_tail_size;
+            if let Some(block_remainder) = bytes_to_block_boundary(inline_start)
+                && block_remainder < tail_size
+            {
+                let pad_size = (block_remainder.div_ceil(INODE_SLOT_SIZE as u64)
+                    * INODE_SLOT_SIZE as u64) as usize;
+                output.write_zeros(pad_size);
+            }
+        }
+
         if matches!(layout, format::DataLayout::FlatInline) {
             let inode_and_xattr_size: u64 = (inode_header_size + xattr_size).try_into().unwrap();
 
@@ -937,7 +1083,7 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
             output.write_struct(format::CompactInodeHeader {
                 format,
                 xattr_icount: xattr_icount.into(),
-                mode: self.file_type() | self.stat.st_mode,
+                mode: self.inode_mode(),
                 nlink: (nlink as u16).into(),
                 size: (size as u32).into(),
                 reserved: 0.into(),
@@ -966,7 +1112,7 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
             output.write_struct(format::ExtendedInodeHeader {
                 format,
                 xattr_icount: xattr_icount.into(),
-                mode: self.file_type() | self.stat.st_mode,
+                mode: self.inode_mode(),
                 size: size.into(),
                 u: u.into(),
                 ino: ino.into(),
@@ -990,8 +1136,9 @@ impl<ObjectID: FsVerityHashValue> Inode<'_, ObjectID> {
     }
 
     fn write_blocks(&self, output: &mut impl Output) {
-        if let InodeContent::Directory(dir) = &self.content {
-            dir.write_blocks(output);
+        match &self.content {
+            InodeContent::Directory(dir) => dir.write_blocks(output),
+            InodeContent::Leaf(leaf) => leaf.write_data_blocks(output),
         }
     }
 }
@@ -1018,18 +1165,36 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
             ..
         }) = content
         {
+            let metacopy = OverlayMetacopy::new(id);
             xattrs.add(
                 format::XATTR_OVERLAY_METACOPY,
-                OverlayMetacopy::new(id).as_bytes(),
+                metacopy.as_bytes(),
                 self.version,
             );
-
             let redirect = format!("/{}", id.to_object_pathname());
             xattrs.add(
                 format::XATTR_OVERLAY_REDIRECT,
                 redirect.as_bytes(),
                 self.version,
             );
+        } else if let InodeContent::Leaf(Leaf {
+            content: tree::LeafContent::Regular(tree::RegularFile::ExternalNoVerity(id, ..)),
+            ..
+        }) = content
+        {
+            xattrs.add(format::XATTR_OVERLAY_METACOPY, b"", self.version);
+            let redirect = format!("/{}", id.to_object_pathname());
+            xattrs.add(
+                format::XATTR_OVERLAY_REDIRECT,
+                redirect.as_bytes(),
+                self.version,
+            );
+        } else if let InodeContent::Leaf(Leaf {
+            content: tree::LeafContent::Regular(tree::RegularFile::Sparse(..)),
+            ..
+        }) = content
+        {
+            xattrs.add(format::XATTR_OVERLAY_METACOPY, b"", self.version);
         }
 
         // Add the normal xattrs.  They're already listed in sorted order.
@@ -1074,11 +1239,54 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
             !(matches!(leaf.content, tree::LeafContent::CharacterDevice(0)) && nlink > 1),
             "ValidatedFileSystem guarantees whiteout nlink == 1"
         );
+        let (n_data_blocks, inline_tail_size) = if self.version.epoch() == FormatEpoch::Epoch1 {
+            match &leaf.content {
+                tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => {
+                    if data.is_empty() {
+                        (0, 0)
+                    } else {
+                        let block_size = format::BLOCK_SIZE as usize;
+                        let mut n_blocks = data.len() / block_size;
+                        let mut tail = data.len() % block_size;
+                        if tail > block_size / 2 {
+                            n_blocks += 1;
+                            tail = 0;
+                        }
+                        (n_blocks as u32, tail)
+                    }
+                }
+                tree::LeafContent::Symlink(target) => {
+                    // Initial: no data blocks, tail = target length.
+                    // May be promoted to data block later by fixup_symlink_data_blocks
+                    // when inode_header + xattr_size + target_len >= BLOCK_SIZE.
+                    (0, target.len())
+                }
+                tree::LeafContent::Regular(
+                    tree::RegularFile::External(.., size)
+                    | tree::RegularFile::ExternalNoVerity(.., size)
+                    | tree::RegularFile::Sparse(size),
+                ) if *size > 0 => {
+                    let chunk_count = compute_chunk_count(*size);
+                    (0, chunk_count as usize * 4)
+                }
+                _ => (0, 0),
+            }
+        } else {
+            match &leaf.content {
+                tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => (0, data.len()),
+                tree::LeafContent::Regular(tree::RegularFile::External(..)) => {
+                    (0, 4) // single null chunk index
+                }
+                _ => (0, 0),
+            }
+        };
         let inode = self.push_inode(
             &leaf.stat,
             InodeContent::Leaf(Leaf {
                 content: &leaf.content,
                 nlink,
+                n_data_blocks,
+                inline_tail_size,
             }),
         );
 
@@ -1348,10 +1556,9 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
                 }
             }
 
-            // V1: if this directory had whiteout children, add parent xattrs.
-            // C adds these once per directory, on first whiteout child found.
-            // Matches OVERLAY_XATTR_ESCAPED_WHITEOUTS, OVERLAY_XATTR_USERXATTR_WHITEOUTS,
-            // OVERLAY_XATTR_ESCAPED_OPAQUE (=x), OVERLAY_XATTR_USERXATTR_OPAQUE (=x).
+            // Epoch1: if this directory had whiteout children, add parent xattrs.
+            // C adds WHITEOUTS + USERXATTR_WHITEOUTS for all versions, and
+            // OPAQUE + USERXATTR_OPAQUE only for version >= 1.
             if self.version.epoch() == FormatEpoch::Epoch1 && dir_has_whiteout {
                 self.inodes[me]
                     .xattrs
@@ -1359,12 +1566,14 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
                 self.inodes[me]
                     .xattrs
                     .add(format::XATTR_USERXATTR_WHITEOUTS, b"", self.version);
-                self.inodes[me]
-                    .xattrs
-                    .add(format::XATTR_OVERLAY_OPAQUE, b"x", self.version);
-                self.inodes[me]
-                    .xattrs
-                    .add(format::XATTR_USERXATTR_OPAQUE, b"x", self.version);
+                if self.version == format::FormatVersion::V1 {
+                    self.inodes[me]
+                        .xattrs
+                        .add(format::XATTR_OVERLAY_OPAQUE, b"x", self.version);
+                    self.inodes[me]
+                        .xattrs
+                        .add(format::XATTR_USERXATTR_OPAQUE, b"x", self.version);
+                }
             }
 
             entries.sort_unstable_by_key(|e| e.name);
@@ -1806,6 +2015,69 @@ type PreparedInodes<'a, ObjectID> = (Vec<Inode<'a, ObjectID>>, Vec<XAttr>, (u64,
 
 /// Shared setup for all `mkfs_erofs_*` entry points.
 ///
+/// Epoch1: promote symlink inodes to data-block layout when the inode header +
+/// xattrs + target would fill a full block. Must run after share_xattrs (so
+/// xattr sizes are final) and after calculate_min_mtime (so compact/extended
+/// is deterministic).
+fn fixup_epoch1_data_blocks<ObjectID: FsVerityHashValue>(
+    inodes: &mut [Inode<ObjectID>],
+    version: format::FormatVersion,
+    min_mtime: (u64, u32),
+) {
+    for inode in inodes.iter_mut() {
+        let (tail_size, nlink, is_symlink) = match &inode.content {
+            InodeContent::Leaf(leaf) if leaf.inline_tail_size > 0 => {
+                let is_sym = matches!(leaf.content, tree::LeafContent::Symlink(..));
+                (leaf.inline_tail_size, leaf.nlink, is_sym)
+            }
+            _ => continue,
+        };
+
+        if is_symlink {
+            let xattr_size = inode.xattrs.byte_size(version);
+            let use_compact = inode.fits_in_compact(min_mtime, tail_size as u64, nlink);
+            let inode_header_size = if use_compact {
+                size_of::<format::CompactInodeHeader>()
+            } else {
+                size_of::<format::ExtendedInodeHeader>()
+            };
+            let total_size = inode_header_size + xattr_size + tail_size;
+            if total_size >= format::BLOCK_SIZE as usize {
+                let leaf = match &mut inode.content {
+                    InodeContent::Leaf(leaf) => leaf,
+                    _ => unreachable!(),
+                };
+                leaf.n_data_blocks += 1;
+                leaf.inline_tail_size = 0;
+            }
+        } else {
+            let is_chunk_based = match &inode.content {
+                InodeContent::Leaf(leaf) => matches!(
+                    leaf.content,
+                    tree::LeafContent::Regular(
+                        tree::RegularFile::External(..)
+                            | tree::RegularFile::ExternalNoVerity(..)
+                            | tree::RegularFile::Sparse(..)
+                    )
+                ),
+                _ => false,
+            };
+            if is_chunk_based {
+                let xattr_size = inode.xattrs.byte_size(version);
+                let overshoot = xattr_size % INODE_SLOT_SIZE;
+                if tail_size + overshoot > format::BLOCK_SIZE as usize {
+                    let leaf = match &mut inode.content {
+                        InodeContent::Leaf(leaf) => leaf,
+                        _ => unreachable!(),
+                    };
+                    leaf.n_data_blocks = 1;
+                    leaf.inline_tail_size = 0;
+                }
+            }
+        }
+    }
+}
+
 /// Collects inodes from the filesystem, injects the Epoch1 opaque xattr on the
 /// root directory, computes `header_flags` and `composefs_version`, promotes
 /// repeated xattrs to the shared table, and calculates `min_mtime`.
@@ -1848,15 +2120,9 @@ fn prepare_erofs_inodes<'a, ObjectID: FsVerityHashValue>(
                 0
             };
 
-            // V0: auto-bump composefs_version to 1 when user whiteouts present.
-            // V1: always write composefs_version=1 (the version enum encodes this directly).
-            let cfs_ver = match version {
-                format::FormatVersion::V0 => {
-                    let has_user_whiteout = inodes.iter().any(|inode| inode.escaped_whiteout);
-                    if has_user_whiteout { 1u32 } else { 0u32 }
-                }
-                _ => version.composefs_version().get(),
-            };
+            // C library writes composefs_version directly from the version option.
+            // V0 always writes 0, V1 always writes 1.
+            let cfs_ver = version.composefs_version().get();
 
             (flags, cfs_ver)
         }
@@ -1865,6 +2131,10 @@ fn prepare_erofs_inodes<'a, ObjectID: FsVerityHashValue>(
 
     let xattrs = share_xattrs(&mut inodes, version);
     let min_mtime = calculate_min_mtime(&inodes);
+
+    if version.epoch() == FormatEpoch::Epoch1 {
+        fixup_epoch1_data_blocks(&mut inodes, version, min_mtime);
+    }
 
     (inodes, xattrs, min_mtime, header_flags, composefs_version)
 }

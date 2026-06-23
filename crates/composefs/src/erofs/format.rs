@@ -263,7 +263,8 @@ impl std::ops::BitOr<u32> for FileType {
     type Output = ModeField;
 
     fn bitor(self, permissions: u32) -> ModeField {
-        ModeField(self | (permissions as u16))
+        // Mask out file type bits so we only keep permission bits from the input
+        ModeField(self | (permissions as u16 & !S_IFMT))
     }
 }
 
