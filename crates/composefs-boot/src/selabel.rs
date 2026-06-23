@@ -14,9 +14,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use fn_error_context::context;
-use pcre2::bytes::Regex;
+use pcre2::bytes::Regex as PcreRegex;
+// the meta regex engine might be able to beat out specifying
+// another engine sometimes, since it kind of just redirects to a different engine,
+// depending on regex, so might as well use it.
+// It's also fairly easy to swap out here if desired, since really only
+// two methods need to be supported.
+use regex_automata::meta::Regex as AutomataRegex;
 use rustix::{
     fd::AsFd,
     fs::{Mode, OFlags, openat},
@@ -101,10 +107,47 @@ fn process_spec_file(
     Ok(())
 }
 
+/* Most Rust crates don't support lookarounds and other features PCRE2 does, but they perform
+ * a lot better when the regex being parsed doesn't involve them. So, we use the Rust
+ * regex parsers, and if they error out, we'll fall back to PCRE2. */
+
+enum RegexImpl {
+    Automata(AutomataRegex),
+    Pcre2(PcreRegex),
+}
+
+impl RegexImpl {
+    #[inline(always)]
+    fn new(pattern: &str) -> Result<Self> {
+        AutomataRegex::new(pattern)
+            .map(RegexImpl::Automata)
+            .or_else(|automata_err| {
+                PcreRegex::new(pattern)
+                    .map(RegexImpl::Pcre2)
+                    .map_err(|pcre_err| {
+                        anyhow!(
+                            "Failed to compile regex `{}` with regex_automata: {}; PCRE2 fallback failed: {}",
+                            pattern,
+                            automata_err,
+                            pcre_err
+                        )
+                    })
+            })
+    }
+
+    #[inline(always)]
+    fn is_match(&self, input: &[u8]) -> bool {
+        match self {
+            RegexImpl::Automata(re) => re.is_match(input),
+            RegexImpl::Pcre2(re) => re.is_match(input).unwrap_or(false),
+        }
+    }
+}
+
 struct Policy {
     aliases: HashMap<OsString, OsString>,
-    regexes: Vec<Regex>,
-    contexts: Vec<String>,
+    // (regex, context)
+    rules: Vec<(RegexImpl, String)>,
 }
 
 /// Open a file in the composefs store, handling inline vs external files.
@@ -172,16 +215,14 @@ impl Policy {
         regexps.reverse();
         contexts.reverse();
 
-        let mut compiled = Vec::with_capacity(regexps.len());
-        for r in &regexps {
-            compiled.push(Regex::new(r).with_context(|| format!("Compiling PCRE2 regex: {r}"))?);
+        let mut rules = Vec::with_capacity(regexps.len());
+        for (re_src, context) in regexps.into_iter().zip(contexts.into_iter()) {
+            let regex =
+                RegexImpl::new(&re_src).with_context(|| format!("Compiling regex: {re_src}"))?;
+            rules.push((regex, context));
         }
 
-        Ok(Policy {
-            aliases,
-            regexes: compiled,
-            contexts,
-        })
+        Ok(Policy { aliases, rules })
     }
 
     pub fn check_aliased(&self, filename: &OsStr) -> Option<&OsStr> {
@@ -191,10 +232,10 @@ impl Policy {
     pub fn lookup(&self, filename: &OsStr, ifmt: u8) -> Option<&str> {
         let key = &[filename.as_bytes(), &[ifmt]].concat();
 
-        for (i, re) in self.regexes.iter().enumerate() {
-            if re.is_match(key).unwrap_or(false) {
-                let ctx = self.contexts[i].as_str();
-                return (ctx != "<<none>>").then_some(ctx);
+        for rule in &self.rules {
+            if rule.0.is_match(key) {
+                let context = rule.1.as_str();
+                return (context != "<<none>>").then_some(context);
             }
         }
         None
