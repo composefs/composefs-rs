@@ -1,0 +1,16 @@
+FROM quay.io/fedora/fedora:latest
+RUN dnf -y install meson gcc gcc-c++ pkg-config openssl-devel erofs-utils \
+    fsverity-utils gzip diffutils coreutils findutils && dnf clean all
+COPY composefs-c /src/composefs-c
+COPY libcomposefs_capi.so /usr/lib64/
+WORKDIR /src/composefs-c
+RUN meson setup build && meson compile -C build
+RUN cp /usr/lib64/libcomposefs_capi.so build/libcomposefs/libcomposefs.so.1.4.0 && \
+    ln -sf libcomposefs.so.1.4.0 build/libcomposefs/libcomposefs.so.1 && \
+    ln -sf libcomposefs.so.1 build/libcomposefs/libcomposefs.so
+RUN export LD_LIBRARY_PATH=/src/composefs-c/build/libcomposefs && \
+    ldd build/tools/mkcomposefs | grep composefs && \
+    tests/test-checksums.sh build/tools tests/assets \
+        "config.dump.gz config-with-hard-link.dump.gz special.dump bigfile.dump bigfile-xattr.dump special_v1.dump honggfuzz-long-symlink.dump honggfuzz-longlink-unterminated.dump honggfuzz-bigfile-with-acl.dump no-newline.dump honggfuzz-chardev-nonzero-size.dump longlink.dump honggfuzz-write-inode-data.dump" && \
+    tests/test-units.sh build/tools && \
+    echo "=== All C tests passed with Rust libcomposefs ==="

@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: Composefs
+Description: library for generating and using composefs images
+Version: @VERSION@
+Libs: -L${libdir} -lcomposefs
+Cflags: -I${includedir}

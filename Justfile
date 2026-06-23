@@ -141,6 +141,11 @@ generate-corpus:
 fuzz-list:
     cd crates/composefs && cargo +nightly fuzz list
 
+# Test composefs-capi against the C composefs test suite in a container.
+# Optionally pass the path to a local checkout of the C composefs repo.
+test-capi *ARGS:
+    crates/composefs-capi/tests/test-capi-container.sh {{ARGS}}
+
 # Clean build artifacts
 clean:
     cargo clean
