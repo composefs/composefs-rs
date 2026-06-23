@@ -46,12 +46,16 @@ pub const INLINE_CONTENT_MAX_V0: usize = 64;
 /// Maximum inline content size accepted when parsing untrusted input (dumpfiles,
 /// EROFS images in composefs-restricted mode).
 ///
+/// Only enforced for v2 images; the C code does not check this limit.
+///
 /// This is intentionally higher than [`INLINE_CONTENT_MAX_V0`] to allow for future
 /// increases to the inline threshold (see
 /// <https://github.com/composefs/composefs-rs/issues/107>).
 pub const MAX_INLINE_CONTENT: usize = 512;
 
 /// Maximum symlink target length in bytes.
+///
+/// Only enforced for v2 images; the C code does not check this limit.
 ///
 /// XFS limits symlink targets to 1024 bytes (`XFS_SYMLINK_MAXLEN`). Since
 /// generic Linux containers are commonly backed by XFS, we enforce that

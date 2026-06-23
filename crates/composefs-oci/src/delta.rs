@@ -130,13 +130,19 @@ impl<ObjectID: FsVerityHashValue> ComposeFsDataSource<ObjectID> {
 
         self.current = Some(match file {
             RegularFile::Inline(data) => CurrentFile::Inline(Cursor::new(data.to_vec())),
-            RegularFile::External(id, _size) => {
+            RegularFile::External(id, _size) | RegularFile::ExternalNoVerity(id, _size) => {
                 let fd = self
                     .source
                     .repo
                     .open_object(id)
                     .with_context(|| format!("Opening source object for {}", path.display()))?;
                 CurrentFile::External(File::from(fd))
+            }
+            RegularFile::Sparse(_) => {
+                anyhow::bail!(
+                    "Sparse file not supported as delta source: {}",
+                    path.display()
+                );
             }
         });
         Ok(())

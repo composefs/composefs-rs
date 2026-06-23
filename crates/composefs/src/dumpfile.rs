@@ -191,7 +191,9 @@ pub fn write_leaf(
             data,
             None,
         ),
-        LeafContent::Regular(RegularFile::External(id, size)) => write_entry(
+        LeafContent::Regular(
+            RegularFile::External(id, size) | RegularFile::ExternalNoVerity(id, size),
+        ) => write_entry(
             writer,
             path,
             stat,
@@ -202,6 +204,18 @@ pub fn write_leaf(
             id.to_object_pathname(),
             &[],
             Some(&id.to_hex()),
+        ),
+        LeafContent::Regular(RegularFile::Sparse(size)) => write_entry(
+            writer,
+            path,
+            stat,
+            FileType::RegularFile,
+            *size,
+            nlink,
+            0,
+            "",
+            &[],
+            None,
         ),
         LeafContent::BlockDevice(rdev) => write_entry(
             writer,
@@ -450,28 +464,38 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
                 .ok_or_else(|| anyhow::anyhow!("Hardlink target not found: {target:?}"))?;
             Inode::leaf(existing_id)
         }
-        Item::RegularInline { ref content, .. } => {
+        Item::RegularInline {
+            ref content, size, ..
+        } => {
             let stat = entry_to_stat(&entry)?;
-            let data: Box<[u8]> = match content {
-                std::borrow::Cow::Borrowed(d) => Box::from(*d),
-                std::borrow::Cow::Owned(d) => d.clone().into_boxed_slice(),
+            let leaf_content = if content.is_empty() && size > 0 {
+                LeafContent::Regular(RegularFile::Sparse(size))
+            } else {
+                let data: Box<[u8]> = match content {
+                    std::borrow::Cow::Borrowed(d) => Box::from(*d),
+                    std::borrow::Cow::Owned(d) => d.clone().into_boxed_slice(),
+                };
+                LeafContent::Regular(RegularFile::Inline(data))
             };
-            let content = LeafContent::Regular(RegularFile::Inline(data));
-            let id = push_leaf(fs, stat, content);
+            let id = push_leaf(fs, stat, leaf_content);
             Inode::leaf(id)
         }
         Item::Regular {
             size,
             ref fsverity_digest,
+            ref path,
             ..
         } => {
             let stat = entry_to_stat(&entry)?;
-            let digest = fsverity_digest
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("External file missing fsverity digest"))?;
-            let object_id = ObjectID::from_hex(digest)?;
-            let content = LeafContent::Regular(RegularFile::External(object_id, size));
-            let id = push_leaf(fs, stat, content);
+            let leaf_content = if let Some(digest) = fsverity_digest.as_ref() {
+                let object_id = ObjectID::from_hex(digest)?;
+                LeafContent::Regular(RegularFile::External(object_id, size))
+            } else {
+                let object_id = ObjectID::from_object_pathname(path.as_os_str().as_bytes())
+                    .map_err(|e| anyhow::anyhow!("invalid object pathname: {e}"))?;
+                LeafContent::Regular(RegularFile::ExternalNoVerity(object_id, size))
+            };
+            let id = push_leaf(fs, stat, leaf_content);
             Inode::leaf(id)
         }
         Item::Device { rdev, nlink } => {

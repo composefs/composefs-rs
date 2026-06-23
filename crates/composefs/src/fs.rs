@@ -306,7 +306,9 @@ fn write_leaf<ObjectID: FsVerityHashValue>(
         LeafContent::Regular(RegularFile::Inline(data)) => {
             set_file_contents(dirfd, name, &leaf.stat, data)?
         }
-        LeafContent::Regular(RegularFile::External(id, size)) => {
+        LeafContent::Regular(
+            RegularFile::External(id, size) | RegularFile::ExternalNoVerity(id, size),
+        ) => {
             let object = repo.open_object(id)?;
             // TODO: make this better.  At least needs to be EINTR-safe.  Could even do reflink in some cases.
             // Regardless we shouldn't read the whole file into memory.
@@ -314,6 +316,9 @@ fn write_leaf<ObjectID: FsVerityHashValue>(
             let mut buffer = vec![MaybeUninit::uninit(); size];
             let (data, _) = read(object, &mut buffer)?;
             set_file_contents(dirfd, name, &leaf.stat, data)?;
+        }
+        LeafContent::Regular(RegularFile::Sparse(..)) => {
+            set_file_contents(dirfd, name, &leaf.stat, &[])?;
         }
         LeafContent::BlockDevice(rdev) => mknodat(dirfd, name, FileType::BlockDevice, mode, *rdev)?,
         LeafContent::CharacterDevice(rdev) => {
@@ -707,7 +712,7 @@ pub fn read_file<ObjectID: FsVerityHashValue>(
 ) -> Result<Box<[u8]>> {
     match file {
         RegularFile::Inline(data) => Ok(data.clone()),
-        RegularFile::External(id, size) => {
+        RegularFile::External(id, size) | RegularFile::ExternalNoVerity(id, size) => {
             let capacity: usize = (*size).try_into().context("file too large for memory")?;
             let mut data = Vec::with_capacity(capacity);
             std::fs::File::from(repo.open_object(id)?).read_to_end(&mut data)?;
@@ -717,6 +722,7 @@ pub fn read_file<ObjectID: FsVerityHashValue>(
             );
             Ok(data.into_boxed_slice())
         }
+        RegularFile::Sparse(..) => Ok(Box::new([])),
     }
 }
 
