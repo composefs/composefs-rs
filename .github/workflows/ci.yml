@@ -88,6 +88,20 @@ jobs:
             crates/composefs/fuzz/artifacts/
             target/fuzz-logs/
 
+  # C API compatibility: builds the Rust cdylib, then runs the C
+  # composefs test suite (test-checksums, test-units) against it.
+  capi:
+    name: C API compatibility
+    needs: smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v4
+      - name: Run C test suite against Rust libcomposefs
+        run: just test-capi
+
   # Full integration tests: builds a bootc container image, runs all
   # tests (both unprivileged and privileged).  Privileged tests execute
   # inside bcvk ephemeral VMs booted from the container image.
@@ -222,7 +236,7 @@ jobs:
   # repository settings as the single required status check.
   required-checks:
     if: always()
-    needs: [nightly, fedora, smoke, fuzz, integration, examples]
+    needs: [nightly, fedora, smoke, fuzz, capi, integration, examples]
     runs-on: ubuntu-latest
     steps:
       - run: exit 1
@@ -231,5 +245,6 @@ jobs:
           needs.fedora.result != 'success' ||
           needs.smoke.result != 'success' ||
           needs.fuzz.result != 'success' ||
+          needs.capi.result != 'success' ||
           needs.integration.result != 'success' ||
           needs.examples.result != 'success'
