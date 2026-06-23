@@ -1,0 +1,25 @@
+[package]
+name = "composefs-capi"
+version = "1.4.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "C-compatible shared library (libcomposefs) backed by Rust composefs implementation"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+composefs = { workspace = true }
+libc = "0.2"
+anyhow = "1"
+rustix = { version = "1", features = ["fs", "mm", "process", "mount"] }
+zerocopy = "0.8"
+
+[build-dependencies]
+cc = "1"
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "allow"
+missing_debug_implementations = "allow"
