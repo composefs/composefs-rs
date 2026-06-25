@@ -35,11 +35,11 @@ pub fn overlayfs_set_fd(fs_fd: BorrowedFd, key: &str, fd: BorrowedFd) -> rustix:
 pub fn overlayfs_set_lower_and_data_fds(
     fs_fd: impl AsFd,
     lower: impl AsFd,
-    data: Option<impl AsFd>,
+    data_fds: &[BorrowedFd<'_>],
 ) -> rustix::io::Result<()> {
     overlayfs_set_fd(fs_fd.as_fd(), "lowerdir+", lower.as_fd())?;
-    if let Some(data) = data {
-        overlayfs_set_fd(fs_fd.as_fd(), "datadir+", data.as_fd())?;
+    for data_fd in data_fds {
+        overlayfs_set_fd(fs_fd.as_fd(), "datadir+", *data_fd)?;
     }
     Ok(())
 }
@@ -84,17 +84,16 @@ pub fn overlayfs_set_fd(fs_fd: BorrowedFd, key: &str, fd: BorrowedFd) -> rustix:
 pub fn overlayfs_set_lower_and_data_fds(
     fs_fd: impl AsFd,
     lower: impl AsFd,
-    data: Option<impl AsFd>,
+    data_fds: &[BorrowedFd<'_>],
 ) -> rustix::io::Result<()> {
     use std::os::fd::AsRawFd;
 
     let lower_fd = lower.as_fd().as_raw_fd().to_string();
-    let arg = if let Some(data) = data {
-        let data_fd = data.as_fd().as_raw_fd().to_string();
-        format!("/proc/self/fd/{lower_fd}::/proc/self/fd/{data_fd}")
-    } else {
-        format!("/proc/self/fd/{lower_fd}")
-    };
+    let mut arg = format!("/proc/self/fd/{lower_fd}");
+    for data_fd in data_fds {
+        let raw = data_fd.as_raw_fd().to_string();
+        arg.push_str(&format!("::/proc/self/fd/{raw}"));
+    }
     rustix::mount::fsconfig_set_string(fs_fd.as_fd(), "lowerdir", arg)
 }
 

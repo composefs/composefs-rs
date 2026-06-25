@@ -149,17 +149,17 @@ impl MountOptions {
     }
 }
 
-/// Creates a composefs mount using overlayfs with an erofs image and base directory.
+/// Creates a composefs mount using overlayfs with an erofs image and base directories.
 ///
 /// This mounts a composefs image by creating an overlayfs that layers the erofs image
-/// (as the lower layer) over a base directory (as the data layer). The overlayfs is
+/// (as the lower layer) over base directories (as data layers). The overlayfs is
 /// configured with metacopy and redirect_dir enabled for composefs functionality.
 ///
 /// # Arguments
 ///
 /// * `image` - File descriptor for the composefs erofs image
 /// * `name` - Name for the mount source (appears as "composefs:{name}")
-/// * `basedir` - File descriptor for the base directory containing the actual file data
+/// * `basedirs` - File descriptors for the base directories containing actual file data
 /// * `enable_verity` - Whether to require fs-verity verification for all files
 /// * `options` - Mount options controlling overlay and read-write behaviour
 ///
@@ -170,7 +170,7 @@ impl MountOptions {
 pub fn composefs_fsmount(
     image: OwnedFd,
     name: &str,
-    basedir: impl AsFd,
+    basedirs: &[BorrowedFd<'_>],
     enable_verity: bool,
     options: &MountOptions,
 ) -> Result<OwnedFd> {
@@ -187,7 +187,7 @@ pub fn composefs_fsmount(
         overlayfs_set_fd(overlayfs.as_fd(), "upperdir", upperdir.as_fd())?;
         overlayfs_set_fd(overlayfs.as_fd(), "workdir", workdir.as_fd())?;
     }
-    overlayfs_set_lower_and_data_fds(&overlayfs, &erofs_mnt, Some(&basedir))?;
+    overlayfs_set_lower_and_data_fds(&overlayfs, &erofs_mnt, basedirs)?;
     fsconfig_create(overlayfs.as_fd())?;
 
     let mount_attr = if options.read_write {

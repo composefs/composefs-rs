@@ -2524,16 +2524,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     #[context("Mounting image '{name}'")]
     pub fn mount_with_options(&self, name: &str, options: &MountOptions) -> Result<OwnedFd> {
         let (image, enable_verity) = self.open_image(name)?;
+        let objects = self
+            .objects_dir()
+            .context("Getting objects directory for mount")?;
 
-        composefs_fsmount(
-            image,
-            name,
-            self.objects_dir()
-                .context("Getting objects directory for mount")?,
-            enable_verity,
-            options,
-        )
-        .context("Creating filesystem mount")
+        composefs_fsmount(image, name, &[objects.as_fd()], enable_verity, options)
+            .context("Creating filesystem mount")
     }
 
     /// Create a detached read-only mount of an image.
