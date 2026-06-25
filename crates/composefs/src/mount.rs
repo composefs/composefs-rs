@@ -145,6 +145,8 @@ pub struct MountOptions {
     /// Overlay upper layer and work directory: (upperdir, workdir).
     upperdirs: Option<(OwnedFd, OwnedFd)>,
     read_write: bool,
+    /// User namespace file descriptor for ID-mapped mounts.
+    idmap_fd: Option<OwnedFd>,
 }
 
 impl MountOptions {
@@ -157,6 +159,12 @@ impl MountOptions {
     /// Make the mount read-write (only meaningful with an overlay).
     pub fn set_read_write(&mut self, read_write: bool) -> &mut Self {
         self.read_write = read_write;
+        self
+    }
+
+    /// Set a user namespace file descriptor for ID-mapped mounts.
+    pub fn set_idmap(&mut self, fd: OwnedFd) -> &mut Self {
+        self.idmap_fd = Some(fd);
         self
     }
 }
@@ -186,7 +194,11 @@ pub fn composefs_fsmount(
     verity: VerityRequirement,
     options: &MountOptions,
 ) -> Result<OwnedFd> {
-    let erofs_mnt = prepare_mount(erofs_mount(image)?)?;
+    let erofs_mnt = erofs_mount(image)?;
+    if let Some(idmap_fd) = &options.idmap_fd {
+        composefs_ioctls::mount::mount_setattr_idmap(erofs_mnt.as_fd(), idmap_fd.as_fd())?;
+    }
+    let erofs_mnt = prepare_mount(erofs_mnt)?;
 
     let overlayfs = FsHandle::open("overlay")?;
     fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;

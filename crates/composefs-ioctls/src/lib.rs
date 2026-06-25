@@ -25,6 +25,7 @@
 #![deny(unsafe_code)]
 
 pub mod fsverity;
+pub mod mount;
 
 #[cfg(feature = "loop-device")]
 pub mod loop_device;
