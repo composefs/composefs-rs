@@ -32,12 +32,14 @@ jobs:
       options: "--privileged --pid=host -v /var/tmp:/var/tmp --tmpfs /tmp:rw,exec,nosuid,nodev -v /:/run/host"
 
     steps:
-    - run: dnf -y install cargo clippy composefs-devel e2fsprogs just ostree rustfmt gcc-c++
+    - run: dnf -y install cargo clippy composefs-devel e2fsprogs fsverity-utils just ostree rustfmt gcc-c++
     - name: Enable fs-verity on /
       run: tune2fs -O verity $(findmnt -vno SOURCE /run/host)
     - uses: actions/checkout@v7
     - name: Run all checks (clippy, fmt, feature combos, tests)
       run: env CFS_TEST_TMPDIR=/run/host/var/tmp just check
+    - name: Run mount.composefs tests
+      run: env TMPDIR=/run/host/var/tmp just test-mount-composefs
 
   # Fast smoke test — catches basic breakage before spending time on
   # container builds and VM boots.  Runs only the unprivileged tests

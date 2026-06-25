@@ -72,6 +72,10 @@ test-integration *ARGS: build
         cargo test -p composefs-integration-tests --test cfsctl-integration-tests -- --skip privileged_ {{ ARGS }}
     fi
 
+# Run mount.composefs shell tests (needs fsverity-utils; mount tests need root)
+test-mount-composefs: build
+    crates/composefs-ctl/tests/test-mount-composefs.sh $(pwd)/target/debug/cfsctl
+
 # Build the test container image for VM-based integration tests
 _integration-container-build:
     podman build --build-arg base_image={{base_image}} --build-arg cfsctl_features={{cfsctl_features}} -t {{_test_image}} .
