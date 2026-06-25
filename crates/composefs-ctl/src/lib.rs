@@ -24,6 +24,7 @@ pub use composefs_oci;
 
 pub mod composefs_info;
 pub mod mkcomposefs;
+pub mod mountcomposefs;
 /// Varlink RPC service exposing repository operations over a Unix socket.
 pub mod varlink;
 

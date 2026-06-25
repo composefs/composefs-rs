@@ -1,8 +1,9 @@
 //! Command-line control utility for composefs repositories and images.
 //!
-//! `cfsctl` is a multi-call binary: when invoked as `mkcomposefs` or
-//! `composefs-info` (via symlink or hardlink), it dispatches to the
-//! corresponding tool. Otherwise it runs the normal `cfsctl` interface.
+//! `cfsctl` is a multi-call binary: when invoked as `mkcomposefs`,
+//! `composefs-info`, or `mount.composefs` (via symlink or hardlink),
+//! it dispatches to the corresponding tool. Otherwise it runs the normal
+//! `cfsctl` interface.
 //!
 //! ## C composefs compatibility roadmap
 //!
@@ -46,6 +47,7 @@ fn main() -> Result<()> {
     match binary_name().as_deref() {
         Some("mkcomposefs") => composefs_ctl::mkcomposefs::run(),
         Some("composefs-info") => composefs_ctl::composefs_info::run(),
+        Some("mount.composefs") => composefs_ctl::mountcomposefs::run(),
         // When called as `cfsctl mkcomposefs ...` or `cfsctl composefs-info ...`,
         // intercept before clap so that --help and all flags go to the real tool.
         _ if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("mkcomposefs")) => {
@@ -53,6 +55,9 @@ fn main() -> Result<()> {
         }
         _ if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("composefs-info")) => {
             composefs_ctl::composefs_info::run_from_args(rest_of_args())
+        }
+        _ if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("mount.composefs")) => {
+            composefs_ctl::mountcomposefs::run_from_args(rest_of_args())
         }
         _ => {
             // If we were spawned as a userns helper process, handle that and exit.
