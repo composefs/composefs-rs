@@ -126,6 +126,18 @@ pub fn erofs_mount(image: OwnedFd) -> Result<OwnedFd> {
     )?)
 }
 
+/// Controls fs-verity enforcement for overlay file data.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum VerityRequirement {
+    /// Do not require fs-verity.
+    #[default]
+    Disabled,
+    /// Require fs-verity; fail if the kernel does not support it.
+    Required,
+    /// Try to enable fs-verity; silently continue if unsupported.
+    Try,
+}
+
 /// Options controlling how a composefs image is mounted.
 #[derive(Debug, Default)]
 #[non_exhaustive]
@@ -160,7 +172,7 @@ impl MountOptions {
 /// * `image` - File descriptor for the composefs erofs image
 /// * `name` - Name for the mount source (appears as "composefs:{name}")
 /// * `basedirs` - File descriptors for the base directories containing actual file data
-/// * `enable_verity` - Whether to require fs-verity verification for all files
+/// * `verity` - Whether and how to enforce fs-verity verification for overlay files
 /// * `options` - Mount options controlling overlay and read-write behaviour
 ///
 /// # Returns
@@ -171,7 +183,7 @@ pub fn composefs_fsmount(
     image: OwnedFd,
     name: &str,
     basedirs: &[BorrowedFd<'_>],
-    enable_verity: bool,
+    verity: VerityRequirement,
     options: &MountOptions,
 ) -> Result<OwnedFd> {
     let erofs_mnt = prepare_mount(erofs_mount(image)?)?;
@@ -180,8 +192,18 @@ pub fn composefs_fsmount(
     fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
     fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
     fsconfig_set_string(overlayfs.as_fd(), "redirect_dir", "on")?;
-    if enable_verity {
-        fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
+    match verity {
+        VerityRequirement::Disabled => {}
+        VerityRequirement::Required => {
+            fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
+        }
+        VerityRequirement::Try => {
+            match fsconfig_set_string(overlayfs.as_fd(), "verity", "require") {
+                Ok(()) => {}
+                Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOSYS) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
     if let Some((upperdir, workdir)) = &options.upperdirs {
         overlayfs_set_fd(overlayfs.as_fd(), "upperdir", upperdir.as_fd())?;

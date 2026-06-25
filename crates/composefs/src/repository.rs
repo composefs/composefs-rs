@@ -113,7 +113,7 @@ use crate::{
         FsVerityHasher, MeasureVerityError, compute_verity, enable_verity_maybe_copy,
         ensure_verity_equal, has_verity, measure_verity, measure_verity_opt,
     },
-    mount::{MountOptions, composefs_fsmount, mount_at},
+    mount::{MountOptions, VerityRequirement, composefs_fsmount, mount_at},
     shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamReader, SplitStreamWriter},
     util::{ErrnoFilter, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
@@ -2527,8 +2527,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let objects = self
             .objects_dir()
             .context("Getting objects directory for mount")?;
+        let verity = if enable_verity {
+            VerityRequirement::Required
+        } else {
+            VerityRequirement::Disabled
+        };
 
-        composefs_fsmount(image, name, &[objects.as_fd()], enable_verity, options)
+        composefs_fsmount(image, name, &[objects.as_fd()], verity, options)
             .context("Creating filesystem mount")
     }
 

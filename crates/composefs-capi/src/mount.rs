@@ -97,12 +97,17 @@ pub unsafe extern "C" fn lcfs_mount_fd(
             }
         }
 
-        let enable_verity = if !options.is_null() {
+        let verity = if !options.is_null() {
             let opts = &*options;
-            (opts.flags & LCFS_MOUNT_FLAGS_REQUIRE_VERITY) != 0
-                || (opts.flags & LCFS_MOUNT_FLAGS_TRY_VERITY) != 0
+            if (opts.flags & LCFS_MOUNT_FLAGS_REQUIRE_VERITY) != 0 {
+                composefs::mount::VerityRequirement::Required
+            } else if (opts.flags & LCFS_MOUNT_FLAGS_TRY_VERITY) != 0 {
+                composefs::mount::VerityRequirement::Try
+            } else {
+                composefs::mount::VerityRequirement::Disabled
+            }
         } else {
-            false
+            composefs::mount::VerityRequirement::Disabled
         };
 
         if !basedirs.is_empty() {
@@ -128,7 +133,7 @@ pub unsafe extern "C" fn lcfs_mount_fd(
                 erofs_fd,
                 "composefs",
                 &borrowed,
-                enable_verity,
+                verity,
                 &mount_options,
             ) {
                 Ok(fs_fd) => {
