@@ -155,7 +155,7 @@ fn overlay_state(base: impl AsFd, state: impl AsFd, source: &str) -> Result<()> 
     fsconfig_set_string(overlayfs.as_fd(), "source", source)?;
     overlayfs_set_fd(overlayfs.as_fd(), "workdir", work.as_fd())?;
     overlayfs_set_fd(overlayfs.as_fd(), "upperdir", upper.as_fd())?;
-    overlayfs_set_lower_and_data_fds(&overlayfs, base.as_fd(), None::<OwnedFd>)?;
+    overlayfs_set_lower_and_data_fds(&overlayfs, base.as_fd(), &[])?;
     fsconfig_create(overlayfs.as_fd())?;
     let fs = fsmount(
         overlayfs.as_fd(),

@@ -1,5 +1,5 @@
 use std::ffi::{CStr, CString, c_char, c_int};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
 use libc::size_t;
 use rustix::fs::{CWD, Mode, OFlags, open};
@@ -106,24 +106,28 @@ pub unsafe extern "C" fn lcfs_mount_fd(
         };
 
         if !basedirs.is_empty() {
-            let basedir_fd = match open(
-                basedirs[0].as_c_str(),
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            ) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    set_errno(e.raw_os_error());
-                    return -1;
+            let mut basedir_fds: Vec<OwnedFd> = Vec::new();
+            for dir in &basedirs {
+                match open(
+                    dir.as_c_str(),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => basedir_fds.push(fd),
+                    Err(e) => {
+                        set_errno(e.raw_os_error());
+                        return -1;
+                    }
                 }
-            };
+            }
 
+            let borrowed: Vec<_> = basedir_fds.iter().map(|fd| fd.as_fd()).collect();
             let mount_options = composefs::mount::MountOptions::default();
 
             match composefs::mount::composefs_fsmount(
                 erofs_fd,
                 "composefs",
-                &basedir_fd,
+                &borrowed,
                 enable_verity,
                 &mount_options,
             ) {
