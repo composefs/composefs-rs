@@ -59,6 +59,20 @@ fn main() -> Result<()> {
         _ if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("mount.composefs")) => {
             composefs_ctl::mountcomposefs::run_from_args(rest_of_args())
         }
+        _ if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--internal-fuse-serve")) => {
+            #[cfg(feature = "fuse")]
+            {
+                use clap::Parser;
+                let args = composefs_ctl::fuse::InternalFuseServeArgs::parse_from(
+                    std::env::args_os().skip(1),
+                );
+                composefs_ctl::fuse::run_internal_fuse_serve(args)
+            }
+            #[cfg(not(feature = "fuse"))]
+            {
+                anyhow::bail!("--internal-fuse-serve requires the 'fuse' feature");
+            }
+        }
         _ => {
             // If we were spawned as a userns helper process, handle that and exit.
             // This MUST be called before the tokio runtime is created.

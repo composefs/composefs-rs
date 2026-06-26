@@ -167,6 +167,21 @@ impl MountOptions {
         self.idmap_fd = Some(fd);
         self
     }
+
+    /// Whether an overlay upper layer was configured.
+    pub fn has_overlay(&self) -> bool {
+        self.upperdirs.is_some()
+    }
+
+    /// Whether the mount should be read-write.
+    pub fn read_write(&self) -> bool {
+        self.read_write
+    }
+
+    /// Consume the options, returning the overlay fds if set.
+    pub fn into_overlay(self) -> Option<(OwnedFd, OwnedFd)> {
+        self.upperdirs
+    }
 }
 
 /// Creates a composefs mount using overlayfs with an erofs image and base directories.
