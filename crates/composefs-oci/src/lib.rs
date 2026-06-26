@@ -59,7 +59,7 @@ pub use containers_image_proxy::oci_spec::image::Digest as OciDigest;
 
 use containers_image_proxy::ImageProxyConfig;
 use containers_image_proxy::oci_spec::image::ImageConfiguration;
-use containers_image_proxy::oci_spec::image::{Descriptor, MediaType};
+use containers_image_proxy::oci_spec::image::{Descriptor, ImageManifest, MediaType};
 use sha2::{Digest, Sha256};
 
 use composefs::{
@@ -69,7 +69,7 @@ use composefs::{
     splitstream::SplitStreamStats,
 };
 
-use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
+use crate::skopeo::{OCI_BLOB_CONTENT_TYPE, OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 
 /// The content-type tag used to identify OCI layer (tar) splitstreams in the
 /// repository.
@@ -78,6 +78,13 @@ use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
 /// reading back a stored layer splitstream by its fs-verity hash.  The value
 /// is the 8-byte ASCII string `"ocilayer"` encoded as a little-endian `u64`.
 pub const LAYER_CONTENT_TYPE: u64 = TAR_LAYER_CONTENT_TYPE;
+
+/// The content-type tag used to identify non-tar OCI artifact blob splitstreams
+/// in the repository.
+///
+/// Used for OCI artifact layers whose media type is not a tar variant.
+/// The value is the 8-byte ASCII string `"oci_blob"` encoded as a little-endian `u64`.
+pub const BLOB_CONTENT_TYPE: u64 = OCI_BLOB_CONTENT_TYPE;
 
 /// Named ref key for the V2 EROFS image derived from this OCI config.
 pub const IMAGE_REF_KEY: &str = "composefs.image";
@@ -485,6 +492,25 @@ fn hash_sha256(bytes: &[u8]) -> OciDigest {
     sha256_content_digest(bytes)
 }
 
+/// Extract ordered layer identifiers from raw manifest and config JSON.
+///
+/// For standard container images (`ImageConfig` media type), parses the
+/// config and returns `rootfs.diff_ids`.  For OCI artifacts with
+/// non-standard config types, falls back to the manifest's layer digests.
+///
+/// This is the high-level entry point for callers that have raw JSON
+/// strings (e.g. from a varlink `Inspect` reply).
+pub fn extract_layer_ids(manifest_json: &str, config_json: &str) -> Result<Vec<String>> {
+    let manifest: ImageManifest =
+        serde_json::from_str(manifest_json).context("parsing manifest JSON")?;
+    extract_diff_ids(
+        manifest.config().media_type(),
+        config_json.as_bytes(),
+        manifest.layers(),
+    )
+    .map(|ids| ids.iter().map(|d| d.to_string()).collect())
+}
+
 /// Extract ordered diff_ids from a config descriptor.
 ///
 /// For standard container images (ImageConfig media type), parses the
@@ -494,7 +520,7 @@ fn hash_sha256(bytes: &[u8]) -> OciDigest {
 /// Note: oci-spec models diff_ids as `Vec<String>` but they are actually
 /// OCI content digests.  We parse them here so the rest of the codebase
 /// can work with the strongly-typed `Digest`.
-pub(crate) fn extract_diff_ids(
+pub fn extract_diff_ids(
     media_type: &MediaType,
     config_reader: impl Read,
     manifest_layers: &[Descriptor],
