@@ -314,14 +314,15 @@ pub enum FormatVersion {
     /// Format V1: same EROFS layout as V0 (compact inodes, BFS, whiteout table),
     /// but `composefs_version` is always `1` in the header.
     ///
-    /// Equivalent to C `mkcomposefs --min-version=1`.  Recommended default for
-    /// new repositories: unconditionally signals support for data-only layers.
+    /// Equivalent to C `mkcomposefs --min-version=1`.  Default format for new
+    /// repositories: unconditionally signals support for data-only layers and
+    /// is compatible with both C `mkcomposefs` 1.0.8 and composefs-rs.
+    #[default]
     V1 = 1,
     /// Format V2: extended inodes, DFS ordering, no whiteout table,
     /// `composefs_version=2`.
     ///
-    /// This is the composefs-rs native format, used by older bootc deployments.
-    #[default]
+    /// composefs-rs native format, used by older bootc deployments.
     V2 = 2,
 }
 
@@ -383,9 +384,9 @@ pub struct FormatConfig {
 }
 
 impl Default for FormatConfig {
-    /// Returns a single-V2 config, matching the default for newly created repositories.
+    /// Returns a single-V1 config, matching the default for newly created repositories.
     fn default() -> Self {
-        Self::single(FormatVersion::V2)
+        Self::single(FormatVersion::V1)
     }
 }
 

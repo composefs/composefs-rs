@@ -21,9 +21,9 @@ struct ContainerImage {
     /// unavailable (e.g. a PR that adds a new mirror entry before it has been
     /// pushed).  Should be pinned by digest for reproducibility.
     upstream_ref: &'static str,
-    /// Expected composefs image ID without `--bootable` (V2/default EROFS).
+    /// Expected composefs image ID without `--bootable` (V2 EROFS).
     expected_id: &'static str,
-    /// Expected composefs image ID with `--bootable` (V2/default EROFS), or
+    /// Expected composefs image ID with `--bootable` (V2 EROFS), or
     /// `None` if the image lacks /sysroot and doesn't support bootable
     /// transformation.
     expected_bootable_id: Option<&'static str>,
@@ -178,7 +178,7 @@ fn try_pull_image(
     bail!("could not find config digest in pull output:\n{output}")
 }
 
-/// Compute the composefs image ID for a pulled OCI image (default V2 EROFS).
+/// Compute the composefs image ID for a pulled OCI image (V2 EROFS, via repo default).
 ///
 /// The `config_digest` should be a bare OCI digest (e.g. `sha256:abc...`);
 /// this function adds the `@` prefix required by the CLI.
@@ -236,8 +236,8 @@ fn compute_id_v1(
 /// Table-driven OCI container digest stability test.
 ///
 /// Pulls each pinned container image from a registry, computes the composefs
-/// image ID for both plain and `--bootable` transforms using both the default
-/// (V2) and V1 EROFS writers, and asserts they match the expected values.
+/// image ID for both plain and `--bootable` transforms using both V1 and V2
+/// EROFS writers explicitly, and asserts they match the expected values.
 ///
 /// Skipped when `COMPOSEFS_SKIP_NETWORK=1` is set.
 fn test_oci_container_digest_stability() -> Result<()> {
@@ -253,7 +253,7 @@ fn test_oci_container_digest_stability() -> Result<()> {
         eprintln!("--- {} ---", image.label);
         let repo_dir = tempfile::tempdir()?;
         let repo = repo_dir.path();
-        // Use V2 explicitly: compute_id() tests V2 (default) hashes; V1 is
+        // Use V2 explicitly: compute_id() tests V2 hashes; V1 is
         // tested separately via compute_id_v1() with --erofs-version 1.
         cmd!(
             sh,
@@ -264,7 +264,7 @@ fn test_oci_container_digest_stability() -> Result<()> {
         eprintln!("Pulling {} (this may take a while)...", image.label);
         let config = pull_image(&sh, &cfsctl, repo, image, image.label)?;
 
-        // V2 (default): plain image ID
+        // V2: plain image ID
         let plain_id = compute_id(&sh, &cfsctl, repo, &config, false)?;
         eprintln!("{} composefs V2 image ID: {plain_id}", image.label);
         assert_eq!(
@@ -274,7 +274,7 @@ fn test_oci_container_digest_stability() -> Result<()> {
             image.label,
         );
 
-        // V2 (default): bootable image ID (only for images that support it)
+        // V2: bootable image ID (only for images that support it)
         if let Some(expected_bootable) = image.expected_bootable_id {
             let bootable_id = compute_id(&sh, &cfsctl, repo, &config, true)?;
             eprintln!(
@@ -359,7 +359,7 @@ fn try_expand_var(sh: &Shell) {
 }
 
 /// Verify that the bootable EROFS digest of a pinned image is identical
-/// across all three computation paths:
+/// across all three computation paths, for both V1 and V2 formats:
 ///
 /// 1. **OCI registry** — verified by `test_oci_container_digest_stability`,
 ///    which pins the expected value in each image's `expected_bootable_id`
@@ -372,9 +372,12 @@ fn try_expand_var(sh: &Shell) {
 /// On digest mismatch, captures dumpfiles from both paths and emits a
 /// unified diff to help identify the divergent entries.
 fn check_digest_equivalence(image: &ContainerImage) -> Result<()> {
-    let expected = image
+    let expected_v2 = image
         .expected_bootable_id
         .expect("image must have expected_bootable_id for equivalence test");
+    let expected_v1 = image
+        .expected_v1_bootable_id
+        .expect("image must have expected_v1_bootable_id for equivalence test");
 
     let sh = Shell::new()?;
     let cfsctl = cfsctl()?;
@@ -386,109 +389,117 @@ fn check_digest_equivalence(image: &ContainerImage) -> Result<()> {
     eprintln!("Pulling {} into podman...", image.label);
     cmd!(sh, "podman pull {image_ref}").run()?;
 
-    // --- containers-storage path ---
-    let repo_dir = tempfile::tempdir()?;
-    let repo = repo_dir.path();
-    cmd!(sh, "{cfsctl} --insecure --repo {repo} init").read()?;
-
-    let cstor_ref = format!("containers-storage:{bare_ref}");
-    eprintln!("Importing via containers-storage...");
-    let pull_out = cmd!(
-        sh,
-        "{cfsctl} --insecure --repo {repo} oci pull --local-fetch auto {cstor_ref}"
-    )
-    .read()?;
-
-    let config = pull_out
-        .lines()
-        .find_map(|l| l.strip_prefix("config").map(|r| r.trim().to_string()))
-        .ok_or_else(|| {
-            anyhow::anyhow!("{}: no config in cstor output:\n{pull_out}", image.label)
-        })?;
-
-    let cstor_digest = compute_id(&sh, &cfsctl, repo, &config, true)?;
-    eprintln!("  containers-storage: {cstor_digest}");
-
-    // --- on-disk filesystem path ---
+    // Mount the container for the on-disk filesystem path.
     let cid = cmd!(sh, "podman create {image_ref} /bin/true").read()?;
     let cid = cid.trim();
     let mountpoint = cmd!(sh, "podman mount {cid}").read()?;
     let mountpoint = mountpoint.trim();
 
-    let fs_digest = cmd!(
-        sh,
-        "{cfsctl} --insecure --repo {repo} compute-id --bootable {mountpoint}"
-    )
-    .read()
-    .map(|s| s.trim().to_string());
+    // Test both V1 and V2 explicitly.
+    for (version, expected) in [("1", expected_v1), ("2", expected_v2)] {
+        eprintln!("  --- V{version} ---");
 
-    // If digests mismatch, capture dumpfiles *before* unmounting.
-    let mismatch = match &fs_digest {
-        Ok(d) => d != &cstor_digest,
-        Err(_) => true,
-    };
-
-    let diff_output = if mismatch {
-        eprintln!("  MISMATCH detected — capturing dumpfiles for diff...");
-
-        // cstor dumpfile: `cfsctl oci dump --bootable @<config>`
-        let at_config = format!("@{config}");
-        let cstor_dump = cmd!(
+        let repo_dir = tempfile::tempdir()?;
+        let repo = repo_dir.path();
+        cmd!(
             sh,
-            "{cfsctl} --insecure --repo {repo} oci dump --bootable {at_config}"
+            "{cfsctl} --insecure --repo {repo} init --erofs-version {version}"
+        )
+        .read()?;
+
+        let cstor_ref = format!("containers-storage:{bare_ref}");
+        eprintln!("  Importing via containers-storage (V{version})...");
+        let pull_out = cmd!(
+            sh,
+            "{cfsctl} --insecure --repo {repo} oci pull --local-fetch auto {cstor_ref}"
+        )
+        .read()?;
+
+        let config = pull_out
+            .lines()
+            .find_map(|l| l.strip_prefix("config").map(|r| r.trim().to_string()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("{}: no config in cstor output:\n{pull_out}", image.label)
+            })?;
+
+        let cstor_digest = compute_id(&sh, &cfsctl, repo, &config, true)?;
+        eprintln!("  containers-storage V{version}: {cstor_digest}");
+
+        let fs_digest = cmd!(
+            sh,
+            "{cfsctl} --insecure --erofs-version {version} --repo {repo} compute-id --bootable {mountpoint}"
         )
         .read()
-        .unwrap_or_else(|e| format!("(failed to dump cstor: {e})"));
+        .map(|s| s.trim().to_string());
 
-        // on-disk dumpfile: `cfsctl create-dumpfile --bootable <mountpoint>`
-        let fs_dump = cmd!(
-            sh,
-            "{cfsctl} --no-repo create-dumpfile --bootable {mountpoint}"
-        )
-        .read()
-        .unwrap_or_else(|e| format!("(failed to dump on-disk: {e})"));
+        // If digests mismatch, capture dumpfiles *before* unmounting.
+        let mismatch = match &fs_digest {
+            Ok(d) => d != &cstor_digest,
+            Err(_) => true,
+        };
 
-        // Write to temp files and diff
-        let cstor_path = std::env::temp_dir().join("cstor.dumpfile");
-        let fs_path = std::env::temp_dir().join("fs.dumpfile");
-        std::fs::write(&cstor_path, &cstor_dump)?;
-        std::fs::write(&fs_path, &fs_dump)?;
+        let diff_output = if mismatch {
+            eprintln!("  MISMATCH detected — capturing dumpfiles for diff...");
 
-        let diff = cmd!(sh, "diff -u {cstor_path} {fs_path}")
-            .ignore_status()
+            let at_config = format!("@{config}");
+            let cstor_dump = cmd!(
+                sh,
+                "{cfsctl} --insecure --repo {repo} oci dump --bootable {at_config}"
+            )
             .read()
-            .unwrap_or_else(|e| format!("(diff failed: {e})"));
+            .unwrap_or_else(|e| format!("(failed to dump cstor: {e})"));
 
-        Some(diff)
-    } else {
-        None
-    };
+            let fs_dump = cmd!(
+                sh,
+                "{cfsctl} --no-repo create-dumpfile --bootable {mountpoint}"
+            )
+            .read()
+            .unwrap_or_else(|e| format!("(failed to dump on-disk: {e})"));
 
-    // Clean up container before asserting.
+            let cstor_path = std::env::temp_dir().join("cstor.dumpfile");
+            let fs_path = std::env::temp_dir().join("fs.dumpfile");
+            std::fs::write(&cstor_path, &cstor_dump)?;
+            std::fs::write(&fs_path, &fs_dump)?;
+
+            let diff = cmd!(sh, "diff -u {cstor_path} {fs_path}")
+                .ignore_status()
+                .read()
+                .unwrap_or_else(|e| format!("(diff failed: {e})"));
+
+            Some(diff)
+        } else {
+            None
+        };
+
+        let fs_digest = fs_digest?;
+        eprintln!("  on-disk filesystem V{version}: {fs_digest}");
+
+        if let Some(ref diff) = diff_output {
+            eprintln!(
+                "\n=== V{version} dumpfile diff (containers-storage vs on-disk) ===\n\
+                 {diff}\n=== end diff ===\n"
+            );
+        }
+
+        if cstor_digest != expected || fs_digest != expected {
+            // Clean up before bailing.
+            cmd!(sh, "podman umount {cid}").ignore_status().run()?;
+            cmd!(sh, "podman rm -f {cid}").ignore_status().run()?;
+            bail!(
+                "{label} V{version}: digest mismatch!\n\
+                 \x20  expected (pinned): {expected}\n\
+                 \x20  containers-storage: {cstor_digest}\n\
+                 \x20  on-disk filesystem: {fs_digest}",
+                label = image.label,
+            );
+        }
+
+        eprintln!("  OK V{version}: all three paths match: {expected}");
+    }
+
     cmd!(sh, "podman umount {cid}").ignore_status().run()?;
     cmd!(sh, "podman rm -f {cid}").ignore_status().run()?;
 
-    let fs_digest = fs_digest?;
-    eprintln!("  on-disk filesystem: {fs_digest}");
-
-    if let Some(ref diff) = diff_output {
-        eprintln!(
-            "\n=== dumpfile diff (containers-storage vs on-disk) ===\n{diff}\n=== end diff ===\n"
-        );
-    }
-
-    // Assert both paths match the pinned expected value.
-    if cstor_digest != expected || fs_digest != expected {
-        bail!(
-            "{label}: digest mismatch!\n\
-             \x20  expected (pinned): {expected}\n\
-             \x20  containers-storage: {cstor_digest}\n\
-             \x20  on-disk filesystem: {fs_digest}",
-            label = image.label,
-        );
-    }
-
-    eprintln!("  OK: all three paths match: {expected}");
     Ok(())
 }
 

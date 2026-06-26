@@ -1902,7 +1902,7 @@ fn test_erofs_versions() -> Result<()> {
     )
     .read()?;
 
-    // Default digest (should be V2)
+    // Default digest (should be V1)
     let id_default = cmd!(
         sh,
         "{cfsctl} --no-repo compute-id --no-propagate-usr-to-root {rootfs}"
@@ -1914,9 +1914,10 @@ fn test_erofs_versions() -> Result<()> {
         id2.trim(),
         "V1 and V2 should produce different digests"
     );
-    assert_eq!(id2.trim(), id_default.trim(), "Default should be V2");
+    assert_eq!(id1.trim(), id_default.trim(), "Default should be V1");
 
-    // Also verify via create-image in a real repo
+    // Also verify via create-image in a repo initialized with explicit V2
+    // (the repo's stored format takes precedence over the global default)
     let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
     let repo = repo_dir.path();
 
@@ -1944,7 +1945,7 @@ fn test_erofs_versions() -> Result<()> {
     assert_eq!(
         img_v2.trim(),
         img_default.trim(),
-        "create-image: default should match V2"
+        "create-image: V2 repo default should match explicit V2"
     );
 
     Ok(())
@@ -2094,7 +2095,8 @@ fn test_oci_pull_v1_digest_stability() -> Result<()> {
         "V1 oci compute-id must be idempotent"
     );
 
-    // V2 (default) must differ from V1
+    // V2 (repo default, since init_insecure_repo uses --erofs-version 2)
+    // must differ from V1
     let v2_id = cmd!(
         sh,
         "{cfsctl} --insecure --repo {repo} oci compute-id {at_config_digest}"

@@ -15,7 +15,7 @@ use composefs::{
     erofs::{
         debug::debug_img,
         format::FormatVersion,
-        writer::{ValidatedFileSystem, mkfs_erofs, mkfs_erofs_versioned},
+        writer::{ValidatedFileSystem, mkfs_erofs_versioned},
     },
     fsverity::{FsVerityHashValue, Sha256HashValue},
     tree::{FileSystem, Inode, LeafContent, RegularFile, Stat},
@@ -32,8 +32,11 @@ fn default_stat() -> Stat {
     }
 }
 
-fn debug_fs(fs: FileSystem<impl FsVerityHashValue>) -> String {
-    let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
+fn debug_fs_v2(fs: FileSystem<impl FsVerityHashValue>) -> String {
+    let image = mkfs_erofs_versioned(
+        &mut ValidatedFileSystem::new(fs).unwrap(),
+        FormatVersion::V2,
+    );
     let mut output = vec![];
     debug_img(&mut output, &image).unwrap();
     String::from_utf8(output).unwrap()
@@ -45,7 +48,7 @@ fn empty(_fs: &mut FileSystem<impl FsVerityHashValue>) {}
 fn test_empty() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     empty(&mut fs);
-    insta::assert_snapshot!(debug_fs(fs));
+    insta::assert_snapshot!(debug_fs_v2(fs));
 }
 
 fn add_leaf<ObjectID: FsVerityHashValue>(
@@ -97,40 +100,24 @@ fn simple(fs: &mut FileSystem<Sha256HashValue>) {
 fn test_simple() {
     let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
     simple(&mut fs);
-    insta::assert_snapshot!(debug_fs(fs));
-}
-
-fn foreach_case(f: fn(FileSystem<Sha256HashValue>)) {
-    for case in [empty, simple] {
-        let mut fs = FileSystem::new(default_stat());
-        case(&mut fs);
-        f(fs);
-    }
+    insta::assert_snapshot!(debug_fs_v2(fs));
 }
 
 #[test_with::executable(fsck.erofs)]
 fn test_fsck() {
-    foreach_case(|fs| {
-        // V2 (default)
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(&mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap()))
-            .unwrap();
-        let mut fsck = Command::new("fsck.erofs").arg(tmp.path()).spawn().unwrap();
-        assert!(fsck.wait().unwrap().success());
-    });
-
-    // V1 — needs its own filesystem instances (whiteout stubs are added by the writer)
-    for case in [empty, simple] {
-        let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
-        case(&mut fs);
-        let image = mkfs_erofs_versioned(
-            &mut ValidatedFileSystem::new(fs).unwrap(),
-            FormatVersion::V1,
-        );
-        let mut tmp = NamedTempFile::new().unwrap();
-        tmp.write_all(&image).unwrap();
-        let mut fsck = Command::new("fsck.erofs").arg(tmp.path()).spawn().unwrap();
-        assert!(fsck.wait().unwrap().success());
+    for version in [FormatVersion::V0, FormatVersion::V1, FormatVersion::V2] {
+        for case in [empty as fn(&mut _), simple] {
+            let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
+            case(&mut fs);
+            let image = mkfs_erofs_versioned(&mut ValidatedFileSystem::new(fs).unwrap(), version);
+            let mut tmp = NamedTempFile::new().unwrap();
+            tmp.write_all(&image).unwrap();
+            let mut fsck = Command::new("fsck.erofs").arg(tmp.path()).spawn().unwrap();
+            assert!(
+                fsck.wait().unwrap().success(),
+                "fsck failed for {version:?}"
+            );
+        }
     }
 }
 
@@ -185,66 +172,64 @@ fn dump_image(img: &[u8]) -> String {
 
 #[test]
 fn test_erofs_digest_stability() {
-    // Pin digests for each test case — any change to the EROFS writer that
-    // alters byte-level output will break these, which is the point: composefs
-    // image digest stability is critical for the bootc sealed UKI trust chain.
-    let cases: &[(&str, fn(&mut FileSystem<Sha256HashValue>), &str)] = &[
+    // Pin digests for each format version × test case.  Any change to the EROFS
+    // writer that alters byte-level output will break these, which is the point:
+    // composefs image digest stability is critical for the bootc sealed UKI trust
+    // chain.  V0 output must also be byte-stable since it needs to match C
+    // mkcomposefs.
+    let cases: &[(
+        FormatVersion,
+        &str,
+        fn(&mut FileSystem<Sha256HashValue>),
+        &str,
+    )] = &[
         (
-            "empty",
+            FormatVersion::V0,
+            "empty_v0",
+            empty,
+            "8f589e8f57ecb88823736b0d857ddca1e1068a23e264fad164b28f7038eb3682",
+        ),
+        (
+            FormatVersion::V0,
+            "simple_v0",
+            simple,
+            "9f3f5620ee0c54708516467d0d58741e7963047c7106b245d94c298259d0fa01",
+        ),
+        (
+            FormatVersion::V1,
+            "empty_v1",
+            empty,
+            "14a26c957c84f6eb774b91205476adc13196c7c33b9dd97d08d43725ecb90b63",
+        ),
+        (
+            FormatVersion::V1,
+            "simple_v1",
+            simple,
+            "ad6db6427568a1e4fdc772cbab7b6063f5eb4b33cb62982a740ba9213e5962b5",
+        ),
+        (
+            FormatVersion::V2,
+            "empty_v2",
             empty,
             "086b702a519b57d6ef5aea6f8b3f2be24355cd1fb835cd80fb4e3d388b24d5a5",
         ),
         (
-            "simple",
+            FormatVersion::V2,
+            "simple_v2",
             simple,
             "a8fcd41f8b313bede69f462f2af0a38d64b99a6333f5df884ea9ab4037fac722",
         ),
     ];
 
-    for (name, case, expected_digest) in cases {
+    for (version, name, case, expected_digest) in cases {
         let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
         case(&mut fs);
-        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
+        let image = mkfs_erofs_versioned(&mut ValidatedFileSystem::new(fs).unwrap(), *version);
         let digest = composefs::fsverity::compute_verity::<Sha256HashValue>(&image);
         let hex = digest.to_hex();
         assert_eq!(
             &hex, expected_digest,
             "{name}: EROFS digest changed — if this is intentional, update the pinned value"
-        );
-    }
-}
-
-#[test]
-fn test_erofs_v1_digest_stability() {
-    // Same as test_erofs_digest_stability but for V0 (C-compatible) format.
-    // V0 uses the same layout as C mkcomposefs default: composefs_version is 0
-    // normally and auto-bumped to 1 when user whiteouts are present.
-    // Output must be byte-stable since it needs to match C mkcomposefs.
-    let cases: &[(&str, fn(&mut FileSystem<Sha256HashValue>), &str)] = &[
-        (
-            "empty_v1",
-            empty,
-            "8f589e8f57ecb88823736b0d857ddca1e1068a23e264fad164b28f7038eb3682",
-        ),
-        (
-            "simple_v1",
-            simple,
-            "9f3f5620ee0c54708516467d0d58741e7963047c7106b245d94c298259d0fa01",
-        ),
-    ];
-
-    for (name, case, expected_digest) in cases {
-        let mut fs = FileSystem::<Sha256HashValue>::new(default_stat());
-        case(&mut fs);
-        let image = mkfs_erofs_versioned(
-            &mut ValidatedFileSystem::new(fs).unwrap(),
-            FormatVersion::V0,
-        );
-        let digest = composefs::fsverity::compute_verity::<Sha256HashValue>(&image);
-        let hex = digest.to_hex();
-        assert_eq!(
-            &hex, expected_digest,
-            "{name}: V0 EROFS digest changed — if this is intentional, update the pinned value"
         );
     }
 }
