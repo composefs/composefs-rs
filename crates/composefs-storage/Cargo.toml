@@ -15,27 +15,31 @@ anyhow = { version = "1.0", default-features = false, features = ["std"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 cap-std = { version = "4.0", default-features = false }
 cap-std-ext = { version = "5.0", default-features = false }
+composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.7.0", optional = true, features = ["tokio"] }
 crc = { version = "3.0", default-features = false }
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
-jsonrpc-fdpass = { workspace = true, optional = true }
 oci-spec = { version = "0.10", default-features = false, features = ["image"] }
-rustix = { version = "1.0", default-features = false, features = ["fs", "std", "process", "thread"] }
+rustix = { version = "1.0", default-features = false, features = ["fs", "std", "process", "thread", "pipe"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-sha2 = { version = "0.11", default-features = false }
 tar-core = "0.1.0"
 thiserror = { version = "2.0", default-features = false }
 tokio = { version = "1.40", default-features = false, features = ["rt", "net", "sync"], optional = true }
 toml = { version = "1.0", default-features = false, features = ["parse", "serde"] }
 tracing = { version = "0.1", default-features = false, optional = true }
+zlink = { workspace = true, optional = true }
 zstd = { version = "0.13", default-features = false }
 
 [features]
 default = []
-userns-helper = ["dep:jsonrpc-fdpass", "dep:tokio", "dep:tracing"]
+# Layer transfer over zlink + splitdirfdstream. Enables both the in-process
+# transport and the rootless `podman unshare` helper (init_if_helper /
+# StorageProxy).
+layer-transfer = ["dep:zlink", "dep:composefs-splitdirfdstream", "dep:tokio", "dep:tracing"]
 
 [dev-dependencies]
 tempfile = { version = "3.8", default-features = false }
+tokio = { version = "1.40", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "sync"] }
 
 [lints]
 workspace = true
