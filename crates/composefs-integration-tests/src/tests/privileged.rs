@@ -968,3 +968,293 @@ fn privileged_cstor_import_xfs_reflink() -> Result<()> {
     Ok(())
 }
 integration_test!(privileged_cstor_import_xfs_reflink);
+
+// ============================================================================
+// FUSE integration test
+// ============================================================================
+
+struct MountGuard {
+    mountpoint: PathBuf,
+    child: Option<std::process::Child>,
+}
+
+impl Drop for MountGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = rustix::mount::unmount(&self.mountpoint, rustix::mount::UnmountFlags::DETACH);
+    }
+}
+
+fn bigfile_content() -> Vec<u8> {
+    vec![b'A'; 600]
+}
+
+fn biglib_content() -> Vec<u8> {
+    (0u8..=255).cycle().take(800).collect()
+}
+
+fn build_test_filesystem(
+    repo: &Repository<Sha256HashValue>,
+) -> Result<composefs_oci::composefs::tree::FileSystem<Sha256HashValue>> {
+    use std::collections::BTreeMap;
+    use std::ffi::OsStr;
+
+    use composefs_oci::composefs::generic_tree::{LeafId, Stat};
+    use composefs_oci::composefs::tree::{
+        Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile,
+    };
+
+    fn mkstat(mode: u32, uid: u32, gid: u32, mtime: i64) -> Stat {
+        Stat {
+            st_mode: mode,
+            st_uid: uid,
+            st_gid: gid,
+            st_mtim_sec: mtime,
+            st_mtim_nsec: 0,
+            xattrs: BTreeMap::new(),
+        }
+    }
+
+    let root_stat = mkstat(0o755, 0, 0, 1_700_000_000);
+
+    let mut fs = FileSystem::<Sha256HashValue>::new(root_stat);
+
+    let hello_id = LeafId(fs.leaves.len());
+    {
+        let mut xattrs = BTreeMap::new();
+        xattrs.insert(
+            OsStr::new("user.test").into(),
+            Box::from(b"hello-value".as_ref()),
+        );
+        fs.leaves.push(Leaf {
+            stat: Stat {
+                st_mode: 0o755,
+                st_uid: 0,
+                st_gid: 0,
+                st_mtim_sec: 1_700_000_001,
+                st_mtim_nsec: 0,
+                xattrs,
+            },
+            content: LeafContent::Regular(RegularFile::Inline(
+                b"hello world binary stub".as_ref().into(),
+            )),
+        });
+    }
+
+    let readme_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: mkstat(0o644, 0, 0, 1_700_000_002),
+        content: LeafContent::Regular(RegularFile::Inline(
+            b"readme text content\n".as_ref().into(),
+        )),
+    });
+
+    let hostname_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: mkstat(0o644, 0, 0, 1_700_000_003),
+        content: LeafContent::Regular(RegularFile::Inline(b"integration-test\n".as_ref().into())),
+    });
+
+    let os_release_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: mkstat(0o644, 0, 0, 1_700_000_004),
+        content: LeafContent::Regular(RegularFile::Inline(b"ID=test\nNAME=Test\n".as_ref().into())),
+    });
+
+    let symlink_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: mkstat(0o777, 0, 0, 1_700_000_005),
+        content: LeafContent::Symlink(OsStr::new("../usr/lib/os-release").into()),
+    });
+
+    let devnull_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: mkstat(0o666, 0, 0, 0),
+        content: LeafContent::CharacterDevice(rustix::fs::makedev(1, 3)),
+    });
+
+    let fifo_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: mkstat(0o644, 0, 0, 1_700_000_006),
+        content: LeafContent::Fifo,
+    });
+
+    let bigfile_data = bigfile_content();
+    let bigfile_hash = repo.ensure_object(&bigfile_data)?;
+    let bigfile_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: mkstat(0o755, 0, 0, 1_700_000_007),
+        content: LeafContent::Regular(RegularFile::External(
+            bigfile_hash,
+            bigfile_data.len() as u64,
+        )),
+    });
+
+    let biglib_data = biglib_content();
+    let biglib_hash = repo.ensure_object(&biglib_data)?;
+    let biglib_id = LeafId(fs.leaves.len());
+    fs.leaves.push(Leaf {
+        stat: mkstat(0o755, 0, 0, 1_700_000_008),
+        content: LeafContent::Regular(RegularFile::External(biglib_hash, biglib_data.len() as u64)),
+    });
+
+    let mut usr_bin = Directory::<Sha256HashValue>::new(mkstat(0o755, 0, 0, 1_700_000_010));
+    usr_bin.insert(OsStr::new("hello"), Inode::leaf(hello_id));
+    usr_bin.insert(OsStr::new("hello2"), Inode::leaf(hello_id));
+    usr_bin.insert(OsStr::new("bigfile"), Inode::leaf(bigfile_id));
+
+    let mut usr_lib = Directory::<Sha256HashValue>::new(mkstat(0o755, 0, 0, 1_700_000_011));
+    usr_lib.insert(OsStr::new("readme.txt"), Inode::leaf(readme_id));
+    usr_lib.insert(OsStr::new("os-release"), Inode::leaf(os_release_id));
+    usr_lib.insert(OsStr::new("biglib.so"), Inode::leaf(biglib_id));
+
+    let mut usr = Directory::<Sha256HashValue>::new(mkstat(0o755, 0, 0, 1_700_000_012));
+    usr.insert(OsStr::new("bin"), Inode::Directory(Box::new(usr_bin)));
+    usr.insert(OsStr::new("lib"), Inode::Directory(Box::new(usr_lib)));
+
+    let mut etc = Directory::<Sha256HashValue>::new(mkstat(0o755, 0, 0, 1_700_000_013));
+    etc.insert(OsStr::new("hostname"), Inode::leaf(hostname_id));
+    etc.insert(OsStr::new("os-release"), Inode::leaf(symlink_id));
+
+    let mut dev = Directory::<Sha256HashValue>::new(mkstat(0o755, 0, 0, 1_700_000_014));
+    dev.insert(OsStr::new("null"), Inode::leaf(devnull_id));
+
+    let mut tmp_dir = Directory::<Sha256HashValue>::new(mkstat(0o1777, 0, 0, 1_700_000_015));
+    tmp_dir.insert(OsStr::new("fifo"), Inode::leaf(fifo_id));
+
+    fs.root
+        .insert(OsStr::new("usr"), Inode::Directory(Box::new(usr)));
+    fs.root
+        .insert(OsStr::new("etc"), Inode::Directory(Box::new(etc)));
+    fs.root
+        .insert(OsStr::new("dev"), Inode::Directory(Box::new(dev)));
+    fs.root
+        .insert(OsStr::new("tmp"), Inode::Directory(Box::new(tmp_dir)));
+
+    Ok(fs)
+}
+
+fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::time::{Duration, Instant};
+
+    use composefs_oci::composefs::{
+        dumpfile::write_dumpfile,
+        erofs::{
+            reader::erofs_to_filesystem,
+            writer::{ValidatedFileSystem, mkfs_erofs},
+        },
+        repository::{Repository, RepositoryConfig},
+    };
+
+    if require_privileged("privileged_fuse_dumpfile_roundtrip")?.is_some() {
+        return Ok(());
+    }
+
+    let work_dir = tempfile::tempdir()?;
+    let mountpoint = work_dir.path().join("mnt");
+    let repo_path = work_dir.path().join("repo");
+    std::fs::create_dir(&mountpoint)?;
+    std::fs::create_dir(&repo_path)?;
+
+    let repo_fd = rustix::fs::open(
+        &repo_path,
+        rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::RDONLY,
+        rustix::fs::Mode::empty(),
+    )?;
+    let (mut repo, _created) = Repository::<Sha256HashValue>::init_path(
+        &repo_fd,
+        ".",
+        RepositoryConfig::default().set_insecure(),
+    )?;
+    repo.set_insecure();
+
+    let synthetic = build_test_filesystem(&repo)?;
+    let erofs_bytes = mkfs_erofs(&ValidatedFileSystem::new(synthetic)?);
+    let canonical_fs = erofs_to_filesystem::<Sha256HashValue>(&erofs_bytes)?;
+
+    let image_id = repo.write_image(None, &erofs_bytes)?;
+    let image_name = image_id.to_hex();
+
+    let mut expected_buf = Vec::new();
+    write_dumpfile(&mut expected_buf, &canonical_fs)?;
+    let expected_dump = String::from_utf8(expected_buf)?;
+
+    let pre_mount_dev = std::fs::metadata(&mountpoint)?.dev();
+
+    let cfsctl_bin = cfsctl()?;
+    let child = std::process::Command::new(&cfsctl_bin)
+        .arg("--repo")
+        .arg(&repo_path)
+        .arg("mount")
+        .arg("--fuse=yes")
+        .arg("--foreground")
+        .arg(&image_name)
+        .arg(&mountpoint)
+        .spawn()
+        .context("spawning cfsctl mount --fuse")?;
+
+    let mut guard = MountGuard {
+        mountpoint: mountpoint.clone(),
+        child: Some(child),
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(child) = guard.child.as_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            bail!("cfsctl mount --fuse exited before mount was ready: {status}");
+        }
+        if std::fs::metadata(&mountpoint)
+            .map(|m| m.dev())
+            .unwrap_or(pre_mount_dev)
+            != pre_mount_dev
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for FUSE mount");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let bigfile_actual = std::fs::read(mountpoint.join("usr/bin/bigfile"))
+        .context("reading bigfile from FUSE mount")?;
+    ensure!(
+        bigfile_actual == bigfile_content(),
+        "bigfile content mismatch: got {} bytes, expected {}",
+        bigfile_actual.len(),
+        bigfile_content().len(),
+    );
+    let biglib_actual = std::fs::read(mountpoint.join("usr/lib/biglib.so"))
+        .context("reading biglib.so from FUSE mount")?;
+    ensure!(
+        biglib_actual == biglib_content(),
+        "biglib.so content mismatch: got {} bytes, expected {}",
+        biglib_actual.len(),
+        biglib_content().len(),
+    );
+
+    let sh = Shell::new()?;
+    let mp = mountpoint.to_str().context("non-UTF-8 mountpoint")?;
+    let repo_arg = repo_path.to_str().context("non-UTF-8 repo path")?;
+    let actual_dump = cmd!(
+        sh,
+        "{cfsctl_bin} --repo {repo_arg} create-dumpfile --no-propagate-usr-to-root {mp}"
+    )
+    .read()?;
+
+    drop(guard);
+
+    similar_asserts::assert_eq!(
+        expected_dump.trim_end_matches('\n'),
+        actual_dump.trim_end_matches('\n')
+    );
+
+    Ok(())
+}
+integration_test!(privileged_fuse_dumpfile_roundtrip);
