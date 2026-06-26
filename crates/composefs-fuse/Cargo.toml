@@ -10,6 +10,10 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+default = ['pre-6.16']
+'pre-6.16' = []
+
 [dependencies]
 anyhow = { version = "1.0.98", default-features = false }
 composefs = { workspace = true }
@@ -17,4 +21,5 @@ fuser = { version = "0.17.0", default-features = false }
 log = { version = "0.4.8", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
 rustix = { version = "1.0.0", default-features = false, features = ["fs", "mount"] }
+tempfile = { version = "3", default-features = false }
 zerocopy = { version = "0.8.0", default-features = false }
