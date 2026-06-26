@@ -3390,20 +3390,55 @@ mod tests {
             bytes
         }
 
-        /// Verify that our Rust V1 writer produces byte-for-byte identical EROFS images
-        /// to C mkcomposefs for the same user-level input.
+        /// Compare a Rust V1 EROFS image byte-for-byte against C mkcomposefs.
         ///
-        /// This is a stronger check than `test_c_composefs_info_reads_v1`: instead of
-        /// comparing parsed dump output (which won't catch wrong binary layout like the
-        /// EUCLEAN block-boundary bug), we compare raw image bytes. If our V1 writer
-        /// disagrees with the C reference even on a single padding byte, this fails.
+        /// Both sides receive the same filesystem: C gets a dumpfile (and adds
+        /// the 256 whiteout stubs internally), Rust gets the tree directly (the
+        /// writer adds stubs automatically).
         ///
-        /// The test mirrors the production flow: C receives a dumpfile of the user-level
-        /// tree (no whiteout stubs) and adds the 256 stubs internally; the Rust V1 writer
-        /// also adds the stubs automatically during image generation.
+        /// C mkcomposefs defaults to --max-version=1, auto-bumping from V0 to
+        /// V1 when whiteouts (chardev rdev=0) are present, so we mirror that.
         ///
         /// On failure the structural diff from `debug_img` is printed to make the
         /// divergence immediately obvious without a separate manual step.
+        fn assert_binary_identical_to_c(fs: tree::FileSystem<Sha256HashValue>) {
+            let mut dumpfile_bytes = Vec::new();
+            write_dumpfile(&mut dumpfile_bytes, &fs).unwrap();
+            let dumpfile = String::from_utf8(dumpfile_bytes).unwrap();
+
+            let c_image = c_mkcomposefs_from_dumpfile(&dumpfile);
+
+            let has_whiteout = fs
+                .leaves
+                .iter()
+                .any(|leaf| matches!(leaf.content, tree::LeafContent::CharacterDevice(0)));
+            let version = if has_whiteout {
+                FormatVersion::V1
+            } else {
+                FormatVersion::V0
+            };
+            let rust_image =
+                mkfs_erofs_versioned(&mut ValidatedFileSystem::new(fs).unwrap(), version);
+
+            if c_image != rust_image.as_ref() {
+                let c_debug = debug_dump(&c_image);
+                let rust_debug = debug_dump(&rust_image);
+                similar_asserts::assert_eq!(
+                    c_debug,
+                    rust_debug,
+                    "binary mismatch (c={} bytes, rust={} bytes)\ndumpfile:\n{dumpfile}",
+                    c_image.len(),
+                    rust_image.len(),
+                );
+            }
+        }
+
+        /// Verify that our Rust V1 writer produces byte-for-byte identical EROFS
+        /// images to C mkcomposefs for the same user-level input.
+        ///
+        /// This is a stronger check than `test_c_composefs_info_reads_v1`: instead
+        /// of comparing parsed dump output (which won't catch wrong binary layout
+        /// like the EUCLEAN block-boundary bug), we compare raw image bytes.
         #[test_with::executable(mkcomposefs)]
         #[test]
         fn test_v1_binary_identical_to_c_mkcomposefs() {
@@ -3411,41 +3446,7 @@ mod tests {
                 proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(200));
             runner
                 .run(&filesystem_spec(), |spec| {
-                    // Build two independent filesystems from the same spec:
-                    //   fs_c  — user entries only, serialized as dumpfile and fed to
-                    //           C mkcomposefs (which adds the 256 whiteout stubs internally)
-                    //   fs_rs — user entries only, fed directly to our Rust V1 writer
-                    //           (the writer adds the 256 whiteout stubs automatically)
-                    //
-                    // Using the same spec for both ensures the user-level content matches.
-                    let fs_c = build_filesystem::<Sha256HashValue>(spec.clone());
-                    let fs_rs = build_filesystem::<Sha256HashValue>(spec);
-
-                    // Serialize the pre-whiteout tree for C (no stubs in dumpfile)
-                    let mut dumpfile_bytes = Vec::new();
-                    write_dumpfile(&mut dumpfile_bytes, &fs_c).unwrap();
-                    let dumpfile = String::from_utf8(dumpfile_bytes).unwrap();
-
-                    // Get C mkcomposefs binary output (C adds stubs internally)
-                    let c_image = c_mkcomposefs_from_dumpfile(&dumpfile);
-
-                    // Get our Rust V0 writer binary output (stubs added automatically by writer)
-                    let rust_image = mkfs_erofs_versioned(
-                        &mut ValidatedFileSystem::new(fs_rs).unwrap(),
-                        FormatVersion::V0,
-                    );
-
-                    if c_image != rust_image.as_ref() {
-                        let c_debug = debug_dump(&c_image);
-                        let rust_debug = debug_dump(&rust_image);
-                        similar_asserts::assert_eq!(
-                            c_debug,
-                            rust_debug,
-                            "binary mismatch (c={} bytes, rust={} bytes)\ndumpfile:\n{dumpfile}",
-                            c_image.len(),
-                            rust_image.len(),
-                        );
-                    }
+                    assert_binary_identical_to_c(build_filesystem::<Sha256HashValue>(spec));
                     Ok(())
                 })
                 .unwrap();
@@ -3458,7 +3459,7 @@ mod tests {
         /// system.posix_acl_access (HAS_ACL flag), large external file sizes, and
         /// cross-type hardlinks (to symlinks, whiteouts, devices, FIFOs).
         ///
-        /// Runs 64 cases against C mkcomposefs byte-for-byte.
+        /// Runs 200 cases against C mkcomposefs byte-for-byte.
         #[test_with::executable(mkcomposefs)]
         #[test]
         fn test_v1_binary_identical_unusual_content() {
@@ -3466,41 +3467,7 @@ mod tests {
                 proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(200));
             runner
                 .run(&unusual_filesystem_spec(), |spec| {
-                    let fs_c = build_unusual_filesystem::<Sha256HashValue>(spec.clone());
-                    let fs_rs = build_unusual_filesystem::<Sha256HashValue>(spec);
-
-                    let mut dumpfile_bytes = Vec::new();
-                    write_dumpfile(&mut dumpfile_bytes, &fs_c).unwrap();
-                    let dumpfile = String::from_utf8(dumpfile_bytes).unwrap();
-
-                    let c_image = c_mkcomposefs_from_dumpfile(&dumpfile);
-                    // C mkcomposefs defaults to --max-version=1, auto-bumping
-                    // from V0 to V1 when whiteouts (chardev rdev=0) are present.
-                    let has_whiteout = fs_rs
-                        .leaves
-                        .iter()
-                        .any(|leaf| matches!(leaf.content, tree::LeafContent::CharacterDevice(0)));
-                    let version = if has_whiteout {
-                        FormatVersion::V1
-                    } else {
-                        FormatVersion::V0
-                    };
-                    let rust_image = mkfs_erofs_versioned(
-                        &mut ValidatedFileSystem::new(fs_rs).unwrap(),
-                        version,
-                    );
-
-                    if c_image != rust_image.as_ref() {
-                        let c_debug = debug_dump(&c_image);
-                        let rust_debug = debug_dump(&rust_image);
-                        similar_asserts::assert_eq!(
-                            c_debug,
-                            rust_debug,
-                            "binary mismatch (c={} bytes, rust={} bytes)\ndumpfile:\n{dumpfile}",
-                            c_image.len(),
-                            rust_image.len(),
-                        );
-                    }
+                    assert_binary_identical_to_c(build_unusual_filesystem::<Sha256HashValue>(spec));
                     Ok(())
                 })
                 .unwrap();
