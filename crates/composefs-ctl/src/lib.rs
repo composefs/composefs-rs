@@ -182,7 +182,7 @@ pub struct App {
     pub hash: Option<HashType>,
 
     /// The EROFS format version to use when generating images.
-    /// If omitted, the library default (V2) is used.
+    /// If omitted, the library default (V1) is used.
     #[clap(long, value_enum)]
     pub erofs_version: Option<ErofsVersion>,
 
@@ -612,7 +612,7 @@ enum Command {
         reset_metadata: bool,
         /// Default EROFS format version for images in this repository.
         /// V1 is compatible with C `mkcomposefs` 1.0.8; V2 is the native format.
-        /// If omitted, falls back to the global `--erofs-version` flag, then defaults to V2.
+        /// If omitted, falls back to the global `--erofs-version` flag, then defaults to V1.
         #[clap(long)]
         erofs_version: Option<ErofsVersion>,
     },
@@ -967,11 +967,11 @@ pub async fn run_app(args: App) -> Result<()> {
         erofs_version: ref init_erofs_version,
     } = args.cmd
     {
-        // Prefer the subcommand-level --erofs-version; fall back to global flag; default V2.
+        // Prefer the subcommand-level --erofs-version; fall back to global flag; default V1.
         let erofs_version = init_erofs_version
             .or(args.erofs_version)
             .map(composefs::erofs::format::FormatVersion::from)
-            .unwrap_or(composefs::erofs::format::FormatVersion::V2);
+            .unwrap_or(composefs::erofs::format::FormatVersion::V1);
         return run_init(
             algorithm,
             path.as_deref(),

@@ -1,7 +1,6 @@
 ---
 source: crates/composefs/tests/mkfs.rs
-assertion_line: 100
-expression: debug_fs(fs)
+expression: debug_fs_v2(fs)
 ---
 00000000 ComposefsHeader
       +0     magic: U32(3497550490)

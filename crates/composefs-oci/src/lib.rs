@@ -1294,12 +1294,13 @@ mod test {
             "expected no V1 image ref for a V2-only config"
         );
 
-        // Also verify via the convenience function
+        // Also verify via the convenience function (V2 lookup, matching the
+        // V2-only ref stored above)
         let img_ref = composefs_erofs_for_config(
             &repo,
             &config_digest,
             Some(&config_verity),
-            repo.erofs_version(),
+            FormatVersion::V2,
         )
         .unwrap();
         assert_eq!(img_ref, Some(fake_erofs_id));

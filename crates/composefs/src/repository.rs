@@ -286,6 +286,12 @@ impl FeatureFlags {
     }
 }
 
+/// Serde default for `RepoMetadata::erofs_formats` — returns `single(V2)` so
+/// that old repos (created before the field existed) deserialize correctly.
+fn legacy_erofs_default() -> FormatConfig {
+    FormatConfig::single(FormatVersion::V2)
+}
+
 /// Repository metadata stored in `meta.json` at the repository root.
 ///
 /// This file records the repository's format version, digest algorithm,
@@ -322,10 +328,10 @@ pub struct RepoMetadata {
     ///
     /// Persisted directly so that dual-format repositories (e.g. V1+V2) can
     /// round-trip through `meta.json`.  For repositories created before this
-    /// field existed, the field is absent from JSON and defaults to
-    /// `FormatConfig::single(FormatVersion::V2)`; the `"v1_erofs"` flag is then
-    /// checked for seamless migration of old V1 repos.
-    #[serde(default)]
+    /// field existed, the field is absent from JSON and deserializes as
+    /// `FormatConfig::single(FormatVersion::V2)` (the legacy default); the
+    /// `"v1_erofs"` flag is then checked for seamless migration of old V1 repos.
+    #[serde(default = "legacy_erofs_default")]
     pub erofs_formats: FormatConfig,
 }
 
@@ -344,13 +350,14 @@ impl RepoMetadata {
 
     /// Return the effective [`FormatConfig`] for this repository.
     ///
-    /// If `erofs_formats` was explicitly set in `meta.json` (i.e. it is not the
-    /// serde default `single(V2)`), it is returned as-is.  Otherwise the config
-    /// is derived from the legacy `"v1_erofs"` ro_compat flag for backward
-    /// compatibility with repos created before the `erofs_formats` field existed.
+    /// If `erofs_formats` was explicitly set in `meta.json` (i.e. it differs
+    /// from the legacy serde default of `single(V2)`), it is returned as-is.
+    /// Otherwise the config is derived from the legacy `"v1_erofs"` ro_compat
+    /// flag for backward compatibility with repos created before the
+    /// `erofs_formats` field existed.
     pub fn format_config(&self) -> FormatConfig {
-        let default_config = FormatConfig::default();
-        if self.erofs_formats != default_config {
+        let legacy_default = legacy_erofs_default();
+        if self.erofs_formats != legacy_default {
             // Field was explicitly stored — use it directly.
             self.erofs_formats.clone()
         } else if self
@@ -362,8 +369,8 @@ impl RepoMetadata {
             // Legacy V1 repo: flag present but new field absent/default.
             FormatConfig::single(FormatVersion::V1)
         } else {
-            // V2 default (new repos or old repos without the flag).
-            default_config
+            // Old V2 repo (field absent, no v1_erofs flag).
+            legacy_default
         }
     }
 }
@@ -5282,9 +5289,17 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
 
         assert_eq!(parsed["features"]["compatible"][0], "some-compat");
-        assert_eq!(
-            parsed["features"]["read-only-compatible"][0],
-            "some-rocompat"
+        // V1 default adds "v1_erofs" as the first ro_compat flag
+        let ro_compat = parsed["features"]["read-only-compatible"]
+            .as_array()
+            .unwrap();
+        assert!(
+            ro_compat.iter().any(|v| v == "v1_erofs"),
+            "expected v1_erofs flag"
+        );
+        assert!(
+            ro_compat.iter().any(|v| v == "some-rocompat"),
+            "expected some-rocompat flag"
         );
 
         // Roundtrip

@@ -2055,7 +2055,10 @@ mod tests {
     use super::*;
     use crate::{
         dumpfile::{dumpfile_to_filesystem, write_dumpfile},
-        erofs::writer::{ValidatedFileSystem, mkfs_erofs},
+        erofs::{
+            format::FormatVersion,
+            writer::{ValidatedFileSystem, mkfs_erofs, mkfs_erofs_versioned},
+        },
         fsverity::Sha256HashValue,
     };
     use std::collections::HashMap;
@@ -2130,13 +2133,16 @@ mod tests {
 
     #[test]
     fn test_empty_directory() {
-        // Create filesystem with empty directory
+        // Create filesystem with empty directory (V2: no whiteout stubs)
         let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
 /empty_dir 0 40755 2 0 0 0 1000.0 - - -
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
+        let image = mkfs_erofs_versioned(
+            &mut ValidatedFileSystem::new(fs).unwrap(),
+            FormatVersion::V2,
+        );
         let img = Image::open(&image).unwrap();
 
         // Root should have . and .. and empty_dir
@@ -2267,7 +2273,7 @@ mod tests {
 
     #[test]
     fn test_nested_directories() {
-        // Test deeply nested directory structure
+        // Test deeply nested directory structure (V2: no whiteout stubs)
         let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
 /a 0 40755 2 0 0 0 1000.0 - - -
 /a/b 0 40755 2 0 0 0 1000.0 - - -
@@ -2276,7 +2282,10 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
+        let image = mkfs_erofs_versioned(
+            &mut ValidatedFileSystem::new(fs).unwrap(),
+            FormatVersion::V2,
+        );
         let img = Image::open(&image).unwrap();
 
         // Navigate through the structure
@@ -2427,7 +2436,7 @@ mod tests {
 
     #[test]
     fn test_round_trip_basic() {
-        // Full round-trip: dumpfile -> tree -> erofs -> read back -> validate
+        // Full round-trip: dumpfile -> tree -> erofs -> read back -> validate (V2)
         let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
 /file1 5 100644 1 0 0 0 1000.0 - hello -
 /file2 6 100644 1 0 0 0 1000.0 - world! -
@@ -2436,7 +2445,10 @@ mod tests {
 "#;
 
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
+        let image = mkfs_erofs_versioned(
+            &mut ValidatedFileSystem::new(fs).unwrap(),
+            FormatVersion::V2,
+        );
         let img = Image::open(&image).unwrap();
 
         // Verify root entries
@@ -2475,7 +2487,7 @@ mod tests {
         assert_eq!(inline_data, Some(b"hello".as_slice()));
     }
 
-    /// Helper: round-trip a dumpfile through erofs and compare the result.
+    /// Helper: round-trip a dumpfile through V2 erofs and compare the result.
     fn round_trip_dumpfile(input: &str) -> (String, String) {
         let fs_orig = dumpfile_to_filesystem::<Sha256HashValue>(input).unwrap();
 
@@ -2483,7 +2495,10 @@ mod tests {
         write_dumpfile(&mut orig_output, &fs_orig).unwrap();
         let orig_str = String::from_utf8(orig_output).unwrap();
 
-        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs_orig).unwrap());
+        let image = mkfs_erofs_versioned(
+            &mut ValidatedFileSystem::new(fs_orig).unwrap(),
+            FormatVersion::V2,
+        );
         let fs_rt = erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
 
         let mut rt_output = Vec::new();
@@ -3038,7 +3053,10 @@ mod tests {
             let mut expected_output = Vec::new();
             write_dumpfile(&mut expected_output, &fs_expected).unwrap();
 
-            let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs_write).unwrap());
+            let image = mkfs_erofs_versioned(
+                &mut ValidatedFileSystem::new(fs_write).unwrap(),
+                FormatVersion::V2,
+            );
             let fs_rt = erofs_to_filesystem::<ObjectID>(&image).unwrap();
 
             let mut rt_output = Vec::new();
@@ -3545,13 +3563,16 @@ mod tests {
     /// first in the BTreeMap, leaving the first leaf unreferenced).
     #[test]
     fn test_duplicate_dirent_rejected() {
-        // Build a valid image with two files
+        // Build a valid V2 image with two files (V2 for predictable byte layout)
         let dumpfile = r#"/ 0 40755 2 0 0 0 1000.0 - - -
 /aaa 5 100644 1 0 0 0 1000.0 - hello -
 /bbb 5 100644 1 0 0 0 1000.0 - world -
 "#;
         let fs = dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        let image = mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap());
+        let image = mkfs_erofs_versioned(
+            &mut ValidatedFileSystem::new(fs).unwrap(),
+            FormatVersion::V2,
+        );
 
         // Sanity: the unmodified image round-trips fine
         erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
@@ -3990,9 +4011,15 @@ mod tests {
     /// Helper: build a simple filesystem from a dumpfile and write it as an
     /// Epoch2 (V2) EROFS image.
     fn build_epoch2_image(dumpfile: &str) -> Box<[u8]> {
-        use crate::erofs::writer::{ValidatedFileSystem, mkfs_erofs};
+        use crate::erofs::{
+            format::FormatVersion,
+            writer::{ValidatedFileSystem, mkfs_erofs_versioned},
+        };
         let fs = crate::dumpfile::dumpfile_to_filesystem::<Sha256HashValue>(dumpfile).unwrap();
-        mkfs_erofs(&mut ValidatedFileSystem::new(fs).unwrap())
+        mkfs_erofs_versioned(
+            &mut ValidatedFileSystem::new(fs).unwrap(),
+            FormatVersion::V2,
+        )
     }
 
     /// Helper: build a filesystem from a dumpfile and write it as an Epoch1 (V1)
