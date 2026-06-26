@@ -279,6 +279,12 @@ pub(crate) struct CfsctlService {
     open_opts: OpenOptions,
 }
 
+impl Default for CfsctlService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CfsctlService {
     /// Construct an empty service with the given repository open options.
     ///
@@ -307,6 +313,11 @@ impl CfsctlService {
     /// before CLI parsing and so has no `App` to consult. Uses default open
     /// options; the client supplies repository paths via `OpenRepository`.
     pub(crate) fn activated() -> Self {
+        Self::with_open_opts(OpenOptions::default())
+    }
+
+    /// Construct a service with default open options.
+    pub(crate) fn new() -> Self {
         Self::with_open_opts(OpenOptions::default())
     }
 
@@ -2768,7 +2779,7 @@ pub(crate) use oci::*;
 /// current-thread Tokio runtime and [`tokio::task::LocalSet`].
 ///
 /// The server thread exits when the client connection is closed.
-#[cfg(all(test, feature = "oci"))]
+#[cfg(feature = "oci")]
 pub(crate) fn spawn_in_process(
     service: CfsctlService,
 ) -> std::io::Result<(zlink::unix::Connection, std::thread::JoinHandle<()>)> {
