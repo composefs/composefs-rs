@@ -35,6 +35,9 @@ pub mod tar;
 #[doc(hidden)]
 pub mod test_util;
 
+#[cfg(doc)]
+pub mod design;
+
 // Re-export the composefs crate for consumers who only need composefs-oci
 pub use composefs;
 
