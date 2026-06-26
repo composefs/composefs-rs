@@ -23,6 +23,8 @@ pub use composefs_http;
 pub use composefs_oci;
 
 pub mod composefs_info;
+#[cfg(feature = "fuse")]
+pub mod fuse;
 pub mod mkcomposefs;
 pub mod mountcomposefs;
 /// Varlink RPC service exposing repository operations over a Unix socket.
@@ -441,15 +443,8 @@ enum OciCommand {
         /// Mount the bootable variant instead of the regular EROFS image
         #[arg(long)]
         bootable: bool,
-        /// Writable upper layer directory for overlayfs
-        #[arg(long, requires = "workdir")]
-        upperdir: Option<PathBuf>,
-        /// Work directory for overlayfs (required with --upperdir)
-        #[arg(long, requires = "upperdir")]
-        workdir: Option<PathBuf>,
-        /// Mount read-write (requires --upperdir)
-        #[arg(long, requires = "upperdir")]
-        read_write: bool,
+        #[clap(flatten)]
+        mount_opts: MountOpts,
     },
     /// Compute the composefs image ID of a stored OCI image's rootfs
     ///
@@ -525,15 +520,8 @@ enum OstreeCommand {
         commit: String,
         /// Target mountpoint
         mountpoint: String,
-        /// Writable upper layer directory for overlayfs
-        #[arg(long, requires = "workdir")]
-        upperdir: Option<PathBuf>,
-        /// Work directory for overlayfs (required with --upperdir)
-        #[arg(long, requires = "upperdir")]
-        workdir: Option<PathBuf>,
-        /// Mount read-write (requires --upperdir)
-        #[arg(long, requires = "upperdir")]
-        read_write: bool,
+        #[clap(flatten)]
+        mount_opts: MountOpts,
     },
     /// Dump the filesystem of an ostree commit as a composefs dumpfile to stdout
     Dump {
@@ -583,6 +571,64 @@ struct FsReadOptions {
     /// Don't copy /usr metadata to root directory (use if root already has well-defined metadata)
     #[clap(long)]
     no_propagate_usr_to_root: bool,
+}
+
+/// Common options for mount commands (shared across regular, OCI, and ostree mount).
+#[derive(Debug, Parser)]
+struct MountOpts {
+    /// Mount mode: auto, yes (force FUSE), or no (force kernel)
+    #[cfg(feature = "fuse")]
+    #[arg(long, value_enum, default_value_t)]
+    fuse: FuseMode,
+    /// Run FUSE server in the foreground (don't daemonize)
+    #[cfg(feature = "fuse")]
+    #[arg(long)]
+    foreground: bool,
+    /// Writable upper layer directory for overlayfs
+    #[arg(long, requires = "workdir")]
+    upperdir: Option<PathBuf>,
+    /// Work directory for overlayfs (required with --upperdir)
+    #[arg(long, requires = "upperdir")]
+    workdir: Option<PathBuf>,
+    /// Mount read-write (requires --upperdir)
+    #[arg(long, requires = "upperdir")]
+    read_write: bool,
+}
+
+impl MountOpts {
+    fn to_mount_options(&self) -> Result<composefs::mount::MountOptions> {
+        get_mount_options(
+            self.upperdir.as_deref(),
+            self.workdir.as_deref(),
+            self.read_write,
+        )
+    }
+
+    fn mount_image<ObjectID: FsVerityHashValue>(
+        &self,
+        repo: &Arc<Repository<ObjectID>>,
+        image_name: &str,
+        mountpoint: &str,
+    ) -> Result<()> {
+        let mount_options = self.to_mount_options()?;
+
+        #[cfg(feature = "fuse")]
+        if let mode @ (MountMode::Fuse | MountMode::FuseOverlay) =
+            detect_mount_mode(self.fuse, self.upperdir.is_some())
+        {
+            return run_fuse_mount(
+                repo,
+                image_name,
+                mountpoint,
+                mode,
+                mount_options,
+                self.foreground,
+            );
+        }
+
+        repo.mount_at(image_name, mountpoint, &mount_options)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -652,15 +698,8 @@ enum Command {
         name: String,
         /// the mountpoint
         mountpoint: String,
-        /// Writable upper layer directory for overlayfs
-        #[arg(long, requires = "workdir")]
-        upperdir: Option<PathBuf>,
-        /// Work directory for overlayfs (required with --upperdir)
-        #[arg(long, requires = "upperdir")]
-        workdir: Option<PathBuf>,
-        /// Mount read-write (requires --upperdir)
-        #[arg(long, requires = "upperdir")]
-        read_write: bool,
+        #[clap(flatten)]
+        mount_opts: MountOpts,
     },
     /// Read rootfs located at a path, add all files to the repo, then create the composefs image of the rootfs,
     /// commit it to the repo, and print its image object ID
@@ -809,6 +848,9 @@ fn get_mount_options(
     options.set_read_write(read_write);
     Ok(options)
 }
+
+#[cfg(feature = "fuse")]
+use fuse::{FuseMode, MountMode, detect_mount_mode, run_fuse_mount};
 
 #[cfg(feature = "oci")]
 pub(crate) fn verity_opt<ObjectID>(opt: &Option<String>) -> Result<Option<ObjectID>>
@@ -1388,12 +1430,8 @@ where
                 ref image,
                 ref mountpoint,
                 bootable,
-                ref upperdir,
-                ref workdir,
-                read_write,
+                ref mount_opts,
             } => {
-                let mount_options =
-                    get_mount_options(upperdir.as_deref(), workdir.as_deref(), read_write)?;
                 let img = if image.starts_with("sha256:") {
                     let digest: composefs_oci::OciDigest =
                         image.parse().context("Parsing manifest digest")?;
@@ -1416,7 +1454,7 @@ where
                         ),
                     }
                 };
-                repo.mount_at(&erofs_id.to_hex(), mountpoint.as_str(), &mount_options)?;
+                mount_opts.mount_image(&repo, &erofs_id.to_hex(), mountpoint.as_str())?;
             }
             OciCommand::ComputeId { config_opts } => {
                 let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
@@ -1699,14 +1737,10 @@ where
             OstreeCommand::Mount {
                 ref commit,
                 ref mountpoint,
-                ref upperdir,
-                ref workdir,
-                read_write,
+                ref mount_opts,
             } => {
-                let mount_options =
-                    get_mount_options(upperdir.as_deref(), workdir.as_deref(), read_write)?;
                 let image_id = composefs_ostree::get_image_ref(&repo, commit)?;
-                repo.mount_at(&image_id.to_hex(), mountpoint.as_str(), &mount_options)?;
+                mount_opts.mount_image(&repo, &image_id.to_hex(), mountpoint.as_str())?;
             }
             OstreeCommand::Dump { ref commit_name } => {
                 let fs = composefs_ostree::create_filesystem(&repo, commit_name)?;
@@ -1766,13 +1800,9 @@ where
         Command::Mount {
             name,
             mountpoint,
-            ref upperdir,
-            ref workdir,
-            read_write,
+            ref mount_opts,
         } => {
-            let mount_options =
-                get_mount_options(upperdir.as_deref(), workdir.as_deref(), read_write)?;
-            repo.mount_at(&name, &mountpoint, &mount_options)?;
+            mount_opts.mount_image(&repo, &name, &mountpoint)?;
         }
         Command::ImageObjects { name } => {
             let objects = repo.objects_for_image(&name)?;
