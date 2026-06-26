@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use libtest_mimic::{Arguments, Trial};
 
 pub(crate) use composefs_integration_tests::{INTEGRATION_TESTS, integration_test};
@@ -55,6 +55,45 @@ pub(crate) fn cfsctl() -> Result<PathBuf> {
         "cfsctl binary not found; build it with `cargo build -p cfsctl` \
          or set CFSCTL_PATH"
     )
+}
+
+/// Bind a listening Unix socket at a fresh tempdir path and spawn `cfsctl`
+/// against it via the systemd socket-activation protocol (`LISTEN_FDS=1`, the
+/// listening socket on fd 3, `LISTEN_PID` set in the child). The socket is
+/// already listening before the child starts, so callers may connect
+/// immediately — no polling needed. The path exists on disk, so `varlinkctl`
+/// (which connects by path) works unchanged.
+///
+/// Returns the spawned child, the tempdir (keep alive for the socket's
+/// lifetime), and the socket path.
+pub(crate) fn spawn_activated_cfsctl() -> Result<(std::process::Child, tempfile::TempDir, PathBuf)>
+{
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+
+    use cap_std_ext::cmdext::{CapStdExtCommandExt, CmdFds, SystemdFdName};
+
+    let cfsctl = cfsctl()?;
+    let socket_dir = tempfile::tempdir()?;
+    let socket = socket_dir.path().join("varlink.sock");
+
+    let listener = UnixListener::bind(&socket)
+        .with_context(|| format!("binding varlink listener at {}", socket.display()))?;
+    let listener_fd: Arc<OwnedFd> = Arc::new(listener.into());
+
+    let mut cmd = std::process::Command::new(&cfsctl);
+    // Bare invocation — no subcommand, no --address.  cfsctl serves on the
+    // inherited listening fd via run_if_socket_activated().
+    //
+    // IMPORTANT: do NOT call cmd.env()/.envs() here — take_fds() sets the
+    // LISTEN_* vars via setenv in pre_exec, and Command::env would clobber
+    // them by building a separate envp array.
+    let fds = CmdFds::new_systemd_fds([(listener_fd, SystemdFdName::new("varlink"))]);
+    cmd.take_fds(fds);
+    let child = cmd.spawn().context("spawning socket-activated cfsctl")?;
+
+    Ok((child, socket_dir, socket))
 }
 
 /// Create a test rootfs fixture inside `parent` and return its path.

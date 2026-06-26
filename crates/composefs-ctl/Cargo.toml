@@ -19,7 +19,7 @@ path = "src/main.rs"
 [features]
 default = ['pre-6.15', 'pre-6.16', 'oci', 'containers-storage', 'ostree', 'fuse']
 http = ['composefs-http']
-oci = ['composefs-oci', 'composefs-oci/varlink']
+oci = ['composefs-oci', 'composefs-oci/varlink', 'composefs-splitdirfdstream']
 containers-storage = ['composefs-oci/containers-storage', 'cstorage']
 ostree = ['composefs-ostree']
 fuse = ['dep:composefs-fuse']
@@ -35,8 +35,9 @@ comfy-table = { version = "7.1", default-features = false }
 composefs = { workspace = true, features = ["varlink"] }
 composefs-boot = { workspace = true }
 composefs-oci = { workspace = true, optional = true, features = ["boot"] }
+composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.7.0", optional = true }
 composefs-http = { workspace = true, optional = true }
-cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.7.0", features = ["userns-helper"], optional = true }
+cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.7.0", features = ["layer-transfer"], optional = true }
 cap-std-ext = { workspace = true }
 composefs-fuse = { workspace = true, optional = true }
 composefs-ostree = { workspace = true, optional = true }
@@ -45,11 +46,17 @@ hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.17.0", default-features = false }
 libsystemd = { version = "0.7" }
 log = { version = "0.4", default-features = false }
-rustix = { version = "1.0.0", default-features = false, features = ["fs", "pipe", "process", "thread"] }
+rustix = { version = "1.0.0", default-features = false, features = ["fs", "net", "pipe", "process", "thread"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-tokio = { version = "1.24.2", default-features = false, features = ["io-std", "io-util", "net", "rt", "sync"] }
+tokio = { version = "1.24.2", default-features = false, features = ["io-std", "io-util", "net", "rt", "rt-multi-thread", "sync"] }
 zlink = { workspace = true }
+
+[dev-dependencies]
+similar-asserts = "1.7.0"
+tar = { version = "0.4.38", default-features = false }
+tempfile = "3.8.0"
+tokio = { version = "1.24.2", default-features = false, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

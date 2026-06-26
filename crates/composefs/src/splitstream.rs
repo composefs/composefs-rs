@@ -1051,6 +1051,39 @@ impl<ObjectID: FsVerityHashValue> SplitStreamReader<ObjectID> {
         }
     }
 
+    /// Walk the stream one chunk at a time, invoking `callback` for each
+    /// inline span and each external object reference, in stream order.
+    ///
+    /// This is the reference-preserving analogue of [`Self::cat`]: where `cat`
+    /// resolves external objects by copying their bytes, this yields the
+    /// object id so callers can re-emit a reference instead.
+    ///
+    /// The callback receives a [`SplitStreamData`] value for each chunk.
+    /// Inline chunks carry their raw bytes; external chunks carry the object
+    /// identifier so the caller can look up the object by whatever means it
+    /// prefers (e.g. emitting a filename reference into a `splitdirfdstream`).
+    #[context("Walking splitstream chunks")]
+    pub fn for_each_chunk(
+        &mut self,
+        mut callback: impl FnMut(SplitStreamData<ObjectID>) -> Result<()>,
+    ) -> Result<()> {
+        let mut buffer = vec![];
+
+        loop {
+            match self.ensure_chunk(true, true, 0)? {
+                ChunkType::Eof => break Ok(()),
+                ChunkType::Inline => {
+                    read_into_vec(&mut self.decoder, &mut buffer, self.inline_bytes)?;
+                    self.inline_bytes = 0;
+                    callback(SplitStreamData::Inline(buffer[..].into()))?;
+                }
+                ChunkType::External(id) => {
+                    callback(SplitStreamData::External(id))?;
+                }
+            }
+        }
+    }
+
     /// Traverses the split stream and calls the callback for each object reference.
     ///
     /// This includes both references from the digest map and external references in the stream.

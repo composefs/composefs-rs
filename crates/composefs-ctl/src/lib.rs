@@ -982,12 +982,18 @@ pub async fn run_if_socket_activated() -> Result<bool> {
     if std::env::args_os().len() != 1 {
         return Ok(false);
     }
-    let Some(listener) = crate::varlink::try_activated_listener()? else {
-        return Ok(false);
-    };
     let service = crate::varlink::CfsctlService::activated();
-    crate::varlink::serve_activated(service, listener).await?;
-    Ok(true)
+    match crate::varlink::try_activated_listener()? {
+        Some(crate::varlink::ActivatedSocket::Connected(l)) => {
+            crate::varlink::serve_activated(service, l).await?;
+            Ok(true)
+        }
+        Some(crate::varlink::ActivatedSocket::Listening(listener)) => {
+            crate::varlink::serve_on_listener(service, listener).await?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// Top-level dispatch: handle init specially, otherwise open repo and run.
