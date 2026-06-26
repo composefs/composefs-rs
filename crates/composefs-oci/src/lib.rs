@@ -22,12 +22,19 @@ pub mod cstor;
 pub(crate) mod delta;
 pub mod image;
 pub mod layer;
+pub mod layer_sync;
+pub mod layer_transport;
 pub mod oci_image;
 pub mod oci_layout;
 /// Re-exported from [`composefs::progress`]; use that path directly in new code.
 pub mod progress;
 pub mod skopeo;
 pub mod tar;
+/// Shared wire types and client proxy for the `org.composefs.Oci` interface.
+///
+/// Available when the `varlink` feature is enabled.
+#[cfg(feature = "varlink")]
+pub mod varlink_types;
 
 /// Test utilities for building OCI images from dumpfile strings.
 #[cfg(any(test, feature = "test"))]
@@ -63,6 +70,14 @@ use composefs::{
 };
 
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, TAR_LAYER_CONTENT_TYPE};
+
+/// The content-type tag used to identify OCI layer (tar) splitstreams in the
+/// repository.
+///
+/// Pass this to [`composefs::repository::Repository::open_stream`] when
+/// reading back a stored layer splitstream by its fs-verity hash.  The value
+/// is the 8-byte ASCII string `"ocilayer"` encoded as a little-endian `u64`.
+pub const LAYER_CONTENT_TYPE: u64 = TAR_LAYER_CONTENT_TYPE;
 
 /// Named ref key for the V2 EROFS image derived from this OCI config.
 pub const IMAGE_REF_KEY: &str = "composefs.image";
@@ -343,6 +358,17 @@ pub(crate) fn layer_identifier(diff_id: &OciDigest) -> String {
     format!("oci-layer-{diff_id}")
 }
 
+/// Return the content-identifier string used to register a layer splitstream.
+///
+/// This is the key passed to [`composefs::repository::Repository::has_stream`]
+/// and [`composefs::repository::Repository::write_stream`] for a given OCI
+/// diff-id.  Callers outside this crate (e.g. the varlink layer-sync service)
+/// use this to look up whether a layer has been imported and to obtain its
+/// fs-verity hash.
+pub fn layer_content_id(diff_id: &OciDigest) -> String {
+    layer_identifier(diff_id)
+}
+
 pub(crate) fn config_identifier(config: &OciDigest) -> String {
     format!("oci-config-{config}")
 }
@@ -445,7 +471,11 @@ pub(crate) fn sha256_output_to_digest(output: sha2::digest::Output<Sha256>) -> O
 
 /// Compute the SHA-256 content digest of `bytes`, returning an OCI digest
 /// (e.g. `sha256:abcd...`).
-pub(crate) fn sha256_content_digest(bytes: &[u8]) -> OciDigest {
+///
+/// This is primarily used to derive an OCI diff-id from a tar layer's raw
+/// bytes (before any compression).  It is also used by tests that construct
+/// synthetic layers without going through the full OCI pull path.
+pub fn sha256_content_digest(bytes: &[u8]) -> OciDigest {
     let mut context = Sha256::new();
     context.update(bytes);
     sha256_output_to_digest(context.finalize())
@@ -754,7 +784,7 @@ pub fn write_config_raw<ObjectID: FsVerityHashValue>(
 /// and are collected by the next GC.
 ///
 /// Returns the EROFS image's ObjectID (fs-verity digest).
-fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
+pub(crate) fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     manifest_digest: &OciDigest,
     manifest_verity: Option<&ObjectID>,

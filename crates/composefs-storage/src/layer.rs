@@ -155,33 +155,21 @@ impl Layer {
     ///
     /// Returns layers in order: [self, parent, grandparent, ..., base]
     ///
+    /// The overlay `lower` file already lists the complete ordered ancestor
+    /// chain (immediate parent first, base last), so the chain is simply
+    /// `self` followed by each resolved parent. No recursive expansion needed.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the layer chain exceeds the maximum depth of 500 layers.
+    /// Returns an error if any parent layer cannot be resolved or opened.
     pub fn layer_chain(self, storage: &Storage) -> Result<Vec<Layer>> {
-        let mut chain = vec![self];
-        let mut current_idx = 0;
-
-        // Maximum depth to prevent infinite loops
-        const MAX_DEPTH: usize = 500;
-
-        while current_idx < chain.len() && chain.len() < MAX_DEPTH {
-            let parent_ids = chain[current_idx].parents(storage)?;
-
-            // Add all parents to the chain
-            for parent_id in parent_ids {
-                chain.push(Layer::open(storage, &parent_id)?);
-            }
-
-            current_idx += 1;
+        // Call parents() before moving self into the vec.
+        let parent_ids = self.parents(storage)?;
+        let mut chain = Vec::with_capacity(1 + parent_ids.len());
+        chain.push(self);
+        for id in parent_ids {
+            chain.push(Layer::open(storage, &id)?);
         }
-
-        if chain.len() >= MAX_DEPTH {
-            return Err(StorageError::InvalidStorage(
-                "Layer chain exceeds maximum depth of 500".to_string(),
-            ));
-        }
-
         Ok(chain)
     }
 
@@ -307,6 +295,81 @@ mod tests {
 
         let storage = Storage::open(root).unwrap();
         Layer::open(&storage, layer_id).unwrap()
+    }
+
+    // --- layer_chain tests ---
+
+    /// Create a 3-layer mock: A → B → C (A's lower lists B and C).
+    ///
+    /// The overlay `lower` file for layer A is `l/<B_link>:l/<C_link>`, meaning
+    /// B is the immediate parent and C is the base.  `layer_chain` should return
+    /// exactly [A, B, C].
+    fn create_three_layer_mock(root: &Path) -> Storage {
+        for d in ["overlay", "overlay/l", "overlay-layers", "overlay-images"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+
+        let layers = [
+            ("layer-a", "AAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            ("layer-b", "BBBBBBBBBBBBBBBBBBBBBBBBBB"),
+            ("layer-c", "CCCCCCCCCCCCCCCCCCCCCCCCCC"),
+        ];
+
+        for (id, link) in &layers {
+            let layer_dir = root.join("overlay").join(id);
+            std::fs::create_dir_all(layer_dir.join("diff")).unwrap();
+            std::fs::write(layer_dir.join("link"), link).unwrap();
+            // Create symlink overlay/l/<link> → ../<id>/diff
+            std::os::unix::fs::symlink(
+                format!("../{}/diff", id),
+                root.join("overlay/l").join(link),
+            )
+            .unwrap();
+        }
+
+        // Layer A's lower: B is immediate parent, C is base.
+        std::fs::write(
+            root.join("overlay/layer-a/lower"),
+            format!(
+                "l/{}:l/{}",
+                layers[1].1, // B link
+                layers[2].1, // C link
+            ),
+        )
+        .unwrap();
+        // Layer B has C as its parent (single entry).
+        std::fs::write(
+            root.join("overlay/layer-b/lower"),
+            format!("l/{}", layers[2].1),
+        )
+        .unwrap();
+        // Layer C is the base — no lower file.
+
+        Storage::open(root).unwrap()
+    }
+
+    /// Regression test: `layer_chain` must return exactly [A, B, C] for a
+    /// 3-layer chain where A's `lower` already lists both B and C.
+    ///
+    /// The old BFS expansion would open B, then expand B's parents (C), giving
+    /// [A, B, C, C] — duplicating C and growing exponentially for real images.
+    #[test]
+    fn test_layer_chain_no_bfs_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = create_three_layer_mock(dir.path());
+
+        let layer_a = Layer::open(&storage, "layer-a").unwrap();
+        let chain = layer_a.layer_chain(&storage).unwrap();
+
+        assert_eq!(
+            chain.len(),
+            3,
+            "layer_chain must return exactly 3 layers [A, B, C], got {}",
+            chain.len()
+        );
+        assert_eq!(chain[0].id(), "layer-a");
+        assert_eq!(chain[1].id(), "layer-b");
+        assert_eq!(chain[2].id(), "layer-c");
     }
 
     // --- has_whiteout tests ---

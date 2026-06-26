@@ -55,27 +55,35 @@ pub mod config;
 pub mod error;
 pub mod image;
 pub mod layer;
+pub mod lock;
 pub mod storage;
 pub mod tar_split;
 
+// Stateless CstorLayerService implementing org.composefs.Oci
+#[cfg(feature = "layer-transfer")]
+pub mod cstor_service;
+
 // User namespace support for rootless access
 pub mod userns;
-#[cfg(feature = "userns-helper")]
+#[cfg(feature = "layer-transfer")]
 pub mod userns_helper;
 
 // Re-export commonly used types
 pub use config::{AdditionalLayerStore, StorageConfig};
+#[cfg(feature = "layer-transfer")]
+pub use cstor_service::{
+    CstorLayerService, InProcessServer as CstorInProcessServer,
+    spawn_in_process as spawn_cstor_in_process,
+};
 pub use error::{Result, StorageError};
 pub use image::Image;
 pub use layer::Layer;
+pub use lock::LayerStoreLock;
 pub use storage::{LayerMetadata, Storage};
 pub use tar_split::{TarHeader, TarSplitFdStream, TarSplitItem};
 pub use userns::can_bypass_file_permissions;
-#[cfg(feature = "userns-helper")]
-pub use userns_helper::{
-    GetImageResult, HelperError, ImageInfo, ProxiedLayerStream, ProxiedTarSplitItem, StorageProxy,
-    init_if_helper,
-};
+#[cfg(feature = "layer-transfer")]
+pub use userns_helper::{HelperError, StorageProxy, init_if_helper};
 
 // Re-export OCI spec types for convenience
 pub use oci_spec::image::{Descriptor, ImageConfiguration, ImageManifest};
