@@ -1,8 +1,43 @@
-//! Rust bindings and utilities for working with composefs images and repositories.
+//! # composefs: The reliability of disk images, the flexibility of files
 //!
-//! Composefs is a read-only FUSE filesystem that enables efficient sharing
-//! of container filesystem layers by using content-addressable storage
-//! and fs-verity for integrity verification.
+//! composefs combines several Linux kernel features to provide read-only
+//! mountable filesystem trees that stack on top of a conventional "lower"
+//! filesystem.
+//!
+//! ## Interfaces
+//!
+//! composefs offers two programmatic interfaces:
+//!
+//! - **Rust API** — this crate and its siblings (`composefs-oci`,
+//!   `composefs-boot`, etc.), usable as regular Cargo dependencies.
+//! - **Varlink API** — a [varlink](https://varlink.org) RPC interface
+//!   exposed by `cfsctl varlink` over a Unix socket, accessible from
+//!   any language.  See the [`varlink`] module for examples.
+//!
+//! Neither interface is declared stable yet.  Both may change across
+//! releases while the project is under active development.
+//!
+//! ## Key technologies
+//!
+//! - **[overlayfs]** — the kernel mount interface that exposes the composed tree
+//! - **[EROFS]** — an in-kernel read-only filesystem for the metadata tree
+//!   (directories, symlinks, permissions, xattrs) with no file data
+//! - **[fs-verity]** (optional) — per-file integrity verification on the
+//!   backing store, validated by overlayfs at access time
+//!
+//! [overlayfs]: https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt
+//! [EROFS]: https://erofs.docs.kernel.org
+//! [fs-verity]: https://www.kernel.org/doc/html/next/filesystems/fsverity.html
+//!
+//! ## Design
+//!
+//! composefs produces an EROFS image containing *only* metadata.  Non-empty
+//! data files live in a content-addressed backing store, with
+//! `trusted.overlay.redirect` xattrs telling overlayfs where to find them.
+//! Identical files across images are stored once on disk and shared in the
+//! Linux page cache.
+//!
+//! See the [`repository_format`] module for the on-disk layout.
 
 #![forbid(unsafe_code)]
 // This is a library: emit diagnostics via the `log` crate (or return them),
@@ -25,9 +60,16 @@ pub mod splitstream;
 pub mod tree;
 pub mod util;
 
+#[cfg(doc)]
+pub mod erofs_format;
 pub mod generic_tree;
+#[cfg(doc)]
+pub mod repository_format;
+#[cfg(doc)]
+pub mod splitstream_format;
 #[cfg(any(test, feature = "test"))]
 pub mod test;
+pub mod varlink;
 
 /// Files with this many bytes or fewer are stored inline in the erofs image
 /// (and in splitstreams).  Files above this threshold are written to object

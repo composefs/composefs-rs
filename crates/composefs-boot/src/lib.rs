@@ -15,6 +15,9 @@ pub mod selabel;
 pub mod uki;
 pub mod write_boot;
 
+#[cfg(doc)]
+pub mod design;
+
 use std::ffi::OsStr;
 
 use anyhow::Result;

@@ -29,6 +29,8 @@ pub struct CommitInfo {
 }
 
 mod commit;
+#[cfg(doc)]
+pub mod design;
 mod ostree;
 mod pull;
 mod repo;

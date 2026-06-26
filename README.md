@@ -34,76 +34,32 @@ and Linux kernel integration, but with the *flexibility* of files
 for content — avoiding doubled disk usage, partition table management,
 and similar headaches.
 
-### Separation between metadata and data
-
-A key aspect of composefs is its separation of "data" (non-empty regular
-files) from "metadata" (everything else: directories, symlinks, permissions,
-ownership, etc.).
-
-composefs produces an [EROFS](https://erofs.docs.kernel.org) filesystem
-image that contains only metadata. The non-empty data files live in a
-separate "backing store" directory. The EROFS image includes
-`trusted.overlay.redirect` extended attributes that tell the overlayfs
-mount how to find the real underlying files.
-
-### Shared backing store
-
-The primary use case for composefs is versioned, immutable filesystem
-trees — container images and bootable host systems — where multiple
-images may share parts of their storage.
-
-By storing files content-addressed (named by the hash of their content),
-shared files need to be stored only once on disk yet can appear in
-multiple mounts. Crucially, these data files are also shared in the
-[page cache](https://static.lwn.net/kerneldoc/admin-guide/mm/concepts.html#page-cache),
-allowing multiple running container images to reliably share memory.
-
-### Filesystem integrity
-
-composefs supports [fs-verity](https://www.kernel.org/doc/html/latest/filesystems/fsverity.html)
-validation of content files. The digest of each content file is stored
-in the EROFS image via `trusted.overlay.metacopy` extended attributes,
-which overlayfs validates when the file is accessed. This means backing
-content cannot be changed (by mistake or by malice) without detection.
-
-You can also enable fs-verity on the image file itself and pass the expected
-digest as a mount option. This provides full trust of both data and metadata,
-solving a weakness of fs-verity alone (which can only verify file data,
-not metadata like permissions, ownership, or directory structure).
+composefs separates metadata (directories, permissions, xattrs) from data
+(file content). An EROFS image carries only the metadata; data files live in
+a content-addressed backing store, shared across images and in the Linux
+[page cache](https://static.lwn.net/kerneldoc/admin-guide/mm/concepts.html#page-cache).
+Optional [fs-verity](https://www.kernel.org/doc/html/latest/filesystems/fsverity.html)
+provides end-to-end integrity verification of both data and metadata.
+For design details, see the [crate documentation](https://docs.rs/composefs).
 
 ## Use cases
 
 ### Container images
 
-For [OCI](https://github.com/opencontainers/image-spec/blob/main/spec.md)
-container images, a common approach (used by both Docker and Podman) is
-to untar each layer separately and use overlayfs to stitch them together.
-composefs improves on this by storing file content in a content-addressed
-fashion, allowing sharing between images even when metadata like
-timestamps or ownership differs.
-
-Combined with approaches like
-[zstd:chunked](https://github.com/containers/storage/pull/775),
-this speeds up pulling container images and avoids redundantly
-creating files that are already present.
+composefs improves on the traditional per-layer overlayfs model for
+[OCI](https://github.com/opencontainers/image-spec/blob/main/spec.md)
+container images by storing file content in a content-addressed store,
+enabling sharing between images and faster pulls via
+[zstd:chunked](https://github.com/containers/storage/pull/775).
 
 ### Bootable host systems
 
-Anywhere one wants versioned immutable filesystem trees ("images"),
-composefs provides compelling advantages. In particular, this project
-aims to be the successor to [OSTree](https://github.com/ostreedev/ostree/).
-
-OSTree uses a content-addressed object store, but traditionally checks out
-into a regular directory (using hardlinks), which is then bind-mounted as
-the rootfs. While OSTree supports enabling fs-verity on files in the store,
-nothing protects the checkout directories from modification.
-
-composefs replaces this checkout with a directly-mountable image pointing
-into the object store. We can enable fs-verity on the composefs image and
-embed its digest in the kernel commandline or a Unified Kernel Image (UKI).
-Since composefs generation is reproducible, we can verify the generated
-image is correct by comparing its digest to one in the metadata produced
-at build time. For more on this, see [this tracking issue](https://github.com/ostreedev/ostree/issues/2867).
+composefs aims to succeed [OSTree](https://github.com/ostreedev/ostree/)
+by replacing hardlink checkouts with directly-mountable images backed by a
+shared object store. Combined with fs-verity and a digest embedded in the
+kernel commandline or a UKI, this provides cryptographic verification of
+the entire filesystem tree. See [this tracking issue](https://github.com/ostreedev/ostree/issues/2867)
+for background.
 
 ## Components
 
@@ -147,9 +103,7 @@ helper that supports `mount -t composefs` syntax directly.
 
 ## Documentation
 
- - [Repository format](doc/repository.md)
- - [OCI integration](doc/oci.md)
- - [Splitstream format](doc/splitstream.md)
+ - [API and design documentation](https://docs.rs/composefs)
  - [Examples README](examples/README.md)
 
 ## Status
