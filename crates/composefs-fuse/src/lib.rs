@@ -883,6 +883,77 @@ pub fn mount_fuse(dev_fuse: impl AsFd, options: &FuseMountOptions) -> anyhow::Re
     )?)
 }
 
+/// Options controlling how an overlayfs is created on top of a FUSE mount.
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct OverlayMountOptions {
+    overlay_xattr: OverlayXattrMode,
+    upperdirs: Option<(OwnedFd, OwnedFd)>,
+    read_write: bool,
+    enable_verity: bool,
+}
+
+impl OverlayMountOptions {
+    /// Set the overlay xattr mode. Defaults to [`OverlayXattrMode::User`].
+    pub fn set_overlay_xattr(&mut self, mode: OverlayXattrMode) -> &mut Self {
+        self.overlay_xattr = mode;
+        self
+    }
+
+    /// Add an overlayfs upper layer and work directory.
+    pub fn set_overlay(&mut self, upperdir: OwnedFd, workdir: OwnedFd) -> &mut Self {
+        self.upperdirs = Some((upperdir, workdir));
+        self
+    }
+
+    /// Make the mount read-write.
+    pub fn set_read_write(&mut self, read_write: bool) -> &mut Self {
+        self.read_write = read_write;
+        self
+    }
+
+    /// Require fs-verity for overlay metacopy verification.
+    pub fn set_enable_verity(&mut self, enable_verity: bool) -> &mut Self {
+        self.enable_verity = enable_verity;
+        self
+    }
+}
+
+/// Creates an overlayfs on top of a FUSE mount.
+pub fn mount_fuse_overlay(
+    fuse_mnt: OwnedFd,
+    basedir: impl AsFd,
+    options: &OverlayMountOptions,
+) -> anyhow::Result<OwnedFd> {
+    let prepared = prepare_mount(fuse_mnt)?;
+
+    let overlayfs = FsHandle::open("overlay")?;
+    fsconfig_set_string(overlayfs.as_fd(), "source", "composefs-fuse")?;
+    if options.overlay_xattr == OverlayXattrMode::User {
+        fsconfig_set_flag(overlayfs.as_fd(), "userxattr")?;
+    }
+    if options.enable_verity {
+        fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
+    }
+    if let Some((upperdir, workdir)) = &options.upperdirs {
+        overlayfs_set_fd(overlayfs.as_fd(), "upperdir", upperdir.as_fd())?;
+        overlayfs_set_fd(overlayfs.as_fd(), "workdir", workdir.as_fd())?;
+    }
+    overlayfs_set_lower_and_data_fds(&overlayfs, &prepared, &[basedir.as_fd()])?;
+    fsconfig_create(overlayfs.as_fd())?;
+
+    let mount_attr = if options.read_write {
+        MountAttrFlags::empty()
+    } else {
+        MountAttrFlags::MOUNT_ATTR_RDONLY
+    };
+    Ok(fsmount(
+        overlayfs.as_fd(),
+        FsMountFlags::FSMOUNT_CLOEXEC,
+        mount_attr,
+    )?)
+}
+
 /// Options controlling how the FUSE server behaves.
 #[derive(Debug, Default)]
 #[non_exhaustive]
