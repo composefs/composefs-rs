@@ -41,6 +41,7 @@ composefs-ostree = { workspace = true }
 # proxy bindings (alongside the external `varlinkctl` CLI), and to assert on the
 # typed wire reply/error types.
 composefs-ctl = { workspace = true, features = ["oci"] }
+containers-image-proxy = { version = "0.11", default-features = false }
 hex = "0.4"
 libtest-mimic = "0.8"
 linkme = "0.3"
