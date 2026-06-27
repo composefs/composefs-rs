@@ -21,7 +21,7 @@ use oci_client::secrets::RegistryAuth;
 
 use crate::OciDigest;
 use crate::oci_image;
-use crate::signature::EROFS_ALONGSIDE_ARTIFACT_TYPE;
+use crate::signature::METADATA_ARTIFACT_TYPE;
 
 /// Fetch OCI referrer artifacts from a remote registry and import them
 /// into the local composefs repository.
@@ -68,7 +68,7 @@ pub async fn fetch_and_import_referrers<ObjectID: FsVerityHashValue>(
     // but store referrers under a tag named "sha256-<hex>" per the OCI 1.1
     // referrers tag scheme fallback.
     let index = match client
-        .pull_referrers(&digest_ref, Some(EROFS_ALONGSIDE_ARTIFACT_TYPE))
+        .pull_referrers(&digest_ref, Some(METADATA_ARTIFACT_TYPE))
         .await
     {
         Ok(idx) => idx,

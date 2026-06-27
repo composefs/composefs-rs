@@ -807,7 +807,7 @@ fn seal<ObjectID: FsVerityHashValue>(
     } = open_config(repo, config_name, config_verity)?;
     let mut myconfig = config.config().clone().unwrap_or_default();
     let labels = myconfig.labels_mut().get_or_insert_with(HashMap::new);
-    let mut fs = crate::image::create_filesystem(repo, config_name, config_verity)?;
+    let fs = crate::image::create_filesystem(repo, config_name, config_verity)?;
     let id = fs.compute_image_id(FormatVersion::V1);
     labels.insert("containers.composefs.fsverity".to_string(), id.to_hex());
     config.set_config(Some(myconfig));

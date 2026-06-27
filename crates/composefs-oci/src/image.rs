@@ -153,7 +153,7 @@ pub fn compute_merged_digest<ObjectID: FsVerityHashValue>(
     config_name: &OciDigest,
     config_verity: Option<&ObjectID>,
 ) -> Result<ObjectID> {
-    let mut fs = create_filesystem(repo, config_name, config_verity)?;
+    let fs = create_filesystem(repo, config_name, config_verity)?;
     Ok(fs.compute_image_id(FormatVersion::V1))
 }
 

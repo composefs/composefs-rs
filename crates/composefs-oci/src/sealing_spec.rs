@@ -173,7 +173,7 @@
 //!     "size": 7682
 //!   }
 //! }
-//! ```
+//! ```text
 //!
 //! The `merged` role refers to the complete flattened filesystem of all layers. The `merged.bootable` role refers to the boot variant — a modified EROFS that excludes `/boot` and applies other boot-specific transformations, as described in [Relationship to Booting with composefs](#relationship-to-booting-with-composefs) below.
 //!
@@ -201,7 +201,7 @@
 //!     __le16 digest_size;
 //!     __u8 digest[];
 //! };
-//! ```
+//! ```text
 //!
 //! Composefs algorithm identifiers map to kernel constants with no salt:
 //! - `fsverity-sha512-12` → `FS_VERITY_HASH_ALG_SHA512`, 4096-byte blocks
@@ -216,9 +216,9 @@
 //! ##### Discovery and Verification
 //!
 //! Discovery uses the standard [OCI Distribution Spec referrers API](https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers):
-//! ```
+//! ```text
 //! GET /v2/<name>/referrers/<digest>?artifactType=application/vnd.composefs.metadata.v1
-//! ```
+//! ```text
 //!
 //! Verification:
 //!
@@ -230,7 +230,7 @@
 //!
 //! The kernel handles PKCS#7 validation when signatures are used — failed verification prevents reading the file.
 //!
-//! ```
+//! ```text
 //! External CA/Keystore
 //!   ↓ issues certificate for .fs-verity keyring
 //! PKCS#7 signatures (from artifact layers)
@@ -238,7 +238,7 @@
 //! Manifest JSON, Config JSON, EROFS blobs
 //!   ↓ kernel fsverity enforcement on every read
 //! Runtime file access
-//! ```
+//! ```text
 //!
 //! ##### Implementation Considerations
 //!
@@ -299,7 +299,7 @@
 //!     "composefs.merged.erofs.v1.fsverity-sha512-12": "d015f70f8bee6cf6453dd5b771eec18994b861c646cec18e2a9dfdec93f631fbb9030e60cfc82b552d33b9a134312a876ef4e519bffe3ef872aefbd84e6198b3"
 //!   }
 //! }
-//! ```
+//! ```text
 //!
 //! Each layer's `composefs.layer.erofs.v1.fsverity-sha512-12` covers the EROFS generated from that individual layer's tar content. The `composefs.config.fsverity-sha512-12` on the config descriptor covers the image config JSON as stored in the registry. The `composefs.merged.erofs.v1.fsverity-sha512-12` at the manifest level represents the complete flattened filesystem of all layers merged together.
 //!
@@ -343,7 +343,7 @@
 //!     "composefs.merged.erofs.v1.fsverity-sha512-12.sig": "MIIEpAIBAAKCAQEA3x7V8mLkP2nQoRfT6wYsHzJdXcBvNqWuAiOeGk1pZ5tYl9sC4mRb0hDjEaFgVwKP7TnUXcMz6QiLe2oNdR8vBpHkYuAl3sXwJmFtOcZa..."
 //!   }
 //! }
-//! ```
+//! ```text
 //!
 //! A few things worth noting about inline signatures:
 //!

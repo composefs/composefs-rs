@@ -606,7 +606,7 @@ async fn run_fuse_serve<ObjectID: FsVerityHashValue>(
     let dev_fuse = open_fuse().map_err(|e| RepositoryError::InternalError {
         message: format!("opening /dev/fuse: {e:#}"),
     })?;
-    let mnt_fd = mount_fuse(&dev_fuse).map_err(|e| RepositoryError::InternalError {
+    let mnt_fd = mount_fuse(&dev_fuse, &Default::default()).map_err(|e| RepositoryError::InternalError {
         message: format!("mounting FUSE: {e:#}"),
     })?;
     composefs::mount::mount_at(&mnt_fd, CWD, &mountpoint).map_err(|e| {
@@ -816,7 +816,7 @@ async fn run_oci_fuse_mount<ObjectID: FsVerityHashValue>(
     let dev_fuse = open_fuse().map_err(|e| oci::OciError::InternalError {
         message: format!("opening /dev/fuse: {e:#}"),
     })?;
-    let mnt_fd = mount_fuse(&dev_fuse).map_err(|e| oci::OciError::InternalError {
+    let mnt_fd = mount_fuse(&dev_fuse, &Default::default()).map_err(|e| oci::OciError::InternalError {
         message: format!("mounting FUSE: {e:#}"),
     })?;
     composefs::mount::mount_at(&mnt_fd, CWD, &mountpoint).map_err(|e| {

@@ -12,13 +12,13 @@
 //!
 //! The canonical tar format is defined as a mapping from composefs dumpfile to tar. The dumpfile is a human-readable textual format that represents a complete filesystem tree and can be converted to/from EROFS. By defining dumpfile-to-tar, we complete a triangle of deterministic conversions:
 //!
-//! ```
+//! ```text
 //! dumpfile  ──→  canonical tar
 //!     ↑                │
 //!     │                │
 //!     └── EROFS (v1) ←─┘
 //!          
-//! ```
+//! ```text
 //!
 //! A client that has an EROFS can convert to dumpfile, then to canonical tar. A builder that has a tar can convert to dumpfile, then to EROFS.
 //!
@@ -38,9 +38,9 @@
 //!
 //! The archive begins with a single pax global extended header (typeflag `g`) containing one record:
 //!
-//! ```
+//! ```text
 //! canonical-tar=1
-//! ```
+//! ```text
 //!
 //! This allows any client to detect canonical tar format by reading the first entry. No other global extended headers are permitted in the archive.
 //!
@@ -49,7 +49,7 @@
 //! Entries appear in depth-first pre-order with children sorted by filename using byte-wise comparison. This matches the ordering produced by iterating a `BTreeMap<OsStr, Inode>`, which is the in-memory representation used by composefs.
 //!
 //! Example:
-//! ```
+//! ```text
 //! ./
 //! ./a/
 //! ./a/x
@@ -57,7 +57,7 @@
 //! ./b/
 //! ./b/z
 //! ./c
-//! ```
+//! ```text
 //!
 //! The root directory entry comes first. Directories are emitted before their children.
 //!

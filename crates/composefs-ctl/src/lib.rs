@@ -62,8 +62,6 @@ use composefs_boot::write_boot;
 
 #[cfg(feature = "oci")]
 use composefs::shared_internals::IO_BUF_CAPACITY;
-#[cfg(feature = "oci")]
-mod oci_run;
 use composefs::{
     dumpfile::{dump_single_dir, dump_single_file},
     erofs::{
@@ -982,6 +980,7 @@ enum Command {
         #[clap(long)]
         json: bool,
     },
+    #[cfg(feature = "rhel9")]
     /// Commands for managing the kernel keyring (requires root)
     Keyring {
         #[clap(subcommand)]
@@ -1017,6 +1016,7 @@ enum Command {
     },
 }
 
+#[cfg(feature = "rhel9")]
 fn run_keyring_cmd(cmd: &KeyringCommand) -> Result<()> {
     match cmd {
         // TODO: Check for CAP_SYS_ADMIN before attempting to inject
@@ -1202,6 +1202,7 @@ pub async fn run_app(args: App) -> Result<()> {
     }
 
     // Handle commands that don't need a repository first
+    #[cfg(feature = "rhel9")]
     if let Command::Keyring { ref cmd } = args.cmd {
         return run_keyring_cmd(cmd);
     }
@@ -1717,7 +1718,7 @@ where
                             .context("parsing EROFS image")?;
 
                         let dev_fuse = open_fuse()?;
-                        let mnt_fd = mount_fuse(&dev_fuse)?;
+                        let mnt_fd = mount_fuse(&dev_fuse, &Default::default())?;
                         composefs::mount::mount_at(&mnt_fd, CWD, mountpoint.as_str())
                             .with_context(|| format!("attaching FUSE mount at {mountpoint}"))?;
 
@@ -2100,7 +2101,7 @@ where
 
                     let layer_descriptors = artifact_image.layer_descriptors();
                     let mut layer_idx = 0usize;
-                    let sig_layer_offset = parsed.erofs_entries.len();
+                    let sig_layer_offset = 0;
                     // Track whether this particular artifact verified with
                     // the given cert (relevant for multi-signer scenarios).
                     let mut artifact_verified = true;
@@ -2117,7 +2118,7 @@ where
                                 ("  merged:  ".to_string(), Some(merged_hex.clone()))
                             }
                             other => {
-                                println!("  {other}: skipped");
+                                println!("  {:?}: skipped", other);
                                 continue;
                             }
                         };
@@ -2143,7 +2144,7 @@ where
                                 .context("layer descriptor out of bounds")?;
                             let blob_digest = layer_desc.digest();
 
-                            if layer_desc.size() == 0 {
+                            if layer_desc.size() == 0u64 {
                                 println!("{label} digest matches but no signature blob");
                                 artifact_verified = false;
                                 continue;
@@ -2670,7 +2671,7 @@ where
                 erofs_to_filesystem::<ObjectID>(&erofs_bytes).context("parsing EROFS image")?;
 
             let dev_fuse = open_fuse()?;
-            let mnt_fd = mount_fuse(&dev_fuse)?;
+            let mnt_fd = mount_fuse(&dev_fuse, &Default::default())?;
             composefs::mount::mount_at(&mnt_fd, CWD, mountpoint)
                 .with_context(|| format!("attaching FUSE mount at {}", mountpoint.display()))?;
 
@@ -2742,6 +2743,7 @@ where
                 }
             }
         }
+        #[cfg(feature = "rhel9")]
         Command::Keyring { .. } => {
             unreachable!("keyring commands are handled before opening a repository")
         }

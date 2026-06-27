@@ -56,9 +56,9 @@
 //!
 //! For each individually-compressed file, the map contains:
 //!
-//! ```
+//! ```text
 //! { fsverity_digest, layer_index, byte_offset, compressed_size }
-//! ```
+//! ```text
 //!
 //! - `fsverity_digest`: the fsverity digest of the file content (matches the EROFS inode's content reference)
 //! - `layer_index`: position in the image manifest's `layers` array (0-indexed)
