@@ -182,10 +182,23 @@ fn test_ostree_pull_remote_archive() -> Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn()?;
 
-    // Give the server a moment to start
-    std::thread::sleep(std::time::Duration::from_millis(500));
-
     let result = (|| -> Result<()> {
+        // Poll the server until it is ready
+        let start_time = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(10);
+        let delay = std::time::Duration::from_millis(50);
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+
+        loop {
+            if std::net::TcpStream::connect_timeout(&addr, delay).is_ok() {
+                break;
+            }
+            if start_time.elapsed() >= timeout {
+                anyhow::bail!("python3 http.server did not become ready on port {port} within 10s");
+            }
+            std::thread::sleep(delay);
+        }
+
         let composefs_dir_remote = TempDir::new()?;
         let repo_remote = create_test_repository(&composefs_dir_remote)?;
 
