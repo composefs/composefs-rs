@@ -353,6 +353,14 @@ impl CfsctlService {
     }
 }
 
+/// Find a typed error anywhere in the anyhow chain.
+///
+/// Errors get `.context()`-wrapped as they propagate, so a top-level
+/// `downcast_ref` is insufficient; walk the whole chain.
+fn find_in_chain<T: std::error::Error + Send + Sync + 'static>(e: &anyhow::Error) -> Option<&T> {
+    e.chain().find_map(|c| c.downcast_ref::<T>())
+}
+
 /// Open the repository and run an fsck.
 async fn run_fsck<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
@@ -392,7 +400,7 @@ async fn run_image_objects<ObjectID: FsVerityHashValue>(
     name: String,
 ) -> std::result::Result<ImageObjectsReply, RepositoryError> {
     let objects = repo.objects_for_image(&name).map_err(|e| {
-        if let Some(nf) = e.downcast_ref::<composefs::ImageNotFound>() {
+        if let Some(nf) = find_in_chain::<composefs::ImageNotFound>(&e) {
             RepositoryError::NoSuchRef {
                 reference: nf.name.clone(),
             }
@@ -701,11 +709,11 @@ async fn run_inspect<ObjectID: FsVerityHashValue>(
             message: format!("invalid image reference: {e:#}"),
         })?;
     let img = crate::resolve_oci_image(repo, &reference).map_err(|e| {
-        if let Some(nf) = e.downcast_ref::<composefs_oci::OciRefNotFound>() {
+        if let Some(nf) = find_in_chain::<composefs_oci::OciRefNotFound>(&e) {
             oci::OciError::NoSuchImage {
                 image: nf.name.clone(),
             }
-        } else if let Some(nf) = e.downcast_ref::<composefs_oci::OciImageNotFound>() {
+        } else if let Some(nf) = find_in_chain::<composefs_oci::OciImageNotFound>(&e) {
             oci::OciError::NoSuchImage {
                 image: nf.digest.clone(),
             }
@@ -774,7 +782,7 @@ async fn run_oci_fuse_mount<ObjectID: FsVerityHashValue>(
         })?
     } else {
         composefs_oci::oci_image::OciImage::open_ref(&repo, &image).map_err(|e| {
-            if let Some(nf) = e.downcast_ref::<composefs_oci::OciRefNotFound>() {
+            if let Some(nf) = find_in_chain::<composefs_oci::OciRefNotFound>(&e) {
                 oci::OciError::NoSuchImage {
                     image: nf.name.clone(),
                 }
@@ -927,9 +935,8 @@ async fn run_seal<ObjectID: FsVerityHashValue>(
             manifest_digest: digest.to_string(),
         })
         .map_err(|e| {
-            if e.downcast_ref::<composefs_oci::OciRefNotFound>().is_some()
-                || e.downcast_ref::<composefs_oci::OciImageNotFound>()
-                    .is_some()
+            if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
+                || find_in_chain::<composefs_oci::OciImageNotFound>(&e).is_some()
             {
                 oci::OciError::NoSuchImage {
                     image: image.clone(),
@@ -964,9 +971,8 @@ async fn run_sign<ObjectID: FsVerityHashValue>(
             artifact_verity: artifact_verity.to_hex(),
         })
         .map_err(|e| {
-            if e.downcast_ref::<composefs_oci::OciRefNotFound>().is_some()
-                || e.downcast_ref::<composefs_oci::OciImageNotFound>()
-                    .is_some()
+            if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
+                || find_in_chain::<composefs_oci::OciImageNotFound>(&e).is_some()
             {
                 oci::OciError::NoSuchImage {
                     image: image.clone(),
@@ -1002,17 +1008,14 @@ async fn run_verify<ObjectID: FsVerityHashValue>(
         None => composefs_oci::verify_image_signatures(repo, &image, None),
     }
     .map_err(|e| {
-        if e.downcast_ref::<composefs_oci::NoSignatureArtifacts>()
-            .is_some()
-            || e.downcast_ref::<composefs_oci::SignatureVerificationFailed>()
-                .is_some()
+        if find_in_chain::<composefs_oci::NoSignatureArtifacts>(&e).is_some()
+            || find_in_chain::<composefs_oci::SignatureVerificationFailed>(&e).is_some()
         {
             oci::OciError::SignatureVerificationFailed {
                 message: format!("{e:#}"),
             }
-        } else if e.downcast_ref::<composefs_oci::OciRefNotFound>().is_some()
-            || e.downcast_ref::<composefs_oci::OciImageNotFound>()
-                .is_some()
+        } else if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
+            || find_in_chain::<composefs_oci::OciImageNotFound>(&e).is_some()
         {
             oci::OciError::NoSuchImage {
                 image: image.clone(),
