@@ -1,6 +1,6 @@
 //! Integration tests for ostree pull functionality.
 
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -377,7 +377,22 @@ impl HttpServer {
             .stderr(std::process::Stdio::null())
             .spawn()?;
 
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Poll the server until it is ready, rather than sleeping for a fixed
+        // duration and racing with the server actually binding the port.
+        let start_time = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(10);
+        let delay = std::time::Duration::from_millis(50);
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse()?;
+        loop {
+            if TcpStream::connect_timeout(&addr, delay).is_ok() {
+                break;
+            }
+            if start_time.elapsed() >= timeout {
+                anyhow::bail!("python3 http.server did not become ready on port {port} within 10s");
+            }
+            std::thread::sleep(delay);
+        }
+
         Ok(HttpServer { child, port })
     }
 
