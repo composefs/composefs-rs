@@ -14,7 +14,7 @@ version.workspace = true
 default = ["containers-storage"]
 test = ["tar", "rand", "composefs/test"]
 boot = ["composefs-boot"]
-containers-storage = ["dep:cstorage", "dep:base64", "cstorage/userns-helper"]
+containers-storage = ["dep:cstorage", "cstorage/userns-helper"]
 varlink = ['dep:zlink-core', 'composefs/varlink']
 # Enable OCI client for fetching referrer artifacts from remote registries
 oci-client = ["dep:oci-client"]
@@ -23,7 +23,7 @@ oci-client = ["dep:oci-client"]
 anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
 async-compression = { version = "0.4.0", default-features = false, features = ["tokio", "zstd", "gzip"] }
-base64 = { version = "0.22", default-features = false, features = ["std"], optional = true }
+base64 = { version = "0.22", default-features = false, features = ["std"] }
 bytes = { version = "1", default-features = false }
 composefs = { workspace = true }
 zlink-core = { workspace = true, optional = true }
