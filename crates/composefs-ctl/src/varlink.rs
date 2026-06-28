@@ -461,6 +461,13 @@ pub struct MountReply {
     pub fd_index: u32,
 }
 
+// Only the `(not oci, not fuse)` and `(oci, fuse)` service variants dispatch to
+// `run_mount`; the `(oci, not fuse)` variant uses `run_oci_mount` instead. Gate
+// the definition to the combos that consume it to avoid dead-code warnings.
+#[cfg(any(
+    all(not(feature = "oci"), not(feature = "fuse")),
+    all(feature = "oci", feature = "fuse")
+))]
 fn run_mount<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     name: &str,

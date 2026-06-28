@@ -353,6 +353,9 @@ impl From<LocalFetchCli> for composefs_oci::LocalFetchOpt {
 /// Multiple options are comma-separated: `--fuse=passthrough,option2`
 /// (only `passthrough` is defined today).
 #[derive(Debug, Default, Clone)]
+// The `--fuse` argument is always parsed so the CLI surface is stable, but the
+// parsed options are only consumed when the `fuse` feature is enabled.
+#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
 struct FuseOptions {
     passthrough: bool,
 }
@@ -1762,10 +1765,10 @@ where
                     config_verity.as_ref(),
                 )?;
                 fs.transform_for_boot(&repo)?;
-                let mut vfs = composefs::erofs::writer::ValidatedFileSystem::new(fs)?;
+                let vfs = composefs::erofs::writer::ValidatedFileSystem::new(fs)?;
                 let digest = composefs::fsverity::compute_verity::<ObjectID>(
                     &composefs::erofs::writer::mkfs_erofs_versioned(
-                        &mut vfs,
+                        &vfs,
                         composefs::erofs::format::FormatVersion::V1,
                     ),
                 );
