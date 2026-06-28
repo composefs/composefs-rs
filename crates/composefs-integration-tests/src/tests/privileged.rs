@@ -1226,7 +1226,10 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
 
     use composefs_oci::composefs::{
         dumpfile::write_dumpfile,
-        erofs::{reader::erofs_to_filesystem, writer::{mkfs_erofs, ValidatedFileSystem}},
+        erofs::{
+            reader::erofs_to_filesystem,
+            writer::{ValidatedFileSystem, mkfs_erofs},
+        },
         repository::{Repository, RepositoryConfig},
     };
 
@@ -1257,7 +1260,7 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
     // 2. Build the synthetic tree, write external objects to the repo, and
     //    round-trip through EROFS for canonical form.
     let synthetic = build_test_filesystem(&repo)?;
-    let erofs_bytes = mkfs_erofs(&mut ValidatedFileSystem::new(synthetic)?);
+    let erofs_bytes = mkfs_erofs(&ValidatedFileSystem::new(synthetic)?);
     std::fs::write(&image_path, &*erofs_bytes)?;
     let canonical_fs = erofs_to_filesystem::<Sha256HashValue>(&erofs_bytes)?;
 

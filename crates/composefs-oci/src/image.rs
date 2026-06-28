@@ -189,7 +189,7 @@ pub fn generate_per_layer_images<ObjectID: FsVerityHashValue>(
             process_entry(&mut single_fs, entry)?;
         }
         let erofs_bytes =
-            mkfs_erofs_versioned(&mut ValidatedFileSystem::new(single_fs)?, FormatVersion::V1);
+            mkfs_erofs_versioned(&ValidatedFileSystem::new(single_fs)?, FormatVersion::V1);
         let digest = compute_verity(&erofs_bytes);
         results.push((erofs_bytes, digest));
     }
@@ -211,7 +211,7 @@ pub fn generate_merged_image<ObjectID: FsVerityHashValue>(
     config_verity: Option<&ObjectID>,
 ) -> Result<(Box<[u8]>, ObjectID)> {
     let fs = create_filesystem(repo, config_name, config_verity)?;
-    let erofs_bytes = mkfs_erofs_versioned(&mut ValidatedFileSystem::new(fs)?, FormatVersion::V1);
+    let erofs_bytes = mkfs_erofs_versioned(&ValidatedFileSystem::new(fs)?, FormatVersion::V1);
     let digest = compute_verity(&erofs_bytes);
     Ok((erofs_bytes, digest))
 }
@@ -760,7 +760,7 @@ mod test {
             compute_per_layer_digests(&repo, &config_digest, Some(&config_verity)).unwrap();
         assert_eq!(per_layer.len(), 1);
 
-        let mut merged_fs = create_filesystem(&repo, &config_digest, Some(&config_verity)).unwrap();
+        let merged_fs = create_filesystem(&repo, &config_digest, Some(&config_verity)).unwrap();
         let merged_digest = merged_fs.compute_image_id(FormatVersion::V1);
 
         // The merged filesystem applies transform_for_oci() which copies /usr metadata
