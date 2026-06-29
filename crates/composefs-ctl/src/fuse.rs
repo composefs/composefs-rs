@@ -25,6 +25,7 @@ pub(crate) enum FuseMode {
     No,
 }
 
+#[derive(Debug)]
 pub(crate) enum MountMode {
     Kernel,
     Fuse,
@@ -46,6 +47,56 @@ fn has_cap_sys_admin() -> bool {
     }
 }
 
+/// Probe whether the kernel supports overlayfs with userxattr + data-only
+/// layers. Kernels without the `5ef7bcde` backport reject this because
+/// data-only layers require metacopy, which conflicts with userxattr.
+///
+/// The probe creates a temporary directory for the lower/data dirs, sets
+/// up a dummy overlay with `userxattr` + data-only layer syntax, and
+/// checks whether `fsconfig_create` succeeds.
+fn supports_userxattr_data_layers() -> bool {
+    use composefs::mount::FsHandle;
+    use rustix::mount::{fsconfig_create, fsconfig_set_flag, fsconfig_set_string};
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+
+    let Ok(tmpdir) = tempfile::tempdir() else {
+        return false;
+    };
+    let lower = tmpdir.path().join("lower");
+    let data = tmpdir.path().join("data");
+    if std::fs::create_dir(&lower).is_err() || std::fs::create_dir(&data).is_err() {
+        return false;
+    }
+    let Ok(lower_fd) = rustix::fs::open(
+        &lower,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    let Ok(data_fd) = rustix::fs::open(
+        &data,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return false;
+    };
+    let lowerdir_arg = format!(
+        "/proc/self/fd/{}::/proc/self/fd/{}",
+        lower_fd.as_raw_fd(),
+        data_fd.as_raw_fd()
+    );
+
+    let Ok(overlayfs) = FsHandle::open("overlay") else {
+        return false;
+    };
+    let supported = fsconfig_set_flag(overlayfs.as_fd(), "userxattr").is_ok()
+        && fsconfig_set_string(overlayfs.as_fd(), "lowerdir", &*lowerdir_arg).is_ok()
+        && fsconfig_create(overlayfs.as_fd()).is_ok();
+    log::debug!("supports_userxattr_data_layers: {supported}");
+    supported
+}
+
 pub(crate) fn detect_mount_mode(fuse_mode: FuseMode, has_upper: bool) -> MountMode {
     let use_fuse = match fuse_mode {
         FuseMode::Yes => true,
@@ -57,11 +108,13 @@ pub(crate) fn detect_mount_mode(fuse_mode: FuseMode, has_upper: bool) -> MountMo
         return MountMode::Kernel;
     }
 
-    if has_upper || has_cap_sys_admin() {
+    let mode = if (has_upper || has_cap_sys_admin()) && supports_userxattr_data_layers() {
         MountMode::FuseOverlay
     } else {
         MountMode::Fuse
-    }
+    };
+    log::debug!("detect_mount_mode: {mode:?}");
+    mode
 }
 
 pub(crate) fn run_fuse_foreground(
