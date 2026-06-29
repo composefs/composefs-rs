@@ -621,9 +621,10 @@ async fn run_fuse_serve<ObjectID: FsVerityHashValue>(
     let dev_fuse = open_fuse().map_err(|e| RepositoryError::InternalError {
         message: format!("opening /dev/fuse: {e:#}"),
     })?;
-    let mnt_fd = mount_fuse(&dev_fuse, &Default::default()).map_err(|e| RepositoryError::InternalError {
-        message: format!("mounting FUSE: {e:#}"),
-    })?;
+    let mnt_fd =
+        mount_fuse(&dev_fuse, &Default::default()).map_err(|e| RepositoryError::InternalError {
+            message: format!("mounting FUSE: {e:#}"),
+        })?;
     composefs::mount::mount_at(&mnt_fd, CWD, &mountpoint).map_err(|e| {
         RepositoryError::InternalError {
             message: format!("attaching FUSE mount at {mountpoint}: {e:#}"),
@@ -831,9 +832,10 @@ async fn run_oci_fuse_mount<ObjectID: FsVerityHashValue>(
     let dev_fuse = open_fuse().map_err(|e| oci::OciError::InternalError {
         message: format!("opening /dev/fuse: {e:#}"),
     })?;
-    let mnt_fd = mount_fuse(&dev_fuse, &Default::default()).map_err(|e| oci::OciError::InternalError {
-        message: format!("mounting FUSE: {e:#}"),
-    })?;
+    let mnt_fd =
+        mount_fuse(&dev_fuse, &Default::default()).map_err(|e| oci::OciError::InternalError {
+            message: format!("mounting FUSE: {e:#}"),
+        })?;
     composefs::mount::mount_at(&mnt_fd, CWD, &mountpoint).map_err(|e| {
         oci::OciError::InternalError {
             message: format!("attaching FUSE mount at {mountpoint}: {e:#}"),
@@ -926,95 +928,21 @@ async fn run_compute_id<ObjectID: FsVerityHashValue>(
 /// Seal an OCI image: generate per-layer and merged EROFS, embed the fs-verity
 /// ID as a config label, and return the new manifest digest.
 #[cfg(feature = "oci")]
-async fn run_seal<ObjectID: FsVerityHashValue>(
+pub(crate) async fn run_seal<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     image: String,
+    inline: bool,
 ) -> std::result::Result<oci::SealReply, oci::OciError> {
-    composefs_oci::seal_image(repo, &image)
-        .map(|digest| oci::SealReply {
-            manifest_digest: digest.to_string(),
-        })
-        .map_err(|e| {
-            if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
-                || find_in_chain::<composefs_oci::OciImageNotFound>(&e).is_some()
-            {
-                oci::OciError::NoSuchImage {
-                    image: image.clone(),
-                }
-            } else {
-                oci::OciError::InternalError {
-                    message: format!("{e:#}"),
-                }
-            }
-        })
-}
-
-/// Sign an OCI image: build the signature artifact and store it. Returns the
-/// artifact digest and its fs-verity ID.
-#[cfg(feature = "oci")]
-async fn run_sign<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    image: String,
-    cert_pem: String,
-    key_pem: String,
-) -> std::result::Result<oci::SignReply, oci::OciError> {
-    let signing_key = composefs_oci::signing::FsVeritySigningKey::from_pem(
-        cert_pem.as_bytes(),
-        key_pem.as_bytes(),
-    )
-    .map_err(|e| oci::OciError::InvalidCertificate {
-        message: format!("{e:#}"),
-    })?;
-    composefs_oci::sign_image(repo, &image, &signing_key)
-        .map(|(artifact_digest, artifact_verity)| oci::SignReply {
-            artifact_digest: artifact_digest.to_string(),
-            artifact_verity: artifact_verity.to_hex(),
-        })
-        .map_err(|e| {
-            if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
-                || find_in_chain::<composefs_oci::OciImageNotFound>(&e).is_some()
-            {
-                oci::OciError::NoSuchImage {
-                    image: image.clone(),
-                }
-            } else {
-                oci::OciError::InternalError {
-                    message: format!("{e:#}"),
-                }
-            }
-        })
-}
-
-/// Verify composefs signature artifacts for an OCI image.
-///
-/// When `cert_pem` is `Some`, performs cryptographic PKCS#7 verification.
-/// When `None`, performs a digest-only consistency check.
-#[cfg(feature = "oci")]
-async fn run_verify<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    image: String,
-    cert_pem: Option<String>,
-) -> std::result::Result<oci::VerifyReply, oci::OciError> {
-    let cert_supplied = cert_pem.is_some();
-    let count = match cert_pem {
-        Some(pem) => {
-            let verifier =
-                composefs_oci::signing::FsVeritySignatureVerifier::from_pem(pem.as_bytes())
-                    .map_err(|e| oci::OciError::InvalidCertificate {
-                        message: format!("{e:#}"),
-                    })?;
-            composefs_oci::verify_image_signatures(repo, &image, Some(&verifier))
-        }
-        None => composefs_oci::verify_image_signatures(repo, &image, None),
-    }
+    let res = if inline {
+        composefs_oci::seal_image_inline(repo, &image)
+    } else {
+        composefs_oci::seal_image(repo, &image)
+    };
+    res.map(|digest| oci::SealReply {
+        manifest_digest: digest.to_string(),
+    })
     .map_err(|e| {
-        if find_in_chain::<composefs_oci::NoSignatureArtifacts>(&e).is_some()
-            || find_in_chain::<composefs_oci::SignatureVerificationFailed>(&e).is_some()
-        {
-            oci::OciError::SignatureVerificationFailed {
-                message: format!("{e:#}"),
-            }
-        } else if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
+        if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
             || find_in_chain::<composefs_oci::OciImageNotFound>(&e).is_some()
         {
             oci::OciError::NoSuchImage {
@@ -1025,11 +953,122 @@ async fn run_verify<ObjectID: FsVerityHashValue>(
                 message: format!("{e:#}"),
             }
         }
+    })
+}
+
+/// Sign an OCI image: build the signature artifact and store it. Returns the
+/// artifact digest and its fs-verity ID.
+#[cfg(feature = "oci")]
+pub(crate) async fn run_sign<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    image: String,
+    cert_pem: String,
+    key_pem: String,
+    inline: bool,
+) -> std::result::Result<oci::SignReply, oci::OciError> {
+    let signing_key = composefs_oci::signing::FsVeritySigningKey::from_pem(
+        cert_pem.as_bytes(),
+        key_pem.as_bytes(),
+    )
+    .map_err(|e| oci::OciError::InvalidCertificate {
+        message: format!("{e:#}"),
     })?;
+    let res = if inline {
+        composefs_oci::sign_image_inline(repo, &image, &signing_key)
+            .map(|digest| (digest, ObjectID::EMPTY))
+    } else {
+        composefs_oci::sign_image(repo, &image, &signing_key)
+    };
+    res.map(|(artifact_digest, artifact_verity)| oci::SignReply {
+        artifact_digest: artifact_digest.to_string(),
+        artifact_verity: artifact_verity.to_hex(),
+    })
+    .map_err(|e| {
+        if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
+            || find_in_chain::<composefs_oci::OciImageNotFound>(&e).is_some()
+        {
+            oci::OciError::NoSuchImage {
+                image: image.clone(),
+            }
+        } else {
+            oci::OciError::InternalError {
+                message: format!("{e:#}"),
+            }
+        }
+    })
+}
+
+/// Verify composefs signature artifacts for an OCI image.
+///
+/// When `cert_pem` is `Some`, performs cryptographic PKCS#7 verification.
+/// When `None`, performs a digest-only consistency check.
+#[cfg(feature = "oci")]
+pub(crate) async fn run_verify<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    image: String,
+    cert_pem: Option<String>,
+) -> std::result::Result<oci::VerifyReply, oci::OciError> {
+    let cert_supplied = cert_pem.is_some();
+    let verifier = match &cert_pem {
+        Some(pem) => Some(
+            composefs_oci::signing::FsVeritySignatureVerifier::from_pem(pem.as_bytes()).map_err(
+                |e| oci::OciError::InvalidCertificate {
+                    message: format!("{e:#}"),
+                },
+            )?,
+        ),
+        None => None,
+    };
+
+    let report =
+        composefs_oci::verify_image_report(repo, &image, verifier.as_ref()).map_err(|e| {
+            if find_in_chain::<composefs_oci::NoSignatureArtifacts>(&e).is_some()
+                || find_in_chain::<composefs_oci::SignatureVerificationFailed>(&e).is_some()
+            {
+                oci::OciError::SignatureVerificationFailed {
+                    message: format!("{e:#}"),
+                }
+            } else if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
+                || find_in_chain::<composefs_oci::OciImageNotFound>(&e).is_some()
+            {
+                oci::OciError::NoSuchImage {
+                    image: image.clone(),
+                }
+            } else {
+                oci::OciError::InternalError {
+                    message: format!("{e:#}"),
+                }
+            }
+        })?;
+
+    let entries = report
+        .entries
+        .into_iter()
+        .map(|entry| oci::VerifyEntry {
+            role: entry.role,
+            expected_digest: entry.expected_digest,
+            digest_ok: entry.digest_ok,
+            signature_verified: entry.signature_verified,
+            detail: entry.detail,
+        })
+        .collect();
+
+    if cert_supplied && report.verified_count == 0 {
+        return Err(oci::OciError::SignatureVerificationFailed {
+            message: "no signatures were cryptographically verified".into(),
+        });
+    }
+
     Ok(oci::VerifyReply {
-        verified_count: count as u64,
+        verified_count: if cert_supplied {
+            report.verified_count as u64
+        } else {
+            0
+        },
         ok: true,
         cert_supplied,
+        algorithm: report.algorithm,
+        entries,
     })
 }
 
@@ -1646,10 +1685,12 @@ mod service_impl {
             &self,
             handle: u64,
             image: String,
+            inline: Option<bool>,
         ) -> std::result::Result<SealReply, OciError> {
+            let inline = inline.unwrap_or(false);
             match self.lookup_oci(handle)? {
-                OpenRepo::Sha256(ref r) => run_seal::<Sha256HashValue>(r, image).await,
-                OpenRepo::Sha512(ref r) => run_seal::<Sha512HashValue>(r, image).await,
+                OpenRepo::Sha256(ref r) => run_seal::<Sha256HashValue>(r, image, inline).await,
+                OpenRepo::Sha512(ref r) => run_seal::<Sha512HashValue>(r, image, inline).await,
             }
         }
 
@@ -1664,13 +1705,15 @@ mod service_impl {
             image: String,
             cert_pem: String,
             key_pem: String,
+            inline: Option<bool>,
         ) -> std::result::Result<SignReply, OciError> {
+            let inline = inline.unwrap_or(false);
             match self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => {
-                    run_sign::<Sha256HashValue>(r, image, cert_pem, key_pem).await
+                    run_sign::<Sha256HashValue>(r, image, cert_pem, key_pem, inline).await
                 }
                 OpenRepo::Sha512(ref r) => {
-                    run_sign::<Sha512HashValue>(r, image, cert_pem, key_pem).await
+                    run_sign::<Sha512HashValue>(r, image, cert_pem, key_pem, inline).await
                 }
             }
         }
@@ -2007,10 +2050,12 @@ mod service_impl {
             &self,
             handle: u64,
             image: String,
+            inline: Option<bool>,
         ) -> std::result::Result<SealReply, OciError> {
+            let inline = inline.unwrap_or(false);
             match self.lookup_oci(handle)? {
-                OpenRepo::Sha256(ref r) => run_seal::<Sha256HashValue>(r, image).await,
-                OpenRepo::Sha512(ref r) => run_seal::<Sha512HashValue>(r, image).await,
+                OpenRepo::Sha256(ref r) => run_seal::<Sha256HashValue>(r, image, inline).await,
+                OpenRepo::Sha512(ref r) => run_seal::<Sha512HashValue>(r, image, inline).await,
             }
         }
 
@@ -2025,13 +2070,15 @@ mod service_impl {
             image: String,
             cert_pem: String,
             key_pem: String,
+            inline: Option<bool>,
         ) -> std::result::Result<SignReply, OciError> {
+            let inline = inline.unwrap_or(false);
             match self.lookup_oci(handle)? {
                 OpenRepo::Sha256(ref r) => {
-                    run_sign::<Sha256HashValue>(r, image, cert_pem, key_pem).await
+                    run_sign::<Sha256HashValue>(r, image, cert_pem, key_pem, inline).await
                 }
                 OpenRepo::Sha512(ref r) => {
-                    run_sign::<Sha512HashValue>(r, image, cert_pem, key_pem).await
+                    run_sign::<Sha512HashValue>(r, image, cert_pem, key_pem, inline).await
                 }
             }
         }
@@ -2367,6 +2414,23 @@ pub mod oci {
         pub artifact_verity: String,
     }
 
+    /// Component-by-component verification result.
+    #[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
+    pub struct VerifyEntry {
+        /// The role of this entry.
+        pub role: String,
+        /// The expected digest for this role.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub expected_digest: Option<String>,
+        /// Whether the expected digest matches actual.
+        pub digest_ok: bool,
+        /// Whether the signature verified successfully.
+        pub signature_verified: bool,
+        /// Optional error or status detail.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub detail: Option<String>,
+    }
+
     /// Reply from verifying an OCI image's signatures.
     #[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
     pub struct VerifyReply {
@@ -2377,6 +2441,12 @@ pub mod oci {
         pub ok: bool,
         /// Whether a certificate was supplied (cryptographic vs digest-only mode).
         pub cert_supplied: bool,
+        /// The algorithm used for verification (e.g. sha256-12).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub algorithm: Option<String>,
+        /// Individual component verification entries.
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub entries: Vec<VerifyEntry>,
     }
 
     /// A single progress frame emitted by the streaming `Pull` method.
@@ -2801,6 +2871,23 @@ pub mod oci {
             message: String,
         },
     }
+
+    impl std::fmt::Display for OciError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                OciError::RepoNotFound { message } => write!(f, "RepoNotFound: {message}"),
+                OciError::InvalidHandle { handle } => write!(f, "InvalidHandle: {handle}"),
+                OciError::NoSuchImage { image } => write!(f, "NoSuchImage: {image}"),
+                OciError::InvalidCertificate { message } => {
+                    write!(f, "InvalidCertificate: {message}")
+                }
+                OciError::SignatureVerificationFailed { message } => {
+                    write!(f, "SignatureVerificationFailed: {message}")
+                }
+                OciError::InternalError { message } => write!(f, "InternalError: {message}"),
+            }
+        }
+    }
 }
 
 /// Typed Rust client bindings (the native-API mirror of the on-the-wire
@@ -2986,6 +3073,7 @@ pub mod proxy {
             &mut self,
             handle: u64,
             image: &str,
+            inline: Option<bool>,
         ) -> zlink::Result<Result<SealReply, OciError>>;
 
         /// Sign a sealed OCI image.
@@ -2995,6 +3083,7 @@ pub mod proxy {
             image: &str,
             cert_pem: &str,
             key_pem: &str,
+            inline: Option<bool>,
         ) -> zlink::Result<Result<SignReply, OciError>>;
 
         /// Verify composefs signature artifacts for an OCI image.
@@ -3084,6 +3173,7 @@ pub mod proxy {
             &mut self,
             handle: u64,
             image: &str,
+            inline: Option<bool>,
         ) -> zlink::Result<Result<SealReply, OciError>>;
 
         /// Sign a sealed OCI image.
@@ -3093,6 +3183,7 @@ pub mod proxy {
             image: &str,
             cert_pem: &str,
             key_pem: &str,
+            inline: Option<bool>,
         ) -> zlink::Result<Result<SignReply, OciError>>;
 
         /// Verify composefs signature artifacts for an OCI image.

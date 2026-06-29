@@ -860,6 +860,124 @@ pub fn seal_image<ObjectID: FsVerityHashValue>(
     Ok(new_manifest_digest)
 }
 
+/// Seals an image by tag in inline mode: embeds digest annotations directly in
+/// the OCI image manifest config descriptor, layer descriptors, and top-level annotations.
+pub fn seal_image_inline<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    name: &str,
+) -> Result<OciDigest> {
+    let img = OciImage::open_ref(repo, name)?;
+    ensure!(
+        img.is_container_image(),
+        "Can only seal container images, not artifacts"
+    );
+
+    let (sealed_config_digest, sealed_config_verity) =
+        crate::seal(repo, img.config_digest(), None)?;
+
+    // Build a new config descriptor for the sealed config
+    let sealed_config_json = {
+        let config_id = crate::config_identifier(&sealed_config_digest);
+        let (data, _) = read_external_splitstream(
+            repo,
+            &config_id,
+            Some(&sealed_config_verity),
+            Some(OCI_CONFIG_CONTENT_TYPE),
+        )?;
+        data
+    };
+
+    let per_layer_digests = crate::image::compute_per_layer_digests(
+        repo,
+        img.config_digest(),
+        Some(img.config_verity()),
+    )?;
+    let merged_digest =
+        crate::image::compute_merged_digest(repo, img.config_digest(), Some(img.config_verity()))?;
+
+    let algorithm = ObjectID::ALGORITHM;
+
+    let mut config_annotations = img
+        .manifest()
+        .config()
+        .annotations()
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    config_annotations.insert(
+        crate::signature::SignatureType::Config.annotation_key(algorithm),
+        sealed_config_verity.to_hex(),
+    );
+
+    let new_config_descriptor = DescriptorBuilder::default()
+        .media_type(MediaType::ImageConfig)
+        .digest(sealed_config_digest.clone())
+        .size(sealed_config_json.len() as u64)
+        .annotations(config_annotations)
+        .build()
+        .context("building config descriptor")?;
+
+    let mut new_layers = Vec::new();
+    for (i, layer) in img.manifest().layers().iter().enumerate() {
+        let mut annotations = layer.annotations().as_ref().cloned().unwrap_or_default();
+        annotations.insert(
+            crate::signature::SignatureType::Layer.annotation_key(algorithm),
+            per_layer_digests
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("manifest has more layers than config diff_ids"))?
+                .to_hex(),
+        );
+        let new_layer = DescriptorBuilder::default()
+            .media_type(layer.media_type().clone())
+            .digest(layer.digest().clone())
+            .size(layer.size())
+            .annotations(annotations)
+            .build()
+            .context("building layer descriptor")?;
+        new_layers.push(new_layer);
+    }
+
+    let mut manifest_annotations = img
+        .manifest()
+        .annotations()
+        .as_ref()
+        .cloned()
+        .unwrap_or_default();
+    manifest_annotations.insert(
+        crate::signature::SignatureType::Merged.annotation_key(algorithm),
+        merged_digest.to_hex(),
+    );
+
+    // Build new manifest with same layers but sealed config
+    let new_manifest = ImageManifestBuilder::default()
+        .schema_version(img.manifest().schema_version())
+        .media_type(MediaType::ImageManifest)
+        .config(new_config_descriptor)
+        .layers(new_layers)
+        .annotations(manifest_annotations)
+        .build()
+        .context("building sealed manifest")?;
+
+    let new_manifest_json = new_manifest.to_string()?;
+    let new_manifest_digest = crate::sha256_content_digest(new_manifest_json.as_bytes());
+
+    let layer_refs_vec: Vec<(Box<str>, ObjectID)> = img
+        .layer_refs()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    write_manifest(
+        repo,
+        &new_manifest,
+        &new_manifest_digest,
+        &sealed_config_verity,
+        &layer_refs_vec,
+        Some(name),
+    )?;
+
+    Ok(new_manifest_digest)
+}
+
 /// Checks if a manifest exists.
 pub fn has_manifest<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,

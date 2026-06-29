@@ -565,6 +565,9 @@ enum OciCommand {
     Seal {
         /// Image reference (tag name or manifest digest)
         image: String,
+        /// Seal the image with inline metadata annotations
+        #[clap(long)]
+        inline: bool,
     },
 
     /// Compute the composefs boot image karg for a stored OCI image.
@@ -628,6 +631,9 @@ enum OciCommand {
         /// Path to PEM-encoded private key
         #[clap(long)]
         key: PathBuf,
+        /// Sign the image with inline annotations
+        #[clap(long)]
+        inline: bool,
     },
     /// Verify composefs signature artifacts for an image
     Verify {
@@ -1681,10 +1687,10 @@ where
                         .with_context(|| format!("failed to read certificate: {cert_path:?}"))?;
                     let verifier =
                         composefs_oci::signing::FsVeritySignatureVerifier::from_pem(&cert_pem)?;
-                    let verified_count =
-                        composefs_oci::verify_image_signatures(&repo, image, Some(&verifier))?;
+                    let report = composefs_oci::verify_image_report(&repo, image, Some(&verifier))?;
                     println!(
-                        "Signature verification passed ({verified_count} signatures verified)"
+                        "Signature verification passed ({} signatures verified)",
+                        report.verified_count
                     );
                 }
 
@@ -1827,10 +1833,11 @@ where
                         .with_context(|| format!("failed to read certificate: {cert_path:?}"))?;
                     let verifier =
                         composefs_oci::signing::FsVeritySignatureVerifier::from_pem(&cert_pem)?;
-                    let verified_count =
-                        composefs_oci::verify_image_signatures(&repo, tag_name, Some(&verifier))?;
+                    let report =
+                        composefs_oci::verify_image_report(&repo, tag_name, Some(&verifier))?;
                     println!(
-                        "Signature verification passed ({verified_count} signatures verified)"
+                        "Signature verification passed ({} signatures verified)",
+                        report.verified_count
                     );
                 }
             }
@@ -1937,10 +1944,11 @@ where
                     composefs_oci::layer_tar(&repo, layer, &mut out)?;
                 }
             }
-            OciCommand::Seal { ref image } => {
-                let repo = Arc::new(repo);
-                let manifest_digest = composefs_oci::seal_image(&repo, image)?;
-                println!("Sealed {image} -> {manifest_digest}");
+            OciCommand::Seal { ref image, inline } => {
+                let reply = crate::varlink::run_seal(&repo, image.clone(), inline)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("Sealed {image} -> {}", reply.manifest_digest);
             }
             OciCommand::PrepareBoot {
                 config_opts:
@@ -2029,187 +2037,82 @@ where
                 ref image,
                 ref cert,
                 ref key,
+                inline,
             } => {
-                // TODO: Warn if the image hasn't been sealed yet. Signing an
-                // unsealed image creates a valid signature, but the image can't
-                // be mounted (mount requires a sealed config). This is almost
-                // certainly a user mistake.
-                let cert_pem = std::fs::read(cert).context("failed to read certificate file")?;
-                let key_pem = std::fs::read(key).context("failed to read private key file")?;
-                let signing_key =
-                    composefs_oci::signing::FsVeritySigningKey::from_pem(&cert_pem, &key_pem)?;
-                let (artifact_digest, _) = composefs_oci::sign_image(&repo, image, &signing_key)?;
-                println!("{artifact_digest}");
+                let cert_pem =
+                    std::fs::read_to_string(cert).context("failed to read certificate file")?;
+                let key_pem =
+                    std::fs::read_to_string(key).context("failed to read private key file")?;
+                let reply =
+                    crate::varlink::run_sign(&repo, image.clone(), cert_pem, key_pem, inline)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("{}", reply.artifact_digest);
             }
             OciCommand::Verify {
                 ref image,
                 ref cert,
             } => {
-                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
-                let manifest_digest = img.manifest_digest();
-
-                let referrers = composefs_oci::oci_image::list_referrers(&repo, manifest_digest)?;
-
-                if referrers.is_empty() {
-                    anyhow::bail!("no signature artifacts found for {image}");
-                }
-
-                let verifier = match cert {
+                let cert_pem = match cert {
                     Some(cert_path) => {
-                        let cert_pem = std::fs::read(cert_path).with_context(|| {
+                        let content = std::fs::read_to_string(cert_path).with_context(|| {
                             format!("failed to read certificate: {cert_path:?}")
                         })?;
-                        Some(composefs_oci::signing::FsVeritySignatureVerifier::from_pem(
-                            &cert_pem,
-                        )?)
+                        Some(content)
                     }
                     None => None,
                 };
 
-                let config_digest = img.config_digest();
-                let algorithm = ObjectID::ALGORITHM;
-
-                let mut digest_ok_all = true;
-                let mut found_composefs = false;
-                let mut verified_count = 0usize;
-
-                for (artifact_digest, artifact_verity) in &referrers {
-                    let artifact_image = composefs_oci::OciImage::open(
-                        &repo,
-                        artifact_digest,
-                        Some(artifact_verity),
-                    )
-                    .with_context(|| format!("opening referrer {artifact_digest}"))?;
-
-                    match artifact_image.manifest().artifact_type() {
-                        Some(composefs_oci::OciMediaType::Other(t))
-                            if t == composefs_oci::signature::ARTIFACT_TYPE => {}
-                        _ => continue,
+                let res = crate::varlink::run_verify(&repo, image.clone(), cert_pem).await;
+                match res {
+                    Err(e) => {
+                        anyhow::bail!("{e}");
                     }
-
-                    found_composefs = true;
-                    let parsed = composefs_oci::signature::parse_signature_artifact(
-                        artifact_image.manifest(),
-                    )
-                    .with_context(|| format!("parsing artifact {artifact_digest}"))?;
-
-                    println!("Signature artifact (algorithm: {})", parsed.algorithm);
-
-                    // Composefs sealing artifacts always use EROFS v1.
-                    let per_layer_digests =
-                        composefs_oci::compute_per_layer_digests(&repo, config_digest, None)?;
-                    let merged_digest: ObjectID =
-                        composefs_oci::compute_merged_digest(&repo, config_digest, None)?;
-                    let merged_hex = merged_digest.to_hex();
-
-                    let layer_descriptors = artifact_image.layer_descriptors();
-                    let mut layer_idx = 0usize;
-                    let sig_layer_offset = 0;
-                    // Track whether this particular artifact verified with
-                    // the given cert (relevant for multi-signer scenarios).
-                    let mut artifact_verified = true;
-
-                    for (entry_idx, entry) in parsed.signature_entries.iter().enumerate() {
-                        let (label, expected_hex) = match entry.sig_type {
-                            composefs_oci::signature::SignatureType::Layer => {
-                                let lbl = format!("  layer[{layer_idx}]:");
-                                let expected = per_layer_digests.get(layer_idx).map(|d| d.to_hex());
-                                layer_idx += 1;
-                                (lbl, expected)
-                            }
-                            composefs_oci::signature::SignatureType::Merged => {
-                                ("  merged:  ".to_string(), Some(merged_hex.clone()))
-                            }
-                            other => {
-                                println!("  {:?}: skipped", other);
-                                continue;
-                            }
-                        };
-
-                        let digest_matches = match &expected_hex {
-                            Some(expected) => *expected == entry.digest,
-                            None => {
+                    Ok(reply) => {
+                        let cert_supplied = reply.cert_supplied;
+                        if let Some(ref alg) = reply.algorithm {
+                            println!("Signature artifact (algorithm: {alg})");
+                        }
+                        for entry in &reply.entries {
+                            let role = &entry.role;
+                            let label = if role.starts_with("layer") {
+                                format!("  {role}:")
+                            } else {
+                                format!("  {role}:  ")
+                            };
+                            if entry.expected_digest.is_none() {
                                 println!("{label} no expected digest - SKIP");
-                                digest_ok_all = false;
-                                continue;
-                            }
-                        };
-
-                        if !digest_matches {
-                            println!("{label} digest MISMATCH");
-                            digest_ok_all = false;
-                            continue;
-                        }
-
-                        if let Some(ref verifier) = verifier {
-                            let layer_desc = layer_descriptors
-                                .get(sig_layer_offset + entry_idx)
-                                .context("layer descriptor out of bounds")?;
-                            let blob_digest = layer_desc.digest();
-
-                            if layer_desc.size() == 0u64 {
-                                println!("{label} digest matches but no signature blob");
-                                artifact_verified = false;
-                                continue;
-                            }
-
-                            let blob_verity = artifact_image
-                                .layer_verity(blob_digest.as_ref())
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("verity not found for {blob_digest}")
-                                })?;
-                            let signature_blob = composefs_oci::oci_image::open_blob(
-                                &repo,
-                                blob_digest,
-                                Some(blob_verity),
-                            )?;
-
-                            let digest_bytes =
-                                hex::decode(&entry.digest).context("invalid hex digest")?;
-
-                            match verifier.verify_raw(
-                                &signature_blob,
-                                algorithm.kernel_id(),
-                                &digest_bytes,
-                            ) {
-                                Ok(()) => {
+                            } else if !entry.digest_ok {
+                                println!("{label} digest MISMATCH");
+                            } else if cert_supplied {
+                                if entry.signature_verified {
                                     println!("{label} signature verified");
-                                    verified_count += 1;
+                                } else {
+                                    let maybe_detail = match &entry.detail {
+                                        Some(detail) => format!(": {detail}"),
+                                        None => "".to_string(),
+                                    };
+                                    println!("{label} not verified by this cert{maybe_detail}");
                                 }
-                                Err(e) => {
-                                    println!("{label} not verified by this cert: {e}");
-                                    artifact_verified = false;
-                                }
+                            } else {
+                                println!("{label} digest matches");
                             }
+                        }
+
+                        if cert_supplied {
+                            println!(
+                                "\nVerification passed ({} signatures verified)",
+                                reply.verified_count
+                            );
                         } else {
-                            println!("{label} digest matches");
+                            println!(
+                                "\nDigest check passed. NOTE: no certificate provided, signatures were NOT cryptographically verified."
+                            );
+                            println!(
+                                "To verify signatures, use: cfsctl oci verify {image} --cert <certificate.pem>"
+                            );
                         }
                     }
-
-                    if verifier.is_some() && !artifact_verified {
-                        println!("  (artifact not signed by given cert, skipping)");
-                    }
-                }
-
-                if !found_composefs {
-                    anyhow::bail!("no composefs signature artifacts found for {image}");
-                }
-
-                if verifier.is_some() {
-                    if verified_count == 0 {
-                        anyhow::bail!("no signature artifacts verified with the given certificate");
-                    }
-                    println!("\nVerification passed ({verified_count} signatures verified)");
-                } else {
-                    if !digest_ok_all {
-                        anyhow::bail!("digest verification failed for one or more entries");
-                    }
-                    println!(
-                        "\nDigest check passed. NOTE: no certificate provided, signatures were NOT cryptographically verified."
-                    );
-                    println!(
-                        "To verify signatures, use: cfsctl oci verify {image} --cert <certificate.pem>"
-                    );
                 }
             }
             OciCommand::Push {
@@ -2387,10 +2290,10 @@ where
                         .with_context(|| format!("failed to read certificate: {cert_path:?}"))?;
                     let verifier =
                         composefs_oci::signing::FsVeritySignatureVerifier::from_pem(&cert_pem)?;
-                    let verified_count =
-                        composefs_oci::verify_image_signatures(&repo, image, Some(&verifier))?;
+                    let report = composefs_oci::verify_image_report(&repo, image, Some(&verifier))?;
                     println!(
-                        "Signature verification passed ({verified_count} signatures verified)"
+                        "Signature verification passed ({} signatures verified)",
+                        report.verified_count
                     );
                 }
 

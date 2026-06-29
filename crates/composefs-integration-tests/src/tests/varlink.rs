@@ -260,10 +260,14 @@ impl VarlinkService {
     }
 
     /// `org.composefs.Oci.Seal` via the typed proxy.
-    fn proxy_seal(&self, image: &str) -> zlink::Result<Result<SealReply, OciError>> {
+    fn proxy_seal(
+        &self,
+        image: &str,
+        inline: Option<bool>,
+    ) -> zlink::Result<Result<SealReply, OciError>> {
         self.rt.block_on(async {
             let mut conn = self.connect().await?;
-            conn.seal(self.handle, image).await
+            conn.seal(self.handle, image, inline).await
         })
     }
 
@@ -273,10 +277,12 @@ impl VarlinkService {
         image: &str,
         cert_pem: &str,
         key_pem: &str,
+        inline: Option<bool>,
     ) -> zlink::Result<Result<SignReply, OciError>> {
         self.rt.block_on(async {
             let mut conn = self.connect().await?;
-            conn.sign(self.handle, image, cert_pem, key_pem).await
+            conn.sign(self.handle, image, cert_pem, key_pem, inline)
+                .await
         })
     }
 
@@ -1457,7 +1463,7 @@ fn test_varlink_oci_seal() -> Result<()> {
 
     // Seal.
     let reply = svc
-        .proxy_seal("seal-test")
+        .proxy_seal("seal-test", None)
         .context("transport/protocol error calling Seal")?
         .map_err(|e| anyhow::anyhow!("Seal returned error: {e:?}"))?;
 
@@ -1498,7 +1504,7 @@ fn test_varlink_oci_sign_then_verify() -> Result<()> {
     )?;
     assert!(frames.last().unwrap()["completed"].is_object());
 
-    svc.proxy_seal("sign-verify-test")
+    svc.proxy_seal("sign-verify-test", None)
         .context("Seal transport error")?
         .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
 
@@ -1507,7 +1513,7 @@ fn test_varlink_oci_sign_then_verify() -> Result<()> {
     let key_pem_str = String::from_utf8(key_pem).unwrap();
 
     let sign_reply = svc
-        .proxy_sign("sign-verify-test", &cert_pem_str, &key_pem_str)
+        .proxy_sign("sign-verify-test", &cert_pem_str, &key_pem_str, None)
         .context("Sign transport error")?
         .map_err(|e| anyhow::anyhow!("Sign error: {e:?}"))?;
     assert!(
@@ -1554,7 +1560,7 @@ fn test_varlink_oci_verify_wrong_cert() -> Result<()> {
     )?;
     assert!(frames.last().unwrap()["completed"].is_object());
 
-    svc.proxy_seal("wrong-cert-test")
+    svc.proxy_seal("wrong-cert-test", None)
         .context("Seal transport error")?
         .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
 
@@ -1565,7 +1571,7 @@ fn test_varlink_oci_verify_wrong_cert() -> Result<()> {
     let cert_b_str = String::from_utf8(cert_b).unwrap();
 
     // Sign with certA / keyA.
-    svc.proxy_sign("wrong-cert-test", &cert_a_str, &key_a_str)
+    svc.proxy_sign("wrong-cert-test", &cert_a_str, &key_a_str, None)
         .context("Sign transport error")?
         .map_err(|e| anyhow::anyhow!("Sign error: {e:?}"))?;
 
@@ -1607,7 +1613,7 @@ fn test_varlink_oci_verify_no_artifacts() -> Result<()> {
     )?;
     assert!(frames.last().unwrap()["completed"].is_object());
 
-    svc.proxy_seal("no-artifacts-test")
+    svc.proxy_seal("no-artifacts-test", None)
         .context("Seal transport error")?
         .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
 
@@ -1651,7 +1657,7 @@ fn test_varlink_oci_verify_digest_only() -> Result<()> {
     )?;
     assert!(frames.last().unwrap()["completed"].is_object());
 
-    svc.proxy_seal("digest-only-test")
+    svc.proxy_seal("digest-only-test", None)
         .context("Seal transport error")?
         .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
 
@@ -1659,7 +1665,7 @@ fn test_varlink_oci_verify_digest_only() -> Result<()> {
     let cert_pem_str = String::from_utf8(cert_pem).unwrap();
     let key_pem_str = String::from_utf8(key_pem).unwrap();
 
-    svc.proxy_sign("digest-only-test", &cert_pem_str, &key_pem_str)
+    svc.proxy_sign("digest-only-test", &cert_pem_str, &key_pem_str, None)
         .context("Sign transport error")?
         .map_err(|e| anyhow::anyhow!("Sign error: {e:?}"))?;
 
@@ -1705,12 +1711,12 @@ fn test_varlink_oci_sign_bad_key() -> Result<()> {
     )?;
     assert!(frames.last().unwrap()["completed"].is_object());
 
-    svc.proxy_seal("bad-key-test")
+    svc.proxy_seal("bad-key-test", None)
         .context("Seal transport error")?
         .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
 
     let err = svc
-        .proxy_sign("bad-key-test", "garbage", "garbage")
+        .proxy_sign("bad-key-test", "garbage", "garbage", None)
         .context("Sign transport error")?
         .expect_err("Sign with garbage cert/key must fail");
     assert!(
@@ -1732,7 +1738,7 @@ fn test_varlink_oci_seal_missing_image() -> Result<()> {
     let svc = VarlinkService::oci(repo)?;
 
     let err = svc
-        .proxy_seal("nope")
+        .proxy_seal("nope", None)
         .context("Seal transport error")?
         .expect_err("Seal of missing image must fail");
     assert!(
@@ -1743,3 +1749,63 @@ fn test_varlink_oci_seal_missing_image() -> Result<()> {
     Ok(())
 }
 integration_test!(test_varlink_oci_seal_missing_image);
+
+/// Pull, seal inline, sign inline, then verify.
+fn test_varlink_oci_sign_then_verify_inline() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+
+    let fixture_dir = tempfile::tempdir()?;
+    let layout = create_oci_layout(fixture_dir.path())?;
+
+    let svc = VarlinkService::oci(repo)?;
+    let frames = svc.call_more(
+        "org.composefs.Oci.Pull",
+        json!({
+            "image": format!("oci:{}", layout.display()),
+            "name": "sign-verify-test-inline",
+            "local_fetch": "disabled",
+            "storage_root": null,
+            "bootable": false,
+        }),
+    )?;
+    assert!(frames.last().unwrap()["completed"].is_object());
+
+    svc.proxy_seal("sign-verify-test-inline", Some(true))
+        .context("Seal transport error")?
+        .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
+
+    let (cert_pem, key_pem) = composefs_oci::signing::generate_test_keypair();
+    let cert_pem_str = String::from_utf8(cert_pem).unwrap();
+    let key_pem_str = String::from_utf8(key_pem).unwrap();
+
+    let sign_reply = svc
+        .proxy_sign(
+            "sign-verify-test-inline",
+            &cert_pem_str,
+            &key_pem_str,
+            Some(true),
+        )
+        .context("Sign transport error")?
+        .map_err(|e| anyhow::anyhow!("Sign error: {e:?}"))?;
+    assert!(
+        !sign_reply.artifact_digest.is_empty(),
+        "artifact_digest should be non-empty"
+    );
+
+    let verify_reply = svc
+        .proxy_verify("sign-verify-test-inline", Some(&cert_pem_str))
+        .context("Verify transport error")?
+        .map_err(|e| anyhow::anyhow!("Verify error: {e:?}"))?;
+    assert!(verify_reply.ok, "verify should be ok");
+    assert!(
+        verify_reply.verified_count >= 1,
+        "at least one signature should verify"
+    );
+    assert!(verify_reply.cert_supplied, "cert_supplied should be true");
+
+    Ok(())
+}
+integration_test!(test_varlink_oci_sign_then_verify_inline);

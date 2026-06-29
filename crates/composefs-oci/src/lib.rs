@@ -106,11 +106,14 @@ pub use oci_image::{
     OciRefNotFound, SplitstreamInfo, add_referrer, export_image_to_oci_layout,
     export_referrers_to_oci_layout, layer_dumpfile, layer_info, layer_tar, list_images,
     list_referrers, list_refs, oci_fsck, oci_fsck_image, remove_referrer,
-    remove_referrers_for_subject, resolve_ref, seal_image, tag_image, untag_image,
+    remove_referrers_for_subject, resolve_ref, seal_image, seal_image_inline, tag_image,
+    untag_image,
 };
 pub use progress::{ComponentId, NullReporter, ProgressEvent, ProgressReporter, SharedReporter};
 pub use signature::{
-    NoSignatureArtifacts, SignatureVerificationFailed, sign_image, verify_image_signatures,
+    NoSignatureArtifacts, SignatureVerificationFailed, VerificationEntry, VerificationReport,
+    sign_image, sign_image_inline, verify_image_report, verify_image_signatures,
+    verify_image_signatures_inline,
 };
 pub use skopeo::pull_image;
 
