@@ -1558,10 +1558,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 if buf.is_empty() {
                     break;
                 }
-                let chunk = &buf[..buf.len().min(FsVerityHasher::<ObjectID>::BLOCK_SIZE)];
-                hasher.add_block(chunk);
-                dst.write_all(chunk)?;
-                let n = chunk.len();
+                hasher.write_all(buf)?;
+                dst.write_all(buf)?;
+                let n = buf.len();
                 src.consume(n);
             }
             drop(dst);
@@ -1940,10 +1939,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             if buf.is_empty() {
                 break;
             }
-            // add_block expects at most one block at a time
-            let chunk_size = buf.len().min(FsVerityHasher::<ObjectID>::BLOCK_SIZE);
-            hasher.add_block(&buf[..chunk_size]);
-            reader.consume(chunk_size);
+            hasher.write_all(buf)?;
+            let n = buf.len();
+            reader.consume(n);
         }
 
         Ok(hasher.digest())
