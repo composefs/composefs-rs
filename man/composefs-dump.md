@@ -1,4 +1,9 @@
-% composefs-dump 5 "" composefs "User Commands"
+---
+title: composefs-dump
+section: 5
+footer: composefs
+header: User Commands
+---
 
 # NAME
 
