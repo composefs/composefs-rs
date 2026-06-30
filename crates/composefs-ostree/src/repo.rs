@@ -156,6 +156,29 @@ impl SummaryCache {
 
         None
     }
+
+    fn list_refs(&self) -> Result<Vec<(String, Sha256Digest)>> {
+        use gvariant::{Marker, Structure, gv};
+
+        let aligned = self
+            .data
+            .try_as_aligned()
+            .map_err(|_| anyhow!("summary data not aligned"))?;
+        let summary = gv!("(a(s(taya{sv}))a{sv})").cast(aligned);
+        let (refs_array, _metadata) = summary.to_tuple();
+
+        refs_array
+            .iter()
+            .map(|entry| {
+                let (name, ref_data) = entry.to_tuple();
+                let (_commit_size, checksum_bytes, _per_ref_metadata) = ref_data.to_tuple();
+                let checksum: Sha256Digest = checksum_bytes
+                    .try_into()
+                    .context("invalid checksum in summary")?;
+                Ok((name.to_str().to_string(), checksum))
+            })
+            .collect()
+    }
 }
 
 /// Parsed summary index (`summary.idx`) with lazy subset lookup.
@@ -248,10 +271,12 @@ fn read_summary_cache_header<ObjectID: FsVerityHashValue>(
 
     let etag = if etag_len > 0 {
         let mut buf = vec![0u8; etag_len];
-        reader
-            .read_inline_exact(&mut buf)
-            .context("reading etag")?;
-        Some(std::str::from_utf8(&buf).context("etag is not UTF-8")?.to_string())
+        reader.read_inline_exact(&mut buf).context("reading etag")?;
+        Some(
+            std::str::from_utf8(&buf)
+                .context("etag is not UTF-8")?
+                .to_string(),
+        )
     } else {
         None
     };
@@ -260,7 +285,11 @@ fn read_summary_cache_header<ObjectID: FsVerityHashValue>(
         reader
             .read_inline_exact(&mut buf)
             .context("reading last-modified")?;
-        Some(std::str::from_utf8(&buf).context("last-modified is not UTF-8")?.to_string())
+        Some(
+            std::str::from_utf8(&buf)
+                .context("last-modified is not UTF-8")?
+                .to_string(),
+        )
     } else {
         None
     };
@@ -286,9 +315,11 @@ fn open_cached_summary<ObjectID: FsVerityHashValue>(
     stream_id: &str,
 ) -> Result<Option<SplitStreamReader<ObjectID>>> {
     if repo.has_stream(stream_id)?.is_some() {
-        Ok(Some(
-            repo.open_stream(stream_id, None, Some(OSTREE_SUMMARY_CONTENT_TYPE))?,
-        ))
+        Ok(Some(repo.open_stream(
+            stream_id,
+            None,
+            Some(OSTREE_SUMMARY_CONTENT_TYPE),
+        )?))
     } else {
         Ok(None)
     }
@@ -331,6 +362,18 @@ impl<ObjectID: FsVerityHashValue> RemoteRepo<ObjectID> {
     pub fn with_summary_subset(mut self, subset: &str) -> Self {
         self.summary_subset = subset.to_string();
         self
+    }
+
+    /// List all refs available in the remote summary.
+    ///
+    /// Returns `(ref_name, commit_checksum)` pairs. Fetches and caches the
+    /// summary if not already loaded.
+    pub async fn list_remote_refs(&self) -> Result<Vec<(String, Sha256Digest)>> {
+        let cache = self
+            .load_summary()
+            .await?
+            .ok_or_else(|| anyhow!("no summary available from remote"))?;
+        cache.list_refs()
     }
 
     fn url_for(&self, segments: &[&str]) -> Url {
