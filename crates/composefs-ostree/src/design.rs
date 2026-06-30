@@ -137,3 +137,80 @@
 //! aligned to 8 bytes with respect to the start of the content area.
 //! This is useful because GVariants (used by ostree) naturally want
 //! 8-byte alignment.
+//!
+//! # Summary caching
+//!
+//! When pulling from a remote OSTree repository, the crate downloads and
+//! caches the repository's **summary** file to resolve ref names to
+//! commit checksums.  The summary is a GVariant in
+//! `OSTREE_SUMMARY_GVARIANT_FORMAT`:
+//!
+//! ```text
+//! (a(s(taya{sv}))a{sv})
+//!   │                │
+//!   │                └─ repository-level metadata
+//!   └─ array of (ref_name, (commit_size, checksum, per-ref metadata))
+//! ```
+//!
+//! ## Summary index (flatpak-style repos)
+//!
+//! Large repositories (e.g. Flathub) serve a **summary index** at
+//! `summary.idx` instead of (or in addition to) the plain `summary`
+//! file.  The index is a small GVariant that maps subset keys to
+//! per-subset subsummary checksums:
+//!
+//! ```text
+//! (a{s(ayaaya{sv})}a{sv})
+//!   │                  │
+//!   │                  └─ index-level metadata
+//!   └─ dict of subset_name → (current_checksum, history, per-subset metadata)
+//! ```
+//!
+//! Subset keys are typically architecture names (e.g. `x86_64`,
+//! `aarch64`) or `{subset}-{arch}` combinations (e.g. `free-x86_64`).
+//! The actual subsummaries are stored gzip-compressed on the server at
+//! `summaries/{checksum}.gz` and have the same GVariant format as a
+//! regular OSTree summary.
+//!
+//! ## Fetch strategy
+//!
+//! [`RemoteRepo`] uses a two-stage strategy:
+//!
+//! 1. **Try the summary index**: fetch `summary.idx` (small, always
+//!    re-downloaded).  Look up the configured subset key (defaults to
+//!    [`std::env::consts::ARCH`]).  If a cached subsummary with a
+//!    matching checksum exists, reuse it; otherwise fetch, decompress,
+//!    and verify the new subsummary.
+//!
+//! 2. **Fall back to the plain summary**: if the index is not available
+//!    (404), fetch the `summary` file using conditional HTTP
+//!    (`If-None-Match` / `If-Modified-Since`) to avoid unnecessary
+//!    re-downloads.
+//!
+//! ## Cache storage
+//!
+//! Cached summaries are stored as splitstreams in the composefs
+//! repository with content type `0x7972616d6d75736f` (`"osummary"` LE).
+//! The splitstream inline data contains a fixed header, variable-length
+//! HTTP caching strings, and the raw summary GVariant bytes.
+//!
+//! ```text
+//! SummaryCacheHeader (36 bytes):
+//!   u16 LE  etag_len           — length of ETag string (0 if absent)
+//!   u16 LE  last_modified_len  — length of Last-Modified string (0 if absent)
+//!   [u8;32] checksum           — SHA-256 of the summary data
+//!
+//! Variable part:
+//!   [etag_len bytes]           — HTTP ETag value
+//!   [last_modified_len bytes]  — HTTP Last-Modified value
+//!
+//! Summary GVariant data:
+//!   [raw bytes]                — (a(s(taya{sv}))a{sv}) format
+//! ```
+//!
+//! Stream identifiers:
+//! - Plain summary: `ostree-summary-{url_key}`
+//! - Subsummary: `ostree-subsummary-{subset}-{url_key}`
+//!
+//! Where `url_key` is the URL with the scheme stripped and `/` replaced
+//! by `-` (e.g. `https://example.com/repo` → `example.com-repo`).

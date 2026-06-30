@@ -22,7 +22,7 @@ rustix = { version = "1.0.0", default-features = false, features = ["fs", "mount
 sha2 = { version = "0.11.0", default-features = false }
 zerocopy = { version = "0.8.0", default-features = false, features = ["derive", "std"] }
 reqwest = { version = "0.12.15", features = ["stream", "zstd"] }
-tokio = { version = "1.24.2", default-features = false, features = ["rt"] }
+tokio = { version = "1.24.2", default-features = false, features = ["rt", "sync"] }
 tokio-stream = "0.1.18"
 tokio-util = { version = "0.7", default-features = false, features = ["io", "io-util"] }
 

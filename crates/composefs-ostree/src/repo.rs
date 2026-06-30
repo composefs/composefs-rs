@@ -7,8 +7,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use configparser::ini::Ini;
 use flate2::read::DeflateDecoder;
-use gvariant::aligned_bytes::AlignedBuf;
-use reqwest::{Client, Url};
+use gvariant::aligned_bytes::{AlignedBuf, TryAsAligned};
+use reqwest::{Client, StatusCode, Url, header};
 use rustix::fd::AsRawFd;
 use rustix::fs::{FileType, Mode, OFlags, fstat, getxattr, listxattr, openat, readlinkat};
 use rustix::io::Errno;
@@ -24,8 +24,10 @@ use std::{
     sync::Arc,
 };
 use tokio::io::AsyncReadExt;
+use tokio::sync::OnceCell;
 use tokio_stream::StreamExt;
 use tokio_util::io::StreamReader;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use composefs::{
     fsverity::FsVerityHashValue,
@@ -111,12 +113,203 @@ pub trait OstreeRepo<ObjectID: FsVerityHashValue>: Send + Sync {
     ) -> impl Future<Output = Result<(AlignedBuf, Option<ObjectID>)>> + Send;
 }
 
+const OSTREE_SUMMARY_CONTENT_TYPE: u64 = u64::from_le_bytes(*b"osummary");
+
+/// Fixed header for a cached summary splitstream blob.
+///
+/// Followed by `etag_len` bytes of ETag, `last_modified_len` bytes of
+/// Last-Modified, then the raw summary gvariant data.
+#[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C)]
+struct SummaryCacheHeader {
+    etag_len: u16,
+    last_modified_len: u16,
+    checksum: Sha256Digest,
+}
+
+struct SummaryCacheInfo {
+    etag: Option<String>,
+    last_modified: Option<String>,
+    checksum: Sha256Digest,
+}
+
+/// Cached summary data with lazy gvariant lookup.
+struct SummaryCache {
+    data: AlignedBuf,
+}
+
+impl SummaryCache {
+    fn resolve_ref(&self, ref_name: &str) -> Option<Sha256Digest> {
+        use gvariant::{Marker, Structure, gv};
+
+        let aligned = self.data.try_as_aligned().ok()?;
+        let summary = gv!("(a(s(taya{sv}))a{sv})").cast(aligned);
+        let (refs_array, _metadata) = summary.to_tuple();
+
+        for entry in refs_array.iter() {
+            let (name, ref_data) = entry.to_tuple();
+            if name.to_str() == ref_name {
+                let (_commit_size, checksum_bytes, _per_ref_metadata) = ref_data.to_tuple();
+                return checksum_bytes.try_into().ok();
+            }
+        }
+
+        None
+    }
+}
+
+/// Parsed summary index (`summary.idx`) with lazy subset lookup.
+struct SummaryIndex {
+    data: AlignedBuf,
+}
+
+impl SummaryIndex {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(SummaryIndex {
+            data: bytes.to_vec().into(),
+        })
+    }
+
+    fn lookup_checksum(&self, subset: &str) -> Result<Option<Sha256Digest>> {
+        use gvariant::{Marker, Structure, gv};
+
+        let aligned = self
+            .data
+            .try_as_aligned()
+            .map_err(|_| anyhow!("summary index not aligned"))?;
+        let index = gv!("(a{s(ayaaya{sv})}a{sv})").cast(aligned);
+        let (subsummaries, _metadata) = index.to_tuple();
+
+        for entry in subsummaries.iter() {
+            let (name, info) = entry.to_tuple();
+            if name.to_str() == subset {
+                let (current_checksum, _history, _per_entry_metadata) = info.to_tuple();
+                return Ok(Some(
+                    current_checksum
+                        .try_into()
+                        .context("invalid subsummary checksum in index")?,
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+fn summary_url_key(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("unknown");
+    let path = url.path().trim_end_matches('/');
+    format!("{host}{path}").replace('/', "-")
+}
+
+fn write_summary_cache<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    stream_id: &str,
+    info: &SummaryCacheInfo,
+    summary_data: &[u8],
+) -> Result<()> {
+    let etag_bytes = info.etag.as_deref().unwrap_or("").as_bytes();
+    let lm_bytes = info.last_modified.as_deref().unwrap_or("").as_bytes();
+
+    let header = SummaryCacheHeader {
+        etag_len: u16::to_le(
+            u16::try_from(etag_bytes.len()).context("ETag too long for cache header")?,
+        ),
+        last_modified_len: u16::to_le(
+            u16::try_from(lm_bytes.len()).context("Last-Modified too long for cache header")?,
+        ),
+        checksum: info.checksum,
+    };
+
+    let mut ss = repo.create_stream(OSTREE_SUMMARY_CONTENT_TYPE)?;
+    ss.write_inline(header.as_bytes());
+    ss.write_inline(etag_bytes);
+    ss.write_inline(lm_bytes);
+    ss.write_inline(summary_data);
+    repo.write_stream(ss, stream_id, None)?;
+    Ok(())
+}
+
+use composefs::splitstream::SplitStreamReader;
+
+fn read_summary_cache_header<ObjectID: FsVerityHashValue>(
+    reader: &mut SplitStreamReader<ObjectID>,
+) -> Result<SummaryCacheInfo> {
+    let header_size = size_of::<SummaryCacheHeader>();
+    let mut header_buf = vec![0u8; header_size];
+    reader
+        .read_inline_exact(&mut header_buf)
+        .context("reading summary cache header")?;
+    let header = SummaryCacheHeader::ref_from_bytes(&header_buf)
+        .map_err(|e| anyhow!("summary cache header: {e:?}"))?;
+
+    let etag_len = u16::from_le(header.etag_len) as usize;
+    let last_modified_len = u16::from_le(header.last_modified_len) as usize;
+
+    let etag = if etag_len > 0 {
+        let mut buf = vec![0u8; etag_len];
+        reader
+            .read_inline_exact(&mut buf)
+            .context("reading etag")?;
+        Some(std::str::from_utf8(&buf).context("etag is not UTF-8")?.to_string())
+    } else {
+        None
+    };
+    let last_modified = if last_modified_len > 0 {
+        let mut buf = vec![0u8; last_modified_len];
+        reader
+            .read_inline_exact(&mut buf)
+            .context("reading last-modified")?;
+        Some(std::str::from_utf8(&buf).context("last-modified is not UTF-8")?.to_string())
+    } else {
+        None
+    };
+
+    Ok(SummaryCacheInfo {
+        etag,
+        last_modified,
+        checksum: header.checksum,
+    })
+}
+
+fn read_summary_cache_data<ObjectID: FsVerityHashValue>(
+    reader: &mut SplitStreamReader<ObjectID>,
+    repo: &Repository<ObjectID>,
+) -> Result<SummaryCache> {
+    let mut data = Vec::new();
+    reader.cat(repo, &mut data)?;
+    Ok(SummaryCache { data: data.into() })
+}
+
+fn open_cached_summary<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    stream_id: &str,
+) -> Result<Option<SplitStreamReader<ObjectID>>> {
+    if repo.has_stream(stream_id)?.is_some() {
+        Ok(Some(
+            repo.open_stream(stream_id, None, Some(OSTREE_SUMMARY_CONTENT_TYPE))?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Fetches ostree objects over HTTP from an archive-z2 repository.
-#[derive(Debug)]
 pub struct RemoteRepo<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
     client: Client,
     url: Url,
+    summary_subset: String,
+    summary: OnceCell<Option<SummaryCache>>,
+}
+
+impl<ObjectID: FsVerityHashValue> std::fmt::Debug for RemoteRepo<ObjectID> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteRepo")
+            .field("url", &self.url)
+            .field("summary_subset", &self.summary_subset)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<ObjectID: FsVerityHashValue> RemoteRepo<ObjectID> {
@@ -126,7 +319,18 @@ impl<ObjectID: FsVerityHashValue> RemoteRepo<ObjectID> {
             repo: repo.clone(),
             client: Client::new(),
             url: Url::parse(url)?,
+            summary_subset: std::env::consts::ARCH.to_string(),
+            summary: OnceCell::new(),
         })
+    }
+
+    /// Override the summary index subset key (defaults to the system architecture).
+    ///
+    /// For flatpak repos this can be e.g. `"free-x86_64"` for a subset, or
+    /// just `"x86_64"` for all refs on that architecture.
+    pub fn with_summary_subset(mut self, subset: &str) -> Self {
+        self.summary_subset = subset.to_string();
+        self
     }
 
     fn url_for(&self, segments: &[&str]) -> Url {
@@ -137,20 +341,183 @@ impl<ObjectID: FsVerityHashValue> RemoteRepo<ObjectID> {
             .extend(segments);
         url
     }
+
+    async fn load_summary(&self) -> Result<Option<&SummaryCache>> {
+        let cached = self
+            .summary
+            .get_or_try_init(|| self.fetch_summary())
+            .await?;
+        Ok(cached.as_ref())
+    }
+
+    async fn fetch_summary(&self) -> Result<Option<SummaryCache>> {
+        // Try the summary index first (flatpak-style repos)
+        if let Some(cache) = self.try_fetch_indexed_summary().await? {
+            return Ok(Some(cache));
+        }
+        // Fall back to plain summary with conditional HTTP
+        self.fetch_plain_summary().await
+    }
+
+    async fn try_fetch_indexed_summary(&self) -> Result<Option<SummaryCache>> {
+        use flate2::read::GzDecoder;
+
+        let url = self.url_for(&["summary.idx"]);
+        let response = match self.client.get(url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return Ok(None),
+        };
+
+        let index_bytes = response.bytes().await?;
+        let index = SummaryIndex::from_bytes(&index_bytes)?;
+
+        let checksum = match index.lookup_checksum(&self.summary_subset)? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let url_key = summary_url_key(&self.url);
+        let stream_id = format!("ostree-subsummary-{}-{url_key}", self.summary_subset);
+
+        // Check if we have a cached subsummary with a matching checksum
+        if let Some(mut reader) = open_cached_summary(&self.repo, &stream_id)?
+            && let Ok(info) = read_summary_cache_header(&mut reader)
+            && info.checksum == checksum
+        {
+            return Ok(Some(read_summary_cache_data(&mut reader, &self.repo)?));
+        }
+
+        // Fetch the new subsummary (gzipped)
+        let checksum_hex = hex::encode(checksum);
+        let filename = format!("{checksum_hex}.gz");
+        let sub_url = self.url_for(&["summaries", &filename]);
+        let response = self
+            .client
+            .get(sub_url.clone())
+            .send()
+            .await
+            .with_context(|| format!("Fetching subsummary from {sub_url}"))?;
+        response
+            .error_for_status_ref()
+            .with_context(|| format!("Fetching subsummary from {sub_url}"))?;
+
+        let compressed = response
+            .bytes()
+            .await
+            .with_context(|| format!("Reading subsummary from {sub_url}"))?;
+
+        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut summary_data = Vec::new();
+        decoder
+            .read_to_end(&mut summary_data)
+            .context("Decompressing subsummary")?;
+
+        let actual = Sha256::digest(&summary_data);
+        if *actual != checksum {
+            bail!(
+                "subsummary checksum mismatch: expected {}, got {}",
+                checksum_hex,
+                hex::encode(actual)
+            );
+        }
+
+        let info = SummaryCacheInfo {
+            etag: None,
+            last_modified: None,
+            checksum,
+        };
+        write_summary_cache(&self.repo, &stream_id, &info, &summary_data)?;
+
+        Ok(Some(SummaryCache {
+            data: summary_data.into(),
+        }))
+    }
+
+    async fn fetch_plain_summary(&self) -> Result<Option<SummaryCache>> {
+        let url_key = summary_url_key(&self.url);
+        let stream_id = format!("ostree-summary-{url_key}");
+        let url = self.url_for(&["summary"]);
+
+        // Read cached header for conditional HTTP (without reading the summary data)
+        let mut cached_reader = open_cached_summary(&self.repo, &stream_id)?;
+        let cached_info = cached_reader
+            .as_mut()
+            .and_then(|r| read_summary_cache_header(r).ok());
+
+        let mut request = self.client.get(url.clone());
+        if let Some(ref info) = cached_info {
+            if let Some(ref etag) = info.etag {
+                request = request.header(header::IF_NONE_MATCH, etag.as_str());
+            } else if let Some(ref lm) = info.last_modified {
+                request = request.header(header::IF_MODIFIED_SINCE, lm.as_str());
+            }
+        }
+
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("Fetching summary from {url}"))?;
+
+        if response.status() == StatusCode::NOT_MODIFIED
+            && let Some(mut reader) = cached_reader
+        {
+            return Ok(Some(read_summary_cache_data(&mut reader, &self.repo)?));
+        }
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        response
+            .error_for_status_ref()
+            .with_context(|| format!("Fetching summary from {url}"))?;
+
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let last_modified = response
+            .headers()
+            .get(header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let summary_data = response
+            .bytes()
+            .await
+            .with_context(|| format!("Reading summary from {url}"))?;
+
+        let data_checksum: Sha256Digest = Sha256::digest(&summary_data).into();
+        let info = SummaryCacheInfo {
+            etag,
+            last_modified,
+            checksum: data_checksum,
+        };
+        write_summary_cache(&self.repo, &stream_id, &info, &summary_data)?;
+
+        Ok(Some(SummaryCache {
+            data: summary_data.to_vec().into(),
+        }))
+    }
 }
 
 impl<ObjectID: FsVerityHashValue> OstreeRepo<ObjectID> for RemoteRepo<ObjectID> {
     async fn resolve_ref(&self, ref_name: &str) -> Result<Sha256Digest> {
-        // TODO: Support summary format
-        let url = self.url_for(&["refs", "heads", ref_name]);
+        if let Some(cache) = self.load_summary().await?
+            && let Some(checksum) = cache.resolve_ref(ref_name)
+        {
+            return Ok(checksum);
+        }
 
+        // Fall back to direct ref file fetch (for repos without summaries)
+        let url = self.url_for(&["refs", "heads", ref_name]);
         let response = self.client.get(url.clone()).send().await?;
         response.error_for_status_ref()?;
         let t = response
             .text()
             .await
-            .with_context(|| format!("Cannot get ostree ref at {}", url))?;
-
+            .with_context(|| format!("Cannot get ostree ref at {url}"))?;
         Ok(parse_sha256(t.trim())?)
     }
 
