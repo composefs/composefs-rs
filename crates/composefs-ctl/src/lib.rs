@@ -837,6 +837,21 @@ where
     run_app(args).await
 }
 
+#[cfg(feature = "ostree")]
+fn print_pull_stats(stats: &composefs_ostree::PullStats) {
+    if stats.delta_parts_applied > 0 {
+        println!(
+            "objects {} metadata + {} files via {} delta parts",
+            stats.metadata_fetched, stats.files_fetched, stats.delta_parts_applied
+        );
+    } else {
+        println!(
+            "objects {} metadata + {} files fetched",
+            stats.metadata_fetched, stats.files_fetched
+        );
+    }
+}
+
 fn get_mount_options(
     upperdir: Option<&Path>,
     workdir: Option<&Path>,
@@ -1717,10 +1732,7 @@ where
                 if !composefs_ostree::is_commit_id(ostree_ref) {
                     println!("tagged  {ostree_ref}");
                 }
-                println!(
-                    "objects {} metadata + {} files fetched",
-                    stats.metadata_fetched, stats.files_fetched
-                );
+                print_pull_stats(&stats);
             }
             OstreeCommand::Pull {
                 ref ostree_repo_url,
@@ -1743,10 +1755,7 @@ where
                 if !composefs_ostree::is_commit_id(ostree_ref) {
                     println!("tagged  {ostree_ref}");
                 }
-                println!(
-                    "objects {} metadata + {} files fetched",
-                    stats.metadata_fetched, stats.files_fetched
-                );
+                print_pull_stats(&stats);
             }
             OstreeCommand::Mount {
                 ref commit,
