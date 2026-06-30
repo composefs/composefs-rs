@@ -10,6 +10,27 @@ use std::{
 
 use thiserror::Error;
 
+/// Default xattr allowlist for container filesystems.
+///
+/// When reading from a mounted container filesystem, host xattrs can leak into
+/// the image (e.g., SELinux labels like `container_t` from overlayfs). This
+/// allowlist specifies which xattrs are safe to preserve.
+///
+/// Currently only `security.capability` is allowed, as it represents actual
+/// file capabilities that should be preserved. SELinux labels (`security.selinux`)
+/// are excluded because they come from the build host and will be regenerated
+/// by `transform_for_boot()` based on the target system's policy.
+///
+/// See: <https://github.com/containers/storage/pull/1608#issuecomment-1600915185>
+pub const CONTAINER_XATTR_ALLOWLIST: &[&str] = &["security.capability"];
+
+/// Returns true if the given xattr name is in [`CONTAINER_XATTR_ALLOWLIST`].
+pub fn is_allowed_container_xattr(name: &OsStr) -> bool {
+    CONTAINER_XATTR_ALLOWLIST
+        .iter()
+        .any(|allowed| name.as_encoded_bytes() == allowed.as_bytes())
+}
+
 /// File metadata similar to `struct stat` from POSIX.
 #[derive(Debug, Clone)]
 pub struct Stat {
@@ -823,8 +844,14 @@ impl<T> FileSystem<T> {
     ///
     /// 1. [`Self::copy_root_metadata_from_usr`] - copies `/usr` metadata to root directory
     /// 2. [`Self::canonicalize_run`] - empties `/run` directory
+    /// 3. [`Self::filter_xattrs`] - filters xattrs to the container allowlist (strips
+    ///    host-leaked xattrs like build-time security.selinux; keeps security.capability)
+    /// 4. [`Self::compact`] - removes leaves orphaned by the steps above (e.g. files
+    ///    that were only referenced from the now-emptied `/run`)
     ///
     /// This is the recommended single entry point for OCI container processing.
+    /// Because the cleanup is built in, callers get a valid (fsck-clean) filesystem
+    /// regardless of whether they came from the OCI tar layers or a mounted root.
     ///
     /// NOTE: If changing this behavior, also update `doc/oci.md`.
     ///
@@ -834,6 +861,10 @@ impl<T> FileSystem<T> {
     pub fn transform_for_oci(&mut self) -> Result<(), ImageError> {
         self.copy_root_metadata_from_usr()?;
         self.canonicalize_run()?;
+        self.filter_xattrs(is_allowed_container_xattr);
+        // Emptying directories above can orphan leaves; drop them so the result
+        // is fsck-clean for every construction path.
+        self.compact();
         Ok(())
     }
 
@@ -1731,6 +1762,125 @@ mod tests {
         let run = fs.root.get_directory(OsStr::new("run")).unwrap();
         assert!(run.entries.is_empty());
         assert_eq!(run.stat.st_mtim_sec, 54321);
+    }
+
+    #[test]
+    fn test_transform_for_oci_filters_xattrs() {
+        let mut leaves = Vec::new();
+        let mut fs = FileSystem::<FileContents>::new(default_stat());
+
+        // Create /usr with both allowed and filtered xattrs
+        let usr_stat = Stat {
+            st_mode: 0o750,
+            st_uid: 100,
+            st_gid: 200,
+            st_mtim_sec: 54321,
+            st_mtim_nsec: 0,
+            xattrs: BTreeMap::from([
+                (
+                    Box::from(OsStr::new("security.selinux")),
+                    Box::from(b"usr_selinux_label".as_slice()),
+                ),
+                (
+                    Box::from(OsStr::new("security.capability")),
+                    Box::from(b"usr_cap".as_slice()),
+                ),
+            ]),
+        };
+        fs.root
+            .insert(OsStr::new("usr"), new_dir_inode_with_stat(usr_stat));
+
+        // Create a regular file in the tree with both xattrs as well
+        let file_stat = Stat {
+            st_mode: 0o644,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 12345,
+            st_mtim_nsec: 0,
+            xattrs: BTreeMap::from([
+                (
+                    Box::from(OsStr::new("security.selinux")),
+                    Box::from(b"file_selinux_label".as_slice()),
+                ),
+                (
+                    Box::from(OsStr::new("security.capability")),
+                    Box::from(b"file_cap".as_slice()),
+                ),
+            ]),
+        };
+        let file_id = push_leaf_file(&mut leaves, 12345);
+        fs.leaves = leaves;
+        // Update leaf's stat
+        fs.leaves[file_id.0].stat = file_stat;
+
+        // Place the file under root
+        fs.root.insert(OsStr::new("testfile"), Inode::leaf(file_id));
+
+        // Transform for OCI
+        fs.transform_for_oci().unwrap();
+
+        // Verify root metadata was copied from /usr and is filtered!
+        assert_eq!(fs.root.stat.st_mode, 0o750);
+        assert!(
+            !fs.root
+                .stat
+                .xattrs
+                .contains_key(OsStr::new("security.selinux"))
+        );
+        assert!(
+            fs.root
+                .stat
+                .xattrs
+                .contains_key(OsStr::new("security.capability"))
+        );
+        assert_eq!(
+            fs.root
+                .stat
+                .xattrs
+                .get(OsStr::new("security.capability"))
+                .unwrap()
+                .as_ref(),
+            b"usr_cap"
+        );
+
+        // Verify /usr itself was filtered
+        let usr_dir = fs.root.get_directory(OsStr::new("usr")).unwrap();
+        assert!(
+            !usr_dir
+                .stat
+                .xattrs
+                .contains_key(OsStr::new("security.selinux"))
+        );
+        assert!(
+            usr_dir
+                .stat
+                .xattrs
+                .contains_key(OsStr::new("security.capability"))
+        );
+
+        // Verify the file's xattrs are also filtered
+        let file_leaf = fs.leaves.get(file_id.0).unwrap();
+        assert!(
+            !file_leaf
+                .stat
+                .xattrs
+                .contains_key(OsStr::new("security.selinux"))
+        );
+        assert!(
+            file_leaf
+                .stat
+                .xattrs
+                .contains_key(OsStr::new("security.capability"))
+        );
+        assert_eq!(
+            file_leaf
+                .stat
+                .xattrs
+                .get(OsStr::new("security.capability"))
+                .unwrap()
+                .as_ref(),
+            b"file_cap"
+        );
     }
 
     #[test]

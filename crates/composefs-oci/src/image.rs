@@ -138,12 +138,11 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
         }
     }
 
-    // Apply OCI container transformations for consistent digests.
+    // Apply OCI container transformations for consistent digests.  This also
+    // compacts the leaves table, dropping any orphaned by whiteout processing
+    // and layer merging above.
     // See https://github.com/containers/composefs-rs/issues/132
     filesystem.transform_for_oci()?;
-
-    // Whiteout processing and layer merging can leave orphaned leaves.
-    filesystem.compact();
 
     debug_assert!(
         filesystem.fsck().is_ok(),
@@ -823,6 +822,66 @@ mod test {
 
         process_entry(&mut fs, file_entry("/etc/config"))?;
         assert_files(&fs, &["/", "/etc", "/etc/config"])?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_filesystem_filters_xattrs() -> Result<()> {
+        use composefs::{repository::Repository, test::tempdir};
+        use rustix::fs::CWD;
+        use std::{ffi::OsStr, sync::Arc};
+
+        let repo_dir = tempdir();
+        let repo_path = repo_dir.path().join("repo");
+        let (repo, _) = Repository::<Sha256HashValue>::init_path(
+            CWD,
+            &repo_path,
+            RepositoryConfig::default().set_insecure(),
+        )?;
+        let repo = Arc::new(repo);
+
+        let layer_str = "\
+/ 0 40755 2 0 0 0 0.0 - - -
+/etc 0 40755 2 0 0 0 0.0 - - - security.selinux=system_u:object_r:etc_t:s0
+/usr 0 40755 2 0 0 0 0.0 - - -
+/usr/bin 0 40755 2 0 0 0 0.0 - - -
+/usr/bin/foo 12 100755 1 0 0 0 0.0 - test_content - security.selinux=system_u:object_r:bin_t:s0 security.capability=\\x02\\x00\\x00\\x02\\x00\\x20\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00
+";
+
+        let image = crate::test_util::create_multi_layer_image(&repo, None, &[layer_str]).await;
+        let fs = create_filesystem(&repo, &image.config_digest, None)?;
+
+        // The OCI tar path must strip non-allowlisted xattrs everywhere in the
+        // tree, identically to the mounted-filesystem path (issue #212).
+        use std::cell::Cell;
+        let has_selinux = Cell::new(false);
+        fs.for_each_stat(|stat| {
+            if stat.xattrs.contains_key(OsStr::new("security.selinux")) {
+                has_selinux.set(true);
+            }
+        });
+        assert!(
+            !has_selinux.get(),
+            "transform_for_oci should have stripped all security.selinux xattrs"
+        );
+
+        // Lookup /usr/bin/foo and check security.capability is preserved
+        let usr_dir = fs.root.get_directory(OsStr::new("usr"))?;
+        let bin_dir = usr_dir.get_directory(OsStr::new("bin"))?;
+        let leaf_id = bin_dir.leaf_id(OsStr::new("foo"))?;
+        let leaf = fs.leaf(leaf_id);
+
+        let cap_val = leaf
+            .stat
+            .xattrs
+            .get(OsStr::new("security.capability"))
+            .expect("security.capability should be preserved");
+
+        // Check if value matches
+        let expected_cap =
+            b"\x02\x00\x00\x02\x00\x20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+        assert_eq!(cap_val.as_ref(), expected_cap);
 
         Ok(())
     }

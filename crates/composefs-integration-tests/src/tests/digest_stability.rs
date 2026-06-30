@@ -425,9 +425,23 @@ fn check_digest_equivalence(image: &ContainerImage) -> Result<()> {
         let cstor_digest = compute_id(&sh, &cfsctl, repo, &config, true)?;
         eprintln!("  containers-storage V{version}: {cstor_digest}");
 
+        let cstor_digest_non_bootable = if version == "1" {
+            compute_id_v1(&sh, &cfsctl, repo, &config, false)?
+        } else {
+            compute_id(&sh, &cfsctl, repo, &config, false)?
+        };
+        eprintln!("  containers-storage V{version} (non-bootable): {cstor_digest_non_bootable}");
+
         let fs_digest = cmd!(
             sh,
             "{cfsctl} --insecure --erofs-version {version} --repo {repo} compute-id --bootable {mountpoint}"
+        )
+        .read()
+        .map(|s| s.trim().to_string());
+
+        let fs_digest_non_bootable = cmd!(
+            sh,
+            "{cfsctl} --insecure --erofs-version {version} --repo {repo} compute-id {mountpoint}"
         )
         .read()
         .map(|s| s.trim().to_string());
@@ -438,8 +452,13 @@ fn check_digest_equivalence(image: &ContainerImage) -> Result<()> {
             Err(_) => true,
         };
 
+        let non_bootable_mismatch = match &fs_digest_non_bootable {
+            Ok(d) => d != &cstor_digest_non_bootable,
+            Err(_) => true,
+        };
+
         let diff_output = if mismatch {
-            eprintln!("  MISMATCH detected — capturing dumpfiles for diff...");
+            eprintln!("  MISMATCH detected (bootable) — capturing dumpfiles for diff...");
 
             let at_config = format!("@{config}");
             let cstor_dump = cmd!(
@@ -471,13 +490,66 @@ fn check_digest_equivalence(image: &ContainerImage) -> Result<()> {
             None
         };
 
+        let diff_output_non_bootable = if non_bootable_mismatch {
+            eprintln!("  MISMATCH detected (non-bootable) — capturing dumpfiles for diff...");
+
+            let at_config = format!("@{config}");
+            let cstor_dump = cmd!(sh, "{cfsctl} --insecure --repo {repo} oci dump {at_config}")
+                .read()
+                .unwrap_or_else(|e| format!("(failed to dump cstor: {e})"));
+
+            let fs_dump = cmd!(sh, "{cfsctl} --no-repo create-dumpfile {mountpoint}")
+                .read()
+                .unwrap_or_else(|e| format!("(failed to dump on-disk: {e})"));
+
+            let cstor_path = std::env::temp_dir().join("cstor-nonboot.dumpfile");
+            let fs_path = std::env::temp_dir().join("fs-nonboot.dumpfile");
+            std::fs::write(&cstor_path, &cstor_dump)?;
+            std::fs::write(&fs_path, &fs_dump)?;
+
+            let diff = cmd!(sh, "diff -u {cstor_path} {fs_path}")
+                .ignore_status()
+                .read()
+                .unwrap_or_else(|e| format!("(diff failed: {e})"));
+
+            Some(diff)
+        } else {
+            None
+        };
+
         let fs_digest = fs_digest?;
         eprintln!("  on-disk filesystem V{version}: {fs_digest}");
 
+        let fs_digest_non_bootable = fs_digest_non_bootable?;
+        eprintln!("  on-disk filesystem V{version} (non-bootable): {fs_digest_non_bootable}");
+
         if let Some(ref diff) = diff_output {
             eprintln!(
-                "\n=== V{version} dumpfile diff (containers-storage vs on-disk) ===\n\
+                "\n=== V{version} dumpfile diff (containers-storage vs on-disk, bootable) ===\n\
                  {diff}\n=== end diff ===\n"
+            );
+        }
+
+        if let Some(ref diff) = diff_output_non_bootable {
+            eprintln!(
+                "\n=== V{version} dumpfile diff (containers-storage vs on-disk, non-bootable) ===\n\
+                 {diff}\n=== end diff ===\n"
+            );
+        }
+
+        // For issue #212, verifying the non-bootable digests is crucial because the bootable path
+        // applies SELinux relabeling (via selabel) which can mask/override any xattr filtration discrepancies
+        // between the container-storage pull path and the on-disk extraction path. Comparing the
+        // non-bootable digests directly exercises the transform_for_oci() xattr allowlist on both paths.
+        if cstor_digest_non_bootable != fs_digest_non_bootable {
+            // Clean up before bailing.
+            cmd!(sh, "podman umount {cid}").ignore_status().run()?;
+            cmd!(sh, "podman rm -f {cid}").ignore_status().run()?;
+            bail!(
+                "{label} V{version} (non-bootable): digest mismatch between OCI pull and on-disk extraction!\n\
+                 \x20  containers-storage: {cstor_digest_non_bootable}\n\
+                 \x20  on-disk filesystem: {fs_digest_non_bootable}",
+                label = image.label,
             );
         }
 

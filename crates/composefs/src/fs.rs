@@ -684,26 +684,7 @@ fn compute_verity_from_fd<ObjectID: FsVerityHashValue>(source: OwnedFd) -> Resul
     Ok(hasher.digest())
 }
 
-/// Default xattr allowlist for container filesystems.
-///
-/// When reading from a mounted container filesystem, host xattrs can leak into
-/// the image (e.g., SELinux labels like `container_t` from overlayfs). This
-/// allowlist specifies which xattrs are safe to preserve.
-///
-/// Currently only `security.capability` is allowed, as it represents actual
-/// file capabilities that should be preserved. SELinux labels (`security.selinux`)
-/// are excluded because they come from the build host and will be regenerated
-/// by `transform_for_boot()` based on the target system's policy.
-///
-/// See: <https://github.com/containers/storage/pull/1608#issuecomment-1600915185>
-pub const CONTAINER_XATTR_ALLOWLIST: &[&str] = &["security.capability"];
-
-/// Returns true if the given xattr name is in [`CONTAINER_XATTR_ALLOWLIST`].
-pub fn is_allowed_container_xattr(name: &OsStr) -> bool {
-    CONTAINER_XATTR_ALLOWLIST
-        .iter()
-        .any(|allowed| name.as_encoded_bytes() == allowed.as_bytes())
-}
+pub use crate::generic_tree::{CONTAINER_XATTR_ALLOWLIST, is_allowed_container_xattr};
 
 /// Read the contents of a file.
 pub fn read_file<ObjectID: FsVerityHashValue>(
@@ -950,14 +931,16 @@ where
 
 /// Load a container root filesystem from the given path.
 ///
-/// Wraps [`read_filesystem_filtered`] with the container xattr allowlist
-/// and applies OCI transformations via [`FileSystem::transform_for_oci`].
+/// Applies OCI transformations via [`FileSystem::transform_for_oci`],
+/// which includes filtering xattrs to the container allowlist.
 pub async fn read_container_root<ObjectID: FsVerityHashValue>(
     dirfd: OwnedFd,
     path: PathBuf,
     repo: Option<Arc<Repository<ObjectID>>>,
 ) -> Result<FileSystem<ObjectID>> {
-    let mut fs = read_filesystem_filtered(dirfd, path, repo, is_allowed_container_xattr).await?;
+    let mut fs = read_filesystem(dirfd, path, repo)
+        .await
+        .context("Reading container root")?;
     fs.transform_for_oci()?;
     Ok(fs)
 }
