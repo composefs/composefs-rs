@@ -558,6 +558,14 @@ enum OstreeCommand {
     /// List all ostree commits in the repository
     #[clap(name = "images")]
     ListCommits,
+    /// List refs available in a remote ostree repository
+    ListRefs {
+        /// URL of the remote ostree repository
+        ostree_repo_url: String,
+        /// Summary index subset key (defaults to system architecture)
+        #[clap(long)]
+        subset: Option<String>,
+    },
 }
 
 /// Common options for reading a filesystem from a path
@@ -1777,6 +1785,27 @@ where
                     table.set_header(["NAME", "COMMIT"]);
                     for c in commits {
                         table.add_row([c.name.as_str(), &c.commit_id]);
+                    }
+                    println!("{table}");
+                }
+            }
+            OstreeCommand::ListRefs {
+                ref ostree_repo_url,
+                ref subset,
+            } => {
+                let mut ostree_repo = composefs_ostree::RemoteRepo::new(&repo, ostree_repo_url)?;
+                if let Some(s) = subset {
+                    ostree_repo = ostree_repo.with_summary_subset(s);
+                }
+                let refs = ostree_repo.list_remote_refs().await?;
+                if refs.is_empty() {
+                    println!("No refs found");
+                } else {
+                    let mut table = Table::new();
+                    table.load_preset(UTF8_FULL);
+                    table.set_header(["REF", "COMMIT"]);
+                    for (name, checksum) in &refs {
+                        table.add_row([name.as_str(), &hex::encode(checksum)]);
                     }
                     println!("{table}");
                 }
