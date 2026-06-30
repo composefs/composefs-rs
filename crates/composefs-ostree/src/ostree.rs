@@ -63,6 +63,32 @@ pub enum ObjectType {
 }
 
 impl ObjectType {
+    /// Decode from the numeric value used in ostree's on-disk format.
+    pub fn from_byte(b: u8) -> Result<Self> {
+        match b {
+            1 => Ok(ObjectType::File),
+            2 => Ok(ObjectType::DirTree),
+            3 => Ok(ObjectType::DirMeta),
+            4 => Ok(ObjectType::Commit),
+            5 => Ok(ObjectType::TombstoneCommit),
+            7 => Ok(ObjectType::PayloadLink),
+            8 => Ok(ObjectType::FileXAttrs),
+            9 => Ok(ObjectType::FileXAttrsLink),
+            _ => Err(anyhow!("Unknown object type {b}")),
+        }
+    }
+
+    /// Returns true for metadata object types (not file content).
+    pub fn is_meta(&self) -> bool {
+        matches!(
+            self,
+            ObjectType::DirTree
+                | ObjectType::DirMeta
+                | ObjectType::Commit
+                | ObjectType::TombstoneCommit
+        )
+    }
+
     /// Returns the file extension used for this object type on disk.
     pub fn extension(&self, repo_mode: RepoMode) -> &'static str {
         match self {
