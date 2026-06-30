@@ -131,6 +131,10 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
         self.lookup_idx(ostree_id).is_some()
     }
 
+    pub fn lookup_data(&self, ostree_id: &Sha256Digest) -> Option<&AlignedBuf> {
+        self.lookup_idx(ostree_id).map(|i| &self.map[i].data)
+    }
+
     pub fn set_commit_id(&mut self, id: &Sha256Digest) {
         self.commit_id = Some(*id);
     }

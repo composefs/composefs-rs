@@ -558,6 +558,11 @@ enum OstreeCommand {
     /// List all ostree commits in the repository
     #[clap(name = "images")]
     ListCommits,
+    /// Apply a static delta to the repository
+    ApplyDelta {
+        /// Path to the delta file (single-file) or superblock
+        delta_path: PathBuf,
+    },
     /// List refs available in a remote ostree repository
     ListRefs {
         /// URL of the remote ostree repository
@@ -1788,6 +1793,17 @@ where
                     }
                     println!("{table}");
                 }
+            }
+            OstreeCommand::ApplyDelta { ref delta_path } => {
+                let (verity, stats) = composefs_ostree::apply_delta_offline(&repo, delta_path)?;
+                let image_id = composefs_ostree::get_image_ref(&repo, &stats.commit_id)?;
+                println!("commit  {}", stats.commit_id);
+                println!("verity  {}", verity.to_hex());
+                println!("image   {}", image_id.to_hex());
+                println!(
+                    "objects {} metadata + {} files applied",
+                    stats.metadata_fetched, stats.files_fetched
+                );
             }
             OstreeCommand::ListRefs {
                 ref ostree_repo_url,

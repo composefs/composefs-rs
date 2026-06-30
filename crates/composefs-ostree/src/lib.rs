@@ -34,6 +34,7 @@ pub struct CommitInfo {
 }
 
 mod commit;
+pub mod delta;
 #[cfg(doc)]
 pub mod design;
 pub mod ostree;
@@ -42,6 +43,7 @@ pub mod repo;
 
 use crate::commit::{CommitReader, CommitWriter};
 use crate::pull::PullOperation;
+pub use crate::delta::apply_delta_offline;
 pub use crate::pull::PullStats;
 pub use crate::repo::{LocalRepo, OstreeRepo, RemoteRepo};
 
