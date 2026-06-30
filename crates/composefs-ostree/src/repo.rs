@@ -439,7 +439,7 @@ impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
 
         let is_symlink = FileType::from_raw_mode(mode).is_symlink();
         let header = OstreeFileHeader {
-            size: st.st_size as u64,
+            size: if is_symlink { 0 } else { st.st_size as u64 },
             uid,
             gid,
             mode,
