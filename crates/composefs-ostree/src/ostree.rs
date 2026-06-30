@@ -10,12 +10,18 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use composefs::{fsverity::FsVerityHashValue, util::Sha256Digest};
 
+/// The storage layout of an ostree repository.
 #[derive(Debug, PartialEq, Copy, Clone)]
-pub(crate) enum RepoMode {
+pub enum RepoMode {
+    /// Objects stored as regular files with original permissions.
     Bare,
+    /// Objects stored compressed; used for HTTP serving.
     Archive,
+    /// Objects stored as regular files owned by the calling user.
     BareUser,
+    /// Like `BareUser` but without xattr or ownership metadata.
     BareUserOnly,
+    /// Like `Bare` but xattrs stored in separate sidecar files.
     BareSplitXAttrs,
 }
 
@@ -34,20 +40,30 @@ impl std::str::FromStr for RepoMode {
     }
 }
 
+/// The type of an ostree content-addressed object.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Copy, Clone)]
-pub(crate) enum ObjectType {
+pub enum ObjectType {
+    /// Regular file, symlink, or device node.
     File,
+    /// Directory listing mapping names to file/subtree checksums.
     DirTree,
+    /// Directory metadata (uid, gid, mode, xattrs).
     DirMeta,
+    /// Top-level commit object referencing a root tree.
     Commit,
+    /// Marker for a deleted commit.
     TombstoneCommit,
+    /// Hard-link placeholder pointing to another object.
     PayloadLink,
+    /// Separate xattr storage for a file object.
     FileXAttrs,
+    /// Symlink to shared xattr data.
     FileXAttrsLink,
 }
 
 impl ObjectType {
+    /// Returns the file extension used for this object type on disk.
     pub fn extension(&self, repo_mode: RepoMode) -> &'static str {
         match self {
             ObjectType::File => {
@@ -85,12 +101,14 @@ pub(crate) fn should_inline_file<ObjectID: FsVerityHashValue>(file_size: usize) 
     file_size <= size_of::<ObjectID>() * 2
 }
 
-/// On-disk header prefixed to gvariant data in ostree objects
+/// On-disk header prefixed to gvariant data in ostree objects.
 #[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
-pub(crate) struct SizedVariantHeader {
-    size: u32,
-    padding: u32,
+pub struct SizedVariantHeader {
+    /// Big-endian size of the following gvariant payload.
+    pub size: u32,
+    /// Padding for 8-byte alignment.
+    pub padding: u32,
 }
 
 pub(crate) fn size_prefix(data: &[u8]) -> AlignedBuf {
@@ -138,16 +156,24 @@ pub(crate) fn split_sized_variant(data: &AlignedSlice<A8>) -> Result<(&AlignedSl
 }
 
 /// Decoded ostree file header (uid, gid, mode, xattrs, symlink target).
-pub(crate) struct OstreeFileHeader {
+#[derive(Debug)]
+pub struct OstreeFileHeader {
+    /// File size in bytes.
     pub size: u64,
+    /// Owner user ID.
     pub uid: u32,
+    /// Owner group ID.
     pub gid: u32,
+    /// Unix file mode bits.
     pub mode: u32,
+    /// Symlink target path (empty string for non-symlinks).
     pub symlink_target: String,
+    /// Extended attributes as (name, value) pairs.
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl OstreeFileHeader {
+    /// Deserialize from the zlib-sized format used in archive-mode objects.
     pub fn from_zlib_sized(data: &AlignedSlice<A8>) -> Result<Self> {
         let header_size = size_of::<SizedVariantHeader>();
         let variant_data: &AlignedSlice<A8> = data
@@ -215,14 +241,20 @@ impl OstreeFileHeader {
 }
 
 /// Decoded ostree directory metadata (uid, gid, mode, xattrs).
-pub(crate) struct OstreeDirMeta {
+#[derive(Debug)]
+pub struct OstreeDirMeta {
+    /// Owner user ID.
     pub uid: u32,
+    /// Owner group ID.
     pub gid: u32,
+    /// Unix file mode bits.
     pub mode: u32,
+    /// Extended attributes as (name, value) pairs.
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl OstreeDirMeta {
+    /// Deserialize from raw gvariant data.
     pub fn from_data(data: &AlignedSlice<A8>) -> Result<Self> {
         let gv = gv!("(uuua(ayay))").cast(data.as_aligned());
         let (uid, gid, mode, xattrs_data) = gv.to_tuple();
@@ -254,12 +286,16 @@ pub(crate) fn parse_xattr_data(data: &AlignedSlice<A8>) -> Result<Vec<(Vec<u8>, 
 }
 
 /// Decoded ostree directory tree listing files and subdirectories.
-pub(crate) struct OstreeDirTree {
+#[derive(Debug)]
+pub struct OstreeDirTree {
+    /// Files in this directory: (name, content checksum).
     pub files: Vec<(String, Sha256Digest)>,
+    /// Subdirectories: (name, tree checksum, dirmeta checksum).
     pub dirs: Vec<(String, Sha256Digest, Sha256Digest)>,
 }
 
 impl OstreeDirTree {
+    /// Deserialize from raw gvariant data.
     pub fn from_data(data: &AlignedSlice<A8>) -> Result<Self> {
         let gv = gv!("(a(say)a(sayay))").cast(data.as_aligned());
         let (files_data, dirs_data) = gv.to_tuple();
@@ -289,13 +325,21 @@ impl OstreeDirTree {
 }
 
 /// Decoded ostree commit object with metadata, tree root, and optional parent.
-pub(crate) struct OstreeCommit {
+#[derive(Debug)]
+pub struct OstreeCommit {
+    /// Checksum of the parent commit, if any.
     pub parent_commit: Option<Sha256Digest>,
+    /// Commit metadata as (key, value) string pairs.
     pub metadata: Vec<(String, String)>,
+    /// One-line commit subject.
     pub subject: String,
+    /// Extended commit description.
     pub body: String,
+    /// Commit timestamp (seconds since Unix epoch).
     pub timestamp: u64,
+    /// Checksum of the root directory tree object.
     pub root_tree: Sha256Digest,
+    /// Checksum of the root directory metadata object.
     pub root_metadata: Sha256Digest,
 }
 
@@ -328,6 +372,7 @@ fn format_variant(v: &gvariant::Variant) -> String {
 }
 
 impl OstreeCommit {
+    /// Deserialize from raw gvariant data.
     pub fn from_data(data: &AlignedSlice<A8>) -> Result<Self> {
         let gv = gv!("(a{sv}aya(say)sstayay)").cast(data.as_aligned());
         let (
