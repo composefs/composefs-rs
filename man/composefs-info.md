@@ -1,4 +1,9 @@
-% composefs-info 1 "" composefs "User Commands"
+---
+title: composefs-info
+section: 1
+footer: composefs
+header: User Commands
+---
 
 # NAME
 

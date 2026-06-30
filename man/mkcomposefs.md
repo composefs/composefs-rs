@@ -1,4 +1,9 @@
-% mkcomposefs 1 "" composefs "User Commands"
+---
+title: mkcomposefs
+section: 1
+footer: composefs
+header: User Commands
+---
 
 # NAME
 

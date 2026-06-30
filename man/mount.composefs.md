@@ -1,4 +1,9 @@
-% mount.composefs 8 "" composefs "User Commands"
+---
+title: mount.composefs
+section: 8
+footer: composefs
+header: User Commands
+---
 
 # NAME
 
