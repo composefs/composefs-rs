@@ -92,12 +92,19 @@ fn hash_and_store_file<ObjectID: FsVerityHashValue>(
 }
 
 /// Abstraction over local and remote ostree repository access.
-pub(crate) trait OstreeRepo<ObjectID: FsVerityHashValue>: Send + Sync {
+///
+/// Implemented by [`LocalRepo`] (on-disk) and [`RemoteRepo`] (HTTP).
+/// Pass an implementor to [`crate::pull()`] to fetch an ostree commit.
+pub trait OstreeRepo<ObjectID: FsVerityHashValue>: Send + Sync {
+    /// Resolve a named ref (e.g. `fedora/40/x86_64`) to its commit checksum.
+    fn resolve_ref(&self, ref_name: &str) -> impl Future<Output = Result<Sha256Digest>> + Send;
+    /// Fetch a metadata object (commit, dirtree, dirmeta) by checksum.
     fn fetch_object(
         &self,
         checksum: &Sha256Digest,
         object_type: ObjectType,
     ) -> impl Future<Output = Result<AlignedBuf>> + Send;
+    /// Fetch a file object by checksum, returning the header and optional object ID.
     fn fetch_file(
         &self,
         checksum: &Sha256Digest,
@@ -106,13 +113,14 @@ pub(crate) trait OstreeRepo<ObjectID: FsVerityHashValue>: Send + Sync {
 
 /// Fetches ostree objects over HTTP from an archive-z2 repository.
 #[derive(Debug)]
-pub(crate) struct RemoteRepo<ObjectID: FsVerityHashValue> {
+pub struct RemoteRepo<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
     client: Client,
     url: Url,
 }
 
 impl<ObjectID: FsVerityHashValue> RemoteRepo<ObjectID> {
+    /// Create a new remote ostree repo client for the given URL.
     pub fn new(repo: &Arc<Repository<ObjectID>>, url: &str) -> Result<Self> {
         Ok(RemoteRepo {
             repo: repo.clone(),
@@ -129,8 +137,10 @@ impl<ObjectID: FsVerityHashValue> RemoteRepo<ObjectID> {
             .extend(segments);
         url
     }
+}
 
-    pub async fn resolve_ref(&self, ref_name: &str) -> Result<Sha256Digest> {
+impl<ObjectID: FsVerityHashValue> OstreeRepo<ObjectID> for RemoteRepo<ObjectID> {
+    async fn resolve_ref(&self, ref_name: &str) -> Result<Sha256Digest> {
         // TODO: Support summary format
         let url = self.url_for(&["refs", "heads", ref_name]);
 
@@ -143,9 +153,7 @@ impl<ObjectID: FsVerityHashValue> RemoteRepo<ObjectID> {
 
         Ok(parse_sha256(t.trim())?)
     }
-}
 
-impl<ObjectID: FsVerityHashValue> OstreeRepo<ObjectID> for RemoteRepo<ObjectID> {
     async fn fetch_object(
         &self,
         checksum: &Sha256Digest,
@@ -262,7 +270,7 @@ fn read_xattrs_from_path(fd: &impl AsFd) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 
 /// Reads ostree objects from a local on-disk repository (any mode).
 #[derive(Debug)]
-pub(crate) struct LocalRepo<ObjectID: FsVerityHashValue> {
+pub struct LocalRepo<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
     mode: RepoMode,
     dir: OwnedFd,
@@ -270,6 +278,7 @@ pub(crate) struct LocalRepo<ObjectID: FsVerityHashValue> {
 }
 
 impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
+    /// Open a local ostree repository at the given path.
     pub fn open_path(
         repo: &Arc<Repository<ObjectID>>,
         dirfd: impl AsFd,
@@ -335,7 +344,7 @@ impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
         })
     }
 
-    pub fn open_object_flags(
+    pub(crate) fn open_object_flags(
         &self,
         checksum: &Sha256Digest,
         object_type: ObjectType,
@@ -347,11 +356,15 @@ impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
             .with_context(|| format!("Cannot open ostree objects object at {}", path))
     }
 
-    pub fn open_object(&self, checksum: &Sha256Digest, object_type: ObjectType) -> Result<OwnedFd> {
+    pub(crate) fn open_object(
+        &self,
+        checksum: &Sha256Digest,
+        object_type: ObjectType,
+    ) -> Result<OwnedFd> {
         self.open_object_flags(checksum, object_type, OFlags::RDONLY | OFlags::NOFOLLOW)
     }
 
-    pub fn read_ref(&self, ref_name: &str) -> Result<Sha256Digest> {
+    pub(crate) fn read_ref(&self, ref_name: &str) -> Result<Sha256Digest> {
         let path1 = format!("refs/{}", ref_name);
         let path2 = format!("refs/heads/{}", ref_name);
 
@@ -484,6 +497,10 @@ impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
 }
 
 impl<ObjectID: FsVerityHashValue> OstreeRepo<ObjectID> for LocalRepo<ObjectID> {
+    async fn resolve_ref(&self, ref_name: &str) -> Result<Sha256Digest> {
+        self.read_ref(ref_name)
+    }
+
     async fn fetch_object(
         &self,
         checksum: &Sha256Digest,

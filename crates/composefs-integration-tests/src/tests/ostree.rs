@@ -63,12 +63,14 @@ fn pull_and_get_image_id(
     base_name: Option<&str>,
 ) -> Result<(Sha256HashValue, composefs_ostree::PullStats)> {
     let rt = tokio::runtime::Runtime::new()?;
-    let (_obj_id, stats) = rt.block_on(composefs_ostree::pull_local(
-        repo,
-        ostree_repo_path,
-        ostree_ref,
-        base_name,
-    ))?;
+    let ostree_repo =
+        composefs_ostree::LocalRepo::open_path(repo, rustix::fs::CWD, ostree_repo_path)?;
+    let opts = composefs_ostree::PullOptions {
+        base_reference: base_name,
+        ..Default::default()
+    };
+    let (_obj_id, stats) =
+        rt.block_on(composefs_ostree::pull(repo, ostree_repo, ostree_ref, opts))?;
 
     let image_id = composefs_ostree::get_image_ref(repo, ostree_ref)?;
 
@@ -191,8 +193,13 @@ fn test_ostree_pull_remote_archive() -> Result<()> {
 
         let rt = tokio::runtime::Runtime::new()?;
         let url = format!("http://127.0.0.1:{port}");
-        let (_obj_id, stats) =
-            rt.block_on(composefs_ostree::pull(&repo_remote, &url, "test", None))?;
+        let ostree_repo = composefs_ostree::RemoteRepo::new(&repo_remote, &url)?;
+        let (_obj_id, stats) = rt.block_on(composefs_ostree::pull(
+            &repo_remote,
+            ostree_repo,
+            "test",
+            Default::default(),
+        ))?;
 
         assert!(stats.metadata_fetched > 0);
         assert!(stats.files_fetched > 0);
@@ -229,11 +236,13 @@ fn test_ostree_pull_with_base() -> Result<()> {
     let repo = create_test_repository(&composefs_dir)?;
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (_, _stats_a) = rt.block_on(composefs_ostree::pull_local(
+    let ostree_repo =
+        composefs_ostree::LocalRepo::open_path(&repo, rustix::fs::CWD, &ostree_repo_path)?;
+    let (_, _stats_a) = rt.block_on(composefs_ostree::pull(
         &repo,
-        &ostree_repo_path,
+        ostree_repo,
         "commit-a",
-        None,
+        Default::default(),
     ))?;
 
     // Modify content slightly and make commit B on branch "commit-b"
@@ -241,21 +250,25 @@ fn test_ostree_pull_with_base() -> Result<()> {
     commit_to_ostree(&sh, &ostree_repo_path, "commit-b", &content)?;
 
     // Pull commit B with base
-    let (_, stats_with_base) = rt.block_on(composefs_ostree::pull_local(
-        &repo,
-        &ostree_repo_path,
-        "commit-b",
-        Some("commit-a"),
-    ))?;
+    let ostree_repo =
+        composefs_ostree::LocalRepo::open_path(&repo, rustix::fs::CWD, &ostree_repo_path)?;
+    let opts = composefs_ostree::PullOptions {
+        base_reference: Some("commit-a"),
+        ..Default::default()
+    };
+    let (_, stats_with_base) =
+        rt.block_on(composefs_ostree::pull(&repo, ostree_repo, "commit-b", opts))?;
 
     // Pull commit B without base into a fresh repo
     let composefs_dir2 = TempDir::new()?;
     let repo2 = create_test_repository(&composefs_dir2)?;
-    let (_, stats_without_base) = rt.block_on(composefs_ostree::pull_local(
+    let ostree_repo =
+        composefs_ostree::LocalRepo::open_path(&repo2, rustix::fs::CWD, &ostree_repo_path)?;
+    let (_, stats_without_base) = rt.block_on(composefs_ostree::pull(
         &repo2,
-        &ostree_repo_path,
+        ostree_repo,
         "commit-b",
-        None,
+        Default::default(),
     ))?;
 
     assert!(

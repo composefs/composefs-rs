@@ -47,11 +47,11 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(any(feature = "oci", feature = "ostree"))]
 use comfy_table::{Table, presets::UTF8_FULL};
-#[cfg(any(feature = "oci", feature = "http"))]
+#[cfg(any(feature = "oci", feature = "http", feature = "ostree"))]
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rustix::fs::{CWD, Mode, OFlags};
 
-#[cfg(any(feature = "oci", feature = "http"))]
+#[cfg(any(feature = "oci", feature = "http", feature = "ostree"))]
 use composefs::progress::{
     ComponentId, ProgressEvent, ProgressReporter, ProgressUnit, SharedReporter,
 };
@@ -81,13 +81,13 @@ use composefs::{
 /// Renders per-component progress bars via [`MultiProgress`].  When a component
 /// completes or is skipped the bar is removed; human-readable messages are
 /// printed above the bar group via [`MultiProgress::println`].
-#[cfg(any(feature = "oci", feature = "http"))]
+#[cfg(any(feature = "oci", feature = "http", feature = "ostree"))]
 struct IndicatifReporter {
     multi: MultiProgress,
     bars: Mutex<HashMap<ComponentId, ProgressBar>>,
 }
 
-#[cfg(any(feature = "oci", feature = "http"))]
+#[cfg(any(feature = "oci", feature = "http", feature = "ostree"))]
 impl IndicatifReporter {
     fn new() -> Self {
         IndicatifReporter {
@@ -102,14 +102,14 @@ impl IndicatifReporter {
     }
 }
 
-#[cfg(any(feature = "oci", feature = "http"))]
+#[cfg(any(feature = "oci", feature = "http", feature = "ostree"))]
 impl std::fmt::Debug for IndicatifReporter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IndicatifReporter").finish_non_exhaustive()
     }
 }
 
-#[cfg(any(feature = "oci", feature = "http"))]
+#[cfg(any(feature = "oci", feature = "http", feature = "ostree"))]
 impl ProgressReporter for IndicatifReporter {
     fn report(&self, event: ProgressEvent) {
         match event {
@@ -1687,14 +1687,15 @@ where
                 ref ostree_ref,
                 base_name,
             } => {
-                eprintln!("Fetching {ostree_ref}");
-                let (verity, stats) = composefs_ostree::pull_local(
-                    &repo,
-                    ostree_repo_path,
-                    ostree_ref,
-                    base_name.as_deref(),
-                )
-                .await?;
+                let ostree_repo =
+                    composefs_ostree::LocalRepo::open_path(&repo, CWD, ostree_repo_path)?;
+                let reporter: SharedReporter = IndicatifReporter::new().into_shared();
+                let opts = composefs_ostree::PullOptions {
+                    base_reference: base_name.as_deref(),
+                    progress: Some(reporter),
+                };
+                let (verity, stats) =
+                    composefs_ostree::pull(&repo, ostree_repo, ostree_ref, opts).await?;
 
                 let image_id = composefs_ostree::get_image_ref(&repo, &stats.commit_id)?;
                 println!("commit  {}", stats.commit_id);
@@ -1713,14 +1714,14 @@ where
                 ref ostree_ref,
                 base_name,
             } => {
-                eprintln!("Fetching {ostree_ref}");
-                let (verity, stats) = composefs_ostree::pull(
-                    &repo,
-                    ostree_repo_url,
-                    ostree_ref,
-                    base_name.as_deref(),
-                )
-                .await?;
+                let ostree_repo = composefs_ostree::RemoteRepo::new(&repo, ostree_repo_url)?;
+                let reporter: SharedReporter = IndicatifReporter::new().into_shared();
+                let opts = composefs_ostree::PullOptions {
+                    base_reference: base_name.as_deref(),
+                    progress: Some(reporter),
+                };
+                let (verity, stats) =
+                    composefs_ostree::pull(&repo, ostree_repo, ostree_ref, opts).await?;
 
                 let image_id = composefs_ostree::get_image_ref(&repo, &stats.commit_id)?;
                 println!("commit  {}", stats.commit_id);
