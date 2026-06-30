@@ -11,6 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use gvariant::aligned_bytes::{AlignedBuf, TryAsAligned};
 use gvariant::{Marker, Structure, gv};
 use rustix::fs::{Mode, OFlags, openat, seek};
@@ -27,6 +29,35 @@ use crate::ostree::{
 use crate::pull::PullStats;
 
 const OBJTYPE_CSUM_LEN: usize = 33; // 1 byte type + 32 bytes SHA-256
+
+/// Encode a SHA-256 digest to ostree's filesystem-safe base64.
+///
+/// Standard base64 with `/` replaced by `_` and trailing `=` stripped.
+pub(crate) fn checksum_to_b64(csum: &Sha256Digest) -> String {
+    STANDARD_NO_PAD.encode(csum).replace('/', "_")
+}
+
+/// Build the relative delta path for fetching from a remote repo.
+///
+/// Returns `"deltas/{prefix}/{rest}/superblock"` or
+/// `"deltas/{from_prefix}/{from_rest}-{to_prefix}{to_rest}/superblock"`.
+pub(crate) fn delta_path(from: Option<&Sha256Digest>, to: &Sha256Digest, target: &str) -> String {
+    let to_b64 = checksum_to_b64(to);
+
+    if let Some(from) = from {
+        let from_b64 = checksum_to_b64(from);
+        format!(
+            "deltas/{}/{}-{}{}/{}",
+            &from_b64[..2],
+            &from_b64[2..],
+            &to_b64[..2],
+            &to_b64[2..],
+            target
+        )
+    } else {
+        format!("deltas/{}/{}/{}", &to_b64[..2], &to_b64[2..], target)
+    }
+}
 
 // Delta opcodes
 const OP_OPEN_SPLICE_AND_CLOSE: u8 = b'S';

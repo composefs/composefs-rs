@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result, bail};
 use rustix::fs::{AtFlags, Dir, OFlags, readlinkat, unlinkat};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use composefs::{
@@ -21,7 +22,7 @@ use composefs::{
     progress::{NullReporter, ProgressEvent, SharedReporter},
     repository::Repository,
     tree::FileSystem,
-    util::parse_sha256,
+    util::{Sha256Digest, parse_sha256},
 };
 
 /// Information about a stored ostree commit.
@@ -42,8 +43,8 @@ mod pull;
 pub mod repo;
 
 use crate::commit::{CommitReader, CommitWriter};
-use crate::pull::PullOperation;
 pub use crate::delta::apply_delta_offline;
+use crate::pull::PullOperation;
 pub use crate::pull::PullStats;
 pub use crate::repo::{LocalRepo, OstreeRepo, RemoteRepo};
 
@@ -110,6 +111,15 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         let checksum = ostree_repo.resolve_ref(ostree_ref).await?;
         (checksum, Some(ostree_ref_path(ostree_ref)))
     };
+
+    // Try delta pull first
+    if let Some((verity, stats)) = ostree_repo.try_pull_delta(repo, &commit_checksum).await? {
+        reporter.report(ProgressEvent::Message("Using static delta".into()));
+        if let Some(ref_name) = reference {
+            repo.name_stream(&format!("ostree-commit-{}", stats.commit_id), &ref_name)?;
+        }
+        return Ok((verity, stats));
+    }
 
     let mut op = PullOperation::new(repo, ostree_repo, reporter);
     if let Some(base_name) = opts.base_reference {
@@ -251,6 +261,31 @@ pub fn list_commits<ObjectID: FsVerityHashValue>(
         .collect();
 
     Ok(commits)
+}
+
+/// Returns the set of ostree commit checksums stored in the repository.
+fn list_local_commit_ids<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+) -> Result<HashSet<Sha256Digest>> {
+    let dir_fd = rustix::fs::openat(
+        repo.repo_fd(),
+        "streams",
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        rustix::fs::Mode::empty(),
+    )?;
+    let mut ids = HashSet::new();
+    for item in Dir::read_from(&dir_fd)? {
+        let entry = item?;
+        let name = entry.file_name().to_bytes();
+        if let Ok(s) = std::str::from_utf8(name)
+            && let Some(hex) = s.strip_prefix("ostree-commit-")
+            && hex.len() == 64
+            && let Ok(checksum) = parse_sha256(hex)
+        {
+            ids.insert(checksum);
+        }
+    }
+    Ok(ids)
 }
 
 /// Ensures the EROFS image exists for a commit and stores a named ref to it

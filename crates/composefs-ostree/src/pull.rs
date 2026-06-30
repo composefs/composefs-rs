@@ -32,10 +32,12 @@ pub struct PullStats {
     pub metadata_fetched: usize,
     /// Number of file objects fetched.
     pub files_fetched: usize,
+    /// Number of delta parts applied (0 if no delta was used).
+    pub delta_parts_applied: usize,
 }
 
 const MAX_CONCURRENT_METADATA_FETCHES: usize = 32;
-const MAX_CONCURRENT_CONTENT_FETCHES: usize = 8;
+pub(crate) const MAX_CONCURRENT_CONTENT_FETCHES: usize = 8;
 
 struct Outstanding {
     id: Sha256Digest,
@@ -297,8 +299,6 @@ impl<ObjectID: FsVerityHashValue, RepoType: OstreeRepo<ObjectID> + 'static>
         self.stats.commit_id = commit_hex;
 
         self.enqueue_fetch(commit_id, ObjectType::Commit);
-
-        // TODO: Support deltas
 
         let metadata_id: ComponentId = "metadata".into();
         self.reporter.report(ProgressEvent::Started {

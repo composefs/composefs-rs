@@ -111,6 +111,19 @@ pub trait OstreeRepo<ObjectID: FsVerityHashValue>: Send + Sync {
         &self,
         checksum: &Sha256Digest,
     ) -> impl Future<Output = Result<(AlignedBuf, Option<ObjectID>)>> + Send;
+
+    /// Try to pull a commit using a static delta.
+    ///
+    /// Returns `Ok(Some(...))` if a delta was found and applied successfully,
+    /// `Ok(None)` if no usable delta is available. The default implementation
+    /// returns `None` (no delta support).
+    fn try_pull_delta(
+        &self,
+        _repo: &Arc<Repository<ObjectID>>,
+        _commit_checksum: &Sha256Digest,
+    ) -> impl Future<Output = Result<Option<(ObjectID, crate::pull::PullStats)>>> + Send {
+        async { Ok(None) }
+    }
 }
 
 const OSTREE_SUMMARY_CONTENT_TYPE: u64 = u64::from_le_bytes(*b"osummary");
@@ -178,6 +191,52 @@ impl SummaryCache {
                 Ok((name.to_str().to_string(), checksum))
             })
             .collect()
+    }
+
+    /// Find available static deltas targeting the given commit.
+    ///
+    /// Returns `(from_checksum, to_checksum)` pairs. `from_checksum` is
+    /// `None` for scratch (from-nothing) deltas.
+    fn find_deltas(&self, to_checksum: &Sha256Digest) -> Vec<(Option<Sha256Digest>, Sha256Digest)> {
+        use gvariant::{Marker, Structure, gv};
+
+        let Ok(aligned) = self.data.try_as_aligned() else {
+            return vec![];
+        };
+        let summary = gv!("(a(s(taya{sv}))a{sv})").cast(aligned);
+        let (_refs_array, metadata) = summary.to_tuple();
+
+        let to_hex = hex::encode(to_checksum);
+        let mut deltas = vec![];
+        for entry in metadata.iter() {
+            let (key, value) = entry.to_tuple();
+            if key.to_str() != "ostree.static-deltas" {
+                continue;
+            }
+            if let Some(delta_dict) = value.get(gv!("a{sv}")) {
+                for delta_entry in delta_dict.iter() {
+                    let (name, _) = delta_entry.to_tuple();
+                    if let Some(from) = parse_delta_name_to(name.to_str(), &to_hex) {
+                        deltas.push((from, *to_checksum));
+                    }
+                }
+            }
+            break;
+        }
+        deltas
+    }
+}
+
+/// Parse a delta name from `ostree.static-deltas` and check if it
+/// targets `to_hex`. Returns `Some(from)` on match, where `from` is
+/// `None` for scratch deltas.
+fn parse_delta_name_to(name: &str, to_hex: &str) -> Option<Option<Sha256Digest>> {
+    if let Some(from_hex) = name.strip_suffix(&format!("-{to_hex}")) {
+        parse_sha256(from_hex).ok().map(Some)
+    } else if name == to_hex {
+        Some(None)
+    } else {
+        None
     }
 }
 
@@ -383,6 +442,138 @@ impl<ObjectID: FsVerityHashValue> RemoteRepo<ObjectID> {
             .pop_if_empty()
             .extend(segments);
         url
+    }
+
+    fn url_for_path(&self, path: &str) -> Url {
+        let segments: Vec<&str> = path.split('/').collect();
+        self.url_for(&segments)
+    }
+
+    /// Find available deltas for the target commit.
+    ///
+    /// Checks both the summary metadata and per-commit delta indexes.
+    pub async fn find_deltas(
+        &self,
+        to_checksum: &Sha256Digest,
+    ) -> Result<Vec<(Option<Sha256Digest>, Sha256Digest)>> {
+        // Try summary metadata first
+        if let Some(cache) = self.load_summary().await? {
+            let deltas = cache.find_deltas(to_checksum);
+            if !deltas.is_empty() {
+                return Ok(deltas);
+            }
+        }
+        // Fall back to per-commit delta index
+        self.fetch_delta_index(to_checksum).await
+    }
+
+    /// Fetch a delta superblock from the remote repository.
+    ///
+    /// Returns `None` if the delta is not found (404).
+    pub async fn fetch_delta_superblock(
+        &self,
+        from: Option<&Sha256Digest>,
+        to: &Sha256Digest,
+    ) -> Result<Option<Vec<u8>>> {
+        let path = crate::delta::delta_path(from, to, "superblock");
+        let url = self.url_for_path(&path);
+        let response = self.client.get(url).send().await?;
+
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        response.error_for_status_ref()?;
+        Ok(Some(response.bytes().await?.to_vec()))
+    }
+
+    /// Fetch the delta index for a target commit, if available.
+    ///
+    /// Delta indexes are at `delta-indexes/{b64[0:2]}/{b64[2:]}.index`
+    /// and contain an `a{sv}` dict with `ostree.static-deltas`.
+    async fn fetch_delta_index(
+        &self,
+        to: &Sha256Digest,
+    ) -> Result<Vec<(Option<Sha256Digest>, Sha256Digest)>> {
+        let to_b64 = crate::delta::checksum_to_b64(to);
+        let path = format!("delta-indexes/{}/{}.index", &to_b64[..2], &to_b64[2..]);
+        let url = self.url_for_path(&path);
+
+        let response = match self.client.get(url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return Ok(vec![]),
+        };
+
+        use gvariant::{Marker, Structure, gv};
+
+        let index_bytes = response.bytes().await?;
+        let aligned: AlignedBuf = index_bytes.to_vec().into();
+        let Ok(aligned) = aligned.try_as_aligned() else {
+            return Ok(vec![]);
+        };
+        let dict = gv!("a{sv}").cast(aligned);
+
+        let to_hex = hex::encode(to);
+        let mut deltas = vec![];
+        for entry in dict.iter() {
+            let (key, value) = entry.to_tuple();
+            if key.to_str() != "ostree.static-deltas" {
+                continue;
+            }
+            if let Some(delta_dict) = value.get(gv!("a{sv}")) {
+                for delta_entry in delta_dict.iter() {
+                    let (name, _) = delta_entry.to_tuple();
+                    if let Some(from) = parse_delta_name_to(name.to_str(), &to_hex) {
+                        deltas.push((from, *to));
+                    }
+                }
+            }
+            break;
+        }
+        Ok(deltas)
+    }
+
+    /// Fetch a delta part from the remote repository.
+    pub async fn fetch_delta_part(
+        &self,
+        from: Option<&Sha256Digest>,
+        to: &Sha256Digest,
+        part_index: usize,
+    ) -> Result<Vec<u8>> {
+        let path = crate::delta::delta_path(from, to, &part_index.to_string());
+        let url = self.url_for_path(&path);
+        let response = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("Fetching delta part {part_index} from {url}"))?;
+        response
+            .error_for_status_ref()
+            .with_context(|| format!("Fetching delta part {part_index} from {url}"))?;
+        Ok(response.bytes().await?.to_vec())
+    }
+
+    async fn fetch_or_read_part(
+        &self,
+        superblock: &crate::delta::DeltaSuperblock,
+        from: Option<&Sha256Digest>,
+        to: &Sha256Digest,
+        index: usize,
+        expected_checksum: &Sha256Digest,
+    ) -> Result<Vec<u8>> {
+        let raw = match superblock.read_inline_part(index)? {
+            Some(data) => data,
+            None => self.fetch_delta_part(from, to, index).await?,
+        };
+        let actual = sha2::Sha256::digest(&raw);
+        if *actual != *expected_checksum {
+            bail!(
+                "delta part {index} checksum mismatch: expected {}, got {}",
+                hex::encode(expected_checksum),
+                hex::encode(actual)
+            );
+        }
+        Ok(raw)
     }
 
     async fn load_summary(&self) -> Result<Option<&SummaryCache>> {
@@ -635,6 +826,144 @@ impl<ObjectID: FsVerityHashValue> OstreeRepo<ObjectID> for RemoteRepo<ObjectID> 
         })
         .await
         .context("spawn_blocking failed")?
+    }
+
+    async fn try_pull_delta(
+        &self,
+        repo: &Arc<Repository<ObjectID>>,
+        commit_checksum: &Sha256Digest,
+    ) -> Result<Option<(ObjectID, crate::pull::PullStats)>> {
+        let deltas = self.find_deltas(commit_checksum).await?;
+        if deltas.is_empty() {
+            return Ok(None);
+        }
+
+        let local_commits = crate::list_local_commit_ids(repo)?;
+
+        // Pick the best delta: prefer differential (from a local commit) over scratch
+        let chosen = deltas
+            .iter()
+            .filter(|(from, _)| from.as_ref().is_none_or(|f| local_commits.contains(f)))
+            .min_by_key(|(from, _)| if from.is_some() { 0 } else { 1 });
+
+        let (from, to) = match chosen {
+            Some(delta) => delta,
+            None => return Ok(None),
+        };
+
+        let superblock_data = match self.fetch_delta_superblock(from.as_ref(), to).await? {
+            Some(data) => data,
+            None => return Ok(None),
+        };
+
+        let superblock = crate::delta::DeltaSuperblock::from_data(superblock_data)?;
+        let part_headers = superblock.part_headers()?;
+
+        let mut base = if let Some(from_csum) = from {
+            let from_stream = format!("ostree-commit-{}", hex::encode(from_csum));
+            Some(crate::commit::CommitReader::<ObjectID>::load(
+                repo,
+                &from_stream,
+            )?)
+        } else {
+            None
+        };
+
+        let mut writer = crate::commit::CommitWriter::<ObjectID>::new();
+        let commit_hex = hex::encode(to);
+        let mut stats = crate::pull::PullStats {
+            commit_id: commit_hex.clone(),
+            ..Default::default()
+        };
+
+        // Pipeline: apply part N in spawn_blocking while fetching
+        // part N+1 on the async runtime via tokio::join!.
+        let mut next_raw = if !part_headers.is_empty() {
+            Some(
+                self.fetch_or_read_part(
+                    &superblock,
+                    from.as_ref(),
+                    to,
+                    0,
+                    &part_headers[0].checksum,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
+        for (i, header) in part_headers.iter().enumerate() {
+            let raw = next_raw.take().unwrap()?;
+
+            // Kick off fetching the next part, then apply the current
+            // one in a blocking task. tokio::join! runs both concurrently.
+            let apply = {
+                let objects = header.objects.clone();
+                let repo_clone = repo.clone();
+                tokio::task::spawn_blocking(move || {
+                    let decompressed = crate::delta::decompress_part(&raw)?;
+                    crate::delta::execute_delta_part(
+                        &repo_clone,
+                        &mut writer,
+                        base.as_ref(),
+                        &decompressed,
+                        &objects,
+                    )?;
+                    Ok::<_, anyhow::Error>((writer, base))
+                })
+            };
+
+            let fetch = async {
+                if let Some(next) = part_headers.get(i + 1) {
+                    self.fetch_or_read_part(&superblock, from.as_ref(), to, i + 1, &next.checksum)
+                        .await
+                } else {
+                    Ok(vec![])
+                }
+            };
+
+            let (apply_result, fetch_result) = tokio::join!(apply, fetch);
+            (writer, base) = apply_result.context("delta apply task failed")??;
+            next_raw = Some(fetch_result);
+
+            stats.delta_parts_applied += 1;
+            for (obj_type, _) in &header.objects {
+                if obj_type.is_meta() {
+                    stats.metadata_fetched += 1;
+                } else {
+                    stats.files_fetched += 1;
+                }
+            }
+        }
+
+        // Fetch fallback objects using the existing trait methods
+        for fb in &superblock.fallbacks()? {
+            if fb.obj_type == ObjectType::File {
+                let (file_header, obj_id) = self.fetch_file(&fb.checksum).await?;
+                writer.insert(&fb.checksum, obj_id.as_ref(), &file_header);
+                stats.files_fetched += 1;
+            } else {
+                let data = self.fetch_object(&fb.checksum, fb.obj_type).await?;
+                writer.insert(&fb.checksum, None, &data);
+                stats.metadata_fetched += 1;
+            }
+        }
+
+        let commit_data = superblock.commit_data()?;
+        writer.insert(to, None, &commit_data);
+        writer.set_commit_id(to);
+        stats.metadata_fetched += 1;
+
+        if let Some(ref base) = base {
+            crate::delta::inherit_base_objects(&mut writer, base, &commit_data)?;
+        }
+
+        let content_id = format!("ostree-commit-{commit_hex}");
+        let verity = writer.serialize(repo, &content_id, None, None)?;
+        crate::ensure_ostree_erofs(repo, &stats.commit_id)?;
+
+        Ok(Some((verity, stats)))
     }
 }
 
