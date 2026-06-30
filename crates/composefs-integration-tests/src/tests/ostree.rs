@@ -15,30 +15,110 @@ use composefs_oci::composefs::repository::Repository;
 use crate::integration_test;
 use composefs_integration_tests::create_test_repository;
 
-fn create_ostree_test_content(parent: &Path) -> Result<std::path::PathBuf> {
+/// Create test content for an ostree commit.
+///
+/// `version` controls what content is generated, allowing two versions
+/// to differ in ways that exercise different delta code paths:
+/// - Files unchanged between versions (inherited from base)
+/// - Small files added/removed (OPEN_SPLICE_AND_CLOSE)
+/// - Large files with minor edits (BSPATCH / rollsum)
+/// - New large files (fallback candidates)
+/// - Symlinks with changed targets
+/// - Nested directory changes (new dirtree metadata)
+fn create_ostree_test_content(parent: &Path, version: u32) -> Result<std::path::PathBuf> {
     let root = parent.join("content");
+    if root.exists() {
+        std::fs::remove_dir_all(&root)?;
+    }
+    std::fs::create_dir_all(root.join("bin"))?;
     std::fs::create_dir_all(root.join("subdir"))?;
+    std::fs::create_dir_all(root.join("lib"))?;
+    std::fs::create_dir_all(root.join("share/locale"))?;
+    std::fs::create_dir_all(root.join("share/icons"))?;
 
-    // Small file (will be inlined by ostree)
-    std::fs::write(root.join("small.txt"), "hello")?;
-    // Large file (external object)
-    std::fs::write(root.join("large.bin"), vec![0xABu8; 128 * 1024])?;
-    // Duplicate of large file (shared object)
-    std::fs::write(root.join("large-dup.bin"), vec![0xABu8; 128 * 1024])?;
-    // Symlink
-    std::os::unix::fs::symlink("small.txt", root.join("link.txt"))?;
-    // Nested file
-    std::fs::write(root.join("subdir/nested.txt"), "nested content")?;
+    // --- Files unchanged between versions ---
 
-    // File with xattr
-    let xattr_file = root.join("with-xattr.txt");
-    std::fs::write(&xattr_file, "has xattr")?;
+    // Small file (inlined by ostree)
+    std::fs::write(root.join("README"), "This is a test application.\n")?;
+    // Medium file
+    std::fs::write(
+        root.join("share/locale/messages.po"),
+        "msgid \"hello\"\nmsgstr \"world\"\n".repeat(50),
+    )?;
+    // Large binary (external object, shared across versions)
+    let mut shared_data = vec![0u8; 64 * 1024];
+    for (i, b) in shared_data.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    std::fs::write(root.join("lib/libshared.so"), &shared_data)?;
+    // Duplicate (tests deduplication)
+    std::fs::write(root.join("lib/libshared.so.1"), &shared_data)?;
+
+    // File with xattr (unchanged across versions)
+    let xattr_file = root.join("share/icons/app.png");
+    std::fs::write(
+        &xattr_file,
+        vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+    )?;
     rustix::fs::setxattr(
         &xattr_file,
         c"user.testxattr",
         b"testvalue",
         rustix::fs::XattrFlags::CREATE,
     )?;
+
+    // Symlink (unchanged across versions)
+    std::os::unix::fs::symlink("libshared.so.1", root.join("lib/libcompat.so"))?;
+
+    // --- Files that vary by version ---
+
+    // Small config file that changes between versions
+    std::fs::write(
+        root.join("config.ini"),
+        format!("[app]\nversion={version}\nname=testapp\n"),
+    )?;
+
+    // Large binary with a minor edit (triggers bspatch in delta)
+    let mut app_binary = vec![0u8; 256 * 1024];
+    for (i, b) in app_binary.iter_mut().enumerate() {
+        *b = ((i * 7 + 13) % 256) as u8;
+    }
+    // Embed version near the start so most of the file is unchanged
+    let version_bytes = version.to_le_bytes();
+    app_binary[100..104].copy_from_slice(&version_bytes);
+    app_binary[200..204].copy_from_slice(&version_bytes);
+    std::fs::write(root.join("bin/app"), &app_binary)?;
+
+    // Another large file with version-dependent content
+    let mut data_file = vec![0u8; 128 * 1024];
+    for (i, b) in data_file.iter_mut().enumerate() {
+        *b = ((i * 3 + version as usize) % 256) as u8;
+    }
+    std::fs::write(root.join("share/data.bin"), &data_file)?;
+
+    // Symlink that changes target between versions
+    std::os::unix::fs::symlink(
+        format!("libshared.so.{version}"),
+        root.join("lib/libcurrent.so"),
+    )?;
+
+    // Nested file that changes
+    std::fs::write(
+        root.join("subdir/nested.txt"),
+        format!("nested content version {version}\n"),
+    )?;
+
+    // Version-specific files (v2 adds extra files, simulating a real update)
+    if version >= 2 {
+        std::fs::create_dir_all(root.join("share/new-feature"))?;
+        std::fs::write(
+            root.join("share/new-feature/data.json"),
+            r#"{"feature": "new", "enabled": true}"#,
+        )?;
+        // A new large file (potential fallback in delta)
+        let new_large = vec![0xCDu8; 192 * 1024];
+        std::fs::write(root.join("share/new-feature/resource.bin"), &new_large)?;
+    }
 
     Ok(root)
 }
@@ -80,7 +160,7 @@ fn pull_and_get_image_id(
 fn test_ostree_pull_local_all_modes() -> Result<()> {
     let sh = Shell::new()?;
     let tmpdir = TempDir::new()?;
-    let content = create_ostree_test_content(tmpdir.path())?;
+    let content = create_ostree_test_content(tmpdir.path(), 1)?;
 
     // Commit to archive-z2 first — some modes can't be committed to directly
     let archive_repo = tmpdir.path().join("ostree-archive-z2");
@@ -154,7 +234,7 @@ integration_test!(test_ostree_pull_local_all_modes);
 fn test_ostree_pull_remote_archive() -> Result<()> {
     let sh = Shell::new()?;
     let tmpdir = TempDir::new()?;
-    let content = create_ostree_test_content(tmpdir.path())?;
+    let content = create_ostree_test_content(tmpdir.path(), 1)?;
 
     // Create archive-z2 repo and commit
     let ostree_repo_path = tmpdir.path().join("ostree-archive");
@@ -166,65 +246,38 @@ fn test_ostree_pull_remote_archive() -> Result<()> {
     let repo_local = create_test_repository(&composefs_dir_local)?;
     let (local_image_id, _) = pull_and_get_image_id(&repo_local, &ostree_repo_path, "test", None)?;
 
-    // Find a free port and start HTTP server
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    let port = listener.local_addr()?.port();
-    drop(listener);
+    // Pull via HTTP and compare
+    let server = HttpServer::start(&ostree_repo_path)?;
+    let composefs_dir_remote = TempDir::new()?;
+    let repo_remote = create_test_repository(&composefs_dir_remote)?;
 
-    let repo_path_str = ostree_repo_path.to_str().unwrap().to_string();
-    let mut server = Command::new("python3")
-        .args([
-            "-m",
-            "http.server",
-            &port.to_string(),
-            "--directory",
-            &repo_path_str,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let ostree_repo = composefs_ostree::RemoteRepo::new(&repo_remote, &server.url())?;
+    let (_obj_id, stats) = rt.block_on(composefs_ostree::pull(
+        &repo_remote,
+        ostree_repo,
+        "test",
+        Default::default(),
+    ))?;
 
-    // Give the server a moment to start
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(stats.metadata_fetched > 0);
+    assert!(stats.files_fetched > 0);
 
-    let result = (|| -> Result<()> {
-        let composefs_dir_remote = TempDir::new()?;
-        let repo_remote = create_test_repository(&composefs_dir_remote)?;
+    let remote_image_id = composefs_ostree::get_image_ref(&repo_remote, "test")?;
 
-        let rt = tokio::runtime::Runtime::new()?;
-        let url = format!("http://127.0.0.1:{port}");
-        let ostree_repo = composefs_ostree::RemoteRepo::new(&repo_remote, &url)?;
-        let (_obj_id, stats) = rt.block_on(composefs_ostree::pull(
-            &repo_remote,
-            ostree_repo,
-            "test",
-            Default::default(),
-        ))?;
+    assert_eq!(
+        local_image_id, remote_image_id,
+        "remote pull image ID differs from local pull"
+    );
 
-        assert!(stats.metadata_fetched > 0);
-        assert!(stats.files_fetched > 0);
-
-        let remote_image_id = composefs_ostree::get_image_ref(&repo_remote, "test")?;
-
-        assert_eq!(
-            local_image_id, remote_image_id,
-            "remote pull image ID differs from local pull"
-        );
-
-        Ok(())
-    })();
-
-    server.kill().ok();
-    server.wait().ok();
-
-    result
+    Ok(())
 }
 integration_test!(test_ostree_pull_remote_archive);
 
 fn test_ostree_pull_with_base() -> Result<()> {
     let sh = Shell::new()?;
     let tmpdir = TempDir::new()?;
-    let content = create_ostree_test_content(tmpdir.path())?;
+    let content = create_ostree_test_content(tmpdir.path(), 1)?;
 
     // Create archive-z2 repo with initial commit on branch "commit-a"
     let ostree_repo_path = tmpdir.path().join("ostree-repo");
@@ -245,9 +298,9 @@ fn test_ostree_pull_with_base() -> Result<()> {
         Default::default(),
     ))?;
 
-    // Modify content slightly and make commit B on branch "commit-b"
-    std::fs::write(content.join("new-file.txt"), "new content for commit B")?;
-    commit_to_ostree(&sh, &ostree_repo_path, "commit-b", &content)?;
+    // Create version 2 content and commit as branch B
+    let content_v2 = create_ostree_test_content(tmpdir.path(), 2)?;
+    commit_to_ostree(&sh, &ostree_repo_path, "commit-b", &content_v2)?;
 
     // Pull commit B with base
     let ostree_repo =
@@ -290,3 +343,226 @@ fn test_ostree_pull_with_base() -> Result<()> {
     Ok(())
 }
 integration_test!(test_ostree_pull_with_base);
+
+struct HttpServer {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl HttpServer {
+    fn start(directory: &Path) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+
+        let child = Command::new("python3")
+            .args([
+                "-m",
+                "http.server",
+                &port.to_string(),
+                "--directory",
+                directory.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        Ok(HttpServer { child, port })
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        self.child.kill().ok();
+        self.child.wait().ok();
+    }
+}
+
+fn generate_delta(sh: &Shell, repo: &Path, from: Option<&str>, to: &str) -> Result<()> {
+    let repo = repo.to_str().unwrap();
+    if let Some(from) = from {
+        cmd!(
+            sh,
+            "ostree static-delta generate --repo={repo} --from={from} --to={to}"
+        )
+        .run()?;
+    } else {
+        cmd!(
+            sh,
+            "ostree static-delta generate --repo={repo} --empty --to={to}"
+        )
+        .run()?;
+    }
+    Ok(())
+}
+
+fn update_summary(sh: &Shell, repo: &Path) -> Result<()> {
+    let repo = repo.to_str().unwrap();
+    cmd!(sh, "ostree summary --repo={repo} --update").run()?;
+    Ok(())
+}
+
+fn test_ostree_pull_remote_scratch_delta() -> Result<()> {
+    let sh = Shell::new()?;
+    let tmpdir = TempDir::new()?;
+    let content = create_ostree_test_content(tmpdir.path(), 1)?;
+
+    let ostree_repo_path = tmpdir.path().join("ostree-archive");
+    init_ostree_repo(&sh, &ostree_repo_path, "archive-z2")?;
+    let commit_id = commit_to_ostree(&sh, &ostree_repo_path, "test", &content)?;
+
+    generate_delta(&sh, &ostree_repo_path, None, &commit_id)?;
+    update_summary(&sh, &ostree_repo_path)?;
+
+    // Pull via direct object fetch for reference
+    let composefs_dir_ref = TempDir::new()?;
+    let repo_ref = create_test_repository(&composefs_dir_ref)?;
+    let (ref_image_id, _) = pull_and_get_image_id(&repo_ref, &ostree_repo_path, "test", None)?;
+
+    // Pull via HTTP with delta
+    let server = HttpServer::start(&ostree_repo_path)?;
+    let composefs_dir = TempDir::new()?;
+    let repo = create_test_repository(&composefs_dir)?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let ostree_repo = composefs_ostree::RemoteRepo::new(&repo, &server.url())?;
+    let (_, stats) = rt.block_on(composefs_ostree::pull(
+        &repo,
+        ostree_repo,
+        "test",
+        Default::default(),
+    ))?;
+
+    assert!(
+        stats.delta_parts_applied > 0,
+        "expected delta to be used, but delta_parts_applied=0"
+    );
+
+    let delta_image_id = composefs_ostree::get_image_ref(&repo, "test")?;
+    assert_eq!(
+        ref_image_id, delta_image_id,
+        "scratch delta image ID differs from local pull"
+    );
+
+    Ok(())
+}
+integration_test!(test_ostree_pull_remote_scratch_delta);
+
+fn test_ostree_pull_remote_diff_delta() -> Result<()> {
+    let sh = Shell::new()?;
+    let tmpdir = TempDir::new()?;
+
+    let ostree_repo_path = tmpdir.path().join("ostree-archive");
+    init_ostree_repo(&sh, &ostree_repo_path, "archive-z2")?;
+
+    let content_v1 = create_ostree_test_content(tmpdir.path(), 1)?;
+    let commit_a = commit_to_ostree(&sh, &ostree_repo_path, "branch-a", &content_v1)?;
+
+    let content_v2 = create_ostree_test_content(tmpdir.path(), 2)?;
+    let commit_b = commit_to_ostree(&sh, &ostree_repo_path, "branch-b", &content_v2)?;
+
+    generate_delta(&sh, &ostree_repo_path, Some(&commit_a), &commit_b)?;
+    update_summary(&sh, &ostree_repo_path)?;
+
+    // Pull commit B via direct local pull for reference image ID
+    let composefs_dir_ref = TempDir::new()?;
+    let repo_ref = create_test_repository(&composefs_dir_ref)?;
+    let (ref_image_id, _) = pull_and_get_image_id(&repo_ref, &ostree_repo_path, "branch-b", None)?;
+
+    // Pull over HTTP: first commit A (no delta), then commit B (should use diff delta)
+    let server = HttpServer::start(&ostree_repo_path)?;
+    let composefs_dir = TempDir::new()?;
+    let repo = create_test_repository(&composefs_dir)?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let ostree_repo = composefs_ostree::RemoteRepo::new(&repo, &server.url())?;
+    rt.block_on(composefs_ostree::pull(
+        &repo,
+        ostree_repo,
+        "branch-a",
+        Default::default(),
+    ))?;
+
+    let ostree_repo = composefs_ostree::RemoteRepo::new(&repo, &server.url())?;
+    let (_, stats_b) = rt.block_on(composefs_ostree::pull(
+        &repo,
+        ostree_repo,
+        "branch-b",
+        Default::default(),
+    ))?;
+
+    assert!(
+        stats_b.delta_parts_applied > 0,
+        "expected differential delta to be used, but delta_parts_applied=0"
+    );
+
+    let delta_image_id = composefs_ostree::get_image_ref(&repo, "branch-b")?;
+    assert_eq!(
+        ref_image_id, delta_image_id,
+        "differential delta image ID differs from local pull"
+    );
+
+    Ok(())
+}
+integration_test!(test_ostree_pull_remote_diff_delta);
+
+fn test_ostree_apply_delta_offline() -> Result<()> {
+    let sh = Shell::new()?;
+    let tmpdir = TempDir::new()?;
+
+    let ostree_repo_path = tmpdir.path().join("ostree-archive");
+    init_ostree_repo(&sh, &ostree_repo_path, "archive-z2")?;
+
+    let content_v1 = create_ostree_test_content(tmpdir.path(), 1)?;
+    let commit_a = commit_to_ostree(&sh, &ostree_repo_path, "branch-a", &content_v1)?;
+
+    let content_v2 = create_ostree_test_content(tmpdir.path(), 2)?;
+    let commit_b = commit_to_ostree(&sh, &ostree_repo_path, "branch-b", &content_v2)?;
+
+    // Generate an inline delta file
+    let delta_file = tmpdir.path().join("delta.bin");
+    let repo_str = ostree_repo_path.to_str().unwrap();
+    let delta_str = delta_file.to_str().unwrap();
+    cmd!(
+        sh,
+        "ostree static-delta generate --repo={repo_str} --from={commit_a} --to={commit_b} --inline --filename={delta_str}"
+    )
+    .run()?;
+
+    // Pull commit A, then apply delta
+    let composefs_dir = TempDir::new()?;
+    let repo = create_test_repository(&composefs_dir)?;
+
+    let ostree_repo =
+        composefs_ostree::LocalRepo::open_path(&repo, rustix::fs::CWD, &ostree_repo_path)?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(composefs_ostree::pull(
+        &repo,
+        ostree_repo,
+        "branch-a",
+        Default::default(),
+    ))?;
+
+    let (_, delta_stats) = composefs_ostree::apply_delta_offline(&repo, &delta_file)?;
+    assert!(delta_stats.metadata_fetched > 0);
+
+    // Pull commit B directly for reference
+    let composefs_dir_ref = TempDir::new()?;
+    let repo_ref = create_test_repository(&composefs_dir_ref)?;
+    let (ref_image_id, _) = pull_and_get_image_id(&repo_ref, &ostree_repo_path, "branch-b", None)?;
+
+    let delta_image_id = composefs_ostree::get_image_ref(&repo, &delta_stats.commit_id)?;
+    assert_eq!(
+        ref_image_id, delta_image_id,
+        "offline delta image ID differs from local pull"
+    );
+
+    Ok(())
+}
+integration_test!(test_ostree_apply_delta_offline);
