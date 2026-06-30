@@ -3,7 +3,7 @@
 //! This module implements the fs-verity Merkle tree algorithm in userspace,
 //! allowing computation of fs-verity digests without kernel support.
 
-use core::{cmp::min, mem::size_of};
+use core::mem::size_of;
 
 use sha2::Digest;
 
@@ -54,6 +54,8 @@ pub struct FsVerityHasher<H: FsVerityHashValue, const LG_BLKSZ: u8 = 12> {
     layers: Vec<FsVerityLayer<H, LG_BLKSZ>>,
     value: Option<H>,
     n_bytes: u64,
+    partial: Vec<u8>,
+    wrote_final_block: bool,
 }
 
 impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
@@ -62,15 +64,10 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
 
     /// Hash a complete buffer and return the fs-verity digest.
     pub fn hash(buffer: &[u8]) -> H {
+        use std::io::Write;
+
         let mut hasher = Self::new();
-
-        let mut start = 0;
-        while start < buffer.len() {
-            let end = min(start + Self::BLOCK_SIZE, buffer.len());
-            hasher.add_block(&buffer[start..end]);
-            start = end;
-        }
-
+        hasher.write_all(buffer).expect("infallible write");
         hasher.digest()
     }
 
@@ -80,14 +77,30 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
             layers: vec![],
             value: None,
             n_bytes: 0,
+            partial: Vec::with_capacity(Self::BLOCK_SIZE),
+            wrote_final_block: false,
         }
     }
 
-    /// Add a block of data to the hasher.
+    fn add_block_from_partial(&mut self) {
+        let block = std::mem::replace(&mut self.partial, Vec::with_capacity(Self::BLOCK_SIZE));
+        self.add_block(&block);
+    }
+
+    /// Add a complete block of data to the hasher.
     ///
-    /// For correct results, data should be provided in block-sized chunks (4KB)
-    /// except for the final chunk which may be smaller.
+    /// The data must be exactly `BLOCK_SIZE` bytes, except for the
+    /// final block which may be smaller. Prefer the [`std::io::Write`]
+    /// impl which handles buffering automatically.
     pub fn add_block(&mut self, data: &[u8]) {
+        assert!(
+            !self.wrote_final_block,
+            "cannot add data after a partial block"
+        );
+        if data.len() < Self::BLOCK_SIZE {
+            self.wrote_final_block = true;
+        }
+
         if let Some(value) = self.value.take() {
             // We had a complete value, but now we're adding new data.
             // This means that we need to add a new hash layer...
@@ -143,8 +156,11 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
 
     /// Finalize and return the fs-verity digest.
     ///
-    /// This consumes any remaining partial data and computes the final digest.
+    /// Flushes any buffered partial block and computes the final digest.
     pub fn digest(&mut self) -> H {
+        if !self.partial.is_empty() {
+            self.add_block_from_partial();
+        }
         /*
         let mut root_hash = [0u8; 64];
         let result = self.root_hash();
@@ -179,6 +195,27 @@ impl<H: FsVerityHashValue, const LG_BLKSZ: u8> FsVerityHasher<H, LG_BLKSZ> {
         context.update([0; 32]); /* salt */
         context.update([0; 144]); /* reserved */
         context.finalize().into()
+    }
+}
+
+impl<H: FsVerityHashValue, const LG_BLKSZ: u8> std::io::Write for FsVerityHasher<H, LG_BLKSZ> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let len = data.len();
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let space = Self::BLOCK_SIZE - self.partial.len();
+            let n = remaining.len().min(space);
+            self.partial.extend_from_slice(&remaining[..n]);
+            remaining = &remaining[n..];
+            if self.partial.len() == Self::BLOCK_SIZE {
+                self.add_block_from_partial();
+            }
+        }
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
