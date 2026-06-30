@@ -6,9 +6,13 @@
 //! shared objects.
 
 use anyhow::{Result, bail};
-use composefs::{fsverity::FsVerityHashValue, repository::Repository, util::Sha256Digest};
+use composefs::{
+    fsverity::FsVerityHashValue,
+    progress::{ComponentId, ProgressEvent, ProgressUnit, SharedReporter},
+    repository::Repository,
+    util::Sha256Digest,
+};
 use gvariant::aligned_bytes::AlignedBuf;
-use indicatif::ProgressBar;
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::{fmt, sync::Arc};
@@ -61,11 +65,11 @@ enum FetchResult<ObjectID: FsVerityHashValue> {
 }
 
 /// Drives a two-phase pull of an ostree commit into a composefs repository.
-#[derive(Debug)]
 pub(crate) struct PullOperation<ObjectID: FsVerityHashValue, RepoType: OstreeRepo<ObjectID>> {
     repo: Arc<Repository<ObjectID>>,
     writer: CommitWriter<ObjectID>,
     ostree_repo: Arc<RepoType>,
+    reporter: SharedReporter,
     base_commits: Vec<CommitReader<ObjectID>>,
     outstanding: VecDeque<Outstanding>,
     // All ids that were ever enqueued (including already fetched and currently being fetched)
@@ -76,11 +80,16 @@ pub(crate) struct PullOperation<ObjectID: FsVerityHashValue, RepoType: OstreeRep
 impl<ObjectID: FsVerityHashValue, RepoType: OstreeRepo<ObjectID> + 'static>
     PullOperation<ObjectID, RepoType>
 {
-    pub fn new(repo: &Arc<Repository<ObjectID>>, ostree_repo: RepoType) -> Self {
+    pub fn new(
+        repo: &Arc<Repository<ObjectID>>,
+        ostree_repo: RepoType,
+        reporter: SharedReporter,
+    ) -> Self {
         PullOperation {
             repo: repo.clone(),
             writer: CommitWriter::<ObjectID>::new(),
             ostree_repo: Arc::new(ostree_repo),
+            reporter,
             outstanding: VecDeque::new(),
             base_commits: vec![],
             fetched: HashSet::new(),
@@ -291,7 +300,12 @@ impl<ObjectID: FsVerityHashValue, RepoType: OstreeRepo<ObjectID> + 'static>
 
         // TODO: Support deltas
 
-        let metadata_bar = ProgressBar::new_spinner().with_message("Fetching metadata");
+        let metadata_id: ComponentId = "metadata".into();
+        self.reporter.report(ProgressEvent::Started {
+            id: metadata_id.clone(),
+            total: None,
+            unit: ProgressUnit::Items,
+        });
         let metadata_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_METADATA_FETCHES));
 
         // Phase 1: Fetch all metadata (commits, dirtrees, dirmetas) in parallel.
@@ -322,11 +336,15 @@ impl<ObjectID: FsVerityHashValue, RepoType: OstreeRepo<ObjectID> + 'static>
 
             match join_set.join_next().await {
                 Some(result) => {
-                    metadata_bar.tick();
                     let fetch = result??;
                     match fetch {
                         FetchResult::Metadata { id, obj_type, data } => {
                             self.stats.metadata_fetched += 1;
+                            self.reporter.report(ProgressEvent::Progress {
+                                id: metadata_id.clone(),
+                                fetched: self.stats.metadata_fetched as u64,
+                                total: None,
+                            });
                             self.process_metadata(&id, obj_type, data)?;
                         }
                         _ => unreachable!(),
@@ -336,7 +354,10 @@ impl<ObjectID: FsVerityHashValue, RepoType: OstreeRepo<ObjectID> + 'static>
             }
         }
 
-        metadata_bar.finish_and_clear();
+        self.reporter.report(ProgressEvent::Done {
+            id: metadata_id,
+            transferred: self.stats.metadata_fetched as u64,
+        });
 
         // Phase 2: Fetch all files in parallel. Files are leaf objects with
         // no dependencies on each other.
@@ -349,7 +370,13 @@ impl<ObjectID: FsVerityHashValue, RepoType: OstreeRepo<ObjectID> + 'static>
             return Ok((commit_id, stats));
         }
 
-        let files_bar = ProgressBar::new(files.len() as u64);
+        let files_total = files.len() as u64;
+        let files_id: ComponentId = "files".into();
+        self.reporter.report(ProgressEvent::Started {
+            id: files_id.clone(),
+            total: Some(files_total),
+            unit: ProgressUnit::Items,
+        });
         let content_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONTENT_FETCHES));
         let mut join_set: JoinSet<Result<FetchResult<ObjectID>>> = JoinSet::new();
 
@@ -377,13 +404,20 @@ impl<ObjectID: FsVerityHashValue, RepoType: OstreeRepo<ObjectID> + 'static>
                 } => {
                     self.stats.files_fetched += 1;
                     self.add_file(&id, obj_id.as_ref(), file_header);
-                    files_bar.inc(1);
+                    self.reporter.report(ProgressEvent::Progress {
+                        id: files_id.clone(),
+                        fetched: self.stats.files_fetched as u64,
+                        total: Some(files_total),
+                    });
                 }
                 _ => unreachable!(),
             }
         }
 
-        files_bar.finish();
+        self.reporter.report(ProgressEvent::Done {
+            id: files_id,
+            transferred: self.stats.files_fetched as u64,
+        });
 
         let commit_id = self
             .writer

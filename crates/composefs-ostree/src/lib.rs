@@ -4,19 +4,24 @@
 //! repository, where they can be mounted as composefs images and share storage
 //! (deduplication) with OCI or other image types.
 //!
-//! The main entry points are [`pull_local()`] and [`pull()`], which fetch an
-//! ostree commit (from a local path or HTTP URL respectively), store it as a
-//! splitstream, and produce an EROFS image that can be mounted.  Additional
-//! functions provide reference management ([`tag`]/[`untag`]), listing
-//! ([`list_commits`]), and inspection ([`inspect`]).
+//! The main entry point is [`pull()`], which fetches an ostree commit from an
+//! [`OstreeRepo`] implementation (either [`LocalRepo`] for on-disk repositories
+//! or [`RemoteRepo`] for HTTP), stores it as a splitstream, and produces an
+//! EROFS image that can be mounted.  Additional functions provide reference
+//! management ([`tag`]/[`untag`]), listing ([`list_commits`]), and inspection
+//! ([`inspect`]).
 //!
 
 use anyhow::{Context, Result, bail};
-use rustix::fs::{AtFlags, CWD, Dir, OFlags, readlinkat, unlinkat};
-use std::{path::Path, sync::Arc};
+use rustix::fs::{AtFlags, Dir, OFlags, readlinkat, unlinkat};
+use std::sync::Arc;
 
 use composefs::{
-    fsverity::FsVerityHashValue, repository::Repository, tree::FileSystem, util::parse_sha256,
+    fsverity::FsVerityHashValue,
+    progress::{NullReporter, ProgressEvent, SharedReporter},
+    repository::Repository,
+    tree::FileSystem,
+    util::parse_sha256,
 };
 
 /// Information about a stored ostree commit.
@@ -31,14 +36,43 @@ pub struct CommitInfo {
 mod commit;
 #[cfg(doc)]
 pub mod design;
-mod ostree;
+pub mod ostree;
 mod pull;
-mod repo;
+pub mod repo;
 
 use crate::commit::{CommitReader, CommitWriter};
 use crate::pull::PullOperation;
 pub use crate::pull::PullStats;
-use crate::repo::{LocalRepo, RemoteRepo};
+pub use crate::repo::{LocalRepo, OstreeRepo, RemoteRepo};
+
+/// Options for a [`pull`] operation.
+#[derive(Default)]
+pub struct PullOptions<'a> {
+    /// An existing ostree ref whose objects should be used as a base to avoid
+    /// re-fetching shared content.
+    pub base_reference: Option<&'a str>,
+
+    /// Progress reporter for this pull operation.
+    ///
+    /// When `None`, all progress events are silently discarded.
+    pub progress: Option<SharedReporter>,
+}
+
+impl std::fmt::Debug for PullOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PullOptions")
+            .field("base_reference", &self.base_reference)
+            .field(
+                "progress",
+                if self.progress.is_some() {
+                    &"Some(<ProgressReporter>)"
+                } else {
+                    &"None"
+                },
+            )
+            .finish()
+    }
+}
 
 const OSTREE_REF_PREFIX: &str = "ostree/";
 const IMAGE_REF_KEY: &str = "composefs.image";
@@ -50,49 +84,23 @@ fn ostree_ref_path(name: &str) -> String {
     )
 }
 
-/// Pull from a local ostree repo into the repository.
+/// Pull an ostree commit into the composefs repository.
 ///
+/// The `ostree_repo` can be any [`OstreeRepo`] implementation — typically a
+/// [`LocalRepo`] for on-disk repositories or a [`RemoteRepo`] for HTTP.
 /// Automatically creates the EROFS image and links it from the commit splitstream.
 /// `ostree_ref` can be either a ref name or a 64-character hex commit ID.
-pub async fn pull_local<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    ostree_repo_path: &Path,
-    ostree_ref: &str,
-    base_reference: Option<&str>,
-) -> Result<(ObjectID, PullStats)> {
-    let ostree_repo = LocalRepo::open_path(repo, CWD, ostree_repo_path)?;
-
-    let (commit_checksum, reference) = if is_commit_id(ostree_ref) {
-        (parse_sha256(ostree_ref)?, None)
-    } else {
-        let checksum = ostree_repo.read_ref(ostree_ref)?;
-        (checksum, Some(ostree_ref_path(ostree_ref)))
-    };
-
-    let mut op = PullOperation::<ObjectID, LocalRepo<ObjectID>>::new(repo, ostree_repo);
-    if let Some(base_name) = base_reference {
-        let base_ref = format!("refs/{}", ostree_ref_path(base_name));
-        op.add_base(&base_ref)?;
-    }
-
-    let (verity, stats) = op
-        .pull_commit(&commit_checksum, reference.as_deref())
-        .await?;
-    ensure_ostree_erofs(repo, &stats.commit_id)?;
-    Ok((verity, stats))
-}
-
-/// Pull from a remote ostree repo into the repository.
 ///
-/// Automatically creates the EROFS image and links it from the commit splitstream.
-/// `ostree_ref` can be either a ref name or a 64-character hex commit ID.
+/// See [`PullOptions`] for tunable knobs (base commit, progress reporting).
 pub async fn pull<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
-    ostree_repo_url: &str,
+    ostree_repo: impl OstreeRepo<ObjectID> + 'static,
     ostree_ref: &str,
-    base_reference: Option<&str>,
+    opts: PullOptions<'_>,
 ) -> Result<(ObjectID, PullStats)> {
-    let ostree_repo = RemoteRepo::new(repo, ostree_repo_url)?;
+    let reporter: SharedReporter = opts.progress.unwrap_or_else(|| Arc::new(NullReporter));
+
+    reporter.report(ProgressEvent::Message(format!("Fetching {ostree_ref}")));
 
     let (commit_checksum, reference) = if is_commit_id(ostree_ref) {
         (parse_sha256(ostree_ref)?, None)
@@ -101,8 +109,8 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         (checksum, Some(ostree_ref_path(ostree_ref)))
     };
 
-    let mut op = PullOperation::<ObjectID, RemoteRepo<ObjectID>>::new(repo, ostree_repo);
-    if let Some(base_name) = base_reference {
+    let mut op = PullOperation::new(repo, ostree_repo, reporter);
+    if let Some(base_name) = opts.base_reference {
         let base_ref = format!("refs/{}", ostree_ref_path(base_name));
         op.add_base(&base_ref)?;
     }
