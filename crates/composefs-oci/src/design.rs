@@ -62,9 +62,14 @@
 //! `container_t` that come from the build host, not from the target system's
 //! policy.
 //!
-//! To ensure reproducibility, `read_container_root()` filters xattrs to only
-//! include those in an allowlist.  Currently this is just `security.capability`,
-//! which represents actual file capabilities that should be preserved.
+//! To ensure reproducibility, `transform_for_oci()` filters xattrs to only
+//! include those in an allowlist. This filtering is applied uniformly to BOTH
+//! mounted filesystems (via `read_container_root()`) and OCI tar layers
+//! (via `create_filesystem()`), ensuring identical, consistent digests between
+//! both construction paths.
+//!
+//! Currently this allowlist is just `security.capability`, which represents
+//! actual file capabilities that should be preserved.
 //!
 //! SELinux labels are handled separately by `transform_for_boot()`:
 //!  - If the target filesystem contains a SELinux policy (in `/etc/selinux`),
