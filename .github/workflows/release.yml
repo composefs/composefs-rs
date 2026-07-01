@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
+
+      - name: Install cargo-vendor-filterer
+        run: cargo install cargo-vendor-filterer
+
+      - name: Generate tarballs
+        run: contrib/packaging/pack.sh
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            target/composefs-rs-${{ steps.version.outputs.version }}.tar.zstd
+            target/composefs-rs-${{ steps.version.outputs.version }}-vendor.tar.zstd
