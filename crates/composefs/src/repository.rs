@@ -3588,18 +3588,40 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     /// Lists all named stream references under a given prefix.
     ///
-    /// Returns (name, target) pairs where name is relative to the prefix.
+    /// Recurses into subdirectories.  Names are returned relative to
+    /// the prefix (e.g. with prefix `"ostree/"`, a ref stored at
+    /// `streams/refs/ostree/stable` is returned as `("stable", target)`).
     pub fn list_stream_refs(&self, prefix: &str) -> Result<Vec<(String, String)>> {
         let ref_path = format!("streams/refs/{prefix}");
+        self.list_refs_in(&ref_path)
+    }
 
-        let dir_fd = match self.openat(&ref_path, OFlags::RDONLY | OFlags::DIRECTORY) {
+    /// Lists all named image references under a given prefix.
+    ///
+    /// Recurses into subdirectories.  Names are returned relative to
+    /// the prefix.
+    pub fn list_image_refs(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let ref_path = format!("images/refs/{prefix}");
+        self.list_refs_in(&ref_path)
+    }
+
+    fn list_refs_in(&self, path: &str) -> Result<Vec<(String, String)>> {
+        let dir_fd = match self.openat(path, OFlags::RDONLY | OFlags::DIRECTORY) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
-
         let mut refs = Vec::new();
-        for item in Dir::read_from(&dir_fd)? {
+        Self::collect_refs(&dir_fd, "", &mut refs)?;
+        Ok(refs)
+    }
+
+    fn collect_refs(
+        dir_fd: &OwnedFd,
+        prefix: &str,
+        refs: &mut Vec<(String, String)>,
+    ) -> Result<()> {
+        for item in Dir::read_from(dir_fd)? {
             let entry = item?;
             let name_bytes = entry.file_name().to_bytes();
 
@@ -3607,19 +3629,32 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 continue;
             }
 
-            let name = match std::str::from_utf8(name_bytes) {
-                Ok(s) => s.to_string(),
-                Err(_) => continue,
+            let Ok(name) = std::str::from_utf8(name_bytes) else {
+                continue;
             };
 
-            if let Ok(target) = readlinkat(&dir_fd, name_bytes, vec![])
-                && let Ok(target_str) = target.into_string()
-            {
-                refs.push((name, target_str));
+            let full_name = format!("{prefix}{name}");
+
+            match entry.file_type() {
+                FileType::Directory => {
+                    let sub_fd = openat(
+                        dir_fd,
+                        name_bytes,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )?;
+                    Self::collect_refs(&sub_fd, &format!("{full_name}/"), refs)?;
+                }
+                _ => {
+                    if let Ok(target) = readlinkat(dir_fd, name_bytes, vec![])
+                        && let Ok(target_str) = target.into_string()
+                    {
+                        refs.push((full_name, target_str));
+                    }
+                }
             }
         }
-
-        Ok(refs)
+        Ok(())
     }
 }
 
