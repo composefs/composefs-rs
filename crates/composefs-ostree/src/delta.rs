@@ -820,6 +820,16 @@ fn dispatch_open_splice_and_close<ObjectID: FsVerityHashValue>(
         let content_len = state.read_varuint()? as usize;
         let content_offset = state.read_varuint()?;
         let data = state.payload_slice(content_offset, content_len as u64)?;
+
+        let actual = Sha256::digest(data);
+        if *actual != checksum {
+            bail!(
+                "metadata object checksum mismatch: expected {}, got {}",
+                hex::encode(checksum),
+                hex::encode(actual)
+            );
+        }
+
         writer.insert(&checksum, None, data);
     } else {
         // File object
@@ -1007,19 +1017,33 @@ fn dispatch_bspatch(state: &mut DeltaExecState) -> Result<()> {
 fn store_file_object<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     writer: &mut CommitWriter<ObjectID>,
-    checksum: &Sha256Digest,
+    expected_checksum: &Sha256Digest,
     header: &OstreeFileHeader,
     content: &[u8],
 ) -> Result<()> {
+    // Verify the ostree content checksum: SHA-256(regular_header + content)
+    let regular_header = header.serialize_regular_sized();
+    let mut hasher = Sha256::new();
+    hasher.update(&*regular_header);
+    hasher.update(content);
+    let actual = hasher.finalize();
+    if *actual != *expected_checksum {
+        bail!(
+            "file object checksum mismatch: expected {}, got {}",
+            hex::encode(expected_checksum),
+            hex::encode(actual)
+        );
+    }
+
     let zlib_header = header.serialize_zlib_sized();
 
     if should_inline_file::<ObjectID>(content.len()) {
         let mut data = zlib_header;
         data.with_vec(|v| v.extend_from_slice(content));
-        writer.insert(checksum, None, &data);
+        writer.insert(expected_checksum, None, &data);
     } else {
         let obj_id = repo.ensure_object(content)?;
-        writer.insert(checksum, Some(&obj_id), &zlib_header);
+        writer.insert(expected_checksum, Some(&obj_id), &zlib_header);
     }
 
     Ok(())
