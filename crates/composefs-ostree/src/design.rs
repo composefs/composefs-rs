@@ -62,9 +62,9 @@
 //! All objects except file objects are stored in the standard ostree
 //! object format.
 //!
-//! OSTree file objects are stored in the archive-z2 format, except not
-//! compressed, and optionally the file content part of it may be stored
-//! as referencing the index of an external object. The z2 format is,
+//! OSTree file objects are stored an ostree object stream (i.e. header +
+//! content data), except the file content part may be stored
+//! by referencing the index of an external object. The object format is,
 //! first an 8-byte header that gives the size (in bytes) of a gvariant,
 //! then comes the gvariant with the file meta in
 //! OSTREE_ZLIB_FILE_HEADER_GVARIANT_FORMAT format, and then the
@@ -94,13 +94,13 @@
 //! content data and optionally a reference to an external object.
 //!
 //! The exact form of the data looks like this, packed in order from the
-//! start of the splitstream content. All ints are in little endian.
+//! start of the splitstream content. All numbers are in little endian.
 //!
 //! ### Header
 //! ```text
 //! +-----------------------------------+
 //! | u32: index of commit object       |
-//! | u32: flags (currently unused)      |
+//! | u32: flags (currently unused)     |
 //! | [u32; 256]: end index of bucket   |
 //! +-----------------------------------+
 //! ```
@@ -112,10 +112,10 @@
 //!
 //! ### Object ids
 //! ```text
-//!  n_objects x
-//! +-----------------------------------+
-//! |  [u8; 32] ostree object id        |
-//! +-----------------------------------+
+//!  n_objects x (sorted)
+//! +--------------------------------------------+
+//! |  [u8; 32] ostree object id (binary sha256) |
+//! +--------------------------------------------+
 //! ```
 //!
 //! ### Object Info
@@ -190,7 +190,7 @@
 //! ## Cache storage
 //!
 //! Cached summaries are stored as splitstreams in the composefs
-//! repository with content type `0x7972616d6d75736f` (`"osummary"` LE).
+//! repository with content type `0x7972616d6d75736f`.
 //! The splitstream inline data contains a fixed header, variable-length
 //! HTTP caching strings, and the raw summary GVariant bytes.
 //!
