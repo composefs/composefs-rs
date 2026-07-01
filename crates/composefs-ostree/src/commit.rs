@@ -109,10 +109,6 @@ pub(crate) struct CommitWriter<ObjectID: FsVerityHashValue> {
     map: Vec<WriterEntry<ObjectID>>,
 }
 
-fn align8(x: usize) -> usize {
-    (x + 7) & !7
-}
-
 impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
     pub fn new() -> Self {
         CommitWriter {
@@ -210,7 +206,7 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
             .iter()
             .map(|e| {
                 let offset = data_size;
-                data_size += align8(e.data.len());
+                data_size += e.data.len().next_multiple_of(8);
                 offset
             })
             .collect();
@@ -256,7 +252,7 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
         const ZERO_PAD: [u8; 7] = [0; 7];
         for e in self.map.iter() {
             ss.write_inline(&e.data);
-            let padding = align8(e.data.len()) - e.data.len();
+            let padding = e.data.len().next_multiple_of(8) - e.data.len();
             if padding > 0 {
                 ss.write_inline(&ZERO_PAD[..padding]);
             }
