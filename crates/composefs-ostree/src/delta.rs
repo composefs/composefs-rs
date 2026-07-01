@@ -101,15 +101,23 @@ fn gv_offset_size(container_size: u64) -> usize {
     }
 }
 
-fn gv_read_offset(data: &[u8], osz: usize, index: usize) -> u64 {
-    let start = index * osz;
-    match osz {
-        1 => data[start] as u64,
-        2 => u16::from_le_bytes(data[start..start + 2].try_into().unwrap()) as u64,
-        4 => u32::from_le_bytes(data[start..start + 4].try_into().unwrap()) as u64,
-        8 => u64::from_le_bytes(data[start..start + 8].try_into().unwrap()),
+fn gv_read_offset(data: &[u8], osz: usize, index: usize) -> Result<u64> {
+    let start = index
+        .checked_mul(osz)
+        .ok_or_else(|| anyhow!("offset index overflow"))?;
+    let end = start
+        .checked_add(osz)
+        .ok_or_else(|| anyhow!("offset end overflow"))?;
+    let slice = data
+        .get(start..end)
+        .ok_or_else(|| anyhow!("offset {start}..{end} out of range (len={})", data.len()))?;
+    Ok(match osz {
+        1 => slice[0] as u64,
+        2 => u16::from_le_bytes(slice.try_into().unwrap()) as u64,
+        4 => u32::from_le_bytes(slice.try_into().unwrap()) as u64,
+        8 => u64::from_le_bytes(slice.try_into().unwrap()),
         _ => 0,
-    }
+    })
 }
 
 // ---------- Superblock parser ----------
@@ -135,9 +143,8 @@ struct SuperblockChildRanges {
 fn compute_child_ranges(
     total_size: u64,
     frame_offsets: &[u64; N_FRAME_OFFSETS],
-) -> SuperblockChildRanges {
-    // Map: for each variable-size child (0,2,3,4,5,6,7), what frame offset index?
-    // var_children: [(child_index, frame_offset_index_for_end)]
+) -> Result<SuperblockChildRanges> {
+    // Frame offset index to child mapping:
     // child 0: end = fo[0]
     // child 1: fixed, 8 bytes
     // child 2: end = fo[1]
@@ -148,7 +155,9 @@ fn compute_child_ranges(
     // child 7: end = total_size - n_frame_offsets * osz (LAST)
 
     let osz = gv_offset_size(total_size) as u64;
-    let data_end = total_size - N_FRAME_OFFSETS as u64 * osz;
+    let data_end = total_size
+        .checked_sub(N_FRAME_OFFSETS as u64 * osz)
+        .ok_or_else(|| anyhow!("superblock too small for frame offsets"))?;
 
     let mut ranges = [(0u64, 0u64); N_SUPERBLOCK_CHILDREN];
 
@@ -157,34 +166,30 @@ fn compute_child_ranges(
 
     // Child 1: t (fixed 8 bytes), starts after child 0 aligned to 8
     let start_1 = frame_offsets[0].next_multiple_of(8);
-    ranges[1] = (start_1, start_1 + 8);
+    ranges[1] = (
+        start_1,
+        start_1.checked_add(8).ok_or_else(|| anyhow!("overflow"))?,
+    );
 
     // Child 2: ay, starts after child 1 (no alignment needed for ay)
-    let start_2 = ranges[1].1;
-    ranges[2] = (start_2, frame_offsets[1]);
+    ranges[2] = (ranges[1].1, frame_offsets[1]);
 
     // Child 3: ay, starts after child 2
-    let start_3 = frame_offsets[1];
-    ranges[3] = (start_3, frame_offsets[2]);
+    ranges[3] = (frame_offsets[1], frame_offsets[2]);
 
     // Child 4: commit tuple, starts after child 3 aligned to 8
-    let start_4 = frame_offsets[2].next_multiple_of(8);
-    ranges[4] = (start_4, frame_offsets[3]);
+    ranges[4] = (frame_offsets[2].next_multiple_of(8), frame_offsets[3]);
 
     // Child 5: ay, starts after child 4
-    let start_5 = frame_offsets[3];
-    ranges[5] = (start_5, frame_offsets[4]);
+    ranges[5] = (frame_offsets[3], frame_offsets[4]);
 
     // Child 6: a(uayttay), starts after child 5 aligned to 8
-    let start_6 = frame_offsets[4].next_multiple_of(8);
-    ranges[6] = (start_6, frame_offsets[5]);
+    ranges[6] = (frame_offsets[4].next_multiple_of(8), frame_offsets[5]);
 
-    // Child 7: a(yaytt), starts after child 6 (1-byte alignment for outer `a`)
-    // Actually a(yaytt) elements contain `t` so alignment is 8
-    let start_7 = frame_offsets[5].next_multiple_of(8);
-    ranges[7] = (start_7, data_end);
+    // Child 7: a(yaytt), elements contain `t` so alignment is 8
+    ranges[7] = (frame_offsets[5].next_multiple_of(8), data_end);
 
-    SuperblockChildRanges { ranges }
+    Ok(SuperblockChildRanges { ranges })
 }
 
 /// Reads a byte range from a file descriptor via pread.
@@ -242,29 +247,34 @@ impl MetadataDictIndex {
         let osz = gv_offset_size(dict_size);
 
         // Read the last offset to find last_end (end of data / start of offset table)
-        let last_ofs_buf = source.read_range(
-            file_offset + dict_size - osz as u64,
-            file_offset + dict_size,
-        )?;
-        let last_end = gv_read_offset(&last_ofs_buf, osz, 0);
+        let last_ofs_start = file_offset
+            .checked_add(dict_size)
+            .and_then(|v| v.checked_sub(osz as u64))
+            .ok_or_else(|| anyhow!("metadata dict offset overflow"))?;
+        let last_ofs_buf = source.read_range(last_ofs_start, file_offset + dict_size)?;
+        let last_end = gv_read_offset(&last_ofs_buf, osz, 0)?;
 
-        let offset_table_size = dict_size as usize - last_end as usize - osz;
+        let offset_table_size = (dict_size as usize)
+            .checked_sub(last_end as usize)
+            .and_then(|v| v.checked_sub(osz))
+            .ok_or_else(|| anyhow!("metadata dict offset table overflow"))?;
         let n_entries = offset_table_size.checked_div(osz).map_or(0, |n| n + 1);
 
         // Read the full offset table (small)
-        let offsets_buf = source.read_range(
-            file_offset + last_end,
-            file_offset + last_end + (offset_table_size + osz) as u64,
-        )?;
+        let table_end = file_offset
+            .checked_add(last_end)
+            .and_then(|v| v.checked_add((offset_table_size + osz) as u64))
+            .ok_or_else(|| anyhow!("offset table range overflow"))?;
+        let offsets_buf = source.read_range(file_offset + last_end, table_end)?;
 
         // Read each entry's key string (short, NUL-terminated at start of entry)
         let mut entries = Vec::with_capacity(n_entries);
         for i in 0..n_entries {
-            let end = gv_read_offset(&offsets_buf, osz, i).min(last_end);
+            let end = gv_read_offset(&offsets_buf, osz, i)?.min(last_end);
             let start = if i == 0 {
                 0u64
             } else {
-                gv_read_offset(&offsets_buf, osz, i - 1).next_multiple_of(8)
+                gv_read_offset(&offsets_buf, osz, i - 1)?.next_multiple_of(8)
             };
             if end <= start {
                 continue;
@@ -373,10 +383,16 @@ impl DeltaSuperblock {
                 // Signed format (taya{sv}): child 0 is fixed (t=8 bytes),
                 // child 1 (ay) has one frame offset, child 2 (a{sv}) is LAST.
                 let osz = gv_offset_size(total_size);
-                let fo_buf = source.read_range(total_size - osz as u64, total_size)?;
+                let fo_start = total_size
+                    .checked_sub(osz as u64)
+                    .ok_or_else(|| anyhow!("signed delta too small"))?;
+                let fo_buf = source.read_range(fo_start, total_size)?;
                 let sb_start = 8u64; // ay starts right after the fixed t
-                let sb_end = gv_read_offset(&fo_buf, osz, 0);
-                (sb_start, sb_end - sb_start)
+                let sb_end = gv_read_offset(&fo_buf, osz, 0)?;
+                let sb_size = sb_end
+                    .checked_sub(sb_start)
+                    .ok_or_else(|| anyhow!("signed delta superblock range invalid"))?;
+                (sb_start, sb_size)
             } else {
                 (0, total_size)
             }
@@ -395,20 +411,30 @@ impl DeltaSuperblock {
             variant_size >= fo_size,
             "superblock too small for frame offsets"
         );
-        let fo_buf = source.read_range(
-            base_offset + variant_size - fo_size,
-            base_offset + variant_size,
-        )?;
+        let fo_start = base_offset + variant_size - fo_size;
+        let fo_end = base_offset + variant_size;
+        let fo_buf = source.read_range(fo_start, fo_end)?;
 
-        let frame_offsets: [u64; N_FRAME_OFFSETS] =
-            std::array::from_fn(|i| gv_read_offset(&fo_buf, osz, N_FRAME_OFFSETS - 1 - i));
+        let frame_offsets: [u64; N_FRAME_OFFSETS] = (0..N_FRAME_OFFSETS)
+            .map(|i| gv_read_offset(&fo_buf, osz, N_FRAME_OFFSETS - 1 - i))
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .unwrap();
 
-        let children = compute_child_ranges(variant_size, &frame_offsets);
+        let children = compute_child_ranges(variant_size, &frame_offsets)?;
 
         // Cache the metadata dict offset table and key strings
         let (meta_start, meta_end) = children.ranges[0];
-        let metadata_index =
-            MetadataDictIndex::load(&source, base_offset + meta_start, meta_end - meta_start)?;
+        let meta_size = meta_end
+            .checked_sub(meta_start)
+            .ok_or_else(|| anyhow!("metadata child range invalid"))?;
+        let metadata_index = MetadataDictIndex::load(
+            &source,
+            base_offset
+                .checked_add(meta_start)
+                .ok_or_else(|| anyhow!("metadata offset overflow"))?,
+            meta_size,
+        )?;
 
         let swap_endian = Self::detect_endianness(&source, &metadata_index)?;
 
@@ -444,8 +470,15 @@ impl DeltaSuperblock {
 
     fn read_child(&self, index: usize) -> Result<Vec<u8>> {
         let (start, end) = self.children.ranges[index];
-        self.source
-            .read_range(self.base_offset + start, self.base_offset + end)
+        let abs_start = self
+            .base_offset
+            .checked_add(start)
+            .ok_or_else(|| anyhow!("child offset overflow"))?;
+        let abs_end = self
+            .base_offset
+            .checked_add(end)
+            .ok_or_else(|| anyhow!("child offset overflow"))?;
+        self.source.read_range(abs_start, abs_end)
     }
 
     fn read_child_aligned(&self, index: usize) -> Result<AlignedBuf> {
@@ -906,9 +939,13 @@ fn dispatch_write(state: &mut DeltaExecState) -> Result<()> {
 
     if let Some(ref source) = state.read_source {
         let start = content_offset as usize;
-        let end = start + content_size as usize;
-        ensure!(end <= source.len(), "read_source offset out of range");
-        state.content_buf.extend_from_slice(&source[start..end]);
+        let end = start
+            .checked_add(content_size as usize)
+            .ok_or_else(|| anyhow!("read_source offset overflow"))?;
+        let slice = source
+            .get(start..end)
+            .ok_or_else(|| anyhow!("read_source range {start}..{end} out of bounds"))?;
+        state.content_buf.extend_from_slice(slice);
     } else {
         let data = state.payload_slice(content_offset, content_size)?;
         state.content_buf.extend_from_slice(data);
@@ -923,11 +960,14 @@ fn dispatch_set_read_source<ObjectID: FsVerityHashValue>(
     state: &mut DeltaExecState,
 ) -> Result<()> {
     let source_offset = state.read_varuint()? as usize;
-    ensure!(
-        source_offset + 32 <= state.payload.len(),
-        "read source checksum offset out of range"
-    );
-    let checksum: Sha256Digest = state.payload[source_offset..source_offset + 32]
+    let csum_end = source_offset
+        .checked_add(32)
+        .ok_or_else(|| anyhow!("read source offset overflow"))?;
+    let csum_slice = state
+        .payload
+        .get(source_offset..csum_end)
+        .ok_or_else(|| anyhow!("read source checksum out of range"))?;
+    let checksum: Sha256Digest = csum_slice
         .try_into()
         .map_err(|_| anyhow!("bad read source checksum"))?;
 
@@ -952,7 +992,9 @@ fn dispatch_set_read_source<ObjectID: FsVerityHashValue>(
         // Inline content: everything after the zlib-sized header
         let header_size = std::mem::size_of::<crate::ostree::SizedVariantHeader>();
         let variant_size = crate::ostree::get_sized_variant_size(file_header_data)?;
-        let content_start = header_size + variant_size;
+        let content_start = header_size
+            .checked_add(variant_size)
+            .ok_or_else(|| anyhow!("file header offset overflow"))?;
         let content = file_header_data.get(content_start..).unwrap_or(&[]);
         state.read_source = Some(content.to_vec());
     }
@@ -1325,37 +1367,43 @@ mod tests {
     #[test]
     fn test_gv_read_offset_u8() {
         let data = [10, 20, 30];
-        assert_eq!(gv_read_offset(&data, 1, 0), 10);
-        assert_eq!(gv_read_offset(&data, 1, 1), 20);
-        assert_eq!(gv_read_offset(&data, 1, 2), 30);
+        assert_eq!(gv_read_offset(&data, 1, 0).unwrap(), 10);
+        assert_eq!(gv_read_offset(&data, 1, 1).unwrap(), 20);
+        assert_eq!(gv_read_offset(&data, 1, 2).unwrap(), 30);
     }
 
     #[test]
     fn test_gv_read_offset_u16() {
         let data = 0x1234u16.to_le_bytes();
-        assert_eq!(gv_read_offset(&data, 2, 0), 0x1234);
+        assert_eq!(gv_read_offset(&data, 2, 0).unwrap(), 0x1234);
     }
 
     #[test]
     fn test_gv_read_offset_u32() {
         let data = 0xDEAD_BEEFu32.to_le_bytes();
-        assert_eq!(gv_read_offset(&data, 4, 0), 0xDEAD_BEEF);
+        assert_eq!(gv_read_offset(&data, 4, 0).unwrap(), 0xDEAD_BEEF);
     }
 
     #[test]
     fn test_gv_read_offset_u64() {
         let data = 0x0123_4567_89AB_CDEFu64.to_le_bytes();
-        assert_eq!(gv_read_offset(&data, 8, 0), 0x0123_4567_89AB_CDEF);
+        assert_eq!(gv_read_offset(&data, 8, 0).unwrap(), 0x0123_4567_89AB_CDEF);
     }
 
     #[test]
     fn test_gv_read_offset_multiple() {
-        // Two u16 offsets: 100, 200
         let mut data = vec![];
         data.extend_from_slice(&100u16.to_le_bytes());
         data.extend_from_slice(&200u16.to_le_bytes());
-        assert_eq!(gv_read_offset(&data, 2, 0), 100);
-        assert_eq!(gv_read_offset(&data, 2, 1), 200);
+        assert_eq!(gv_read_offset(&data, 2, 0).unwrap(), 100);
+        assert_eq!(gv_read_offset(&data, 2, 1).unwrap(), 200);
+    }
+
+    #[test]
+    fn test_gv_read_offset_out_of_bounds() {
+        let data = [10];
+        assert!(gv_read_offset(&data, 2, 0).is_err());
+        assert!(gv_read_offset(&data, 1, 1).is_err());
     }
 
     // --- checksum_to_b64 ---
