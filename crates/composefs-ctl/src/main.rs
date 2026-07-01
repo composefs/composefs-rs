@@ -79,6 +79,12 @@ fn main() -> Result<()> {
             #[cfg(feature = "containers-storage")]
             cstorage::init_if_helper();
 
+            clap_complete::CompleteEnv::with_factory(|| {
+                use clap::CommandFactory;
+                composefs_ctl::App::command()
+            })
+            .complete();
+
             // Now we can create the tokio runtime for the main application
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
