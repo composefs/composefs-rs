@@ -59,24 +59,32 @@ const NO_EXTERNAL_INDEX: u32 = u32::MAX;
 #[derive(Debug, FromBytes, Immutable, IntoBytes, KnownLayout, Clone)]
 #[repr(C)]
 struct DataRef {
-    offset: u32,
+    /// Byte offset into the content region, divided by 8 (the alignment).
+    data_block: u32,
     size: u32,
     external_index: u32,
 }
 
 impl DataRef {
-    pub fn new(offset: usize, size: usize, external_index: Option<usize>) -> Self {
-        DataRef {
-            offset: u32::to_le(offset as u32),
-            size: u32::to_le(size as u32),
+    pub fn new(offset: usize, size: usize, external_index: Option<usize>) -> Result<Self> {
+        ensure!(
+            offset.is_multiple_of(8),
+            "data offset {offset} is not 8-byte aligned"
+        );
+        let block = u32::try_from(offset / 8)
+            .map_err(|_| anyhow!("data offset {offset} exceeds 32 GB limit"))?;
+        let size = u32::try_from(size).map_err(|_| anyhow!("data size {size} exceeds u32::MAX"))?;
+        Ok(DataRef {
+            data_block: u32::to_le(block),
+            size: u32::to_le(size),
             external_index: u32::to_le(match external_index {
                 Some(idx) => idx as u32,
                 None => NO_EXTERNAL_INDEX,
             }),
-        }
+        })
     }
     pub fn get_offset(&self) -> usize {
-        u32::from_le(self.offset) as usize
+        u32::from_le(self.data_block) as usize * 8
     }
     pub fn get_size(&self) -> usize {
         u32::from_le(self.size) as usize
@@ -211,11 +219,7 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
             })
             .collect();
 
-        // Ensure all data can be indexed by u32
-        ensure!(
-            data_size <= u32::MAX as usize,
-            "Too large data in object map"
-        );
+        // DataRef::new() validates that offsets fit in u32 (as offset/8)
 
         // Compute bucket ends
         for e in self.map.iter() {
@@ -244,7 +248,7 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
                 .external_object
                 .as_ref()
                 .map(|external_object| ss.add_object_ref(external_object));
-            let d = DataRef::new(offset, e.data.len(), idx);
+            let d = DataRef::new(offset, e.data.len(), idx)?;
             ss.write_inline(d.as_bytes());
         }
 
