@@ -122,7 +122,7 @@
 //! ```text
 //!  n_objects x
 //! +-----------------------------------+
-//! | u32: Offset to per-object data    |
+//! | u32: data_block (byte offset / 8) |
 //! | u32: Length of per-object data    |
 //! | u32: Index of external object ref |
 //! |      or MAXUINT32 if none.        |
@@ -132,8 +132,10 @@
 //! This is an array of information for each object. Once you have found
 //! the object id in the object ids table, you would look at the same
 //! index in this table to find the information. Offsets to per-object
-//! data are in bytes from the start of the content area, which starts at
-//! the end of the Objects Info table. All data chunks references are
+//! data are stored divided by 8 (since all data is 8-byte aligned),
+//! allowing up to 32 GB of content to be addressed. The byte offset
+//! is relative to the start of the content area, which starts at
+//! the end of the Objects Info table. All data chunks are
 //! aligned to 8 bytes with respect to the start of the content area.
 //! This is useful because GVariants (used by ostree) naturally want
 //! 8-byte alignment.
