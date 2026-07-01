@@ -43,7 +43,7 @@ cap-std = { version = "4.0.0", default-features = false }
 cap-tempfile = { version = "4.0.0", default-features = false }
 insta = "1.42.2"
 proptest = "1"
-similar-asserts = "1.7.0"
+similar-asserts = "2.0.0"
 tempfile = { version = "3.8.0", default-features = false }
 test-with = { version = "0.16", default-features = false, features = ["executable", "runtime"] }
 tokio-test = "0.4.4"
