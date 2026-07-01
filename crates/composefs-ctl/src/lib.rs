@@ -513,6 +513,9 @@ enum OstreeCommand {
         ostree_ref: String,
         #[clap(long)]
         base_name: Option<String>,
+        /// Disable static delta usage, forcing object-by-object fetching
+        #[clap(long)]
+        no_delta: bool,
     },
     /// Mount an ostree commit's composefs EROFS at the given mountpoint
     Mount {
@@ -1721,6 +1724,7 @@ where
                 let opts = composefs_ostree::PullOptions {
                     base_reference: base_name.as_deref(),
                     progress: Some(reporter),
+                    ..Default::default()
                 };
                 let (verity, stats) =
                     composefs_ostree::pull(&repo, ostree_repo, ostree_ref, opts).await?;
@@ -1738,12 +1742,14 @@ where
                 ref ostree_repo_url,
                 ref ostree_ref,
                 base_name,
+                no_delta,
             } => {
                 let ostree_repo = composefs_ostree::RemoteRepo::new(&repo, ostree_repo_url)?;
                 let reporter: SharedReporter = IndicatifReporter::new().into_shared();
                 let opts = composefs_ostree::PullOptions {
                     base_reference: base_name.as_deref(),
                     progress: Some(reporter),
+                    disable_deltas: no_delta,
                 };
                 let (verity, stats) =
                     composefs_ostree::pull(&repo, ostree_repo, ostree_ref, opts).await?;
