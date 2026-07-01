@@ -28,7 +28,7 @@ serde = { version = "1.0.145", default-features = false, features = ["derive"] }
 toml = { version = "1.0.0", default-features = false, features = ["parse", "serde"] }
 
 [dev-dependencies]
-similar-asserts = "1.7.0"
+similar-asserts = "2.0.0"
 
 [lints]
 workspace = true

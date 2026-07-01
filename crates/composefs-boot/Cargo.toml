@@ -25,7 +25,7 @@ zerocopy = { version = "0.8.0", default-features = false, features = ["derive"] 
 composefs = { workspace = true, features = ["test"] }
 indoc = "2"
 proptest = "1"
-similar-asserts = "1.7.0"
+similar-asserts = "2.0.0"
 
 [lints]
 workspace = true

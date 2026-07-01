@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "composefs"
-version = "0.4.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "composefs-ioctls",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "composefs-ioctls"
-version = "0.4.0"
+version = "0.7.0"
 dependencies = [
  "rustix",
  "thiserror",
@@ -287,9 +287,9 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "libfuzzer-sys"
-version = "0.4.12"
+version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f12a681b7dd8ce12bff52488013ba614b869148d54dd79836ab85aafdd53f08d"
+checksum = "a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2"
 dependencies = [
  "arbitrary",
  "cc",
