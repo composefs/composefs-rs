@@ -26,7 +26,7 @@ sha2 = { version = "0.11", default-features = false }
 tar-core = "0.1.0"
 thiserror = { version = "2.0", default-features = false }
 tokio = { version = "1.40", default-features = false, features = ["rt", "net", "sync"], optional = true }
-toml = { version = "1.0", default-features = false, features = ["parse"] }
+toml = { version = "1.0", default-features = false, features = ["parse", "serde"] }
 tracing = { version = "0.1", default-features = false, optional = true }
 zstd = { version = "0.13", default-features = false }
 
