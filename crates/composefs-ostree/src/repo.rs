@@ -126,7 +126,7 @@ pub trait OstreeRepo<ObjectID: FsVerityHashValue>: Send + Sync {
     }
 }
 
-const OSTREE_SUMMARY_CONTENT_TYPE: u64 = u64::from_le_bytes(*b"osummary");
+const OSTREE_SUMMARY_CONTENT_TYPE: u64 = 0x7972616D6D75736F;
 
 /// Fixed header for a cached summary splitstream blob.
 ///
