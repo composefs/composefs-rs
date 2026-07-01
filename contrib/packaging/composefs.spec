@@ -7,12 +7,16 @@ Summary:        Tools to handle creating and mounting composefs images
 
 License:        MIT OR Apache-2.0
 URL:            https://github.com/composefs/composefs-rs
-Source0:        https://github.com/composefs/composefs-rs/releases/download/v%{version}/%{name}-rs-%{version}.tar.xz
+Source0:        https://github.com/composefs/composefs-rs/releases/download/v%{version}/%{name}-rs-%{version}.tar.zstd
+Source1:        https://github.com/composefs/composefs-rs/releases/download/v%{version}/%{name}-rs-%{version}-vendor.tar.zstd
 
 BuildRequires:  cargo >= 1.88.0
 BuildRequires:  rust >= 1.88.0
 BuildRequires:  gcc
 BuildRequires:  openssl-devel
+BuildRequires:  pkgconf-pkg-config
+BuildRequires:  zlib-devel
+BuildRequires:  zstd
 %if %{with man}
 BuildRequires:  pandoc
 %endif
@@ -44,7 +48,9 @@ License:        MIT OR Apache-2.0
 Library files for %{name}.
 
 %prep
-%autosetup -n %{name}-rs-%{version} -p1
+%autosetup -n %{name}-rs-%{version} -p1 -a1
+mkdir -p .cargo
+cp .cargo/vendor-config.toml .cargo/config.toml
 
 %build
 cargo build --release -p composefs-ctl -p composefs-capi -p composefs-setup-root
