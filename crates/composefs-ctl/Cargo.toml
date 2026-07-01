@@ -43,7 +43,7 @@ composefs-fuse = { workspace = true, optional = true }
 composefs-ostree = { workspace = true, optional = true }
 env_logger = { version = "0.11.0", default-features = false }
 hex = { version = "0.4.0", default-features = false }
-indicatif = { version = "0.17.0", default-features = false }
+indicatif = { version = "0.18.0", default-features = false }
 libsystemd = { version = "0.7" }
 log = { version = "0.4", default-features = false }
 rustix = { version = "1.0.0", default-features = false, features = ["fs", "pipe", "process", "thread"] }

@@ -42,7 +42,7 @@ composefs-fuse = { version = "0.7.0", path = "crates/composefs-fuse", default-fe
 composefs-http = { version = "0.7.0", path = "crates/composefs-http", default-features = false }
 composefs-ostree = { version = "0.7.0", path = "crates/composefs-ostree", default-features = false }
 cap-std-ext = "5.1.2"
-ocidir = "0.7.2"
+ocidir = "0.8.0"
 
 # JSON-RPC with FD passing for userns helper
 jsonrpc-fdpass = { version = "0.1.0", default-features = false }
