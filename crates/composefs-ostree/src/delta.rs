@@ -1237,8 +1237,202 @@ fn inherit_file<ObjectID: FsVerityHashValue>(
     if writer.contains(id) {
         return Ok(());
     }
+
     if let Some((obj_id, file_header)) = base.lookup(id)? {
         writer.insert(id, obj_id, file_header);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- read_varuint64 ---
+
+    #[test]
+    fn test_varuint_single_byte() {
+        let data = [0x00];
+        let mut pos = 0;
+        assert_eq!(read_varuint64(&data, &mut pos).unwrap(), 0);
+        assert_eq!(pos, 1);
+    }
+
+    #[test]
+    fn test_varuint_max_single_byte() {
+        let data = [0x7F];
+        let mut pos = 0;
+        assert_eq!(read_varuint64(&data, &mut pos).unwrap(), 127);
+        assert_eq!(pos, 1);
+    }
+
+    #[test]
+    fn test_varuint_two_bytes() {
+        // 300 = 0b100101100 → [0xAC, 0x02]
+        let data = [0xAC, 0x02];
+        let mut pos = 0;
+        assert_eq!(read_varuint64(&data, &mut pos).unwrap(), 300);
+        assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn test_varuint_large() {
+        // 16384 = 0x4000 → [0x80, 0x80, 0x01]
+        let data = [0x80, 0x80, 0x01];
+        let mut pos = 0;
+        assert_eq!(read_varuint64(&data, &mut pos).unwrap(), 16384);
+        assert_eq!(pos, 3);
+    }
+
+    #[test]
+    fn test_varuint_with_offset() {
+        let data = [0xFF, 0x05, 0x00];
+        let mut pos = 1;
+        assert_eq!(read_varuint64(&data, &mut pos).unwrap(), 5);
+        assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn test_varuint_truncated() {
+        let data = [0x80]; // continuation bit set but no next byte
+        let mut pos = 0;
+        assert!(read_varuint64(&data, &mut pos).is_err());
+    }
+
+    #[test]
+    fn test_varuint_empty() {
+        let data = [];
+        let mut pos = 0;
+        assert!(read_varuint64(&data, &mut pos).is_err());
+    }
+
+    // --- gv_offset_size ---
+
+    #[test]
+    fn test_gv_offset_size() {
+        assert_eq!(gv_offset_size(0), 0);
+        assert_eq!(gv_offset_size(1), 1);
+        assert_eq!(gv_offset_size(0xFF), 1);
+        assert_eq!(gv_offset_size(0x100), 2);
+        assert_eq!(gv_offset_size(0xFFFF), 2);
+        assert_eq!(gv_offset_size(0x1_0000), 4);
+        assert_eq!(gv_offset_size(0xFFFF_FFFF), 4);
+        assert_eq!(gv_offset_size(0x1_0000_0000), 8);
+    }
+
+    // --- gv_read_offset ---
+
+    #[test]
+    fn test_gv_read_offset_u8() {
+        let data = [10, 20, 30];
+        assert_eq!(gv_read_offset(&data, 1, 0), 10);
+        assert_eq!(gv_read_offset(&data, 1, 1), 20);
+        assert_eq!(gv_read_offset(&data, 1, 2), 30);
+    }
+
+    #[test]
+    fn test_gv_read_offset_u16() {
+        let data = 0x1234u16.to_le_bytes();
+        assert_eq!(gv_read_offset(&data, 2, 0), 0x1234);
+    }
+
+    #[test]
+    fn test_gv_read_offset_u32() {
+        let data = 0xDEAD_BEEFu32.to_le_bytes();
+        assert_eq!(gv_read_offset(&data, 4, 0), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn test_gv_read_offset_u64() {
+        let data = 0x0123_4567_89AB_CDEFu64.to_le_bytes();
+        assert_eq!(gv_read_offset(&data, 8, 0), 0x0123_4567_89AB_CDEF);
+    }
+
+    #[test]
+    fn test_gv_read_offset_multiple() {
+        // Two u16 offsets: 100, 200
+        let mut data = vec![];
+        data.extend_from_slice(&100u16.to_le_bytes());
+        data.extend_from_slice(&200u16.to_le_bytes());
+        assert_eq!(gv_read_offset(&data, 2, 0), 100);
+        assert_eq!(gv_read_offset(&data, 2, 1), 200);
+    }
+
+    // --- checksum_to_b64 ---
+
+    #[test]
+    fn test_checksum_to_b64_known() {
+        // All zeros → known base64
+        let zeros = [0u8; 32];
+        let b64 = checksum_to_b64(&zeros);
+        assert_eq!(b64.len(), 43);
+        assert_eq!(b64, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    }
+
+    #[test]
+    fn test_checksum_to_b64_no_slash() {
+        // Ensure '/' is replaced with '_'
+        let csum = [0xFF; 32];
+        let b64 = checksum_to_b64(&csum);
+        assert!(!b64.contains('/'), "base64 should not contain '/'");
+        assert!(!b64.contains('='), "base64 should not contain '='");
+        assert_eq!(b64.len(), 43);
+    }
+
+    #[test]
+    fn test_checksum_to_b64_roundtrip() {
+        use base64::engine::general_purpose::STANDARD;
+        // Verify our encoding matches standard base64 (with / → _ and no padding)
+        let csum: Sha256Digest = [
+            0x49, 0x3e, 0xd6, 0x52, 0x12, 0x57, 0x01, 0x0b, 0xca, 0x52, 0x5c, 0xb6, 0x53, 0x0d,
+            0xcb, 0x27, 0xa9, 0xb2, 0x39, 0x1c, 0x6f, 0x73, 0x3d, 0x0b, 0x30, 0x44, 0x4c, 0x94,
+            0xdf, 0x0e, 0xa9, 0x0f,
+        ];
+        let our_b64 = checksum_to_b64(&csum);
+        let std_b64 = STANDARD
+            .encode(csum)
+            .replace('/', "_")
+            .trim_end_matches('=')
+            .to_string();
+        assert_eq!(our_b64, std_b64);
+    }
+
+    // --- delta_path ---
+
+    #[test]
+    fn test_delta_path_scratch() {
+        let to = [0u8; 32];
+        let path = delta_path(None, &to, "superblock");
+        let b64 = checksum_to_b64(&to);
+        assert_eq!(
+            path,
+            format!("deltas/{}/{}/superblock", &b64[..2], &b64[2..])
+        );
+    }
+
+    #[test]
+    fn test_delta_path_differential() {
+        let from = [1u8; 32];
+        let to = [2u8; 32];
+        let path = delta_path(Some(&from), &to, "superblock");
+        let from_b64 = checksum_to_b64(&from);
+        let to_b64 = checksum_to_b64(&to);
+        assert_eq!(
+            path,
+            format!(
+                "deltas/{}/{}-{}{}/superblock",
+                &from_b64[..2],
+                &from_b64[2..],
+                &to_b64[..2],
+                &to_b64[2..]
+            )
+        );
+    }
+
+    #[test]
+    fn test_delta_path_part() {
+        let to = [0u8; 32];
+        let path = delta_path(None, &to, "0");
+        assert!(path.ends_with("/0"));
+    }
 }
