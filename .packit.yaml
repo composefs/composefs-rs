@@ -1,0 +1,39 @@
+---
+upstream_package_name: composefs
+downstream_package_name: composefs
+
+upstream_tag_template: v{version}
+
+specfile_path: contrib/packaging/composefs.spec
+
+srpm_build_deps:
+  - cargo
+  - git
+  - zstd
+  - gcc
+  - openssl-devel
+
+actions:
+  create-archive:
+    - bash -c "cargo install cargo-vendor-filterer"
+    - bash -c "contrib/packaging/pack.sh"
+    - bash -c "cat target/composefs.spec"
+    - bash -c "cp target/composefs* contrib/packaging/"
+    # Packit requires the last line to be the source archive path
+    - bash -c "ls -1 target/composefs-rs-*.tar.zstd | grep -v vendor"
+  fix-spec-file:
+    - bash -c "cat contrib/packaging/composefs.spec"
+    - bash -c "ls -al contrib/packaging/"
+
+jobs:
+  - job: copr_build
+    trigger: pull_request
+    targets:
+      - fedora-rawhide-x86_64
+      - fedora-rawhide-aarch64
+
+  - job: copr_build
+    trigger: commit
+    branch: main
+    owner: rhcontainerbot
+    project: composefs-rs
