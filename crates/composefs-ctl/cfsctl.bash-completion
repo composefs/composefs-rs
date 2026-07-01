@@ -1,0 +1,66 @@
+# Bash completion for cfsctl
+#
+# Install: source this file, or copy it to /etc/bash_completion.d/
+#
+# This script works around bash's COMP_WORDBREAKS splitting which
+# breaks values containing ':' (like docker:// image references).
+# It re-parses COMP_LINE so the full unsplit word reaches cfsctl's
+# dynamic completer, then trims the colon prefix from replies so
+# bash replaces the correct fragment on the command line.
+
+_clap_complete_cfsctl() {
+    local IFS=$'\013'
+    local _CLAP_COMPLETE_COMP_TYPE=${COMP_TYPE}
+    if compopt +o nospace 2> /dev/null; then
+        local _CLAP_COMPLETE_SPACE=false
+    else
+        local _CLAP_COMPLETE_SPACE=true
+    fi
+
+    # Split COMP_LINE on whitespace only, ignoring COMP_WORDBREAKS,
+    # so that docker://quay.io/foo:latest stays one word.
+    local line="${COMP_LINE:0:COMP_POINT}"
+    local -a words
+    IFS=$' \t\n' read -ra words <<< "$line"
+    if [[ "$line" =~ [[:space:]]$ ]]; then
+        words+=('')
+    fi
+    local cword=$(( ${#words[@]} - 1 ))
+
+    COMPREPLY=( $( \
+        _CLAP_IFS="$IFS" \
+        _CLAP_COMPLETE_INDEX="$cword" \
+        _CLAP_COMPLETE_COMP_TYPE="$_CLAP_COMPLETE_COMP_TYPE" \
+        _CLAP_COMPLETE_SPACE="$_CLAP_COMPLETE_SPACE" \
+        COMPLETE="bash" \
+        cfsctl -- "${words[@]}" \
+    ) )
+
+    if [[ $? != 0 ]]; then
+        unset COMPREPLY
+        return
+    fi
+
+    if [[ $_CLAP_COMPLETE_SPACE == false ]] && [[ "${COMPREPLY-}" =~ [=/:]$ ]]; then
+        compopt -o nospace
+    fi
+
+    # Bash already has everything up to the last COMP_WORDBREAKS
+    # character (: or =) on the command line.  Strip that prefix
+    # from COMPREPLY so bash replaces the right fragment.
+    local cur="${words[$cword]}"
+    if [[ "$cur" == *[:=]* ]]; then
+        local suffix="${cur##*[:=]}"
+        local wb_prefix="${cur%"$suffix"}"
+        local i
+        for (( i = 0; i < ${#COMPREPLY[@]}; i++ )); do
+            COMPREPLY[$i]="${COMPREPLY[$i]#"$wb_prefix"}"
+        done
+    fi
+}
+
+if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
+    complete -o nospace -o bashdefault -o nosort -F _clap_complete_cfsctl cfsctl
+else
+    complete -o nospace -o bashdefault -F _clap_complete_cfsctl cfsctl
+fi

@@ -22,6 +22,8 @@ pub use composefs_http;
 #[cfg(feature = "oci")]
 pub use composefs_oci;
 
+/// Shell completion helpers for dynamic value completion via [`clap_complete`].
+pub mod complete;
 pub mod composefs_info;
 #[cfg(feature = "fuse")]
 pub mod fuse;
@@ -45,8 +47,14 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use clap_complete::engine::ArgValueCompleter;
 #[cfg(any(feature = "oci", feature = "ostree"))]
 use comfy_table::{Table, presets::UTF8_FULL};
+#[cfg(feature = "ostree")]
+use complete::complete_ostree_refs;
+use complete::{complete_image_refs, complete_stream_refs};
+#[cfg(feature = "oci")]
+use complete::{complete_oci_digests, complete_oci_tags, complete_oci_tags_and_digests};
 #[cfg(any(feature = "oci", feature = "http", feature = "ostree"))]
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rustix::fs::{CWD, Mode, OFlags};
@@ -169,7 +177,7 @@ impl ProgressReporter for IndicatifReporter {
 #[clap(name = "cfsctl", version)]
 pub struct App {
     /// Operate on repo at path
-    #[clap(long, group = "repopath")]
+    #[clap(long, group = "repopath", value_hint = clap::ValueHint::DirPath)]
     repo: Option<PathBuf>,
     /// Operate on repo at standard user location $HOME/.var/lib/composefs
     #[clap(long, group = "repopath")]
@@ -339,6 +347,7 @@ struct OCIConfigFilesystemOptions {
 #[derive(Debug, Parser)]
 struct OCIConfigOptions {
     /// Ref name (e.g. myimage:latest) or @digest (e.g. @sha256:a1b2c3...)
+    #[arg(add = ArgValueCompleter::new(complete_oci_tags_and_digests))]
     config_name: OciReference,
     /// verity digest for the manifest stream to be verified against
     config_verity: Option<String>,
@@ -397,6 +406,7 @@ enum OciCommand {
     #[clap(name = "inspect")]
     Inspect {
         /// Ref name (e.g. myimage:latest) or @digest (e.g. @sha256:a1b2c3...)
+        #[arg(add = ArgValueCompleter::new(complete_oci_tags_and_digests))]
         image: OciReference,
         /// Output only the raw manifest JSON (as originally stored)
         #[clap(long, conflicts_with = "config")]
@@ -410,6 +420,7 @@ enum OciCommand {
     /// Example: cfsctl oci tag sha256:a1b2c3... myimage:latest
     Tag {
         /// Manifest digest, e.g. sha256:a1b2c3...
+        #[arg(add = ArgValueCompleter::new(complete_oci_digests))]
         manifest_digest: composefs_oci::OciDigest,
         /// Tag name to assign (must not contain '@')
         name: String,
@@ -417,6 +428,7 @@ enum OciCommand {
     /// Remove a tag from an image
     Untag {
         /// Tag name to remove
+        #[arg(add = ArgValueCompleter::new(complete_oci_tags))]
         name: String,
     },
     /// Inspect a stored layer
@@ -437,8 +449,10 @@ enum OciCommand {
     /// Mount an OCI image's composefs EROFS at the given mountpoint
     Mount {
         /// Image reference (tag name or manifest digest)
+        #[arg(add = ArgValueCompleter::new(complete_oci_tags_and_digests))]
         image: String,
         /// Target mountpoint
+        #[arg(value_hint = clap::ValueHint::AnyPath)]
         mountpoint: String,
         /// Mount the bootable variant instead of the regular EROFS image
         #[arg(long)]
@@ -464,7 +478,7 @@ enum OciCommand {
         #[clap(flatten)]
         config_opts: OCIConfigOptions,
         /// boot partition mount point
-        #[clap(long, default_value = "/boot")]
+        #[clap(long, default_value = "/boot", value_hint = clap::ValueHint::DirPath)]
         bootdir: PathBuf,
         /// Boot entry identifier to use. By default uses ID provided by the image or kernel version
         #[clap(long)]
@@ -480,6 +494,7 @@ enum OciCommand {
     /// integrity and splitstream validation.
     Fsck {
         /// Check only the named image instead of all tagged images
+        #[arg(add = ArgValueCompleter::new(complete_oci_tags))]
         image: Option<String>,
         /// Output results as JSON (always exits 0 unless the check itself fails)
         #[clap(long)]
@@ -492,7 +507,7 @@ enum OciCommand {
     /// socket. Kept for discoverability under the `oci` subcommand.
     Varlink {
         /// Unix socket path to listen on (omit when using systemd socket activation).
-        #[clap(long)]
+        #[clap(long, value_hint = clap::ValueHint::AnyPath)]
         address: Option<PathBuf>,
     },
 }
@@ -501,6 +516,7 @@ enum OciCommand {
 #[derive(Debug, Subcommand)]
 enum OstreeCommand {
     PullLocal {
+        #[arg(value_hint = clap::ValueHint::DirPath)]
         ostree_repo_path: PathBuf,
         /// Ostree ref name or commit ID (64-character hex)
         ostree_ref: String,
@@ -508,6 +524,7 @@ enum OstreeCommand {
         base_name: Option<String>,
     },
     Pull {
+        #[arg(value_hint = clap::ValueHint::Url)]
         ostree_repo_url: String,
         /// Ostree ref name or commit ID (64-character hex)
         ostree_ref: String,
@@ -517,8 +534,10 @@ enum OstreeCommand {
     /// Mount an ostree commit's composefs EROFS at the given mountpoint
     Mount {
         /// Ostree commit ref or commit ID
+        #[arg(add = ArgValueCompleter::new(complete_ostree_refs))]
         commit: String,
         /// Target mountpoint
+        #[arg(value_hint = clap::ValueHint::AnyPath)]
         mountpoint: String,
         #[clap(flatten)]
         mount_opts: MountOpts,
@@ -526,16 +545,19 @@ enum OstreeCommand {
     /// Dump the filesystem of an ostree commit as a composefs dumpfile to stdout
     Dump {
         /// Ostree commit ref name
+        #[arg(add = ArgValueCompleter::new(complete_ostree_refs))]
         commit_name: String,
     },
     /// Compute the composefs image ID of an ostree commit
     ComputeId {
         /// Ostree commit ref name
+        #[arg(add = ArgValueCompleter::new(complete_ostree_refs))]
         commit_name: String,
     },
     /// Show the contents of an ostree commit
     Inspect {
         /// Ostree ref name, commit ID, or commit ID prefix
+        #[arg(add = ArgValueCompleter::new(complete_ostree_refs))]
         source: String,
         /// Print only the commit metadata key-value pairs
         #[clap(long)]
@@ -546,6 +568,7 @@ enum OstreeCommand {
     /// The source can be an ostree commit checksum or an existing ref name.
     Tag {
         /// Ostree commit checksum (hex) or existing ref name
+        #[arg(add = ArgValueCompleter::new(complete_ostree_refs))]
         source: String,
         /// Tag name to assign
         name: String,
@@ -553,6 +576,7 @@ enum OstreeCommand {
     /// Remove a named ostree reference
     Untag {
         /// Tag name to remove
+        #[arg(add = ArgValueCompleter::new(complete_ostree_refs))]
         name: String,
     },
     /// List all ostree commits in the repository
@@ -561,11 +585,13 @@ enum OstreeCommand {
     /// Apply a static delta to the repository
     ApplyDelta {
         /// Path to the delta file (single-file) or superblock
+        #[arg(value_hint = clap::ValueHint::FilePath)]
         delta_path: PathBuf,
     },
     /// List refs available in a remote ostree repository
     ListRefs {
         /// URL of the remote ostree repository
+        #[arg(value_hint = clap::ValueHint::Url)]
         ostree_repo_url: String,
         /// Summary index subset key (defaults to system architecture)
         #[clap(long)]
@@ -577,6 +603,7 @@ enum OstreeCommand {
 #[derive(Debug, Parser)]
 struct FsReadOptions {
     /// The path to the filesystem
+    #[arg(value_hint = clap::ValueHint::DirPath)]
     path: PathBuf,
     /// Transform the filesystem for boot (SELinux labels, empty /boot and /sysroot)
     #[clap(long)]
@@ -598,10 +625,10 @@ struct MountOpts {
     #[arg(long)]
     foreground: bool,
     /// Writable upper layer directory for overlayfs
-    #[arg(long, requires = "workdir")]
+    #[arg(long, requires = "workdir", value_hint = clap::ValueHint::DirPath)]
     upperdir: Option<PathBuf>,
     /// Work directory for overlayfs (required with --upperdir)
-    #[arg(long, requires = "upperdir")]
+    #[arg(long, requires = "upperdir", value_hint = clap::ValueHint::DirPath)]
     workdir: Option<PathBuf>,
     /// Mount read-write (requires --upperdir)
     #[arg(long, requires = "upperdir")]
@@ -659,6 +686,7 @@ enum Command {
         algorithm: Algorithm,
         /// Path to the repository directory (created if it doesn't exist).
         /// If omitted, uses --repo/--user/--system location.
+        #[arg(value_hint = clap::ValueHint::DirPath)]
         path: Option<PathBuf>,
         /// Do not enable fs-verity on meta.json (insecure repository).
         #[clap(long)]
@@ -681,6 +709,7 @@ enum Command {
     /// Reconstitutes a split stream and writes it to stdout
     Cat {
         /// the name of the stream to cat, either a content identifier or prefixed with 'ref/'
+        #[arg(add = ArgValueCompleter::new(complete_stream_refs))]
         name: String,
     },
     /// Perform garbage collection
@@ -708,8 +737,10 @@ enum Command {
     /// Mounts a composefs image, possibly enforcing fsverity of the image
     Mount {
         /// the name of the image to mount, either an fs-verity hash or prefixed with 'ref/'
+        #[arg(add = ArgValueCompleter::new(complete_image_refs))]
         name: String,
         /// the mountpoint
+        #[arg(value_hint = clap::ValueHint::AnyPath)]
         mountpoint: String,
         #[clap(flatten)]
         mount_opts: MountOpts,
@@ -746,6 +777,7 @@ enum Command {
     #[clap(name = "compute-karg")]
     ComputeKarg {
         /// The path to the filesystem
+        #[arg(value_hint = clap::ValueHint::DirPath)]
         path: PathBuf,
         /// Don't copy /usr metadata to root directory (use if root already has well-defined metadata)
         #[clap(long)]
@@ -760,6 +792,7 @@ enum Command {
     /// Lists all object IDs referenced by an image
     ImageObjects {
         /// the name of the image to read, either an object ID digest or prefixed with 'ref/'
+        #[arg(add = ArgValueCompleter::new(complete_image_refs))]
         name: String,
     },
     /// Extract file information from a composefs image for specified files or directories
@@ -767,8 +800,10 @@ enum Command {
     /// By default, outputs information in composefs dumpfile format
     DumpFiles {
         /// The name of the composefs image to read from, either an object ID digest or prefixed with 'ref/'
+        #[arg(add = ArgValueCompleter::new(complete_image_refs))]
         image_name: String,
         /// File or directory paths to process. If a path is a directory, its contents will be listed.
+        #[arg(value_hint = clap::ValueHint::AnyPath)]
         files: Vec<PathBuf>,
         /// Show backing path information instead of dumpfile format
         /// For each file, prints either "inline" for files stored within the image,
@@ -791,7 +826,11 @@ enum Command {
         metadata_only: bool,
     },
     #[cfg(feature = "http")]
-    Fetch { url: String, name: String },
+    Fetch {
+        #[arg(value_hint = clap::ValueHint::Url)]
+        url: String,
+        name: String,
+    },
     /// Serve the varlink RPC API on a Unix socket or systemd socket.
     ///
     /// A single service answers both the `org.composefs.Repository` and (when
@@ -799,7 +838,7 @@ enum Command {
     /// socket.
     Varlink {
         /// Unix socket path to listen on (omit when using systemd socket activation).
-        #[clap(long)]
+        #[clap(long, value_hint = clap::ValueHint::AnyPath)]
         address: Option<PathBuf>,
     },
 
