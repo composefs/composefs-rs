@@ -112,10 +112,6 @@ fn gv_read_offset(data: &[u8], osz: usize, index: usize) -> u64 {
     }
 }
 
-fn align_up(offset: u64, alignment: u64) -> u64 {
-    (offset + alignment - 1) & !(alignment - 1)
-}
-
 // ---------- Superblock parser ----------
 
 /// The superblock format `(a{sv}tayay(...)aya(uayttay)a(yaytt))` has 8 children.
@@ -160,7 +156,7 @@ fn compute_child_ranges(
     ranges[0] = (0, frame_offsets[0]);
 
     // Child 1: t (fixed 8 bytes), starts after child 0 aligned to 8
-    let start_1 = align_up(frame_offsets[0], 8);
+    let start_1 = frame_offsets[0].next_multiple_of(8);
     ranges[1] = (start_1, start_1 + 8);
 
     // Child 2: ay, starts after child 1 (no alignment needed for ay)
@@ -172,7 +168,7 @@ fn compute_child_ranges(
     ranges[3] = (start_3, frame_offsets[2]);
 
     // Child 4: commit tuple, starts after child 3 aligned to 8
-    let start_4 = align_up(frame_offsets[2], 8);
+    let start_4 = frame_offsets[2].next_multiple_of(8);
     ranges[4] = (start_4, frame_offsets[3]);
 
     // Child 5: ay, starts after child 4
@@ -180,12 +176,12 @@ fn compute_child_ranges(
     ranges[5] = (start_5, frame_offsets[4]);
 
     // Child 6: a(uayttay), starts after child 5 aligned to 8
-    let start_6 = align_up(frame_offsets[4], 8);
+    let start_6 = frame_offsets[4].next_multiple_of(8);
     ranges[6] = (start_6, frame_offsets[5]);
 
     // Child 7: a(yaytt), starts after child 6 (1-byte alignment for outer `a`)
     // Actually a(yaytt) elements contain `t` so alignment is 8
-    let start_7 = align_up(frame_offsets[5], 8);
+    let start_7 = frame_offsets[5].next_multiple_of(8);
     ranges[7] = (start_7, data_end);
 
     SuperblockChildRanges { ranges }
@@ -268,7 +264,7 @@ impl MetadataDictIndex {
             let start = if i == 0 {
                 0u64
             } else {
-                align_up(gv_read_offset(&offsets_buf, osz, i - 1), 8)
+                gv_read_offset(&offsets_buf, osz, i - 1).next_multiple_of(8)
             };
             if end <= start {
                 continue;
