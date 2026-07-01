@@ -59,6 +59,9 @@ pub struct PullOptions<'a> {
     ///
     /// When `None`, all progress events are silently discarded.
     pub progress: Option<SharedReporter>,
+
+    /// Disable static delta usage, forcing object-by-object fetching.
+    pub disable_deltas: bool,
 }
 
 impl std::fmt::Debug for PullOptions<'_> {
@@ -113,7 +116,9 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     };
 
     // Try delta pull first
-    if let Some((verity, stats)) = ostree_repo.try_pull_delta(repo, &commit_checksum).await? {
+    if !opts.disable_deltas
+        && let Some((verity, stats)) = ostree_repo.try_pull_delta(repo, &commit_checksum).await?
+    {
         reporter.report(ProgressEvent::Message("Using static delta".into()));
         if let Some(ref_name) = reference {
             repo.name_stream(&format!("ostree-commit-{}", stats.commit_id), &ref_name)?;
