@@ -3,7 +3,7 @@
 //! Defines the Rust representations of ostree objects (commits, directory
 //! trees, directory metadata, file headers) and their gvariant wire formats.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use gvariant::aligned_bytes::{A8, AlignedBuf, AlignedSlice, AsAligned, TryAsAligned};
 use gvariant::{Marker, Structure, gv};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -29,14 +29,14 @@ impl std::str::FromStr for RepoMode {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<RepoMode> {
-        match s {
-            "bare" => Ok(RepoMode::Bare),
-            "archive" | "archive-z2" => Ok(RepoMode::Archive),
-            "bare-user" => Ok(RepoMode::BareUser),
-            "bare-user-only" => Ok(RepoMode::BareUserOnly),
-            "bare-split-xattrs" => Ok(RepoMode::BareSplitXAttrs),
-            _ => Err(anyhow!("Unsupported repo mode {}", s)),
-        }
+        Ok(match s {
+            "bare" => RepoMode::Bare,
+            "archive" | "archive-z2" => RepoMode::Archive,
+            "bare-user" => RepoMode::BareUser,
+            "bare-user-only" => RepoMode::BareUserOnly,
+            "bare-split-xattrs" => RepoMode::BareSplitXAttrs,
+            _ => bail!("Unsupported repo mode {}", s),
+        })
     }
 }
 
@@ -65,17 +65,17 @@ pub enum ObjectType {
 impl ObjectType {
     /// Decode from the numeric value used in ostree's on-disk format.
     pub fn from_byte(b: u8) -> Result<Self> {
-        match b {
-            1 => Ok(ObjectType::File),
-            2 => Ok(ObjectType::DirTree),
-            3 => Ok(ObjectType::DirMeta),
-            4 => Ok(ObjectType::Commit),
-            5 => Ok(ObjectType::TombstoneCommit),
-            7 => Ok(ObjectType::PayloadLink),
-            8 => Ok(ObjectType::FileXAttrs),
-            9 => Ok(ObjectType::FileXAttrsLink),
-            _ => Err(anyhow!("Unknown object type {b}")),
-        }
+        Ok(match b {
+            1 => ObjectType::File,
+            2 => ObjectType::DirTree,
+            3 => ObjectType::DirMeta,
+            4 => ObjectType::Commit,
+            5 => ObjectType::TombstoneCommit,
+            7 => ObjectType::PayloadLink,
+            8 => ObjectType::FileXAttrs,
+            9 => ObjectType::FileXAttrsLink,
+            _ => bail!("Unknown object type {b}"),
+        })
     }
 
     /// Returns true for metadata object types (not file content).
