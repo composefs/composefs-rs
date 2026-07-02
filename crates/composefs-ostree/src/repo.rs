@@ -5,6 +5,7 @@
 //! HTTP-served repos ([`RemoteRepo`]).
 
 use anyhow::{Context, Result, anyhow, bail};
+use cap_std::fs::Dir;
 use configparser::ini::Ini;
 use flate2::read::DeflateDecoder;
 use gvariant::aligned_bytes::{AlignedBuf, TryAsAligned};
@@ -18,7 +19,7 @@ use std::mem::MaybeUninit;
 use std::{
     fs::File,
     future::Future,
-    io::{Read, empty},
+    io::{Read, Seek, Write, empty},
     os::fd::{AsFd, OwnedFd},
     path::Path,
     sync::Arc,
@@ -30,9 +31,10 @@ use tokio_util::io::StreamReader;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use composefs::{
+    erofs::format::{S_IFLNK, S_IFMT, S_IFREG},
     fsverity::FsVerityHashValue,
     repository::Repository,
-    util::{ErrnoFilter, Sha256Digest, parse_sha256},
+    util::{Sha256Digest, parse_sha256},
 };
 
 use crate::ostree::{
@@ -1012,8 +1014,9 @@ fn read_xattrs_from_path(fd: &impl AsFd) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 pub struct LocalRepo<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
     mode: RepoMode,
-    dir: OwnedFd,
-    objects: OwnedFd,
+    dir: Dir,
+    objects: Dir,
+    tmp: Dir,
 }
 
 impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
@@ -1032,19 +1035,13 @@ impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
         )
         .with_context(|| format!("Cannot open ostree repository at {}", path.display()))?;
 
-        let configfd = openat(
-            &repofd,
-            "config",
-            OFlags::RDONLY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .with_context(|| format!("Cannot open ostree repo config file at {}", path.display()))?;
+        let dir = Dir::from_std_file(File::from(repofd));
 
         let mut config_data = String::new();
-
-        File::from(configfd)
+        dir.open("config")
+            .context("Cannot open ostree repo config file")?
             .read_to_string(&mut config_data)
-            .with_context(|| "Can't read config file")?;
+            .context("Can't read config file")?;
 
         let mut config = Ini::new();
         let map = config
@@ -1062,24 +1059,19 @@ impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
             .ok_or_else(|| anyhow!("No mode in [core] section in config"))?
             .parse()?;
 
-        let objectsfd = openat(
-            &repofd,
-            "objects",
-            OFlags::PATH | OFlags::CLOEXEC | OFlags::DIRECTORY,
-            0o666.into(),
-        )
-        .with_context(|| {
-            format!(
-                "Cannot open ostree repository objects directory at {}",
-                path.display()
-            )
-        })?;
+        let objects = dir
+            .open_dir("objects")
+            .context("Cannot open ostree repository objects directory")?;
+        let tmp = dir
+            .open_dir("tmp")
+            .context("Cannot open ostree repository tmp directory")?;
 
         Ok(Self {
             repo: repo.clone(),
             mode,
-            dir: repofd,
-            objects: objectsfd,
+            dir,
+            objects,
+            tmp,
         })
     }
 
@@ -1107,30 +1099,22 @@ impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
         let path1 = format!("refs/{}", ref_name);
         let path2 = format!("refs/heads/{}", ref_name);
 
-        let fd1 = openat(
-            &self.dir,
-            &path1,
-            OFlags::RDONLY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .filter_errno(Errno::NOENT)
-        .with_context(|| format!("Cannot open ostree ref at {}", path1))?;
-
-        let fd = match fd1 {
-            Some(fd) => fd,
-            None => openat(
-                &self.dir,
-                &path2,
-                OFlags::RDONLY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .with_context(|| format!("Cannot open ostree ref at {}", path2))?,
-        };
-
         let mut buffer = String::new();
-        File::from(fd)
-            .read_to_string(&mut buffer)
-            .with_context(|| "Can't read ref file")?;
+        let result = self.dir.open(&path1);
+        let mut file = match result {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self
+                .dir
+                .open(&path2)
+                .with_context(|| format!("Cannot open ostree ref at {path2}"))?,
+            Err(e) => {
+                return Err(
+                    anyhow::Error::from(e).context(format!("Cannot open ostree ref at {path1}"))
+                );
+            }
+        };
+        file.read_to_string(&mut buffer)
+            .context("Can't read ref file")?;
 
         Ok(parse_sha256(buffer.trim())?)
     }
@@ -1232,6 +1216,344 @@ impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
 
         // Decompress rest
         Ok((header_buf, Box::new(DeflateDecoder::new(file))))
+    }
+}
+
+/// Adapter that implements `io::Write` by feeding bytes into a SHA-256 hasher.
+pub(crate) struct HashWriter<'a>(pub &'a mut Sha256);
+
+impl Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+const ZERO_TIMESTAMPS: rustix::fs::Timestamps = rustix::fs::Timestamps {
+    last_access: rustix::fs::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    },
+    last_modification: rustix::fs::Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    },
+};
+
+fn make_tmp_name(prefix: &str) -> String {
+    let random: u64 = rand::random();
+    format!(".tmp{prefix}.{random:016x}")
+}
+
+/// Create a temporary symlink in `dirfd` with a unique name.
+///
+/// Retries with a new random suffix on `EEXIST`.
+fn make_tmp_symlink(dirfd: &impl AsFd, target: &str, prefix: &str) -> Result<String> {
+    loop {
+        let name = make_tmp_name(prefix);
+        match rustix::fs::symlinkat(target, dirfd, name.as_str()) {
+            Ok(()) => return Ok(name),
+            Err(Errno::EXIST) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Create a temporary file in `dirfd` with a unique name.
+///
+/// Retries with a new random suffix on `EEXIST`.
+fn make_tmp_file(dirfd: &impl AsFd, prefix: &str) -> Result<(String, OwnedFd)> {
+    loop {
+        let name = make_tmp_name(prefix);
+        match openat(
+            dirfd,
+            name.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        ) {
+            Ok(fd) => return Ok((name, fd)),
+            Err(Errno::EXIST) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Content source for writing a file object to an ostree repo.
+#[derive(Debug)]
+pub enum FileContent<'a> {
+    /// File content (copied via `copy_file_range` when possible).
+    External(File),
+    /// Inline byte data (small files).
+    Inline(&'a [u8]),
+    /// No content (e.g. symlinks handled separately, empty files).
+    Empty,
+}
+
+impl<ObjectID: FsVerityHashValue> LocalRepo<ObjectID> {
+    /// Returns the repo mode.
+    pub fn mode(&self) -> RepoMode {
+        self.mode
+    }
+
+    /// Returns the repo root directory.
+    pub fn dir(&self) -> &Dir {
+        &self.dir
+    }
+
+    /// Check if an object already exists in the repository.
+    pub fn has_object(&self, checksum: &Sha256Digest, obj_type: ObjectType) -> bool {
+        let path = get_object_pathname(self.mode, checksum, obj_type);
+        self.objects.exists(&path)
+    }
+
+    /// Ensure the two-character prefix directory exists under objects/.
+    fn ensure_objdir(&self, checksum: &Sha256Digest) -> Result<()> {
+        let prefix = format!("{:02x}", checksum[0]);
+        match self.objects.create_dir(&prefix) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write a metadata object (dirtree, dirmeta, commit) to the repository.
+    ///
+    /// Verifies the SHA256 checksum of `data` before writing.
+    pub fn write_metadata_object(
+        &self,
+        checksum: &Sha256Digest,
+        obj_type: ObjectType,
+        data: &[u8],
+    ) -> Result<()> {
+        if self.has_object(checksum, obj_type) {
+            return Ok(());
+        }
+
+        let actual: Sha256Digest = Sha256::digest(data).into();
+        if actual != *checksum {
+            bail!(
+                "metadata object checksum mismatch: expected {}, got {}",
+                hex::encode(checksum),
+                hex::encode(actual)
+            );
+        }
+
+        let tmpfd = openat(
+            &self.tmp,
+            ".",
+            OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+        .context("Creating tmpfile for metadata object")?;
+
+        rustix::io::write(&tmpfd, data)?;
+
+        rustix::fs::futimens(&tmpfd, &ZERO_TIMESTAMPS)?;
+
+        self.link_tmpfile(&tmpfd, checksum, obj_type)
+    }
+
+    /// Write a file object to the repository.
+    ///
+    /// `content` provides the file data as either a raw fd (for external
+    /// objects — reflink is attempted first, falling back to copy) or a
+    /// byte slice (for inline data).
+    pub fn write_file_object(
+        &self,
+        checksum: &Sha256Digest,
+        header: &OstreeFileHeader,
+        content: FileContent<'_>,
+    ) -> Result<()> {
+        if self.has_object(checksum, ObjectType::File) {
+            return Ok(());
+        }
+
+        let is_symlink = (header.mode & S_IFMT as u32) == S_IFLNK as u32;
+
+        if is_symlink && (self.mode == RepoMode::Bare || self.mode == RepoMode::BareUserOnly) {
+            return self.write_symlink_object(checksum, header);
+        }
+
+        let tmpfd = openat(
+            &self.tmp,
+            ".",
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )
+        .context("Creating tmpfile for file object")?;
+
+        // Ostree file checksum = SHA256(regular_sized_header + content).
+        let regular_header = header.serialize_regular_sized();
+        let mut hasher = Sha256::new();
+        hasher.update(&*regular_header);
+
+        if is_symlink {
+            // bare-user: symlinks stored as regular files with target + NUL
+            // note: Symlinks have no content in the checksum (the target is in the header).
+            let mut target_bytes = header.symlink_target.as_bytes().to_vec();
+            target_bytes.push(0);
+            rustix::io::write(&tmpfd, &target_bytes)?;
+        } else {
+            match content {
+                FileContent::External(mut src) => {
+                    let mut dst = File::from(tmpfd.try_clone()?);
+                    std::io::copy(&mut src, &mut dst)?;
+                    // We can't tee through the hasher here because that
+                    // would defeat the copy_file_range/reflink optimization
+                    // that std::io::copy uses.  Instead, read back what was
+                    // actually written to the destination.
+                    let mut tmpfile = File::from(tmpfd.try_clone()?);
+                    tmpfile.seek(std::io::SeekFrom::Start(0))?;
+                    std::io::copy(&mut tmpfile, &mut HashWriter(&mut hasher))?;
+                }
+                FileContent::Inline(data) => {
+                    rustix::io::write(&tmpfd, data)?;
+                    hasher.update(data);
+                }
+                FileContent::Empty => {}
+            }
+        }
+
+        let actual: Sha256Digest = hasher.finalize().into();
+        if actual != *checksum {
+            bail!(
+                "file object checksum mismatch: expected {}, got {}",
+                hex::encode(checksum),
+                hex::encode(actual)
+            );
+        }
+
+        self.apply_file_metadata(&tmpfd, header)?;
+
+        self.link_tmpfile(&tmpfd, checksum, ObjectType::File)
+    }
+
+    fn write_symlink_object(
+        &self,
+        checksum: &Sha256Digest,
+        header: &OstreeFileHeader,
+    ) -> Result<()> {
+        self.ensure_objdir(checksum)?;
+        let path = get_object_pathname(self.mode, checksum, ObjectType::File);
+        let tmp_name = make_tmp_symlink(&self.tmp, &header.symlink_target, "symlink")?;
+
+        if self.mode == RepoMode::Bare {
+            rustix::fs::chownat(
+                &self.tmp,
+                tmp_name.as_str(),
+                Some(rustix::process::Uid::from_raw(header.uid)),
+                Some(rustix::process::Gid::from_raw(header.gid)),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )?;
+            for (key, value) in &header.xattrs {
+                let key_str = std::str::from_utf8(key)?;
+                rustix::fs::lsetxattr(
+                    format!("/proc/self/fd/{}/{tmp_name}", self.tmp.as_raw_fd()),
+                    key_str,
+                    value,
+                    rustix::fs::XattrFlags::empty(),
+                )?;
+            }
+        }
+
+        rustix::fs::utimensat(
+            &self.tmp,
+            tmp_name.as_str(),
+            &ZERO_TIMESTAMPS,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+
+        self.tmp.rename(&tmp_name, &self.objects, &path)?;
+        Ok(())
+    }
+
+    fn apply_file_metadata(&self, fd: &OwnedFd, header: &OstreeFileHeader) -> Result<()> {
+        match self.mode {
+            RepoMode::Bare => {
+                rustix::fs::fchown(
+                    fd,
+                    Some(rustix::process::Uid::from_raw(header.uid)),
+                    Some(rustix::process::Gid::from_raw(header.gid)),
+                )?;
+                rustix::fs::fchmod(fd, Mode::from_raw_mode(header.mode))?;
+                for (key, value) in &header.xattrs {
+                    let key_str = std::str::from_utf8(key)?;
+                    rustix::fs::fsetxattr(fd, key_str, value, rustix::fs::XattrFlags::empty())?;
+                }
+            }
+            RepoMode::BareUser => {
+                let meta = OstreeDirMeta {
+                    uid: header.uid,
+                    gid: header.gid,
+                    mode: header.mode,
+                    xattrs: header.xattrs.clone(),
+                };
+                let meta_bytes = meta.serialize();
+                rustix::fs::fsetxattr(
+                    fd,
+                    "user.ostreemeta",
+                    &meta_bytes,
+                    rustix::fs::XattrFlags::empty(),
+                )?;
+                if (header.mode & S_IFMT as u32) == S_IFREG as u32 {
+                    let content_mode = (header.mode & 0o775) | 0o400;
+                    rustix::fs::fchmod(fd, Mode::from_raw_mode(content_mode))?;
+                }
+            }
+            RepoMode::BareUserOnly => {
+                rustix::fs::fchmod(fd, Mode::from_raw_mode(header.mode))?;
+            }
+            _ => bail!("Archive mode not supported for export"),
+        }
+
+        rustix::fs::futimens(fd, &ZERO_TIMESTAMPS)?;
+
+        Ok(())
+    }
+
+    fn link_tmpfile(
+        &self,
+        tmpfd: &OwnedFd,
+        checksum: &Sha256Digest,
+        obj_type: ObjectType,
+    ) -> Result<()> {
+        self.ensure_objdir(checksum)?;
+        let path = get_object_pathname(self.mode, checksum, obj_type);
+        let proc_path = format!("/proc/self/fd/{}", tmpfd.as_raw_fd());
+        match rustix::fs::linkat(
+            rustix::fs::CWD,
+            proc_path.as_str(),
+            &self.objects,
+            path.as_str(),
+            rustix::fs::AtFlags::SYMLINK_FOLLOW,
+        ) {
+            Ok(()) => Ok(()),
+            Err(Errno::EXIST) => Ok(()),
+            Err(e) => Err(e).context(format!("Linking object {}", hex::encode(checksum))),
+        }
+    }
+
+    /// Write a ref file pointing to a commit checksum.
+    pub fn write_ref(&self, ref_name: &str, commit_id: &Sha256Digest) -> Result<()> {
+        let ref_path = format!("refs/heads/{ref_name}");
+
+        if let Some((parent, _)) = ref_path.rsplit_once('/') {
+            self.dir.create_dir_all(parent)?;
+        }
+
+        let (tmp_name, tmpfd) = make_tmp_file(&self.tmp, "ref")?;
+        let content = format!("{}\n", hex::encode(commit_id));
+        rustix::io::write(&tmpfd, content.as_bytes())?;
+        drop(tmpfd);
+
+        self.tmp
+            .rename(&tmp_name, &self.dir, &ref_path)
+            .with_context(|| format!("Writing ref {ref_name}"))?;
+
+        Ok(())
     }
 }
 

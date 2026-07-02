@@ -373,6 +373,111 @@ pub fn commit_filesystem<ObjectID: FsVerityHashValue>(
     Ok((verity, hex::encode(commit_id)))
 }
 
+/// Export an ostree commit from the composefs repository to a local ostree repository.
+///
+/// Walks the commit's tree depth-first, writing all objects (files, dirtrees,
+/// dirmetas, commit) to the destination repo. File content is reflinked when
+/// possible. If `reference` is given, the ref is set in the destination repo.
+///
+/// Only bare, bare-user, and bare-user-only destination repos are supported.
+pub fn export_commit<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    source: &str,
+    dest: &LocalRepo<ObjectID>,
+    reference: Option<&str>,
+) -> Result<String> {
+    if dest.mode() == ostree::RepoMode::Archive {
+        bail!("Export to archive-mode repositories is not supported");
+    }
+
+    let content_id = resolve_source(repo, source)?;
+    let reader = CommitReader::<ObjectID>::load(repo, &content_id)?;
+    let commit_id = reader.commit_id();
+
+    let commit_data = reader
+        .lookup_data(&commit_id)?
+        .ok_or_else(|| anyhow::anyhow!("commit object not found in stream"))?;
+    let commit = ostree::OstreeCommit::from_data(commit_data)?;
+
+    export_dir(
+        repo,
+        &reader,
+        dest,
+        &commit.root_tree,
+        &commit.root_metadata,
+    )?;
+
+    dest.write_metadata_object(&commit_id, ostree::ObjectType::Commit, commit_data)?;
+
+    if let Some(ref_name) = reference {
+        dest.write_ref(ref_name, &commit_id)?;
+    }
+
+    rustix::fs::syncfs(dest.dir())?;
+
+    Ok(hex::encode(commit_id))
+}
+
+fn export_dir<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    reader: &CommitReader<ObjectID>,
+    dest: &LocalRepo<ObjectID>,
+    dirtree_id: &Sha256Digest,
+    dirmeta_id: &Sha256Digest,
+) -> Result<()> {
+    let (_obj_id, dirtree_data) = reader
+        .lookup(dirtree_id)?
+        .ok_or_else(|| anyhow::anyhow!("Missing dirtree object {}", hex::encode(dirtree_id)))?;
+    let dirtree = ostree::OstreeDirTree::from_data(dirtree_data)?;
+
+    let (_obj_id, dirmeta_data) = reader
+        .lookup(dirmeta_id)?
+        .ok_or_else(|| anyhow::anyhow!("Missing dirmeta object {}", hex::encode(dirmeta_id)))?;
+    // Write file objects first
+    for (_, file_checksum) in &dirtree.files {
+        export_file(repo, reader, dest, file_checksum)?;
+    }
+
+    // Recurse into subdirectories (depth-first)
+    for (_, tree_checksum, meta_checksum) in &dirtree.dirs {
+        export_dir(repo, reader, dest, tree_checksum, meta_checksum)?;
+    }
+
+    // Now write the metadata objects (all children exist)
+    dest.write_metadata_object(dirmeta_id, ostree::ObjectType::DirMeta, dirmeta_data)?;
+    dest.write_metadata_object(dirtree_id, ostree::ObjectType::DirTree, dirtree_data)?;
+
+    Ok(())
+}
+
+fn export_file<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    reader: &CommitReader<ObjectID>,
+    dest: &LocalRepo<ObjectID>,
+    checksum: &Sha256Digest,
+) -> Result<()> {
+    if dest.has_object(checksum, ostree::ObjectType::File) {
+        return Ok(());
+    }
+
+    let (maybe_obj_id, file_data) = reader
+        .lookup(checksum)?
+        .ok_or_else(|| anyhow::anyhow!("Missing file object {}", hex::encode(checksum)))?;
+
+    let (sized_data, remaining_data) = ostree::split_sized_variant(file_data)?;
+    let header = ostree::OstreeFileHeader::from_zlib_sized(sized_data)?;
+
+    let content = if let Some(obj_id) = maybe_obj_id {
+        repo::FileContent::External(std::fs::File::from(repo.open_object(obj_id)?))
+    } else if !remaining_data.is_empty() {
+        repo::FileContent::Inline(remaining_data)
+    } else {
+        repo::FileContent::Empty
+    };
+
+    dest.write_file_object(checksum, &header, content)
+}
+
 /// Reads and parses an ostree commit object.
 ///
 /// `source` can be an ostree ref name or a commit ID / prefix.
