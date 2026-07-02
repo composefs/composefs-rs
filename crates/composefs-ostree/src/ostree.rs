@@ -1,11 +1,13 @@
-//! Core ostree on-disk format types and gvariant deserialization.
+//! Core ostree on-disk format types and gvariant serialization/deserialization.
 //!
 //! Defines the Rust representations of ostree objects (commits, directory
 //! trees, directory metadata, file headers) and their gvariant wire formats.
 
+use std::fmt;
+
 use anyhow::{Result, anyhow, bail};
 use gvariant::aligned_bytes::{A8, AlignedBuf, AlignedSlice, AsAligned, TryAsAligned};
-use gvariant::{Marker, Structure, gv};
+use gvariant::{Marker, Owned, Structure, Variant, gv};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use composefs::{fsverity::FsVerityHashValue, util::Sha256Digest};
@@ -355,8 +357,8 @@ impl OstreeDirTree {
 pub struct OstreeCommit {
     /// Checksum of the parent commit, if any.
     pub parent_commit: Option<Sha256Digest>,
-    /// Commit metadata as (key, value) string pairs.
-    pub metadata: Vec<(String, String)>,
+    /// Commit metadata as (key, value) pairs with preserved variant types.
+    pub metadata: Vec<(String, MetadataValue)>,
     /// One-line commit subject.
     pub subject: String,
     /// Extended commit description.
@@ -369,32 +371,89 @@ pub struct OstreeCommit {
     pub root_metadata: Sha256Digest,
 }
 
-fn format_variant(v: &gvariant::Variant) -> String {
-    if let Some(s) = v.get(gv!("s")) {
-        return s.to_str().to_string();
+/// A typed value from an ostree commit metadata dictionary (`a{sv}`).
+#[derive(Debug)]
+pub enum MetadataValue {
+    /// GVariant type `s`.
+    String(String),
+    /// GVariant type `b`.
+    Bool(bool),
+    /// GVariant type `u`.
+    Uint32(u32),
+    /// GVariant type `t`.
+    Uint64(u64),
+    /// GVariant type `as`.
+    StringArray(Vec<String>),
+    /// GVariant type `ay`.
+    ByteArray(Vec<u8>),
+    /// Raw GVariant variant data for types not handled above.
+    Other(Owned<Variant>),
+}
+
+impl Clone for MetadataValue {
+    fn clone(&self) -> Self {
+        match self {
+            Self::String(s) => Self::String(s.clone()),
+            Self::Bool(b) => Self::Bool(*b),
+            Self::Uint32(u) => Self::Uint32(*u),
+            Self::Uint64(t) => Self::Uint64(*t),
+            Self::StringArray(a) => Self::StringArray(a.clone()),
+            Self::ByteArray(a) => Self::ByteArray(a.clone()),
+            Self::Other(v) => {
+                let v: &Variant = v;
+                Self::Other(v.to_owned())
+            }
+        }
     }
-    if let Some(b) = v.get(gv!("b")) {
-        return bool::from(*b).to_string();
+}
+
+impl MetadataValue {
+    fn from_variant(v: &Variant) -> Self {
+        if let Some(s) = v.get(gv!("s")) {
+            return Self::String(s.to_str().to_string());
+        }
+        if let Some(b) = v.get(gv!("b")) {
+            return Self::Bool(bool::from(*b));
+        }
+        if let Some(u) = v.get(gv!("u")) {
+            return Self::Uint32(*u);
+        }
+        if let Some(t) = v.get(gv!("t")) {
+            return Self::Uint64(*t);
+        }
+        if let Some(arr) = v.get(gv!("as")) {
+            return Self::StringArray(arr.iter().map(|s| s.to_str().to_string()).collect());
+        }
+        if let Some(ay) = v.get(gv!("ay")) {
+            return Self::ByteArray(ay.to_vec());
+        }
+        Self::Other(v.to_owned())
     }
-    if let Some(u) = v.get(gv!("u")) {
-        return u.to_string();
+}
+
+impl fmt::Display for MetadataValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::String(s) => write!(f, "{s}"),
+            Self::Bool(b) => write!(f, "{b}"),
+            Self::Uint32(u) => write!(f, "{u}"),
+            Self::Uint64(t) => write!(f, "{t}"),
+            Self::StringArray(arr) => {
+                let items: Vec<&str> = arr.iter().map(|s| s.as_str()).collect();
+                write!(f, "[{}]", items.join(", "))
+            }
+            Self::ByteArray(ay) => write!(f, "{}", hex::encode(ay)),
+            Self::Other(v) => {
+                let (typestr, data) = v.split();
+                write!(
+                    f,
+                    "<{}:{}>",
+                    std::str::from_utf8(typestr).unwrap_or("?"),
+                    hex::encode(data)
+                )
+            }
+        }
     }
-    if let Some(t) = v.get(gv!("t")) {
-        return t.to_string();
-    }
-    if let Some(arr) = v.get(gv!("as")) {
-        let items: Vec<&str> = arr.iter().map(|s| s.to_str()).collect();
-        return format!("[{}]", items.join(", "));
-    }
-    if let Some(ay) = v.get(gv!("ay")) {
-        return hex::encode(ay);
-    }
-    let (typestr, data) = v.split();
-    format!(
-        "<{}:{}>",
-        std::str::from_utf8(typestr).unwrap_or("?"),
-        hex::encode(data)
-    )
 }
 
 impl OstreeCommit {
@@ -418,7 +477,7 @@ impl OstreeCommit {
             .iter()
             .map(|entry| {
                 let (key, value) = entry.to_tuple();
-                (key.to_str().to_string(), format_variant(value))
+                (key.to_str().to_string(), MetadataValue::from_variant(value))
             })
             .collect();
 
