@@ -25,13 +25,32 @@ use composefs::{
 };
 
 use crate::ostree::{
-    OstreeCommit, OstreeDirMeta, OstreeDirTree, OstreeFileHeader, split_sized_variant,
+    CommitMetadata, OstreeCommit, OstreeDirMeta, OstreeDirTree, OstreeFileHeader,
+    should_inline_file, split_sized_variant,
 };
 
 const OSTREE_COMMIT_CONTENT_TYPE: u64 = 0xAFE138C18C463EF1;
 
-const S_IFMT: u32 = 0o170000;
-const S_IFLNK: u32 = 0o120000;
+fn stat_xattrs_to_vec(stat: &Stat) -> Vec<(Vec<u8>, Vec<u8>)> {
+    stat.xattrs
+        .iter()
+        .map(|(k, v)| {
+            let mut val = v.to_vec();
+            // The kernel stores security.selinux with a NUL terminator,
+            // but programmatic labeling (e.g. bootc's selabel()) may omit
+            // it.  Canonicalize to always include the NUL so that ostree
+            // checksums match what ostree fsck expects.
+            if k.as_bytes() == b"security.selinux" && !val.ends_with(&[0]) {
+                val.push(0);
+            }
+            (k.as_bytes().to_vec(), val)
+        })
+        .collect()
+}
+
+const S_IFMT: u32 = composefs::erofs::format::S_IFMT as u32;
+const S_IFDIR: u32 = composefs::erofs::format::S_IFDIR as u32;
+const S_IFLNK: u32 = composefs::erofs::format::S_IFLNK as u32;
 
 fn xattrs_to_btreemap(xattrs: &[(Vec<u8>, Vec<u8>)]) -> BTreeMap<Box<OsStr>, Box<[u8]>> {
     xattrs
@@ -171,6 +190,170 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
         }
         writer.set_commit_id(&reader.commit_id());
         Ok(writer)
+    }
+
+    /// Build a commit from an in-memory filesystem tree.
+    ///
+    /// Walks the tree bottom-up, producing ostree dirtree/dirmeta/file
+    /// objects with correct checksums, then creates the commit object.
+    /// Returns the writer and the commit's ostree checksum.
+    pub fn from_filesystem(
+        repo: &Arc<Repository<ObjectID>>,
+        fs: &FileSystem<ObjectID>,
+        metadata: CommitMetadata,
+    ) -> Result<(Self, Sha256Digest)> {
+        let mut writer = CommitWriter::new();
+        let mut leaf_cache: HashMap<LeafId, Sha256Digest> = HashMap::new();
+
+        let (root_tree_id, root_meta_id) =
+            Self::write_dir(repo, &mut writer, fs, &fs.root, &mut leaf_cache)?;
+
+        let commit = metadata.into_commit(root_tree_id, root_meta_id);
+        let commit_data = commit.serialize();
+        let commit_id: Sha256Digest = Sha256::digest(&commit_data).into();
+        writer.insert(&commit_id, None, &commit_data);
+        writer.set_commit_id(&commit_id);
+
+        Ok((writer, commit_id))
+    }
+
+    fn write_dir(
+        repo: &Arc<Repository<ObjectID>>,
+        writer: &mut CommitWriter<ObjectID>,
+        fs: &FileSystem<ObjectID>,
+        dir: &Directory<ObjectID>,
+        leaf_cache: &mut HashMap<LeafId, Sha256Digest>,
+    ) -> Result<(Sha256Digest, Sha256Digest)> {
+        let mut file_entries = Vec::new();
+        let mut dir_entries = Vec::new();
+
+        for (name, inode) in dir.entries() {
+            let name_str = name
+                .to_str()
+                .ok_or_else(|| anyhow!("non-UTF8 filename: {:?}", name))?;
+            match inode {
+                Inode::Leaf(leaf_id, _) => {
+                    let checksum = if let Some(cached) = leaf_cache.get(leaf_id) {
+                        *cached
+                    } else {
+                        let checksum = Self::write_leaf(repo, writer, fs, *leaf_id)?;
+                        leaf_cache.insert(*leaf_id, checksum);
+                        checksum
+                    };
+                    file_entries.push((name_str.to_string(), checksum));
+                }
+                Inode::Directory(subdir) => {
+                    let (tree_id, meta_id) = Self::write_dir(repo, writer, fs, subdir, leaf_cache)?;
+                    dir_entries.push((name_str.to_string(), tree_id, meta_id));
+                }
+            }
+        }
+
+        let dirmeta = OstreeDirMeta {
+            uid: dir.stat.st_uid,
+            gid: dir.stat.st_gid,
+            mode: (dir.stat.st_mode & !S_IFMT) | S_IFDIR,
+            xattrs: stat_xattrs_to_vec(&dir.stat),
+        };
+        let dirmeta_data = dirmeta.serialize();
+        let dirmeta_id: Sha256Digest = Sha256::digest(&dirmeta_data).into();
+        writer.insert(&dirmeta_id, None, &dirmeta_data);
+
+        let dirtree = OstreeDirTree {
+            files: file_entries,
+            dirs: dir_entries,
+        };
+        let dirtree_data = dirtree.serialize();
+        let dirtree_id: Sha256Digest = Sha256::digest(&dirtree_data).into();
+        writer.insert(&dirtree_id, None, &dirtree_data);
+
+        Ok((dirtree_id, dirmeta_id))
+    }
+
+    fn write_leaf(
+        repo: &Arc<Repository<ObjectID>>,
+        writer: &mut CommitWriter<ObjectID>,
+        fs: &FileSystem<ObjectID>,
+        leaf_id: LeafId,
+    ) -> Result<Sha256Digest> {
+        let leaf = fs.leaf(leaf_id);
+
+        let symlink_target = match &leaf.content {
+            LeafContent::Symlink(target) => target
+                .to_str()
+                .ok_or_else(|| anyhow!("non-UTF8 symlink target: {:?}", target))?
+                .to_string(),
+            _ => String::new(),
+        };
+
+        let file_size = match &leaf.content {
+            LeafContent::Regular(reg) => reg.file_size(),
+            _ => 0,
+        };
+
+        let header = OstreeFileHeader {
+            size: file_size,
+            uid: leaf.stat.st_uid,
+            gid: leaf.stat.st_gid,
+            mode: (leaf.stat.st_mode & !S_IFMT) | leaf.content.file_type_bits(),
+            symlink_target,
+            xattrs: stat_xattrs_to_vec(&leaf.stat),
+        };
+
+        let regular_header = header.serialize_regular_sized();
+        let zlib_header = header.serialize_zlib_sized();
+
+        match &leaf.content {
+            LeafContent::Regular(
+                RegularFile::External(obj_id, size) | RegularFile::ExternalNoVerity(obj_id, size),
+            ) if !should_inline_file::<ObjectID>(*size as usize) => {
+                // Stream through the hasher without buffering the entire file.
+                let mut hasher = Sha256::new();
+                hasher.update(&*regular_header);
+                let fd = repo.open_object(obj_id)?;
+                let mut file = std::io::BufReader::new(std::fs::File::from(fd));
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = std::io::Read::read(&mut file, &mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                let checksum: Sha256Digest = hasher.finalize().into();
+                writer.insert(&checksum, Some(obj_id), &zlib_header);
+                Ok(checksum)
+            }
+            _ => {
+                // Inline content: symlinks, small files, devices, etc.
+                let content: Option<Vec<u8>> = match &leaf.content {
+                    LeafContent::Regular(RegularFile::Inline(data)) => Some(data.to_vec()),
+                    LeafContent::Regular(
+                        RegularFile::External(obj_id, _) | RegularFile::ExternalNoVerity(obj_id, _),
+                    ) => Some(repo.read_object(obj_id)?),
+                    LeafContent::Regular(RegularFile::Sparse(size)) => {
+                        Some(vec![0u8; *size as usize])
+                    }
+                    _ => None,
+                };
+
+                let mut hasher = Sha256::new();
+                hasher.update(&*regular_header);
+                if let Some(ref bytes) = content {
+                    hasher.update(bytes);
+                }
+                let checksum: Sha256Digest = hasher.finalize().into();
+
+                if let Some(bytes) = content {
+                    let mut data = zlib_header;
+                    data.with_vec(|v| v.extend_from_slice(&bytes));
+                    writer.insert(&checksum, None, &data);
+                } else {
+                    writer.insert(&checksum, None, &zlib_header);
+                }
+                Ok(checksum)
+            }
+        }
     }
 
     pub fn serialize(

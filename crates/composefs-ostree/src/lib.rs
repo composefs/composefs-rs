@@ -346,6 +346,48 @@ pub fn create_filesystem<ObjectID: FsVerityHashValue>(
     Ok(fs)
 }
 
+/// Create an ostree commit from an in-memory filesystem tree.
+///
+/// Walks the tree to produce ostree objects (dirtrees, dirmetas, file
+/// headers), serializes them into a commit splitstream, and generates
+/// the EROFS image.  Returns the splitstream verity and the hex-encoded
+/// commit ID.
+///
+/// Use [`ostree::CommitMetadata::default()`] for a minimal commit, the
+/// builder methods to set fields, or [`ostree::OstreeCommit::commit_metadata()`]
+/// to round-trip an existing commit.
+pub fn commit_filesystem<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    fs: &FileSystem<ObjectID>,
+    metadata: ostree::CommitMetadata,
+    reference: Option<&str>,
+) -> Result<(ObjectID, String)> {
+    let (writer, commit_id) = CommitWriter::from_filesystem(repo, fs, metadata)?;
+
+    let content_id = format!("ostree-commit-{}", hex::encode(commit_id));
+    let ref_path = reference.map(ostree_ref_path);
+
+    let image_id = fs.commit_image(repo, None)?;
+    let verity = writer.serialize(repo, &content_id, ref_path.as_deref(), Some(&image_id))?;
+
+    Ok((verity, hex::encode(commit_id)))
+}
+
+/// Reads and parses an ostree commit object.
+///
+/// `source` can be an ostree ref name or a commit ID / prefix.
+pub fn read_commit<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    source: &str,
+) -> Result<ostree::OstreeCommit> {
+    let content_id = resolve_source(repo, source)?;
+    let reader = CommitReader::<ObjectID>::load(repo, &content_id)?;
+    let commit_data = reader
+        .lookup_data(&reader.commit_id())?
+        .ok_or_else(|| anyhow::anyhow!("commit object not found in stream"))?;
+    ostree::OstreeCommit::from_data(commit_data)
+}
+
 /// Prints the contents of an ostree commit object.
 ///
 /// `source` can be an ostree ref name or a commit ID / prefix.
