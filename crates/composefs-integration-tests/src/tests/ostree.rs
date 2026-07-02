@@ -512,6 +512,37 @@ fn test_ostree_pull_remote_diff_delta() -> Result<()> {
 }
 integration_test!(test_ostree_pull_remote_diff_delta);
 
+fn test_ostree_commit_roundtrip() -> Result<()> {
+    let sh = Shell::new()?;
+    let tmpdir = TempDir::new()?;
+    let content = create_ostree_test_content(tmpdir.path(), 1)?;
+
+    let ostree_repo_path = tmpdir.path().join("ostree-repo");
+    init_ostree_repo(&sh, &ostree_repo_path, "archive-z2")?;
+    let original_commit_id = commit_to_ostree(&sh, &ostree_repo_path, "original", &content)?;
+
+    let composefs_dir = TempDir::new()?;
+    let repo = create_test_repository(&composefs_dir)?;
+    pull_and_get_image_id(&repo, &ostree_repo_path, "original", None)?;
+
+    // Read the original commit's metadata and filesystem
+    let fs = composefs_ostree::create_filesystem(&repo, "original")?;
+    let commit = composefs_ostree::read_commit(&repo, "original")?;
+    let commit_meta = commit.commit_metadata();
+
+    // Recreate the commit — should produce the same commit ID
+    let (_, roundtrip_commit_id) =
+        composefs_ostree::commit_filesystem(&repo, &fs, commit_meta, None)?;
+
+    assert_eq!(
+        original_commit_id, roundtrip_commit_id,
+        "roundtrip commit ID differs from original"
+    );
+
+    Ok(())
+}
+integration_test!(test_ostree_commit_roundtrip);
+
 fn test_ostree_apply_delta_offline() -> Result<()> {
     let sh = Shell::new()?;
     let tmpdir = TempDir::new()?;
