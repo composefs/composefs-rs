@@ -582,6 +582,21 @@ enum OstreeCommand {
         #[arg(add = ArgValueCompleter::new(complete_ostree_refs))]
         name: String,
     },
+    /// Create an ostree commit from a composefs image in the repository
+    ///
+    /// The image is specified by its object ID or refs/ name (the same
+    /// format used by `cfsctl mount` and `cfsctl image-objects`).
+    Commit {
+        /// Composefs image ID or refs/ name
+        #[arg(add = ArgValueCompleter::new(complete_image_refs))]
+        image: String,
+        /// Ostree ref name to tag the commit with
+        #[clap(long)]
+        reference: Option<String>,
+        /// One-line commit subject
+        #[clap(long, default_value = "")]
+        subject: String,
+    },
     /// List all ostree commits in the repository
     #[clap(name = "images")]
     ListCommits,
@@ -1833,6 +1848,46 @@ where
             }
             OstreeCommand::Untag { ref name } => {
                 composefs_ostree::untag(&repo, name)?;
+            }
+            OstreeCommand::Commit {
+                ref image,
+                ref reference,
+                ref subject,
+            } => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+
+                let (img_fd, _) = repo.open_image(image)?;
+                let mut img_buf = Vec::new();
+                std::fs::File::from(img_fd).read_to_end(&mut img_buf)?;
+                let fs = composefs::erofs::reader::erofs_to_filesystem(&img_buf)?;
+
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let mut commit_meta = composefs_ostree::ostree::CommitMetadata::default()
+                    .subject(subject.as_str())
+                    .timestamp(timestamp);
+                if let Some(ref_name) = reference {
+                    commit_meta = commit_meta.add_metadata(
+                        "ostree.ref-binding",
+                        composefs_ostree::ostree::MetadataValue::StringArray(vec![
+                            ref_name.clone(),
+                        ]),
+                    );
+                }
+
+                let (verity, commit_id) = composefs_ostree::commit_filesystem(
+                    &repo,
+                    &fs,
+                    commit_meta,
+                    reference.as_deref(),
+                )?;
+                println!("commit  {commit_id}");
+                println!("verity  {}", verity.to_hex());
+                if let Some(ref_name) = reference {
+                    println!("tagged  {ref_name}");
+                }
             }
             OstreeCommand::ListCommits => {
                 let commits = composefs_ostree::list_commits(&repo)?;
