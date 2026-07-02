@@ -48,7 +48,6 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::engine::ArgValueCompleter;
-#[cfg(any(feature = "oci", feature = "ostree"))]
 use comfy_table::{Table, presets::UTF8_FULL};
 #[cfg(feature = "ostree")]
 use complete::complete_ostree_refs;
@@ -726,6 +725,16 @@ enum Command {
     },
     /// Imports a composefs image (unsafe!)
     ImportImage { reference: String },
+    /// List all named image references in the repository
+    #[clap(name = "images", alias = "list-images")]
+    Images {
+        /// Output as JSON array
+        #[clap(long)]
+        json: bool,
+        /// Show full digest instead of truncated form
+        #[clap(long)]
+        no_trunc: bool,
+    },
     /// Commands for dealing with OCI images and layers
     #[cfg(feature = "oci")]
     Oci {
@@ -1903,6 +1912,38 @@ where
             ref mount_opts,
         } => {
             mount_opts.mount_image(&repo, &name, &mountpoint)?;
+        }
+        Command::Images { json, no_trunc } => {
+            let refs = repo.list_image_refs("")?;
+
+            if json {
+                let entries: Vec<serde_json::Value> = refs
+                    .iter()
+                    .map(|(name, target)| {
+                        let digest = target.rsplit('/').next().unwrap_or(target);
+                        serde_json::json!({ "name": name, "digest": digest })
+                    })
+                    .collect();
+                serde_json::to_writer_pretty(std::io::stdout().lock(), &entries)?;
+                println!();
+            } else if refs.is_empty() {
+                println!("No images found");
+            } else {
+                let mut table = Table::new();
+                table.load_preset(UTF8_FULL);
+                table.set_header(["NAME", "DIGEST"]);
+
+                for (name, target) in &refs {
+                    let digest = target.rsplit('/').next().unwrap_or(target);
+                    let digest_display = if !no_trunc && digest.len() > 12 {
+                        &digest[..12]
+                    } else {
+                        digest
+                    };
+                    table.add_row([name.as_str(), digest_display]);
+                }
+                println!("{table}");
+            }
         }
         Command::ImageObjects { name } => {
             let objects = repo.objects_for_image(&name)?;
