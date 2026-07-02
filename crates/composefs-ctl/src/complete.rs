@@ -178,13 +178,15 @@ fn collect_refs<ObjectID: FsVerityHashValue>(
         return vec![];
     };
     let prefix = prefix.as_encoded_bytes();
-    refs.into_iter()
-        .filter_map(|(name, _)| {
-            let candidate = format!("refs/{name}");
-            candidate
-                .as_bytes()
-                .starts_with(prefix)
-                .then(|| CompletionCandidate::new(candidate))
-        })
-        .collect()
+    let mut out = Vec::new();
+    for (name, _) in &refs {
+        if name.as_bytes().starts_with(prefix) {
+            out.push(CompletionCandidate::new(name));
+        }
+        let prefixed = format!("refs/{name}");
+        if prefixed.as_bytes().starts_with(prefix) {
+            out.push(CompletionCandidate::new(prefixed));
+        }
+    }
+    out
 }
