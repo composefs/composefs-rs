@@ -388,6 +388,75 @@ impl OstreeDirTree {
     }
 }
 
+/// Caller-controlled fields for creating a new ostree commit.
+///
+/// Use [`Default::default()`] for a minimal commit (timestamp defaults
+/// to 0 — set it with [`.timestamp()`](Self::timestamp)), or
+/// [`OstreeCommit::commit_metadata()`] to extract from an existing
+/// commit for round-tripping.
+#[derive(Debug, Default)]
+pub struct CommitMetadata {
+    /// Checksum of the parent commit, if any.
+    pub parent_commit: Option<Sha256Digest>,
+    /// Commit metadata key-value pairs.
+    pub metadata: Vec<(String, MetadataValue)>,
+    /// One-line commit subject.
+    pub subject: String,
+    /// Extended commit description.
+    pub body: String,
+    /// Commit timestamp (seconds since Unix epoch).
+    /// Defaults to 0; the caller should set this (e.g. to the current time).
+    pub timestamp: u64,
+}
+
+impl CommitMetadata {
+    /// Set the commit subject.
+    pub fn subject(mut self, s: impl Into<String>) -> Self {
+        self.subject = s.into();
+        self
+    }
+
+    /// Set the commit body.
+    pub fn body(mut self, b: impl Into<String>) -> Self {
+        self.body = b.into();
+        self
+    }
+
+    /// Set the parent commit.
+    pub fn parent(mut self, p: Sha256Digest) -> Self {
+        self.parent_commit = Some(p);
+        self
+    }
+
+    /// Set the commit timestamp.
+    pub fn timestamp(mut self, t: u64) -> Self {
+        self.timestamp = t;
+        self
+    }
+
+    /// Add a metadata key-value pair.
+    pub fn add_metadata(mut self, key: impl Into<String>, value: MetadataValue) -> Self {
+        self.metadata.push((key.into(), value));
+        self
+    }
+
+    pub(crate) fn into_commit(
+        self,
+        root_tree: Sha256Digest,
+        root_metadata: Sha256Digest,
+    ) -> OstreeCommit {
+        OstreeCommit {
+            parent_commit: self.parent_commit,
+            metadata: self.metadata,
+            subject: self.subject,
+            body: self.body,
+            timestamp: self.timestamp,
+            root_tree,
+            root_metadata,
+        }
+    }
+}
+
 /// Decoded ostree commit object with metadata, tree root, and optional parent.
 #[derive(Debug)]
 pub struct OstreeCommit {
@@ -405,6 +474,19 @@ pub struct OstreeCommit {
     pub root_tree: Sha256Digest,
     /// Checksum of the root directory metadata object.
     pub root_metadata: Sha256Digest,
+}
+
+impl OstreeCommit {
+    /// Extract the caller-controlled fields for re-creating this commit.
+    pub fn commit_metadata(&self) -> CommitMetadata {
+        CommitMetadata {
+            parent_commit: self.parent_commit,
+            metadata: self.metadata.clone(),
+            subject: self.subject.clone(),
+            body: self.body.clone(),
+            timestamp: self.timestamp,
+        }
+    }
 }
 
 /// A typed value from an ostree commit metadata dictionary (`a{sv}`).

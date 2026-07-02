@@ -28,6 +28,16 @@ pub enum RegularFile<ObjectID: FsVerityHashValue> {
     Sparse(u64),
 }
 
+impl<ObjectID: FsVerityHashValue> RegularFile<ObjectID> {
+    /// Returns the file size in bytes.
+    pub fn file_size(&self) -> u64 {
+        match self {
+            Self::Inline(data) => data.len() as u64,
+            Self::External(_, size) | Self::ExternalNoVerity(_, size) | Self::Sparse(size) => *size,
+        }
+    }
+}
+
 // Re-export generic types. Note that we don't need to re-write
 // the generic constraint T: FsVerityHashValue here because it will
 // be transitively enforced.

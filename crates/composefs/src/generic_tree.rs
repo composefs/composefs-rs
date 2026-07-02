@@ -97,6 +97,19 @@ pub enum LeafContent<T> {
 }
 
 impl<T> LeafContent<T> {
+    /// Returns the `S_IFMT` file-type bits for this content type.
+    pub fn file_type_bits(&self) -> u32 {
+        use crate::erofs::format;
+        match self {
+            Self::Regular(_) => format::S_IFREG as u32,
+            Self::Symlink(_) => format::S_IFLNK as u32,
+            Self::BlockDevice(_) => format::S_IFBLK as u32,
+            Self::CharacterDevice(_) => format::S_IFCHR as u32,
+            Self::Fifo => format::S_IFIFO as u32,
+            Self::Socket => format::S_IFSOCK as u32,
+        }
+    }
+
     /// Maps `Regular(&T)` to `Regular(U)` via a fallible function,
     /// passing all other variants through unchanged.
     pub fn try_map_ref<U, E>(
