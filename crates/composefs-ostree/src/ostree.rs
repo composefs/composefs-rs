@@ -4,10 +4,11 @@
 //! trees, directory metadata, file headers) and their gvariant wire formats.
 
 use std::fmt;
+use std::io::Write;
 
 use anyhow::{Result, anyhow, bail};
 use gvariant::aligned_bytes::{A8, AlignedBuf, AlignedSlice, AsAligned, TryAsAligned};
-use gvariant::{Marker, Owned, Structure, Variant, gv};
+use gvariant::{Marker, Owned, SerializeTo, Structure, Variant, VariantWrap, gv};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use composefs::{fsverity::FsVerityHashValue, util::Sha256Digest};
@@ -282,6 +283,21 @@ pub struct OstreeDirMeta {
 }
 
 impl OstreeDirMeta {
+    /// Serialize to raw gvariant data.
+    pub fn serialize(&self) -> Vec<u8> {
+        let xattrs = self
+            .xattrs
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect::<Vec<_>>();
+        gv!("(uuua(ayay))").serialize_to_vec(&(
+            u32::to_be(self.uid),
+            u32::to_be(self.gid),
+            u32::to_be(self.mode),
+            &xattrs,
+        ))
+    }
+
     /// Deserialize from raw gvariant data.
     pub fn from_data(data: &AlignedSlice<A8>) -> Result<Self> {
         let gv = gv!("(uuua(ayay))").cast(data.as_aligned());
@@ -323,6 +339,26 @@ pub struct OstreeDirTree {
 }
 
 impl OstreeDirTree {
+    /// Serialize to raw gvariant data.
+    ///
+    /// Files and directories are sorted by name, matching ostree's
+    /// `create_tree_variant_from_hashes` which sorts with `strcmp`.
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut files: Vec<(&str, [u8; 32])> = self
+            .files
+            .iter()
+            .map(|(name, checksum)| (name.as_str(), *checksum))
+            .collect();
+        files.sort_by_key(|(name, _)| *name);
+        let mut dirs: Vec<(&str, [u8; 32], [u8; 32])> = self
+            .dirs
+            .iter()
+            .map(|(name, tree, meta)| (name.as_str(), *tree, *meta))
+            .collect();
+        dirs.sort_by_key(|(name, _, _)| *name);
+        gv!("(a(say)a(sayay))").serialize_to_vec(&(&files, &dirs))
+    }
+
     /// Deserialize from raw gvariant data.
     pub fn from_data(data: &AlignedSlice<A8>) -> Result<Self> {
         let gv = gv!("(a(say)a(sayay))").cast(data.as_aligned());
@@ -456,7 +492,49 @@ impl fmt::Display for MetadataValue {
     }
 }
 
+impl SerializeTo<Variant> for &MetadataValue {
+    fn serialize(self, f: &mut impl Write) -> std::io::Result<usize> {
+        match self {
+            MetadataValue::String(s) => VariantWrap(gv!("s"), s.as_str()).serialize(f),
+            MetadataValue::Bool(b) => VariantWrap(gv!("b"), b).serialize(f),
+            MetadataValue::Uint32(u) => VariantWrap(gv!("u"), *u).serialize(f),
+            MetadataValue::Uint64(t) => VariantWrap(gv!("t"), *t).serialize(f),
+            MetadataValue::StringArray(arr) => {
+                let refs: Vec<&str> = arr.iter().map(|s| s.as_str()).collect();
+                VariantWrap(gv!("as"), refs).serialize(f)
+            }
+            MetadataValue::ByteArray(ay) => VariantWrap(gv!("ay"), ay.as_slice()).serialize(f),
+            MetadataValue::Other(v) => {
+                let v: &Variant = v;
+                v.serialize(f)
+            }
+        }
+    }
+}
+
 impl OstreeCommit {
+    /// Serialize to raw gvariant data.
+    pub fn serialize(&self) -> Vec<u8> {
+        let metadata: Vec<(&str, &MetadataValue)> =
+            self.metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        let parent: &[u8] = self
+            .parent_commit
+            .as_ref()
+            .map(|c| c.as_slice())
+            .unwrap_or(&[]);
+        let related: Vec<(&str, [u8; 32])> = vec![];
+        gv!("(a{sv}aya(say)sstayay)").serialize_to_vec(&(
+            &metadata,
+            parent,
+            &related,
+            self.subject.as_str(),
+            self.body.as_str(),
+            u64::to_be(self.timestamp),
+            self.root_tree.as_slice(),
+            self.root_metadata.as_slice(),
+        ))
+    }
+
     /// Deserialize from raw gvariant data.
     pub fn from_data(data: &AlignedSlice<A8>) -> Result<Self> {
         let gv = gv!("(a{sv}aya(say)sstayay)").cast(data.as_aligned());
