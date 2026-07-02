@@ -26,6 +26,14 @@ use composefs_integration_tests::create_test_repository;
 /// - Symlinks with changed targets
 /// - Nested directory changes (new dirtree metadata)
 fn create_ostree_test_content(parent: &Path, version: u32) -> Result<std::path::PathBuf> {
+    create_ostree_test_content_opts(parent, version, false)
+}
+
+fn create_ostree_test_content_opts(
+    parent: &Path,
+    version: u32,
+    bare_user_only: bool,
+) -> Result<std::path::PathBuf> {
     let root = parent.join("content");
     if root.exists() {
         std::fs::remove_dir_all(&root)?;
@@ -60,12 +68,14 @@ fn create_ostree_test_content(parent: &Path, version: u32) -> Result<std::path::
         &xattr_file,
         vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
     )?;
-    rustix::fs::setxattr(
-        &xattr_file,
-        c"user.testxattr",
-        b"testvalue",
-        rustix::fs::XattrFlags::CREATE,
-    )?;
+    if !bare_user_only {
+        rustix::fs::setxattr(
+            &xattr_file,
+            c"user.testxattr",
+            b"testvalue",
+            rustix::fs::XattrFlags::CREATE,
+        )?;
+    }
 
     // Symlink (unchanged across versions)
     std::os::unix::fs::symlink("libshared.so.1", root.join("lib/libcompat.so"))?;
@@ -542,6 +552,62 @@ fn test_ostree_commit_roundtrip() -> Result<()> {
     Ok(())
 }
 integration_test!(test_ostree_commit_roundtrip);
+
+fn test_ostree_export() -> Result<()> {
+    let sh = Shell::new()?;
+    let tmpdir = TempDir::new()?;
+
+    let composefs_dir = TempDir::new()?;
+    let repo = create_test_repository(&composefs_dir)?;
+
+    for mode in &["bare-user", "bare-user-only"] {
+        let is_buo = *mode == "bare-user-only";
+        let content = create_ostree_test_content_opts(tmpdir.path(), 1, is_buo)?;
+
+        let ostree_source = tmpdir.path().join(format!("ostree-source-{mode}"));
+        init_ostree_repo(&sh, &ostree_source, "archive-z2")?;
+        let source_str = ostree_source.to_str().unwrap();
+        let content_str = content.to_str().unwrap();
+
+        let original_commit_id = if is_buo {
+            cmd!(
+                sh,
+                "ostree commit --repo={source_str} --branch=test --owner-uid=0 --owner-gid=0 --no-xattrs {content_str}"
+            )
+            .read()?
+            .trim()
+            .to_string()
+        } else {
+            commit_to_ostree(&sh, &ostree_source, "test", &content)?
+        };
+
+        pull_and_get_image_id(&repo, &ostree_source, "test", None)?;
+
+        let dest_path = tmpdir.path().join(format!("ostree-export-{mode}"));
+        init_ostree_repo(&sh, &dest_path, mode)?;
+
+        let dest = composefs_ostree::LocalRepo::open_path(&repo, rustix::fs::CWD, &dest_path)?;
+        let exported_id = composefs_ostree::export_commit(&repo, "test", &dest, Some("exported"))?;
+
+        assert_eq!(
+            original_commit_id, exported_id,
+            "{mode}: exported commit ID differs from original"
+        );
+
+        let dest_str = dest_path.to_str().unwrap();
+        cmd!(sh, "ostree --repo={dest_str} fsck").run()?;
+
+        let ref_output = cmd!(sh, "ostree --repo={dest_str} rev-parse exported").read()?;
+        assert_eq!(
+            original_commit_id,
+            ref_output.trim(),
+            "{mode}: ref 'exported' points to wrong commit"
+        );
+    }
+
+    Ok(())
+}
+integration_test!(test_ostree_export);
 
 fn test_ostree_apply_delta_offline() -> Result<()> {
     let sh = Shell::new()?;
