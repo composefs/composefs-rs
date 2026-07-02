@@ -407,6 +407,41 @@ async fn run_image_objects<ObjectID: FsVerityHashValue>(
     Ok(ImageObjectsReply { object_ids })
 }
 
+/// A single image reference entry.
+#[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
+pub struct ImageRefEntry {
+    /// The reference name.
+    pub name: String,
+    /// The fs-verity digest the reference points to.
+    pub digest: String,
+}
+
+/// Reply listing all named image references in the repository.
+#[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
+pub struct ListImageRefsReply {
+    /// The image references.
+    pub images: Vec<ImageRefEntry>,
+}
+
+/// Collect all named image references from the repository.
+pub fn run_list_image_refs<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+) -> std::result::Result<ListImageRefsReply, RepositoryError> {
+    let refs = repo
+        .list_image_refs("")
+        .map_err(|e| RepositoryError::InternalError {
+            message: format!("{e:#}"),
+        })?;
+    let images = refs
+        .into_iter()
+        .map(|(name, target)| {
+            let digest = target.rsplit('/').next().unwrap_or(&target).to_string();
+            ImageRefEntry { name, digest }
+        })
+        .collect();
+    Ok(ListImageRefsReply { images })
+}
+
 /// Options for a `Mount` call. All fields are optional for forward
 /// compatibility — new mount options can be added without breaking the
 /// wire format.
@@ -743,9 +778,10 @@ mod service_impl {
     #![allow(missing_docs)]
 
     use super::{
-        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, MountParams,
-        MountReply, OpenRepo, OpenRepositoryReply, RepositoryError, run_fsck, run_gc,
-        run_image_objects, run_init_repository, run_mount,
+        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply,
+        ListImageRefsReply, MountParams, MountReply, OpenRepo, OpenRepositoryReply,
+        RepositoryError, run_fsck, run_gc, run_image_objects, run_init_repository,
+        run_list_image_refs, run_mount,
     };
     use composefs::fsverity::{Algorithm, Sha256HashValue, Sha512HashValue};
 
@@ -852,6 +888,17 @@ mod service_impl {
             }
         }
 
+        /// List all named image references in the repository.
+        async fn list_image_refs(
+            &self,
+            handle: u64,
+        ) -> std::result::Result<ListImageRefsReply, RepositoryError> {
+            match self.lookup_repo(handle)? {
+                OpenRepo::Sha256(ref r) => run_list_image_refs::<Sha256HashValue>(r),
+                OpenRepo::Sha512(ref r) => run_list_image_refs::<Sha512HashValue>(r),
+            }
+        }
+
         /// Create a detached mount of an image and return the mount fd.
         ///
         /// If overlay upper/work directories are needed, pass them as two fds
@@ -898,10 +945,11 @@ mod service_impl {
         parse_local_fetch, pull_stream,
     };
     use super::{
-        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, MountParams,
-        MountReply, OpenRepo, OpenRepositoryReply, RepositoryError, run_compute_id, run_fsck,
-        run_gc, run_image_objects, run_init_repository, run_inspect, run_list_images, run_mount,
-        run_oci_fsck, run_oci_mount, run_tag, run_untag,
+        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply,
+        ListImageRefsReply, MountParams, MountReply, OpenRepo, OpenRepositoryReply,
+        RepositoryError, run_compute_id, run_fsck, run_gc, run_image_objects, run_init_repository,
+        run_inspect, run_list_image_refs, run_list_images, run_mount, run_oci_fsck, run_oci_mount,
+        run_tag, run_untag,
     };
     use composefs::fsverity::{Algorithm, Sha256HashValue, Sha512HashValue};
 
@@ -1007,6 +1055,17 @@ mod service_impl {
             match self.lookup_repo(handle)? {
                 OpenRepo::Sha256(ref r) => run_image_objects::<Sha256HashValue>(r, name).await,
                 OpenRepo::Sha512(ref r) => run_image_objects::<Sha512HashValue>(r, name).await,
+            }
+        }
+
+        /// List all named image references in the repository.
+        async fn list_image_refs(
+            &self,
+            handle: u64,
+        ) -> std::result::Result<ListImageRefsReply, RepositoryError> {
+            match self.lookup_repo(handle)? {
+                OpenRepo::Sha256(ref r) => run_list_image_refs::<Sha256HashValue>(r),
+                OpenRepo::Sha512(ref r) => run_list_image_refs::<Sha512HashValue>(r),
             }
         }
 

@@ -48,7 +48,6 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::engine::ArgValueCompleter;
-#[cfg(any(feature = "oci", feature = "ostree"))]
 use comfy_table::{Table, presets::UTF8_FULL};
 #[cfg(feature = "ostree")]
 use complete::complete_ostree_refs;
@@ -741,6 +740,16 @@ enum Command {
     },
     /// Imports a composefs image (unsafe!)
     ImportImage { reference: String },
+    /// List all named image references in the repository
+    #[clap(name = "images", alias = "list-images")]
+    Images {
+        /// Output as JSON array
+        #[clap(long)]
+        json: bool,
+        /// Show full digest instead of truncated form
+        #[clap(long)]
+        no_trunc: bool,
+    },
     /// Commands for dealing with OCI images and layers
     #[cfg(feature = "oci")]
     Oci {
@@ -1958,6 +1967,31 @@ where
             ref mount_opts,
         } => {
             mount_opts.mount_image(&repo, &name, &mountpoint)?;
+        }
+        Command::Images { json, no_trunc } => {
+            let reply =
+                varlink::run_list_image_refs(&repo).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+            if json {
+                serde_json::to_writer_pretty(std::io::stdout().lock(), &reply)?;
+                println!();
+            } else if reply.images.is_empty() {
+                println!("No images found");
+            } else {
+                let mut table = Table::new();
+                table.load_preset(UTF8_FULL);
+                table.set_header(["NAME", "DIGEST"]);
+
+                for entry in &reply.images {
+                    let digest_display = if !no_trunc && entry.digest.len() > 12 {
+                        &entry.digest[..12]
+                    } else {
+                        &entry.digest
+                    };
+                    table.add_row([entry.name.as_str(), digest_display]);
+                }
+                println!("{table}");
+            }
         }
         Command::ImageObjects { name } => {
             let objects = repo.objects_for_image(&name)?;
