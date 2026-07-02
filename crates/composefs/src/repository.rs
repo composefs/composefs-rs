@@ -2491,6 +2491,20 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     pub fn open_image(&self, name: &str) -> Result<(OwnedFd, bool)> {
         let image = match self.openat(&format!("images/{name}"), OFlags::RDONLY) {
             Ok(fd) => fd,
+            Err(Errno::NOENT) if !name.contains('/') => {
+                // Try resolving as a named ref before giving up
+                match self.openat(&format!("images/refs/{name}"), OFlags::RDONLY) {
+                    Ok(fd) => return Ok((fd, true)),
+                    Err(Errno::NOENT) => {
+                        return Err(anyhow::Error::new(ImageNotFound {
+                            name: name.to_string(),
+                        }));
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("Opening ref 'images/refs/{name}'"));
+                    }
+                }
+            }
             Err(Errno::NOENT) => {
                 return Err(anyhow::Error::new(ImageNotFound {
                     name: name.to_string(),
@@ -5948,6 +5962,34 @@ mod tests {
             !target_str.contains(&v2_id.to_hex()),
             "named ref must NOT point to V2 image, but points to: {target_str}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_open_image_resolves_bare_ref_name() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj_size: u64 = 32 * 1024;
+        let obj = generate_test_data(obj_size, 0xBB);
+        let obj_id = repo.ensure_object(&obj)?;
+
+        let fs = make_test_fs(&obj_id, obj_size);
+        let image_id = fs.commit_image(&repo, Some("myimage"))?;
+        repo.sync()?;
+
+        // Opening by digest should work
+        repo.open_image(&image_id.to_hex())?;
+
+        // Opening by refs/ prefix should work
+        repo.open_image("refs/myimage")?;
+
+        // Opening by bare ref name should also work
+        repo.open_image("myimage")?;
+
+        // Non-existent bare name should fail
+        assert!(repo.open_image("no-such-ref").is_err());
+
         Ok(())
     }
 
