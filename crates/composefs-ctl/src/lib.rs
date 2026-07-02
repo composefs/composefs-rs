@@ -597,6 +597,22 @@ enum OstreeCommand {
         #[clap(long, default_value = "")]
         subject: String,
     },
+    /// Export an ostree commit to a local ostree repository
+    ///
+    /// Writes all objects (files, dirtrees, dirmetas, commit) to the
+    /// destination repo. File content is reflinked when possible.
+    /// Only bare, bare-user, and bare-user-only repos are supported.
+    Export {
+        /// Ostree ref name or commit ID to export
+        #[arg(add = ArgValueCompleter::new(complete_ostree_refs))]
+        source: String,
+        /// Path to the destination ostree repository
+        #[arg(value_hint = clap::ValueHint::DirPath)]
+        ostree_repo_path: PathBuf,
+        /// Ref name to set in the destination repo
+        #[clap(long)]
+        reference: Option<String>,
+    },
     /// List all ostree commits in the repository
     #[clap(name = "images")]
     ListCommits,
@@ -1885,6 +1901,19 @@ where
                 )?;
                 println!("commit  {commit_id}");
                 println!("verity  {}", verity.to_hex());
+                if let Some(ref_name) = reference {
+                    println!("tagged  {ref_name}");
+                }
+            }
+            OstreeCommand::Export {
+                ref source,
+                ref ostree_repo_path,
+                ref reference,
+            } => {
+                let dest = composefs_ostree::LocalRepo::open_path(&repo, CWD, ostree_repo_path)?;
+                let commit_id =
+                    composefs_ostree::export_commit(&repo, source, &dest, reference.as_deref())?;
+                println!("commit  {commit_id}");
                 if let Some(ref_name) = reference {
                     println!("tagged  {ref_name}");
                 }
