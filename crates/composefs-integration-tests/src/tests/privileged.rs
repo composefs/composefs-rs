@@ -639,19 +639,19 @@ integration_test!(privileged_pull_readonly_repo);
 /// Supports ext4 (with verity) and XFS (with reflinks).  The backing sparse
 /// file is 512 MB — large enough for a synthetic OCI image in
 /// containers-storage plus a composefs repo.
-struct LoopTempDir {
+pub(crate) struct LoopTempDir {
     mountpoint: PathBuf,
     _backing: tempfile::TempDir,
 }
 
 impl LoopTempDir {
     /// Create a loop-mounted ext4 filesystem with verity support.
-    fn ext4_verity() -> Result<Self> {
+    pub(crate) fn ext4_verity() -> Result<Self> {
         Self::create("mkfs.ext4", &["-q", "-O", "verity", "-b", "4096"])
     }
 
     /// Create a loop-mounted XFS filesystem with reflink support.
-    fn xfs_reflink() -> Result<Self> {
+    pub(crate) fn xfs_reflink() -> Result<Self> {
         Self::create("mkfs.xfs", &["-q", "-m", "reflink=1"])
     }
 
@@ -672,7 +672,7 @@ impl LoopTempDir {
         })
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.mountpoint
     }
 }
