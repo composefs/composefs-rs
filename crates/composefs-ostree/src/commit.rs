@@ -331,8 +331,8 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
                     LeafContent::Regular(
                         RegularFile::External(obj_id, _) | RegularFile::ExternalNoVerity(obj_id, _),
                     ) => Some(repo.read_object(obj_id)?),
-                    LeafContent::Regular(RegularFile::Sparse(size)) => {
-                        Some(vec![0u8; *size as usize])
+                    LeafContent::Regular(RegularFile::Sparse(_)) => {
+                        bail!("Sparse files not supported in ostree commit")
                     }
                     _ => None,
                 };
