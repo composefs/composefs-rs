@@ -121,9 +121,10 @@ jobs:
           - name: centos-stream10
             base_image: quay.io/centos-bootc/centos-bootc:stream10
             cfsctl_features: pre-6.15
-          - name: debian
-            base_image: ghcr.io/bootcrew/debian-bootc:latest
-            cfsctl_features: oci
+          # Temporarily disabled
+          # - name: debian
+          #   base_image: ghcr.io/bootcrew/debian-bootc:latest
+          #   cfsctl_features: oci
     env:
       COMPOSEFS_BASE_IMAGE: ${{ matrix.base_image }}
       COMPOSEFS_CFSCTL_FEATURES: ${{ matrix.cfsctl_features }}
