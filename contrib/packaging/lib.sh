@@ -29,7 +29,17 @@ debian_apt_init() {
 pkg_install() {
     case "${ID}" in
         centos|fedora|rhel)
-            dnf install -y "$@"
+            # Filter out already-installed packages to avoid unintended
+            # upgrades (e.g. podman 5→6 without a matching netavark bump).
+            local -a to_install=()
+            for pkg in "$@"; do
+                if ! rpm -q "$pkg" &>/dev/null; then
+                    to_install+=("$pkg")
+                fi
+            done
+            if [ ${#to_install[@]} -gt 0 ]; then
+                dnf install -y "${to_install[@]}"
+            fi
             dnf clean all
             ;;
         debian|ubuntu)
