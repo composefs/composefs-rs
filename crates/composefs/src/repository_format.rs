@@ -66,13 +66,21 @@
 //!    - `incompatible` — old tools must refuse the repository entirely.
 //!
 //!    The currently defined feature flags are:
-//!      - `v1_erofs` (read-only-compatible) — present on repositories whose
-//!        EROFS image format is [V1][crate::erofs_format] (C-tool compatible:
-//!        compact inodes, BFS ordering, whiteout table).  This is the single
-//!        flag that encodes the EROFS format version: present → V1, absent
-//!        → V2.  Old
-//!        tools that do not recognise this flag open the repository read-only
-//!        rather than accidentally writing images in the wrong format.
+//!      - `v1_erofs` (read-only-compatible) — legacy on-disk signal for the
+//!        EROFS format, kept for compatibility with tools that predate the
+//!        `erofs_formats` field described below: present → [V1][crate::erofs_format],
+//!        absent → V2.  Tools that do not recognise this flag open the
+//!        repository read-only rather than accidentally writing images in the
+//!        wrong format.
+//!
+//!  - `erofs_formats` (optional) — the authoritative [`FormatConfig`][crate::erofs::format::FormatConfig]
+//!    for this repository, e.g. `{"default": 1}` or, for a repository that
+//!    generates both V1 and V2 images, `{"default": 1, "extra": [2]}`.  When
+//!    present, this field determines the EROFS format(s) produced by
+//!    `commit_image`; the `v1_erofs` flag is derived from it and kept in sync
+//!    purely for old-tool compatibility.  When absent (repositories created
+//!    before this field existed), the effective format falls back to the
+//!    `v1_erofs` flag as described above.
 //!
 //! When `meta.json` is present, `cfsctl` auto-detects the hash algorithm and
 //! errors if `--hash` is explicitly passed with a conflicting value.  When
@@ -82,28 +90,79 @@
 //! ### `cfsctl init --erofs-version`
 //!
 //! The `--erofs-version` flag selects the EROFS format for newly committed
-//! images.  It controls the `v1_erofs` feature flag in `meta.json`:
+//! images.  It sets `erofs_formats` (and, for V1, the legacy `v1_erofs` flag)
+//! in `meta.json`:
 //!
 //! ```text
-//! cfsctl init                          # default: V2 EROFS (composefs-rs native)
-//! cfsctl init --erofs-version 1        # V1 EROFS (C-tool compatible)
+//! cfsctl init                          # default: V1 EROFS (C-tool compatible)
+//! cfsctl init --erofs-version 2        # V2 EROFS (legacy composefs-rs format)
 //! ```
 //!
-//! **V2** (the `cfsctl` default) uses extended inodes, DFS ordering, and
-//! `composefs_version=2` in the EROFS superblock.  This is the composefs-rs native
-//! format and is what all repositories created before V1 support was added use.
-//! Higher-level tools (e.g. bootc) may configure a repository with multiple format
-//! versions (V1 primary + V2 extra) so that images are usable on both RHEL9-era and
-//! newer kernels.
+//! **V1** (the `cfsctl` default) uses compact inodes where possible, BFS
+//! ordering, and a whiteout stub table, producing output byte-for-byte
+//! identical to C `mkcomposefs --min-version=1`.  It is understood by both C
+//! `mkcomposefs`/`composefs-info` 1.0.8+ and composefs-rs, making it the best
+//! choice for interoperability, which is why it became the default on the
+//! path towards a stable composefs-rs 1.0.  The `v1_erofs` ro-compat flag is
+//! written to `meta.json` so that tools which predate V1 support open the
+//! repository read-only rather than writing images in the wrong format.
 //!
-//! **V1** uses compact inodes where possible, BFS ordering, and a whiteout stub
-//! table, producing output byte-for-byte identical to the C `mkcomposefs` tool.
-//! The `v1_erofs` ro-compat flag is written to `meta.json` so that tools which
-//! predate V1 support open the repository read-only rather than writing images
-//! in the wrong format.
+//! **V2** uses extended inodes, DFS ordering, and `composefs_version=2` in the
+//! EROFS superblock.  This is composefs-rs's original format, now legacy, and
+//! is what all repositories created before V1 support was added use — those
+//! old repositories (which lack an `erofs_formats` field and the `v1_erofs`
+//! flag) continue to default to V2 rather than being silently reinterpreted
+//! as V1.  V2 remains available for callers that need it, e.g. higher-level
+//! tools (such as bootc) may configure a repository with multiple format
+//! versions (V1 primary + V2 extra) so that images are usable on both
+//! RHEL9-era and newer kernels.
+//!
+//! There is also a [V0][crate::erofs_format] format matching the plain
+//! (non-`--min-version=1`) default output of C `mkcomposefs`.  It shares V1's
+//! on-disk layout and is selectable via `--erofs-version 0`, but — since no
+//! repository created before `erofs_formats` existed could have used it — it
+//! is not represented by a `meta.json` feature flag of its own; the
+//! `erofs_formats` field is authoritative for it.
 //!
 //! Re-initializing an existing repository with a different `--erofs-version` is
-//! rejected with an error; the format version is fixed at init time.
+//! rejected with an error; the format version is fixed at init time (see below
+//! for how to configure more than one format).
+//!
+//! ### Generating multiple EROFS formats
+//!
+//! `erofs_formats` is not limited to a single version: [`FormatConfig`][crate::erofs::format::FormatConfig]
+//! has a `default` version (which claims the named ref and is what
+//! [`erofs_version()`][crate::repository::Repository::erofs_version] reports)
+//! plus an `extra` set of additional versions to generate alongside it, e.g.
+//! `{"default": 1, "extra": [2]}` for a repository that produces both V1 and
+//! V2 images from every commit.
+//!
+//! This is an API-level capability, not currently exposed through `cfsctl`:
+//! a caller embedding the `composefs` crate directly (such as bootc) builds a
+//! [`RepositoryConfig`][crate::repository::RepositoryConfig] with the desired
+//! `erofs_formats` and passes it to
+//! [`Repository::init_path`][crate::repository::Repository::init_path] at
+//! creation time.  As above, there is currently no supported way — via the
+//! CLI or the library — to add a format to a repository after it has been
+//! initialized; `erofs_formats` is fixed for the lifetime of the repository.
+//!
+//! Once configured, every commit uses
+//! [`FileSystem::commit_images()`][crate::tree::FileSystem::commit_images],
+//! which generates one EROFS image per configured version and returns a
+//! `HashMap<FormatVersion, ObjectID>`.  Only the `default` version's image
+//! receives the optional named ref passed in; images for `extra` versions are
+//! still written to `objects/` (content-addressed, like any other image) but
+//! are otherwise anonymous, so the caller is responsible for tracking their
+//! IDs itself.  [`FileSystem::commit_image()`][crate::tree::FileSystem::commit_image]
+//! is a convenience wrapper around `commit_images()` that returns just the
+//! `default` version's ID, for callers that don't need `extra` formats.
+//!
+//! The OCI crate does exactly this for dual-format repositories: it calls
+//! `commit_images()` once per image and stores the resulting IDs as two
+//! separate named refs on the config splitstream (`composefs.image` for V2,
+//! `composefs.image.v1` for V1 — see [EROFS image tracking](#erofs-image-tracking-via-config-splitstream-refs)
+//! below), so that both versions of the image stay reachable through GC
+//! regardless of which one is the repository's `default`.
 //!
 //! ## `objects/`
 //!

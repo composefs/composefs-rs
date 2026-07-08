@@ -731,7 +731,7 @@ enum Command {
         #[clap(long)]
         reset_metadata: bool,
         /// Default EROFS format version for images in this repository.
-        /// V1 is compatible with C `mkcomposefs` 1.0.8; V2 is the native format.
+        /// V1 is compatible with C `mkcomposefs` 1.0.8; V2 is the legacy composefs-rs format.
         /// If omitted, falls back to the global `--erofs-version` flag, then defaults to V1.
         #[clap(long)]
         erofs_version: Option<ErofsVersion>,

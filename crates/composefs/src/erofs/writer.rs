@@ -26,10 +26,10 @@
 //! writes `composefs_version=1` in the header — equivalent to C `mkcomposefs --min-version=1`.
 //! This is the recommended default for new repositories.
 //!
-//! **V2** (`FormatVersion::V2`) is the composefs-rs native format. It always uses extended
-//! inodes (64 bytes), collects inodes in DFS order, omits the whiteout stub table, sets
-//! `build_time` to 0, and sets `composefs_version` to 2. Whiteout files are stored without
-//! escaping.
+//! **V2** (`FormatVersion::V2`) is composefs-rs's original, now legacy format, kept for
+//! repositories that predate V1 support. It always uses extended inodes (64 bytes), collects
+//! inodes in DFS order, omits the whiteout stub table, sets `build_time` to 0, and sets
+//! `composefs_version` to 2. Whiteout files are stored without escaping.
 //!
 //! ## Two-pass layout + emit design
 //!
@@ -2139,7 +2139,7 @@ fn prepare_erofs_inodes<'a, ObjectID: FsVerityHashValue>(
     (inodes, xattrs, min_mtime, header_flags, composefs_version)
 }
 
-/// Creates an EROFS filesystem image from a composefs tree using the default format (V2).
+/// Creates an EROFS filesystem image from a composefs tree using the default format (V1).
 ///
 /// This function performs a two-pass generation:
 /// 1. First pass determines the layout and sizes of all structures
@@ -2223,7 +2223,7 @@ pub(crate) fn mkfs_erofs_inner<ObjectID: FsVerityHashValue>(
 ///   `composefs_version` is `0` normally, auto-bumped to `1` when user whiteouts are present.
 /// - [`FormatVersion::V1`]: Same layout as V0 but `composefs_version` is always `1`.
 ///   Equivalent to C `mkcomposefs --min-version=1`.
-/// - [`FormatVersion::V2`]: Rust-native format (extended inodes, DFS, `composefs_version=2`).
+/// - [`FormatVersion::V2`]: Legacy composefs-rs format (extended inodes, DFS, `composefs_version=2`).
 ///
 /// Whiteout stubs for Epoch1 formats (V0/V1) are added automatically.
 ///

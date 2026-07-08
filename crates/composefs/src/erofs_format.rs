@@ -5,36 +5,47 @@
 //! and referenced by their fs-verity digest. The EROFS image itself carries only metadata: inodes,
 //! directory entries, extended attributes, and chunk index entries that point to the external files.
 //!
-//! composefs-rs supports two EROFS format versions. V1 is byte-for-byte compatible with the C
-//! `mkcomposefs` tool. V2 is the composefs-rs native format and drops several V1 constraints
-//! that exist only for C compatibility.
+//! composefs-rs supports three EROFS format versions, selected by
+//! [`FormatVersion`][crate::erofs::format::FormatVersion]. V0 and V1 share the same on-disk
+//! layout (compact inodes, BFS ordering, whiteout stub table) and are both byte-for-byte
+//! compatible with the C `mkcomposefs` tool (in its default and `--min-version=1` modes,
+//! respectively); they differ only in the `composefs_version` header field. V2 is
+//! composefs-rs's original, now legacy format, predating V1 support, and drops several V0/V1
+//! constraints that exist only for C compatibility.
 //!
-//! `cfsctl init` defaults to V2; pass `--erofs-version 1` to select V1. Higher-level tools
-//! such as bootc initialize repositories with multiple formats enabled (V1 primary) so that images
-//! can be booted on RHEL9-era kernels that require the `composefs.digest=` karg.
+//! `cfsctl init` defaults to V1; pass `--erofs-version 2` to select V2, or `--erofs-version 0`
+//! to match the plain (no-flags) default of the C `mkcomposefs` tool. Higher-level tools such as
+//! bootc initialize repositories with multiple formats enabled (V1 primary) so that images can be
+//! booted on RHEL9-era kernels that require the `composefs.digest=` karg — see
+//! [Generating multiple EROFS formats][crate::repository_format#generating-multiple-erofs-formats]
+//! for how that's configured.
 //!
-//! ## Format V1
+//! ## Format V0 and V1 — C `mkcomposefs` compatible
 //!
-//! V1 is selected with `cfsctl init --erofs-version 1`. The `v1_erofs` ro-compat feature flag
-//! is written to `meta.json` so that tools without V1 support open the repository read-only.
+//! V0 is selected with `cfsctl init --erofs-version 0` and matches the C `mkcomposefs` tool's
+//! plain (no version flags) output. V1 is selected with `cfsctl init --erofs-version 1` (the
+//! `cfsctl` default) and matches C `mkcomposefs --min-version=1`. The `v1_erofs` ro-compat
+//! feature flag is written to `meta.json` when V1 is the primary format, so that tools without
+//! V1 support open the repository read-only; V0 is not covered by a compatibility flag of its
+//! own (see [`repository_format`][crate::repository_format] for how the format is recorded).
 //!
-//! **`composefs_version` field values in V1:**
+//! **`composefs_version` field values:**
 //!
-//! - `0` — no user-visible whiteout files (character devices with rdev=0) in the tree
-//! - `1` — at least one user-visible whiteout file is present
+//! - V0 — `0` (the constant `COMPOSEFS_VERSION_V0`) when no user-visible whiteout files
+//!   (character devices with rdev=0) are present in the tree, auto-bumped to `1`
+//!   (`COMPOSEFS_VERSION_V1`) when at least one is present.
+//! - V1 — always `1` (`COMPOSEFS_VERSION_V1`), regardless of whether user whiteouts are present.
+//!   This matches C `mkcomposefs --min-version=1`, which forces the same value for forward
+//!   compatibility.
 //!
-//! The constant `COMPOSEFS_VERSION_V1` is 0; the field only reaches 1 when user whiteouts are
-//! found. The `--min-version` flag in `mkcomposefs` (mirrored by `mkfs_erofs_v1_min_version`)
-//! forces the value to 1 even when no user whiteouts exist, for forward compatibility.
+//! **Inode layout:** V0 and V1 use compact inodes (32 bytes) when the file data and inode fit
+//! within the constraints of the compact format, and extended inodes (64 bytes) otherwise.
 //!
-//! **Inode layout:** V1 uses compact inodes (32 bytes) when the file data and inode fit within
-//! the constraints of the compact format, and extended inodes (64 bytes) otherwise.
+//! **Inode traversal order:** V0 and V1 collect inodes in breadth-first order — all entries at
+//! one directory level before descending.
 //!
-//! **Inode traversal order:** V1 collects inodes in breadth-first order — all entries at one
-//! directory level before descending.
-//!
-//! **Whiteout stub table:** V1 includes 256 synthetic inode entries at the start of the inode
-//! area, one per two-hex-character prefix `00`–`ff`. Each entry is a character-device stub
+//! **Whiteout stub table:** V0 and V1 include 256 synthetic inode entries at the start of the
+//! inode area, one per two-hex-character prefix `00`–`ff`. Each entry is a character-device stub
 //! (chr 0,0) used by the overlay filesystem to resolve whiteout paths against the object store.
 //! V2 omits them entirely.
 //!
@@ -46,9 +57,12 @@
 //!
 //! **xattr sharing:** Xattr entries are deduplicated using a sort key that is the full xattr name (prefix string concatenated with the suffix).
 //!
-//! ## Format V2 — Created in composefs-rs
+//! ## Format V2 — legacy composefs-rs format
 //!
-//! V2 is the default for repositories created with `cfsctl init` without `--erofs-version 1`.
+//! V2 is selected with `cfsctl init --erofs-version 2`. It was the `cfsctl` default until V1
+//! became the default; repositories created before V1 support was added, and which therefore
+//! predate the `erofs_formats` `meta.json` field, are still treated as V2 for backward
+//! compatibility.
 //!
 //! **`composefs_version` field:** Always `2` (the constant `COMPOSEFS_VERSION`).
 //!
@@ -68,15 +82,17 @@
 //! The format is fixed at repository initialization time and cannot be changed afterward.
 //!
 //! ```text
-//! cfsctl init                    # V2 (default)
-//! cfsctl init --erofs-version 1  # V1 (C-tool compatible)
+//! cfsctl init                    # V1 (default, C-tool compatible)
+//! cfsctl init --erofs-version 2  # V2 (legacy composefs-rs format)
+//! cfsctl init --erofs-version 0  # V0 (plain C mkcomposefs compatible)
 //! ```
 //!
-//! The format is recorded in `meta.json` (see [`repository_format`][crate::repository_format]) as the `v1_erofs` ro-compat feature flag: present
-//! means V1, absent means V2. Tools that do not recognize this flag open the repository
-//! read-only rather than writing images in the wrong format.
+//! The format is recorded in `meta.json` (see [`repository_format`][crate::repository_format])
+//! in the `erofs_formats` field, which is authoritative. For backward compatibility with tools
+//! that predate that field, the `v1_erofs` ro-compat feature flag is also kept in sync: present
+//! means V1, absent means V2 (the legacy default). Tools that do not recognize the flag open the
+//! repository read-only rather than writing images in the wrong format.
 //!
-//! For the standalone `mkcomposefs` tool, the equivalent flag is `--erofs-version`. The
-//! `--min-version` flag (`mkfs_erofs_v1_min_version` in the Rust API) controls whether the
-//! `composefs_version` field starts at 0 or 1 in V1 images regardless of whether user whiteouts
-//! are present.
+//! The standalone `mkcomposefs` tool (as opposed to `cfsctl`) has no `--erofs-version` flag;
+//! instead its `--version`/`--max-version` flags control whether the `composefs_version` field
+//! starts at 0 or 1 (see the `mkcomposefs` man page for details).
