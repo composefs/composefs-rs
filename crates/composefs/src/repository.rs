@@ -461,7 +461,7 @@ impl RepoMetadata {
 /// use composefs::repository::RepositoryConfig;
 /// use composefs::fsverity::Algorithm;
 ///
-/// // Default: SHA-256, fs-verity required, EROFS V2.
+/// // Default: SHA-256, fs-verity required, EROFS V1.
 /// let config = RepositoryConfig::default();
 ///
 /// // SHA-512 with fs-verity required.

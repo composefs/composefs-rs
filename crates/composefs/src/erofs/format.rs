@@ -272,7 +272,7 @@ impl std::ops::BitOr<u32> for FileType {
 
 /// EROFS format version number
 pub const VERSION: U32 = U32::new(1);
-/// Composefs-specific version number (V2, Rust-native format)
+/// Composefs-specific version number (V2, the legacy composefs-rs format)
 pub const COMPOSEFS_VERSION: U32 = U32::new(2);
 /// Composefs-specific version number for V0 (C-compatible, no user whiteouts)
 pub const COMPOSEFS_VERSION_V0: U32 = U32::new(0);
@@ -322,7 +322,8 @@ pub enum FormatVersion {
     /// Format V2: extended inodes, DFS ordering, no whiteout table,
     /// `composefs_version=2`.
     ///
-    /// composefs-rs native format, used by older bootc deployments.
+    /// composefs-rs's original format, now legacy: superseded by V1 as the
+    /// default, but still used by older bootc deployments.
     V2 = 2,
 }
 

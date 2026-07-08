@@ -17,7 +17,8 @@
 //!    See individual module docs for remaining gaps.
 //! 2. **EROFS output format**: V1 (C-compatible) writer with compact inodes,
 //!    BFS ordering, whiteout table, and overlay xattr escaping is complete and
-//!    tested.  V2 (Rust-native) is the default for the composefs-rs repository.
+//!    tested, and is now the default for new repositories.  V2 remains
+//!    available for callers that need it.
 //! 3. **C shared library (`libcomposefs`)**: TODO(compat): Not yet started.
 //!    This is the next major milestone — providing a C-ABI compatible shared
 //!    library so that existing C consumers (e.g. ostree, bootc) can link
