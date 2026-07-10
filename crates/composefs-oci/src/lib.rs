@@ -37,6 +37,8 @@ pub mod test_util;
 
 #[cfg(doc)]
 pub mod design;
+#[cfg(doc)]
+pub mod sealing_spec;
 
 // Re-export the composefs crate for consumers who only need composefs-oci
 pub use composefs;
