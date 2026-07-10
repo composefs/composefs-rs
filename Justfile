@@ -47,9 +47,13 @@ test-all: test test-integration
 check: clippy check-feature-combos fmt-check test check-fuzz
 
 # Base image for test container builds.
+# Defaults to centos-bootc:stream10: ghcr.io/bootcrew/debian-bootc:latest currently
+# fails to bootstrap (a circular dependency in Debian sid's systemd/mount/libselinux1
+# packaging surfaces when apt installs onto the empty dpkg database that debian-bootc
+# ships with by design; this is an upstream packaging issue, not ours).
 # Override to test on a different distro, e.g.:
-#   just base_image=quay.io/centos-bootc/centos-bootc:stream10 test-integration-vm
-base_image := env("COMPOSEFS_BASE_IMAGE", "ghcr.io/bootcrew/debian-bootc:latest")
+#   just base_image=ghcr.io/bootcrew/debian-bootc:latest cfsctl_features='' test-integration-vm
+base_image := env("COMPOSEFS_BASE_IMAGE", "quay.io/centos-bootc/centos-bootc:stream10")
 
 # cfsctl feature flags for the container build.  Defaults match the base_image:
 #   debian (>= 6.15 kernel): no compat features needed
