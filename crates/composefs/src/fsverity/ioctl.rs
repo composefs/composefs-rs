@@ -37,6 +37,15 @@ pub(super) fn fs_ioc_enable_verity_with_sig<H: FsVerityHashValue>(
     )
 }
 
+/// Check whether a file has a kernel-enrolled fs-verity builtin signature.
+///
+/// Unlike the other wrappers in this module, this isn't parameterized by
+/// [`FsVerityHashValue`]: `FS_IOC_READ_VERITY_METADATA` doesn't depend on
+/// the hash algorithm.
+pub(super) fn fs_ioc_has_verity_signature(fd: impl AsFd) -> std::io::Result<bool> {
+    composefs_ioctls::fsverity::fs_ioc_has_verity_signature(fd)
+}
+
 /// Measure the fsverity digest of the provided file descriptor.
 ///
 /// Returns the digest as the appropriate FsVerityHashValue type.

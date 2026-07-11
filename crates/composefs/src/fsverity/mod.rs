@@ -118,9 +118,22 @@ pub fn enable_verity_raw_with_sig<H: FsVerityHashValue>(
 pub fn enable_verity_with_retry<H: FsVerityHashValue>(
     fd: impl AsFd,
 ) -> Result<(), EnableVerityError> {
+    enable_verity_with_retry_with_sig::<H>(fd, None)
+}
+
+/// Enable fs-verity on the given file, retrying if the file is opened for
+/// writing, optionally with a PKCS#7 signature.
+///
+/// Like [`enable_verity_with_retry`], but accepts an optional DER-encoded
+/// PKCS#7 detached signature, which is passed through to
+/// [`enable_verity_raw_with_sig`].
+pub fn enable_verity_with_retry_with_sig<H: FsVerityHashValue>(
+    fd: impl AsFd,
+    signature: Option<&[u8]>,
+) -> Result<(), EnableVerityError> {
     let mut attempt = 1;
     loop {
-        match enable_verity_raw::<H>(&fd) {
+        match enable_verity_raw_with_sig::<H>(&fd, signature) {
             Err(EnableVerityError::FileOpenedForWrite) if attempt < 3 => {
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 attempt += 1;
@@ -155,22 +168,39 @@ pub fn enable_verity_maybe_copy<H: FsVerityHashValue>(
     dirfd: impl AsFd,
     fd: BorrowedFd,
 ) -> Result<Option<OwnedFd>, EnableVerityError> {
-    match enable_verity_with_retry::<H>(&fd) {
+    enable_verity_maybe_copy_with_sig::<H>(dirfd, fd, None)
+}
+
+/// Enable fs-verity on the given file, optionally with a PKCS#7 signature,
+/// making a copy if necessary.
+///
+/// Like [`enable_verity_maybe_copy`], but accepts an optional DER-encoded
+/// PKCS#7 detached signature, which is passed through to
+/// [`enable_verity_raw_with_sig`] (and to the retry-on-copy path, if a copy
+/// turns out to be necessary). See [`enable_verity_maybe_copy`] for the full
+/// semantics around when a copy is made.
+pub fn enable_verity_maybe_copy_with_sig<H: FsVerityHashValue>(
+    dirfd: impl AsFd,
+    fd: BorrowedFd,
+    signature: Option<&[u8]>,
+) -> Result<Option<OwnedFd>, EnableVerityError> {
+    match enable_verity_with_retry_with_sig::<H>(&fd, signature) {
         Ok(()) => Ok(None),
         Err(EnableVerityError::FileOpenedForWrite) => {
-            let fd = enable_verity_on_copy::<H>(dirfd, fd)?;
+            let fd = enable_verity_on_copy_with_sig::<H>(dirfd, fd, signature)?;
             Ok(Some(fd))
         }
         Err(other) => Err(other),
     }
 }
 
-/// Enable fs-verity on a new copy of `fd`, consuming `fd` and
-/// returning the new copy.  The copy is created via O_TMPFILE
-/// relative to `dirfd`.
-fn enable_verity_on_copy<H: FsVerityHashValue>(
+/// Enable fs-verity on a new copy of `fd`, consuming `fd` and returning the
+/// new copy, optionally enrolling a PKCS#7 signature.  The copy is created
+/// via O_TMPFILE relative to `dirfd`.
+fn enable_verity_on_copy_with_sig<H: FsVerityHashValue>(
     dirfd: impl AsFd,
     fd: BorrowedFd,
+    signature: Option<&[u8]>,
 ) -> Result<OwnedFd, EnableVerityError> {
     let fd = fd.try_clone_to_owned().map_err(EnableVerityError::Io)?;
     let mut fd = File::from(fd);
@@ -197,10 +227,28 @@ fn enable_verity_on_copy<H: FsVerityHashValue>(
         )
         .map_err(|e| EnableVerityError::Io(e.into()))?;
         drop(new_rw_fd);
-        if enable_verity_with_retry::<H>(&new_ro_fd).is_ok() {
+        if enable_verity_with_retry_with_sig::<H>(&new_ro_fd, signature).is_ok() {
             return Ok(new_ro_fd);
         }
     }
+}
+
+/// Check whether a file has a kernel-enrolled fs-verity builtin signature.
+///
+/// This is a thin wrapper for the `FS_IOC_READ_VERITY_METADATA` ioctl with
+/// `FS_VERITY_METADATA_TYPE_SIGNATURE`. It's used to observe whether
+/// [`enable_verity_raw_with_sig`] actually got a signature enrolled with the
+/// kernel, as opposed to just enabling plain verity: a repository may fall
+/// back to enabling verity without a signature when the `.fs-verity`
+/// keyring has no certificate able to verify it, so `signature.is_some()`
+/// at the call site doesn't guarantee kernel enrollment succeeded.
+///
+/// Returns `Ok(false)` if fs-verity is enabled but no signature was
+/// enrolled (kernel reports `ENODATA`), `Ok(true)` if a signature is
+/// present, and passes through any other ioctl error (e.g. fs-verity not
+/// enabled on the file, or not supported by the filesystem).
+pub fn has_verity_signature(fd: impl AsFd) -> std::io::Result<bool> {
+    ioctl::fs_ioc_has_verity_signature(fd)
 }
 
 /// Measures fs-verity on the given file.
@@ -746,6 +794,45 @@ mod tests {
             .unwrap();
 
         // The new fd has the correct data
+        assert!(
+            ensure_verity_equal(
+                fd,
+                &Sha256HashValue::from_hex(
+                    "1e2eaa4202d750a41174ee454970b92c1bc2f925b1e35076d8c7d5f56362ba64",
+                )
+                .unwrap(),
+            )
+            .is_ok()
+        );
+    }
+
+    // The following two tests mirror `test_enable_verity_maybe_copy_{without,with}_copy`
+    // above, but go through the `_with_sig` entry point with `signature: None`. This
+    // exercises the API threading added for kernel signature enrollment without
+    // requiring a fs-verity builtin-signatures-capable kernel/keyring, which isn't
+    // available in this sandboxed test environment.
+
+    #[test]
+    fn test_enable_verity_maybe_copy_with_sig_none_without_copy() {
+        let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDONLY, 0o644.into());
+        let tempdir_fd = File::open(tempdir.path()).unwrap();
+        let fd =
+            enable_verity_maybe_copy_with_sig::<Sha256HashValue>(&tempdir_fd, fd.as_fd(), None)
+                .unwrap();
+        assert!(fd.is_none());
+    }
+
+    #[test]
+    fn test_enable_verity_maybe_copy_with_sig_none_with_copy() {
+        let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDWR, 0o644.into());
+        let tempdir_fd = File::open(tempdir.path()).unwrap();
+        let mut fd = File::from(fd);
+        let _ = fd.write(b"hello world").unwrap();
+        let fd =
+            enable_verity_maybe_copy_with_sig::<Sha256HashValue>(&tempdir_fd, fd.as_fd(), None)
+                .unwrap()
+                .unwrap();
+
         assert!(
             ensure_verity_equal(
                 fd,

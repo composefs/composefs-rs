@@ -38,6 +38,25 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
         repository: &Repository<ObjectID>,
         image_name: Option<&str>,
     ) -> Result<HashMap<FormatVersion, ObjectID>> {
+        self.commit_images_with_sig(repository, image_name, None)
+    }
+
+    /// Like [`commit_images`](Self::commit_images), but enrolls a kernel
+    /// fs-verity signature for each generated EROFS image whose digest is
+    /// found in `signatures`.
+    ///
+    /// `signatures` maps the expected fs-verity digest of an EROFS image to
+    /// its PKCS#7 signature, as parsed from either inline manifest
+    /// annotations or an OCI referrers-API signature artifact. Images not
+    /// present in the map are stored unsigned, exactly as with
+    /// [`commit_images`](Self::commit_images).
+    #[context("Committing filesystem as EROFS images")]
+    pub fn commit_images_with_sig(
+        &self,
+        repository: &Repository<ObjectID>,
+        image_name: Option<&str>,
+        signatures: Option<&HashMap<ObjectID, Vec<u8>>>,
+    ) -> Result<HashMap<FormatVersion, ObjectID>> {
         // Validate once before writing any version.
         // add_overlay_whiteouts() for V1 is called inside mkfs_erofs_inner (on a clone).
         validate_filesystem(self)?;
@@ -54,7 +73,7 @@ impl<ObjectID: FsVerityHashValue> FileSystem<ObjectID> {
                 #[cfg(test)]
                 None,
             );
-            let id = repository.write_image(name, &image_data)?;
+            let id = repository.write_image_with_sig(name, &image_data, signatures)?;
             result.insert(version, id);
         }
         Ok(result)

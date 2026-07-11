@@ -28,9 +28,25 @@ pub enum EnableVerityError {
     /// The file has an open writable file descriptor.
     #[error("File is opened for writing")]
     FileOpenedForWrite,
-    /// Signature verification failed (when using kernel signatures).
-    #[error("Signature verification failed")]
+    /// The kernel rejected the signature as invalid (`EKEYREJECTED`) or
+    /// malformed (`EBADMSG`). Unlike [`Self::SigningKeyNotFound`], this
+    /// means a certificate *is* present in the `.fs-verity` keyring, but
+    /// the given signature does not verify against it -- this is a real
+    /// tamper-evidence signal and should not be silently ignored.
+    #[error(
+        "fs-verity signature rejected by kernel: no certificate in the \
+         .fs-verity keyring could verify it (see `cfsctl keyring add-cert`), \
+         or the file has been tampered with"
+    )]
     SignatureVerificationFailed,
+    /// The `.fs-verity` keyring has no certificate able to verify this
+    /// signature (`ENOKEY`). This commonly just means no certificate has
+    /// been loaded yet (see `cfsctl keyring add-cert`), so unlike
+    /// [`Self::SignatureVerificationFailed`] this is not evidence of
+    /// tampering and callers may reasonably fall back to enabling
+    /// verity without a signature.
+    #[error("No certificate in the .fs-verity keyring can verify this signature")]
+    SigningKeyNotFound,
 }
 
 /// Measuring fsverity failed.
@@ -118,8 +134,8 @@ pub fn fs_ioc_enable_verity_with_sig(
         None => (0, 0),
     };
 
-    unsafe {
-        match ioctl(
+    let r = unsafe {
+        ioctl(
             fd,
             Setter::<{ FS_IOC_ENABLE_VERITY }, FsVerityEnableArg>::new(FsVerityEnableArg {
                 version: 1,
@@ -132,16 +148,24 @@ pub fn fs_ioc_enable_verity_with_sig(
                 sig_ptr,
                 __reserved2: [0; 11],
             }),
-        ) {
-            Err(Errno::NOTTY) | Err(Errno::OPNOTSUPP) => {
-                Err(EnableVerityError::FilesystemNotSupported)
-            }
-            Err(Errno::EXIST) => Err(EnableVerityError::AlreadyEnabled),
-            Err(Errno::TXTBSY) => Err(EnableVerityError::FileOpenedForWrite),
-            Err(Errno::KEYREJECTED) => Err(EnableVerityError::SignatureVerificationFailed),
-            Err(e) => Err(Error::from(e).into()),
-            Ok(_) => Ok(()),
-        }
+        )
+    };
+    r.map_err(enable_verity_errno_to_error)
+}
+
+/// Maps the `errno` values documented for `FS_IOC_ENABLE_VERITY` (see
+/// `Documentation/filesystems/fsverity.rst`) onto [`EnableVerityError`].
+///
+/// Split out as a free function so the mapping can be unit tested without
+/// needing an fs-verity- or signature-capable kernel/filesystem.
+fn enable_verity_errno_to_error(e: Errno) -> EnableVerityError {
+    match e {
+        Errno::NOTTY | Errno::OPNOTSUPP => EnableVerityError::FilesystemNotSupported,
+        Errno::EXIST => EnableVerityError::AlreadyEnabled,
+        Errno::TXTBSY => EnableVerityError::FileOpenedForWrite,
+        Errno::KEYREJECTED | Errno::BADMSG => EnableVerityError::SignatureVerificationFailed,
+        Errno::NOKEY => EnableVerityError::SigningKeyNotFound,
+        e => Error::from(e).into(),
     }
 }
 
@@ -212,6 +236,71 @@ pub fn fs_ioc_measure_verity<const N: usize>(
     }
 }
 
+/// Metadata type identifier for the builtin PKCS#7 signature, as passed to
+/// `FS_IOC_READ_VERITY_METADATA` in `fsverity_read_metadata_arg::metadata_type`.
+///
+/// See `FS_VERITY_METADATA_TYPE_SIGNATURE` in `/usr/include/linux/fsverity.h`.
+const FS_VERITY_METADATA_TYPE_SIGNATURE: u64 = 3;
+
+// See /usr/include/linux/fsverity.h
+#[repr(C)]
+#[derive(Debug)]
+struct FsVerityReadMetadataArg {
+    metadata_type: u64,
+    offset: u64,
+    length: u64,
+    buf_ptr: u64,
+    __reserved: u64,
+}
+
+// #define FS_IOC_READ_VERITY_METADATA _IOWR('f', 135, struct fsverity_read_metadata_arg)
+const FS_IOC_READ_VERITY_METADATA: Opcode =
+    opcode::read_write::<FsVerityReadMetadataArg>(b'f', 135);
+
+/// Check whether a file has a kernel-enrolled fs-verity builtin signature.
+///
+/// This is a thin safe wrapper around `FS_IOC_READ_VERITY_METADATA` with
+/// `FS_VERITY_METADATA_TYPE_SIGNATURE`, used only to answer a yes/no
+/// question about signature *presence* -- it does not return the signature
+/// bytes themselves. See `fs_ioc_enable_verity_with_sig` for enrolling one.
+///
+/// # Arguments
+/// * `fd` - File descriptor to query (fs-verity must already be enabled on it,
+///   though the descriptor doesn't need to be opened `O_RDONLY`).
+///
+/// # Returns
+/// * `Ok(true)` if a signature was enrolled with `FS_IOC_ENABLE_VERITY`.
+/// * `Ok(false)` if fs-verity is enabled but no signature was enrolled
+///   (kernel reports `ENODATA`).
+/// * `Err` for any other ioctl failure, e.g. fs-verity not enabled on the
+///   file or not supported by the filesystem.
+pub fn fs_ioc_has_verity_signature(fd: impl AsFd) -> std::io::Result<bool> {
+    // We only care whether a signature is present, not its contents, so a
+    // one-byte buffer is enough: any successful read means a signature is
+    // enrolled (a real PKCS#7 signature is never zero-length).
+    let mut buf = [0u8; 1];
+    let mut arg = FsVerityReadMetadataArg {
+        metadata_type: FS_VERITY_METADATA_TYPE_SIGNATURE,
+        offset: 0,
+        length: buf.len() as u64,
+        buf_ptr: buf.as_mut_ptr() as u64,
+        __reserved: 0,
+    };
+
+    let r = unsafe {
+        ioctl(
+            fd,
+            Updater::<{ FS_IOC_READ_VERITY_METADATA }, FsVerityReadMetadataArg>::new(&mut arg),
+        )
+    };
+
+    match r {
+        Ok(()) => Ok(true),
+        Err(Errno::NODATA) => Ok(false),
+        Err(e) => Err(Error::from(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -268,5 +357,71 @@ mod tests {
         let file = tempfile_in("/dev/shm").unwrap();
         let err = fs_ioc_enable_verity(&file, 1, 4096).unwrap_err();
         assert!(matches!(err, EnableVerityError::FilesystemNotSupported));
+    }
+
+    // `FS_IOC_ENABLE_VERITY` signature-related errnos (`ENOKEY`,
+    // `EKEYREJECTED`, `EBADMSG`) can't reliably be triggered in a test
+    // sandbox: they require a kernel built with
+    // `CONFIG_FS_VERITY_BUILTIN_SIGNATURES` and a real PKCS#7 signature.
+    // Test the errno mapping directly instead of going through the ioctl.
+    #[test]
+    fn test_enable_verity_errno_mapping() {
+        let cases = [
+            (Errno::NOTTY, "FilesystemNotSupported"),
+            (Errno::OPNOTSUPP, "FilesystemNotSupported"),
+            (Errno::EXIST, "AlreadyEnabled"),
+            (Errno::TXTBSY, "FileOpenedForWrite"),
+            (Errno::KEYREJECTED, "SignatureVerificationFailed"),
+            (Errno::BADMSG, "SignatureVerificationFailed"),
+            (Errno::NOKEY, "SigningKeyNotFound"),
+        ];
+        for (errno, expected) in cases {
+            let err = enable_verity_errno_to_error(errno);
+            let actual = match err {
+                EnableVerityError::FilesystemNotSupported => "FilesystemNotSupported",
+                EnableVerityError::AlreadyEnabled => "AlreadyEnabled",
+                EnableVerityError::FileOpenedForWrite => "FileOpenedForWrite",
+                EnableVerityError::SignatureVerificationFailed => "SignatureVerificationFailed",
+                EnableVerityError::SigningKeyNotFound => "SigningKeyNotFound",
+                EnableVerityError::Io(_) => "Io",
+            };
+            assert_eq!(actual, expected, "mapping for {errno:?}");
+        }
+    }
+
+    // Actually enrolling a kernel signature can't be exercised in this
+    // sandbox (see `test_enable_verity_errno_mapping` above), but plain
+    // fs-verity enablement can, so we can at least confirm the "no
+    // signature enrolled" (`ENODATA`) side of `fs_ioc_has_verity_signature`
+    // against a real kernel ioctl.
+    #[test]
+    fn test_has_verity_signature_no_signature() {
+        let mut tf = test_tempfile();
+        tf.write_all(b"hello world").unwrap();
+        tf.sync_all().unwrap();
+
+        // Re-open read-only: verity can only be enabled on an fd with no
+        // other writable descriptors outstanding.
+        let path = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&tf));
+        let ro_fd =
+            rustix::fs::open(&path, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty()).unwrap();
+        drop(tf);
+
+        fs_ioc_enable_verity(&ro_fd, 1, 4096).unwrap();
+
+        assert!(!fs_ioc_has_verity_signature(&ro_fd).unwrap());
+    }
+
+    #[test_with::path(/dev/shm)]
+    #[test]
+    fn test_has_verity_signature_wrong_fs() {
+        let file = tempfile_in("/dev/shm").unwrap();
+        let err = fs_ioc_has_verity_signature(&file).unwrap_err();
+        let raw = err.raw_os_error();
+        assert!(
+            raw == Some(Errno::NOTTY.raw_os_error())
+                || raw == Some(Errno::OPNOTSUPP.raw_os_error()),
+            "unexpected error for fs-verity-unsupported filesystem: {err}"
+        );
     }
 }

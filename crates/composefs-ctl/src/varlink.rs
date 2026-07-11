@@ -129,6 +129,12 @@ pub enum RepositoryError {
         /// The ref name that was not found.
         reference: String,
     },
+    /// `require_signature` was requested but the underlying image has no
+    /// kernel-enrolled fs-verity signature.
+    SignatureRequired {
+        /// The name/selector that was requested to be mounted.
+        name: String,
+    },
     /// An unexpected internal error occurred while servicing the request.
     InternalError {
         /// Description of the failure.
@@ -545,6 +551,16 @@ pub struct MountParams {
     pub overlay: Option<bool>,
     /// Whether to mount read-write (only meaningful with overlay).
     pub read_write: Option<bool>,
+    /// When `true`, require that the underlying EROFS image has a kernel
+    /// fs-verity signature enrolled (i.e. a signature was successfully
+    /// registered via `FS_IOC_ENABLE_VERITY` at pull/import time — see
+    /// `has_verity_signature()`). If the image has verity enabled but no
+    /// enrolled signature, the mount is refused. This does NOT perform any
+    /// certificate-trust validation (see the separate Seal/Sign/Verify
+    /// varlink methods for that) — it only confirms *some* signature was
+    /// enrolled and is therefore subject to the kernel's own enforcement
+    /// via `.fs-verity` keyring lookups at read time.
+    pub require_signature: Option<bool>,
 }
 
 impl MountParams {
@@ -589,12 +605,45 @@ pub struct MountReply {
     pub fd_index: u32,
 }
 
+/// Check whether `name`'s underlying image has a kernel-enrolled fs-verity
+/// signature, for [`MountParams::require_signature`].
+///
+/// Opens the image fd fresh via [`Repository::open_image`] rather than
+/// threading through the fd that `mount_with_options` will open again
+/// internally: this is a cheap read-only open of a file that's immutable
+/// once fs-verity is enabled, and keeps this varlink-layer policy check out
+/// of the core `Repository` API.
+fn image_has_verity_signature<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    name: &str,
+) -> anyhow::Result<bool> {
+    let (fd, _enable_verity) = repo.open_image(name)?;
+    composefs::fsverity::has_verity_signature(&fd)
+        .context("Checking kernel fs-verity signature enrollment")
+}
+
 fn run_mount<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     name: &str,
     params: &MountParams,
     fds: Vec<std::os::fd::OwnedFd>,
 ) -> std::result::Result<(MountReply, Vec<std::os::fd::OwnedFd>), RepositoryError> {
+    if params.require_signature.unwrap_or(false) {
+        match image_has_verity_signature(repo, name) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(RepositoryError::SignatureRequired {
+                    name: name.to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(RepositoryError::InternalError {
+                    message: format!("Checking fs-verity signature enrollment: {e:#}"),
+                });
+            }
+        }
+    }
+
     let options = params.to_mount_options(fds)?;
 
     let mount_fd =
@@ -639,6 +688,22 @@ fn run_oci_mount<ObjectID: composefs::fsverity::FsVerityHashValue>(
             "No composefs EROFS image linked".into()
         },
     })?;
+
+    if params.require_signature.unwrap_or(false) {
+        match image_has_verity_signature(repo, &erofs_id.to_hex()) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(oci::OciError::SignatureRequired {
+                    image: image.to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(oci::OciError::InternalError {
+                    message: format!("Checking fs-verity signature enrollment: {e:#}"),
+                });
+            }
+        }
+    }
 
     let options = params
         .to_mount_options(fds)
@@ -849,6 +914,153 @@ async fn run_compute_id<ObjectID: FsVerityHashValue>(
     })
 }
 
+/// Seal an OCI image: generate per-layer and merged EROFS, embed the fs-verity
+/// ID as a config label, and return the new manifest digest.
+#[cfg(feature = "oci")]
+pub(crate) async fn run_seal<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    image: String,
+    inline: bool,
+) -> std::result::Result<oci::SealReply, oci::OciError> {
+    let res = if inline {
+        composefs_oci::seal_image_inline(repo, &image)
+    } else {
+        composefs_oci::seal_image(repo, &image)
+    };
+    res.map(|digest| oci::SealReply {
+        manifest_digest: digest.to_string(),
+    })
+    .map_err(|e| {
+        if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
+            || find_in_chain::<composefs_oci::OciImageNotFound>(&e).is_some()
+        {
+            oci::OciError::NoSuchImage {
+                image: image.clone(),
+            }
+        } else {
+            oci::OciError::InternalError {
+                message: format!("{e:#}"),
+            }
+        }
+    })
+}
+
+/// Sign an OCI image: build the signature artifact and store it. Returns the
+/// artifact digest and its fs-verity ID.
+#[cfg(feature = "oci")]
+pub(crate) async fn run_sign<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    image: String,
+    cert_pem: String,
+    key_pem: String,
+    inline: bool,
+) -> std::result::Result<oci::SignReply, oci::OciError> {
+    let signing_key = composefs_oci::signing::FsVeritySigningKey::from_pem(
+        cert_pem.as_bytes(),
+        key_pem.as_bytes(),
+    )
+    .map_err(|e| oci::OciError::InvalidCertificate {
+        message: format!("{e:#}"),
+    })?;
+    let res = if inline {
+        composefs_oci::sign_image_inline(repo, &image, &signing_key)
+            .map(|digest| (digest, ObjectID::EMPTY))
+    } else {
+        composefs_oci::sign_image(repo, &image, &signing_key)
+    };
+    res.map(|(artifact_digest, artifact_verity)| oci::SignReply {
+        artifact_digest: artifact_digest.to_string(),
+        artifact_verity: artifact_verity.to_hex(),
+    })
+    .map_err(|e| {
+        if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
+            || find_in_chain::<composefs_oci::OciImageNotFound>(&e).is_some()
+        {
+            oci::OciError::NoSuchImage {
+                image: image.clone(),
+            }
+        } else {
+            oci::OciError::InternalError {
+                message: format!("{e:#}"),
+            }
+        }
+    })
+}
+
+/// Verify composefs signature artifacts for an OCI image.
+///
+/// When `cert_pem` is `Some`, performs cryptographic PKCS#7 verification.
+/// When `None`, performs a digest-only consistency check.
+#[cfg(feature = "oci")]
+pub(crate) async fn run_verify<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    image: String,
+    cert_pem: Option<String>,
+) -> std::result::Result<oci::VerifyReply, oci::OciError> {
+    let cert_supplied = cert_pem.is_some();
+    let verifier = match &cert_pem {
+        Some(pem) => Some(
+            composefs_oci::signing::FsVeritySignatureVerifier::from_pem(pem.as_bytes()).map_err(
+                |e| oci::OciError::InvalidCertificate {
+                    message: format!("{e:#}"),
+                },
+            )?,
+        ),
+        None => None,
+    };
+
+    let report =
+        composefs_oci::verify_image_report(repo, &image, verifier.as_ref()).map_err(|e| {
+            if find_in_chain::<composefs_oci::NoSignatureArtifacts>(&e).is_some()
+                || find_in_chain::<composefs_oci::SignatureVerificationFailed>(&e).is_some()
+            {
+                oci::OciError::SignatureVerificationFailed {
+                    message: format!("{e:#}"),
+                }
+            } else if find_in_chain::<composefs_oci::OciRefNotFound>(&e).is_some()
+                || find_in_chain::<composefs_oci::OciImageNotFound>(&e).is_some()
+            {
+                oci::OciError::NoSuchImage {
+                    image: image.clone(),
+                }
+            } else {
+                oci::OciError::InternalError {
+                    message: format!("{e:#}"),
+                }
+            }
+        })?;
+
+    let entries = report
+        .entries
+        .into_iter()
+        .map(|entry| oci::VerifyEntry {
+            role: entry.role,
+            expected_digest: entry.expected_digest,
+            digest_ok: entry.digest_ok,
+            signature_verified: entry.signature_verified,
+            detail: entry.detail,
+        })
+        .collect();
+
+    if cert_supplied && report.verified_count == 0 {
+        return Err(oci::OciError::SignatureVerificationFailed {
+            message: "no signatures were cryptographically verified".into(),
+        });
+    }
+
+    Ok(oci::VerifyReply {
+        verified_count: if cert_supplied {
+            report.verified_count as u64
+        } else {
+            0
+        },
+        ok: true,
+        cert_supplied,
+        algorithm: report.algorithm,
+        entries,
+    })
+}
+
 // The `zlink::service` macro emits several `pub` helper enums (method dispatch,
 // reply params, etc.) as siblings of the impl block. Those cannot be annotated
 // individually, so the macro invocation lives in a dedicated private submodule
@@ -995,7 +1207,9 @@ mod service_impl {
         ///
         /// If overlay upper/work directories are needed, pass them as two fds
         /// (upperdir, workdir) via SCM_RIGHTS. The returned fd is a detached
-        /// mount that the caller can attach with `move_mount()`.
+        /// mount that the caller can attach with `move_mount()`. If
+        /// `options.require_signature` is `true`, the mount is refused unless
+        /// the underlying image has a kernel-enrolled fs-verity signature.
         #[zlink(return_fds)]
         async fn mount(
             &self,
@@ -1037,14 +1251,14 @@ mod service_impl {
     };
     use super::oci::{
         ListImagesReply, OciComputeIdReply, OciError, OciFsckReply, OciInspectReply, PullProgress,
-        parse_local_fetch, pull_stream,
+        SealReply, SignReply, VerifyReply, parse_local_fetch, pull_stream,
     };
     use super::{
         CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply,
         ListImageRefsReply, MountParams, MountReply, OpenRepo, OpenRepositoryReply,
         RepositoryError, run_compute_id, run_fsck, run_gc, run_image_objects, run_init_repository,
         run_inspect, run_list_image_refs, run_list_images, run_mount, run_oci_fsck, run_oci_mount,
-        run_tag, run_untag,
+        run_seal, run_sign, run_tag, run_untag, run_verify,
     };
     use composefs::fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue};
     use composefs_oci::layer_transport::{RepoLayerSource, serve_get_layer};
@@ -1170,7 +1384,9 @@ mod service_impl {
         ///
         /// If overlay upper/work directories are needed, pass them as two fds
         /// (upperdir, workdir) via SCM_RIGHTS. The returned fd is a detached
-        /// mount that the caller can attach with `move_mount()`.
+        /// mount that the caller can attach with `move_mount()`. If
+        /// `options.require_signature` is `true`, the mount is refused unless
+        /// the underlying image has a kernel-enrolled fs-verity signature.
         #[zlink(return_fds)]
         async fn mount(
             &self,
@@ -1296,6 +1512,63 @@ mod service_impl {
             }
         }
 
+        /// Seal an OCI container image: generate per-layer and merged EROFS images
+        /// and embed the fs-verity ID as a label in the image config.
+        #[zlink(interface = "org.composefs.Oci")]
+        async fn seal(
+            &self,
+            handle: u64,
+            image: String,
+            inline: Option<bool>,
+        ) -> std::result::Result<SealReply, OciError> {
+            let inline = inline.unwrap_or(false);
+            match self.lookup_oci(handle)? {
+                OpenRepo::Sha256(ref r) => run_seal::<Sha256HashValue>(r, image, inline).await,
+                OpenRepo::Sha512(ref r) => run_seal::<Sha512HashValue>(r, image, inline).await,
+            }
+        }
+
+        /// Sign a sealed OCI image using a PKCS#7 certificate and private key.
+        ///
+        /// `cert_pem` and `key_pem` are PEM-encoded certificate and private key
+        /// strings. Returns the artifact digest and its fs-verity ID.
+        #[zlink(interface = "org.composefs.Oci")]
+        async fn sign(
+            &self,
+            handle: u64,
+            image: String,
+            cert_pem: String,
+            key_pem: String,
+            inline: Option<bool>,
+        ) -> std::result::Result<SignReply, OciError> {
+            let inline = inline.unwrap_or(false);
+            match self.lookup_oci(handle)? {
+                OpenRepo::Sha256(ref r) => {
+                    run_sign::<Sha256HashValue>(r, image, cert_pem, key_pem, inline).await
+                }
+                OpenRepo::Sha512(ref r) => {
+                    run_sign::<Sha512HashValue>(r, image, cert_pem, key_pem, inline).await
+                }
+            }
+        }
+
+        /// Verify composefs signature artifacts for an OCI image.
+        ///
+        /// When `cert_pem` is supplied, performs PKCS#7 cryptographic verification.
+        /// When `None`, performs a digest-only consistency check.
+        #[zlink(interface = "org.composefs.Oci")]
+        async fn verify(
+            &self,
+            handle: u64,
+            image: String,
+            cert_pem: Option<String>,
+        ) -> std::result::Result<VerifyReply, OciError> {
+            match self.lookup_oci(handle)? {
+                OpenRepo::Sha256(ref r) => run_verify::<Sha256HashValue>(r, image, cert_pem).await,
+                OpenRepo::Sha512(ref r) => run_verify::<Sha512HashValue>(r, image, cert_pem).await,
+            }
+        }
+
         /// Pull an OCI image into the repository, streaming progress.
         ///
         /// Emits zero or more intermediate [`PullProgress`] frames describing
@@ -1342,7 +1615,9 @@ mod service_impl {
         /// Resolves the image by ref name or `sha256:` digest, finds its
         /// EROFS image (or boot variant if `bootable` is true), and creates
         /// a composefs mount. If `options.overlay` is true, the fd array
-        /// must contain upperdir and workdir fds.
+        /// must contain upperdir and workdir fds. If `options.require_signature`
+        /// is `true`, the mount is refused unless the resolved EROFS image has
+        /// a kernel-enrolled fs-verity signature.
         #[zlink(interface = "org.composefs.Oci", return_fds)]
         async fn oci_mount(
             &self,
@@ -2076,6 +2351,57 @@ pub mod oci {
         pub image_id: String,
     }
 
+    /// Reply from sealing an OCI image.
+    #[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
+    pub struct SealReply {
+        /// The manifest digest of the sealed image (e.g. `sha256:...`).
+        pub manifest_digest: String,
+    }
+
+    /// Reply from signing an OCI image.
+    #[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
+    pub struct SignReply {
+        /// The OCI digest of the stored signature artifact.
+        pub artifact_digest: String,
+        /// The hex fs-verity ID of the signature artifact object.
+        pub artifact_verity: String,
+    }
+
+    /// Component-by-component verification result.
+    #[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
+    pub struct VerifyEntry {
+        /// The role of this entry.
+        pub role: String,
+        /// The expected digest for this role.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub expected_digest: Option<String>,
+        /// Whether the expected digest matches actual.
+        pub digest_ok: bool,
+        /// Whether the signature verified successfully.
+        pub signature_verified: bool,
+        /// Optional error or status detail.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub detail: Option<String>,
+    }
+
+    /// Reply from verifying an OCI image's signatures.
+    #[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
+    pub struct VerifyReply {
+        /// Number of signature entries that were cryptographically verified.
+        /// Always `0` when `cert_supplied` is false (digest-only check).
+        pub verified_count: u64,
+        /// Whether all reachable checks passed successfully.
+        pub ok: bool,
+        /// Whether a certificate was supplied (cryptographic vs digest-only mode).
+        pub cert_supplied: bool,
+        /// The algorithm used for verification (e.g. sha256-12).
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub algorithm: Option<String>,
+        /// Individual component verification entries.
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        pub entries: Vec<VerifyEntry>,
+    }
+
     /// A single progress frame emitted by the streaming `Pull` method.
     ///
     /// varlink has no tagged/data-union type, so a sum-of-events is modelled as a
@@ -2372,10 +2698,14 @@ pub mod oci {
                 })?;
 
             let boot_image = if bootable {
-                let id = composefs_oci::generate_boot_image(&repo, &result.manifest_digest)
-                    .map_err(|e| OciError::InternalError {
-                        message: format!("{e:#}"),
-                    })?;
+                let id = composefs_oci::generate_boot_image(
+                    &repo,
+                    &result.manifest_digest,
+                    name.as_deref(),
+                )
+                .map_err(|e| OciError::InternalError {
+                    message: format!("{e:#}"),
+                })?;
                 Some(id.to_hex())
             } else {
                 None
@@ -2479,6 +2809,23 @@ pub mod oci {
         /// The named OCI image/reference does not exist.
         NoSuchImage {
             /// The image reference that was not found.
+            image: String,
+        },
+        /// The supplied certificate or private key could not be parsed.
+        InvalidCertificate {
+            /// Description of the failure.
+            message: String,
+        },
+        /// No signature verified against the supplied certificate, or the image
+        /// has no composefs signature artifacts.
+        SignatureVerificationFailed {
+            /// Description of the failure.
+            message: String,
+        },
+        /// `require_signature` was requested but the underlying image has no
+        /// kernel-enrolled fs-verity signature.
+        SignatureRequired {
+            /// The image reference that lacks an enrolled signature.
             image: String,
         },
         /// An unexpected internal error occurred while servicing the request.
@@ -2645,6 +2992,39 @@ pub mod layer_sync {
         /// Hex-encoded fs-verity hash of the config splitstream.
         pub config_verity: String,
     }
+
+    impl std::fmt::Display for OciError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                OciError::RepoNotFound { message } => write!(f, "RepoNotFound: {message}"),
+                OciError::InvalidHandle { handle } => write!(f, "InvalidHandle: {handle}"),
+                OciError::NoSuchImage { image } => write!(f, "NoSuchImage: {image}"),
+                OciError::InvalidCertificate { message } => {
+                    write!(f, "InvalidCertificate: {message}")
+                }
+                OciError::SignatureVerificationFailed { message } => {
+                    write!(f, "SignatureVerificationFailed: {message}")
+                }
+                OciError::SignatureRequired { image } => {
+                    write!(f, "SignatureRequired: {image}")
+                }
+                OciError::InternalError { message } => write!(f, "InternalError: {message}"),
+                OciError::NoSuchLayer { diff_id } => write!(f, "NoSuchLayer: {diff_id}"),
+                OciError::InvalidDigest { message } => write!(f, "InvalidDigest: {message}"),
+                OciError::DiffIdMismatch { expected, actual } => {
+                    write!(f, "DiffIdMismatch: expected {expected}, got {actual}")
+                }
+                OciError::InvalidRequest { message } => write!(f, "InvalidRequest: {message}"),
+                OciError::FdLimitExceeded {
+                    fd_count,
+                    max_per_frame,
+                } => write!(
+                    f,
+                    "FdLimitExceeded: {fd_count} fds exceeds max {max_per_frame} per frame"
+                ),
+            }
+        }
+    }
 }
 
 /// Typed Rust client bindings (the native-API mirror of the on-the-wire
@@ -2662,11 +3042,14 @@ pub mod proxy {
     #[cfg(feature = "oci")]
     use super::oci::{
         ListImagesReply, OciComputeIdReply, OciError, OciFsckReply, OciInspectReply, PullProgress,
+        SealReply, SignReply, VerifyReply,
     };
     use super::{
         FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, OpenRepositoryReply,
         RepositoryError,
     };
+    #[cfg(feature = "oci")]
+    use super::{MountParams, MountReply};
     #[cfg(feature = "oci")]
     pub use composefs_oci::varlink_types::GetLayerParams;
     #[cfg(feature = "oci")]
@@ -2765,6 +3148,43 @@ pub mod proxy {
             verity: Option<&str>,
             bootable: bool,
         ) -> zlink::Result<Result<OciComputeIdReply, OciError>>;
+
+        /// Seal an OCI container image.
+        async fn seal(
+            &mut self,
+            handle: u64,
+            image: &str,
+            inline: Option<bool>,
+        ) -> zlink::Result<Result<SealReply, OciError>>;
+
+        /// Sign a sealed OCI image.
+        async fn sign(
+            &mut self,
+            handle: u64,
+            image: &str,
+            cert_pem: &str,
+            key_pem: &str,
+            inline: Option<bool>,
+        ) -> zlink::Result<Result<SignReply, OciError>>;
+
+        /// Verify composefs signature artifacts for an OCI image.
+        async fn verify(
+            &mut self,
+            handle: u64,
+            image: &str,
+            cert_pem: Option<&str>,
+        ) -> zlink::Result<Result<VerifyReply, OciError>>;
+
+        /// Mount an OCI image and return the detached mount fd.
+        #[zlink(return_fds)]
+        async fn oci_mount(
+            &mut self,
+            handle: u64,
+            image: &str,
+            bootable: bool,
+            options: MountParams,
+            #[zlink(fds)] fds: Vec<std::os::fd::OwnedFd>,
+        ) -> zlink::Result<(Result<MountReply, OciError>, Vec<std::os::fd::OwnedFd>)>;
 
         /// Pull an OCI image, streaming progress frames.
         #[zlink(more, rename = "Pull")]

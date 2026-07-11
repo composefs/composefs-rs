@@ -101,7 +101,8 @@ use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
         Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, StatVfsMountFlags,
-        accessat, flock, fstatvfs, linkat, mkdirat, openat, readlinkat, statat, syncfs, unlinkat,
+        accessat, flock, fstatvfs, linkat, mkdirat, openat, readlinkat, renameat, statat, syncfs,
+        unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -111,12 +112,13 @@ use crate::{
     fsverity::{
         Algorithm, CompareVerityError, DEFAULT_LG_BLOCKSIZE, EnableVerityError, FsVerityHashValue,
         FsVerityHasher, MeasureVerityError, compute_verity, enable_verity_maybe_copy,
-        ensure_verity_equal, has_verity, measure_verity, measure_verity_opt,
+        enable_verity_maybe_copy_with_sig, ensure_verity_equal, has_verity, measure_verity,
+        measure_verity_opt,
     },
     mount::{MountOptions, VerityRequirement, composefs_fsmount, mount_at},
     shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamReader, SplitStreamWriter},
-    util::{ErrnoFilter, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
+    util::{ErrnoFilter, generate_tmpname, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
 };
 
 /// The filename used for repository metadata.
@@ -1947,59 +1949,126 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(hasher.digest())
     }
 
+    /// Atomically install a read-only fd as an object at `path`, replacing
+    /// any existing object under that name.
+    ///
+    /// This links the fd into the objects directory under a random
+    /// temporary name and then `renameat`s it over `path`. Unlike a plain
+    /// `linkat`, this always succeeds in replacing an existing entry at
+    /// `path` (renameat silently overwrites), which is what we want when
+    /// upgrading a previously-unsigned object to a signed one. Any process
+    /// holding an open fd to the previous object is unaffected, since the
+    /// old inode remains valid until closed; only the directory entry
+    /// changes.
+    fn install_object_by_rename(
+        &self,
+        dirfd: &OwnedFd,
+        ro_fd: &impl AsFd,
+        id: &ObjectID,
+        path: &str,
+    ) -> Result<()> {
+        let parent_dir = id.to_object_dir();
+        loop {
+            let tmpname = format!("{parent_dir}/.tmp-{}", generate_tmpname(""));
+            match linkat(
+                CWD,
+                proc_self_fd(ro_fd),
+                dirfd,
+                &tmpname,
+                AtFlags::SYMLINK_FOLLOW,
+            ) {
+                Ok(()) => {
+                    renameat(dirfd, &tmpname, dirfd, path)
+                        .context("Renaming signed object into place")?;
+                    return Ok(());
+                }
+                Err(Errno::EXIST) => continue,
+                Err(other) => return Err(other).context("Linking temporary object file"),
+            }
+        }
+    }
+
     /// Store an object with a pre-computed fs-verity ID.
     ///
     /// This is an internal helper that stores data assuming the caller has already
     /// computed the correct fs-verity digest. The digest is verified after storage.
+    ///
+    /// If `signature` is provided, it is enrolled with the kernel via the
+    /// `FS_IOC_ENABLE_VERITY` signature parameter. In that case, unlike the
+    /// unsigned path, an existing object with the same digest is **not**
+    /// treated as "already present and done": we always build a fresh
+    /// tmpfile, enable verity with the signature on it, and atomically
+    /// `renameat` it over the existing name. This lets an object that was
+    /// previously imported without a signature (e.g. from an earlier
+    /// unsigned pull of the same content) be upgraded in place once a
+    /// signature becomes available, without ever downgrading a
+    /// already-signed object (we simply never take this path when we don't
+    /// have a signature to offer). Any process with an open fd to the old
+    /// inode is unaffected, since `renameat` only repoints the name.
+    ///
+    /// If the kernel rejects the signature because the `.fs-verity` keyring
+    /// has no certificate that can verify it ([`EnableVerityError::SigningKeyNotFound`],
+    /// `ENOKEY`), that's treated as "kernel enrollment unavailable" rather
+    /// than a hard error: we fall back to enabling verity without the
+    /// signature. This keeps the never-downgrade guarantee (an existing
+    /// signed object won't be overwritten by this unsigned fallback, since
+    /// only a successful signature enrollment takes the atomic-rename
+    /// install path below). A signature the keyring actively rejects as
+    /// invalid ([`EnableVerityError::SignatureVerificationFailed`],
+    /// `EKEYREJECTED`/`EBADMSG`) is a real tamper-evidence signal and
+    /// remains a hard error.
     #[context("Storing object with ID {id:?}")]
     fn store_object_with_id(
         &self,
         data: &[u8],
         id: &ObjectID,
         _writable: &WritableRepo,
+        signature: Option<&[u8]>,
     ) -> Result<()> {
         let dirfd = self
             .objects_dir()
             .context("Getting objects directory for storage")?;
         let path = id.to_object_pathname();
 
-        // the usual case is that the file will already exist
-        match openat(
-            dirfd,
-            &path,
-            OFlags::RDONLY | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => {
-                // measure the existing file to ensure that it's correct
-                // TODO: try to replace file if it's broken?
-                match ensure_verity_equal(&fd, id) {
-                    Ok(()) => {}
-                    Err(CompareVerityError::Measure(MeasureVerityError::VerityMissing))
-                        if self.insecure =>
-                    {
-                        match enable_verity_maybe_copy::<ObjectID>(dirfd, fd.as_fd()) {
-                            Ok(Some(fd)) => ensure_verity_equal(&fd, id)
-                                .context("Verifying verity after enabling (copied)")?,
-                            Ok(None) => ensure_verity_equal(&fd, id)
-                                .context("Verifying verity after enabling (original)")?,
-                            Err(other) => {
-                                Err(other).context("Enabling verity on existing object")?
+        if signature.is_none() {
+            // the usual case is that the file will already exist
+            match openat(
+                dirfd,
+                &path,
+                OFlags::RDONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => {
+                    // measure the existing file to ensure that it's correct
+                    // TODO: try to replace file if it's broken?
+                    match ensure_verity_equal(&fd, id) {
+                        Ok(()) => {}
+                        Err(CompareVerityError::Measure(MeasureVerityError::VerityMissing))
+                            if self.insecure =>
+                        {
+                            match enable_verity_maybe_copy::<ObjectID>(dirfd, fd.as_fd()) {
+                                Ok(Some(fd)) => ensure_verity_equal(&fd, id)
+                                    .context("Verifying verity after enabling (copied)")?,
+                                Ok(None) => ensure_verity_equal(&fd, id)
+                                    .context("Verifying verity after enabling (original)")?,
+                                Err(other) => {
+                                    Err(other).context("Enabling verity on existing object")?
+                                }
                             }
                         }
+                        Err(CompareVerityError::Measure(
+                            MeasureVerityError::FilesystemNotSupported,
+                        )) if self.insecure => {}
+                        Err(other) => Err(other).context("Verifying existing object integrity")?,
                     }
-                    Err(CompareVerityError::Measure(
-                        MeasureVerityError::FilesystemNotSupported,
-                    )) if self.insecure => {}
-                    Err(other) => Err(other).context("Verifying existing object integrity")?,
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            Err(Errno::NOENT) => {
-                // in this case we'll create the file
-            }
-            Err(other) => {
-                return Err(other).context("Checking for existing object in repository")?;
+                Err(Errno::NOENT) => {
+                    // in this case we'll create the file
+                }
+                Err(other) => {
+                    return Err(other).context("Checking for existing object in repository")?;
+                }
             }
         }
 
@@ -2012,35 +2081,80 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         // to coordinate this at a higher level.  See .write_stream().
         let ro_fd = reopen_tmpfile_ro(file).context("Re-opening file as read-only for verity")?;
 
-        let ro_fd = match enable_verity_maybe_copy::<ObjectID>(dirfd, ro_fd.as_fd()) {
-            Ok(maybe_fd) => {
-                let ro_fd = maybe_fd.unwrap_or(ro_fd);
-                match ensure_verity_equal(&ro_fd, id) {
-                    Ok(()) => ro_fd,
-                    Err(CompareVerityError::Measure(
-                        MeasureVerityError::VerityMissing
-                        | MeasureVerityError::FilesystemNotSupported,
-                    )) if self.insecure => ro_fd,
-                    Err(other) => Err(other).context("Double-checking verity digest")?,
-                }
+        // Checks that `fd`'s verity digest matches `id`, tolerating a missing
+        // or unsupported digest when the repo is `insecure`. Shared between
+        // the normal and unsigned-fallback paths below.
+        let check_digest = |fd: &OwnedFd, context: &'static str| -> Result<()> {
+            match ensure_verity_equal(fd, id) {
+                Ok(()) => Ok(()),
+                Err(CompareVerityError::Measure(
+                    MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported,
+                )) if self.insecure => Ok(()),
+                Err(other) => Err(other).context(context),
             }
-            Err(EnableVerityError::FilesystemNotSupported) if self.insecure => ro_fd,
-            Err(other) => Err(other).context("Enabling verity digest")?,
         };
 
-        match linkat(
-            CWD,
-            proc_self_fd(&ro_fd),
-            dirfd,
-            path,
-            AtFlags::SYMLINK_FOLLOW,
-        ) {
-            Ok(()) => {}
-            Err(Errno::EXIST) => {
-                // TODO: strictly, we should measure the newly-appeared file
-            }
-            Err(other) => {
-                return Err(other).context("Linking created object file");
+        // Track whether verity actually ended up being enabled *with* the
+        // signature enrolled, since that (rather than merely `signature.is_some()`)
+        // determines whether it's safe to overwrite an existing object below
+        // (see the `ENOKEY` handling immediately below for why the two can differ).
+        let mut signature_enrolled = false;
+        let ro_fd =
+            match enable_verity_maybe_copy_with_sig::<ObjectID>(dirfd, ro_fd.as_fd(), signature) {
+                Ok(maybe_fd) => {
+                    signature_enrolled = signature.is_some();
+                    let ro_fd = maybe_fd.unwrap_or(ro_fd);
+                    check_digest(&ro_fd, "Double-checking verity digest")?;
+                    ro_fd
+                }
+                Err(EnableVerityError::FilesystemNotSupported) if self.insecure => ro_fd,
+                Err(EnableVerityError::SigningKeyNotFound) => {
+                    // The `.fs-verity` keyring has no certificate able to verify
+                    // this signature, most likely because none has been loaded
+                    // yet (see `cfsctl keyring add-cert`). This isn't evidence of
+                    // tampering, so gracefully degrade: enable verity without the
+                    // signature instead of failing the whole operation. Userspace
+                    // PKCS#7 verification (`cfsctl oci verify` / `--require-signature`)
+                    // remains the authoritative trust check regardless.
+                    match enable_verity_maybe_copy::<ObjectID>(dirfd, ro_fd.as_fd()) {
+                        Ok(maybe_fd) => {
+                            let ro_fd = maybe_fd.unwrap_or(ro_fd);
+                            check_digest(
+                                &ro_fd,
+                                "Double-checking verity digest (unsigned fallback)",
+                            )?;
+                            ro_fd
+                        }
+                        Err(EnableVerityError::FilesystemNotSupported) if self.insecure => ro_fd,
+                        Err(other) => {
+                            Err(other).context("Enabling verity digest (unsigned fallback)")?
+                        }
+                    }
+                }
+                Err(other) => Err(other).context("Enabling verity digest")?,
+            };
+
+        if signature_enrolled {
+            // The signature was actually enrolled with the kernel: atomically
+            // install this fresh, signed copy over the object's name, upgrading
+            // any previously-stored unsigned object with the same digest.
+            self.install_object_by_rename(dirfd, &ro_fd, id, &path)
+                .context("Installing signed object")?;
+        } else {
+            match linkat(
+                CWD,
+                proc_self_fd(&ro_fd),
+                dirfd,
+                &path,
+                AtFlags::SYMLINK_FOLLOW,
+            ) {
+                Ok(()) => {}
+                Err(Errno::EXIST) => {
+                    // TODO: strictly, we should measure the newly-appeared file
+                }
+                Err(other) => {
+                    return Err(other).context("Linking created object file");
+                }
             }
         }
 
@@ -2069,7 +2183,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         writable: &WritableRepo,
     ) -> Result<ObjectID> {
         let id: ObjectID = compute_verity(data);
-        self.store_object_with_id(data, &id, writable)?;
+        self.store_object_with_id(data, &id, writable, None)?;
         Ok(id)
     }
 
@@ -2453,8 +2567,30 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// This function is not safe for untrusted users.
     #[context("Writing image to repository")]
     pub fn write_image(&self, name: Option<&str>, data: &[u8]) -> Result<ObjectID> {
+        self.write_image_with_sig(name, data, None)
+    }
+
+    /// Like [`write_image`](Self::write_image), but if `signatures` contains
+    /// a fs-verity PKCS#7 signature for this image's digest, that signature
+    /// is enrolled with the kernel via `FS_IOC_ENABLE_VERITY` as the object
+    /// is stored.
+    ///
+    /// This is used for EROFS image objects (per-layer, merged, and boot
+    /// artifacts) so that the kernel can enforce signature verification on
+    /// access, independent of composefs's own userspace PKCS#7
+    /// verification. It is intentionally not used for generic
+    /// content-addressed blob objects.
+    #[context("Writing image to repository")]
+    pub fn write_image_with_sig(
+        &self,
+        name: Option<&str>,
+        data: &[u8],
+        signatures: Option<&HashMap<ObjectID, Vec<u8>>>,
+    ) -> Result<ObjectID> {
         let writable = self.ensure_writable_token()?;
-        let object_id = self.ensure_object_impl(data, &writable)?;
+        let object_id: ObjectID = compute_verity(data);
+        let signature = signatures.and_then(|map| map.get(&object_id).map(Vec::as_slice));
+        self.store_object_with_id(data, &object_id, &writable, signature)?;
 
         let object_path = Self::format_object_path(&object_id);
         let image_path = format!("images/{}", object_id.to_hex());
@@ -3881,6 +4017,124 @@ mod tests {
         assert!(result.objects_bytes > 0);
         assert_eq!(result.streams_pruned, 1);
         assert_eq!(result.images_pruned, 0);
+        Ok(())
+    }
+
+    // ---- Signature-aware object storage (kernel fs-verity enrollment) ----
+
+    #[test]
+    fn test_write_image_with_sig_upgrades_unsigned_object() -> Result<()> {
+        // An image imported without a signature must be upgradeable in
+        // place once a signature for its digest becomes available (e.g. on
+        // a later pull of the same content with a signature attached),
+        // without erroring out as "already present".
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let image_data = generate_test_data(32 * 1024, 0x51);
+        let id: Sha512HashValue = compute_verity(&image_data);
+
+        let unsigned_id = repo.write_image(None, &image_data)?;
+        assert_eq!(unsigned_id, id);
+        assert!(test_object_exists(&tmp, &id)?);
+
+        let mut signatures = HashMap::new();
+        signatures.insert(id.clone(), b"fake-pkcs7-signature-bytes".to_vec());
+
+        let signed_id = repo.write_image_with_sig(None, &image_data, Some(&signatures))?;
+        assert_eq!(
+            signed_id, id,
+            "digest must not change when adding a signature"
+        );
+        assert!(test_object_exists(&tmp, &id)?);
+
+        // Content must still be exactly what was written.
+        let stored = repo.open_object(&id)?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut File::from(stored), &mut buf)?;
+        assert_eq!(buf, image_data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_image_with_sig_keeps_open_fd_valid_across_upgrade() -> Result<()> {
+        // Upgrading via renameat must not disturb a reader that already has
+        // the old object open: renameat only repoints the directory entry,
+        // it doesn't touch the inode a pre-existing fd refers to.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let image_data = generate_test_data(16 * 1024, 0x7A);
+        let id: Sha512HashValue = compute_verity(&image_data);
+        repo.write_image(None, &image_data)?;
+
+        let old_fd = repo.open_object(&id)?;
+
+        let mut signatures = HashMap::new();
+        signatures.insert(id.clone(), b"another-fake-signature".to_vec());
+        repo.write_image_with_sig(None, &image_data, Some(&signatures))?;
+
+        // The fd opened before the upgrade must still be readable and
+        // return the original content.
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut File::from(old_fd), &mut buf)?;
+        assert_eq!(buf, image_data);
+
+        // And the object must still be resolvable by digest afterwards.
+        assert!(test_object_exists(&tmp, &id)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_image_never_downgrades_signed_object() -> Result<()> {
+        // Once an object has been stored with a signature, a subsequent
+        // unsigned write of the same content must not error, and must
+        // leave the (already correct, already signed) object alone rather
+        // than attempting a downgrade.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let image_data = generate_test_data(8 * 1024, 0x33);
+        let id: Sha512HashValue = compute_verity(&image_data);
+
+        let mut signatures = HashMap::new();
+        signatures.insert(id.clone(), b"yet-another-fake-signature".to_vec());
+        repo.write_image_with_sig(None, &image_data, Some(&signatures))?;
+        assert!(test_object_exists(&tmp, &id)?);
+
+        // Re-importing without a signature takes the existing "already
+        // present" fast path and must succeed unchanged.
+        let unsigned_id = repo.write_image(None, &image_data)?;
+        assert_eq!(unsigned_id, id);
+        assert!(test_object_exists(&tmp, &id)?);
+
+        let stored = repo.open_object(&id)?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut File::from(stored), &mut buf)?;
+        assert_eq!(buf, image_data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_image_with_sig_no_matching_digest_stores_unsigned() -> Result<()> {
+        // A signature map that doesn't contain this image's digest must
+        // behave exactly like the unsigned path.
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let image_data = generate_test_data(4 * 1024, 0x99);
+        let id: Sha512HashValue = compute_verity(&image_data);
+
+        let mut signatures = HashMap::new();
+        signatures.insert(Sha512HashValue::EMPTY, b"unrelated-signature".to_vec());
+
+        let written_id = repo.write_image_with_sig(None, &image_data, Some(&signatures))?;
+        assert_eq!(written_id, id);
+        assert!(test_object_exists(&tmp, &id)?);
+
         Ok(())
     }
 

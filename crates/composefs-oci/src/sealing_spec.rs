@@ -349,7 +349,7 @@
 //!
 //! - The `.sig` values are base64-encoded PKCS#7 DER, identical in content to the raw blobs stored in artifact mode signature layers. To apply them locally, base64-decode the value and pass the result to `FS_IOC_ENABLE_VERITY`.
 //! - There is no manifest signature in inline mode. Adding a `composefs.manifest.fsverity-sha512-12` annotation would alter the manifest bytes, invalidating any digest computed before the annotation was added.
-//! - For large certificate chains, the base64-encoded signature annotation may be several kilobytes. If annotation size is a concern — for example, registries or tooling that imposes limits — use artifact mode instead, where signatures travel as separate layer blobs.
+//! - Signature annotations stay small: this crate's signer (see `signing.rs`), like standard fsverity signing tooling (e.g. `fsverity-utils`), builds the PKCS#7 message with `PKCS7_NOCERTS`, omitting the signer's certificate entirely — verification matches directly against a certificate already loaded into the `.fs-verity` keyring (kernel side) or supplied out-of-band via `--trust-cert`/`--cert` (userspace verifier). A base64-encoded signature is typically a few hundred bytes, not a source of manifest bloat.
 //!
 //! #### Whiteout Handling in Merged Filesystem
 //!
@@ -360,6 +360,24 @@
 //! #### Linux kernel fsverity signatures
 //!
 //! The primary signature mechanism is Linux kernel [fsverity built-in signature verification](https://docs.kernel.org/filesystems/fsverity.html#built-in-signature-verification). The kernel's `FS_IOC_ENABLE_VERITY` ioctl accepts a PKCS#7 signature that is verified against the `.fs-verity` keyring. This provides a clear chain of trust: the same component that controls data access (the Linux kernel) also validates the signature. The Linux kernel has subsystems that can build on top of fsverity signatures, such as [IPE](https://docs.kernel.org/admin-guide/LSM/ipe.html) (Integrity Policy Enforcement).
+//!
+//! #### Local kernel enrollment during pull
+//!
+//! `composefs-oci` opportunistically enrolls fsverity signatures with the kernel while pulling an image, so that the objects it writes locally benefit from kernel-enforced tamper evidence without any extra step. This applies only to the EROFS image objects it generates itself — the per-layer, merged, and merged-bootable EROFS files. It does not apply to plain content-addressed blob objects (e.g. individual extracted layer files), which have no associated composefs signature to enroll.
+//!
+//! Both integrity metadata modes feed the same enrollment step: a signature found either as an inline `.sig` annotation or fetched from a composefs metadata artifact via the OCI referrers API is looked up by the expected EROFS digest before the corresponding EROFS is generated, so it can be passed to `FS_IOC_ENABLE_VERITY` at the point the file is written.
+//!
+//! Repository object storage never downgrades an object from signed to unsigned: an image previously stored without a signature can later be upgraded in place (via an atomic rename) once a signature becomes available on a subsequent pull, but a previously-enrolled signed object is left untouched when written again without one.
+//!
+//! Because enrollment only happens as a side effect of the repository write path, it is inherently a *pull-time* operation. `cfsctl oci sign` — which signs an OCI artifact or updates inline annotations against a registry image — does not itself touch any locally-stored copy of that image. If an image was already pulled locally before it was signed, kernel enrollment for that existing local copy only happens on a subsequent pull; there is no mechanism to retroactively enroll a signature into an object already sitting in the repository.
+//!
+//! Kernel enrollment is a coarse, machine-wide, best-effort layer, not the primary trust decision. The `.fs-verity` keyring has no notion of which certificate should apply to which file — any signature that verifies against *any* certificate loaded via `cfsctl keyring add-cert` is accepted for enrollment. If the keyring has no certificate able to verify the signature at all (`ENOKEY`), that's treated as "kernel enrollment unavailable" rather than a failure: the object is still stored with plain (unsigned) fsverity enabled, and the pull proceeds normally. If the keyring does have a certificate but the signature fails to verify against it (`EKEYREJECTED`/`EBADMSG`), that's a real tamper-evidence signal and the object write fails outright. Userspace PKCS#7 verification (`cfsctl oci verify`, or `--require-signature` on pull) remains the authoritative trust decision regardless of whether kernel enrollment happened to succeed.
+//!
+//! ##### Single active signature per content digest
+//!
+//! A given fsverity signature can only be attached to a file at the moment `FS_IOC_ENABLE_VERITY` is called on it; it cannot be changed or read back out afterward, and it is a property of the inode rather than the content. Because repository object storage is content-addressed by digest, there is only one namable slot per digest for an enrolled object. If byte-identical EROFS content is pulled and enrolled with signature A, and later the same content is pulled again enrolled with a different signature B, B's enrollment replaces A's in that slot (still subject to the never-downgrade rule above: a signed slot is never replaced by an unsigned write, but two *signed* writes for the same digest are last-one-wins).
+//!
+//! This is intentional for now, not an oversight: kernel enrollment already can't distinguish which certificate produced the signature it accepted, so from the kernel's point of view A's and B's enrollments are equally valid tamper-evidence — the meaningful trust decision (which specific signer to require) is made in userspace beforehand, not by whichever enrollment happens to be currently on disk. A future extension could support multiple simultaneously-enrolled variants of the same content, keyed by a composite of `(digest, signature)`, letting several signers' copies coexist rather than overwrite each other. This is more tractable than it sounds because composefs EROFS images are metadata-only — actual file contents live in separate content-addressed objects referenced out-of-line via EROFS's chunk-based inode data layout, not embedded — so each additional enrolled variant is small regardless of how large the filesystem tree it describes is, and on filesystems supporting reflink (`ioctl_ficlone`, already used elsewhere in the object-import path) it need not even duplicate that small amount of data.
 //!
 //! #### Digest-only verification
 //!

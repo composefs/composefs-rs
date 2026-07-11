@@ -33,8 +33,9 @@ fn-error-context = "0.2"
 clap = { version = "4.5.0", default-features = false, features = ["std", "help", "usage", "derive", "wrap_help"] }
 clap_complete = { version = "4.5.0", default-features = false, features = ["unstable-dynamic"] }
 comfy-table = { version = "7.1", default-features = false }
-composefs = { workspace = true, features = ["varlink"] }
+composefs = { workspace = true, features = ["varlink", "keyring"] }
 composefs-boot = { workspace = true }
+composefs-ioctls = { workspace = true, features = ["keyring"] }
 composefs-oci = { workspace = true, optional = true, features = ["boot"] }
 composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.7.0", optional = true }
 composefs-http = { workspace = true, optional = true }
