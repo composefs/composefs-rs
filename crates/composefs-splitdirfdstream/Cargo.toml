@@ -20,7 +20,7 @@ tokio = ["dep:tokio"]
 rand = { version = "0.10.0", default-features = false, features = ["alloc"] }
 rand_pcg = { version = "0.10.0", default-features = false }
 rustix = { version = "1.0.0", default-features = false, features = ["fs", "pipe", "std"] }
-sha2 = { version = "0.10", default-features = false, features = ["std"] }
+sha2 = { version = "0.11", default-features = false, features = ["std"] }
 thiserror = { version = "2.0.0", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
 
