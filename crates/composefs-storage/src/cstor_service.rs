@@ -496,8 +496,9 @@ pub fn spawn_in_process(
     server_std.set_nonblocking(true)?;
 
     let client_stream = tokio::net::UnixStream::from_std(client_std)?;
-    let client_zlink = zlink::unix::Stream::from(client_stream);
-    let client_conn = zlink::Connection::from(client_zlink);
+    let client_zlink =
+        zlink::unix::Stream::try_from(client_stream).map_err(std::io::Error::other)?;
+    let client_conn = zlink::Connection::new(client_zlink);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -525,7 +526,15 @@ pub fn spawn_in_process(
                         return;
                     }
                 };
-                let server_zlink = zlink::unix::Stream::from(server_stream);
+                let server_zlink = match zlink::unix::Stream::try_from(server_stream) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(
+                            "CstorLayerService server zlink stream conversion failed: {e:#?}"
+                        );
+                        return;
+                    }
+                };
                 let listener = zlink::ReadyListener::new(server_zlink);
                 let server = zlink::Server::new(listener, service);
 
@@ -569,7 +578,7 @@ pub fn serve_on_socket_blocking(socket: std::os::unix::net::UnixStream) -> std::
     local.block_on(&rt, async move {
         // `from_std` must be called inside the runtime context.
         let stream = tokio::net::UnixStream::from_std(socket)?;
-        let zs = zlink::unix::Stream::from(stream);
+        let zs = zlink::unix::Stream::try_from(stream).map_err(std::io::Error::other)?;
         let listener = zlink::ReadyListener::new(zs);
         let server = zlink::Server::new(listener, CstorLayerService);
         server
