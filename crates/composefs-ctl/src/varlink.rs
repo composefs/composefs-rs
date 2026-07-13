@@ -1796,9 +1796,9 @@ pub(crate) struct ActivatedListener {
 impl zlink::Listener for ActivatedListener {
     type Socket = zlink::unix::Stream;
 
-    async fn accept(&mut self) -> zlink::Result<zlink::Connection<Self::Socket>> {
+    async fn accept(&mut self) -> zlink::Result<Option<zlink::Connection<Self::Socket>>> {
         match self.conn.take() {
-            Some(conn) => Ok(conn),
+            Some(conn) => Ok(Some(conn)),
             None => std::future::pending().await,
         }
     }
@@ -1863,8 +1863,9 @@ pub(crate) fn try_activated_listener() -> Result<Option<ActivatedSocket>> {
             .context("setting systemd socket to non-blocking")?;
         let tokio_stream = tokio::net::UnixStream::from_std(std_stream)
             .context("converting systemd UnixStream to tokio")?;
-        let zlink_stream = zlink::unix::Stream::from(tokio_stream);
-        let conn = zlink::Connection::from(zlink_stream);
+        let zlink_stream =
+            zlink::unix::Stream::try_from(tokio_stream).map_err(|e| anyhow::anyhow!(e))?;
+        let conn = zlink::Connection::new(zlink_stream);
         Ok(Some(ActivatedSocket::Connected(ActivatedListener {
             conn: Some(conn),
         })))
@@ -2847,8 +2848,9 @@ pub(crate) fn spawn_in_process(
     server_std.set_nonblocking(true)?;
 
     let client_stream = tokio::net::UnixStream::from_std(client_std)?;
-    let client_zlink = zlink::unix::Stream::from(client_stream);
-    let client_conn = zlink::Connection::from(client_zlink);
+    let client_zlink =
+        zlink::unix::Stream::try_from(client_stream).map_err(std::io::Error::other)?;
+    let client_conn = zlink::Connection::new(client_zlink);
 
     let handle = std::thread::Builder::new()
         .name("cfsctl-service-server".into())
@@ -2872,7 +2874,13 @@ pub(crate) fn spawn_in_process(
                         return;
                     }
                 };
-                let server_zlink = zlink::unix::Stream::from(server_stream);
+                let server_zlink = match zlink::unix::Stream::try_from(server_stream) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!("CfsctlService server zlink stream conversion failed: {e:#?}");
+                        return;
+                    }
+                };
                 let listener = zlink::ReadyListener::new(server_zlink);
                 let server = zlink::Server::new(listener, service);
                 if let Err(e) = server.run().await {

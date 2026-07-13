@@ -238,8 +238,8 @@ impl StorageProxy {
         parent_sock.set_nonblocking(true)?;
         let tok = tokio::net::UnixStream::from_std(parent_sock)
             .map_err(|e| HelperError::Ipc(format!("failed to convert socket: {e}")))?;
-        let zs = zlink::unix::Stream::from(tok);
-        let conn = zlink::Connection::from(zs);
+        let zs = zlink::unix::Stream::try_from(tok).map_err(std::io::Error::other)?;
+        let conn = zlink::Connection::new(zs);
 
         Ok(Self {
             child: Some(child),
