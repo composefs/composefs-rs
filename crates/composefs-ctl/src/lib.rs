@@ -1520,11 +1520,25 @@ async fn load_filesystem_from_ondisk_fs<ObjectID: FsVerityHashValue>(
     Ok(fs)
 }
 
-fn dump_file_impl(
-    fs: FileSystem<RegularFile<impl FsVerityHashValue>>,
+/// Print file information from a composefs filesystem for the given paths
+///
+/// For each path in `files`, looks up the entry in the filesystem and either
+/// outputs composefs dumpfile-format metadata or, when `backing_path_only` is
+/// set, prints whether the file is stored inline or its object-relative path.
+/// Directory paths have their contents listed.
+pub fn dump_files<ObjectID: FsVerityHashValue>(
+    repo: &Repository<ObjectID>,
+    image_name: &str,
     files: &Vec<PathBuf>,
     backing_path_only: bool,
 ) -> Result<()> {
+    let (img_fd, _) = repo.open_image(image_name)?;
+
+    let mut img_buf = Vec::new();
+    std::fs::File::from(img_fd).read_to_end(&mut img_buf)?;
+
+    let fs = erofs_to_filesystem::<ObjectID>(&img_buf)?;
+
     let mut out = Vec::new();
     let nlink_map = fs.nlinks();
 
@@ -2267,16 +2281,7 @@ where
             files,
             backing_path_only,
         } => {
-            let (img_fd, _) = repo.open_image(&image_name)?;
-
-            let mut img_buf = Vec::new();
-            std::fs::File::from(img_fd).read_to_end(&mut img_buf)?;
-
-            dump_file_impl(
-                erofs_to_filesystem::<ObjectID>(&img_buf)?,
-                &files,
-                backing_path_only,
-            )?;
+            dump_files(&repo, &image_name, &files, backing_path_only)?;
         }
         Command::Fsck {
             json,
