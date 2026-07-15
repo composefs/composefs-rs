@@ -30,7 +30,7 @@ rhel9 = ['composefs/rhel9']
 [dependencies]
 anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
-clap = { version = "4.5.0", default-features = false, features = ["std", "help", "usage", "derive", "wrap_help"] }
+clap = { version = "4.5.0", default-features = false, features = ["std", "help", "usage", "derive", "wrap_help", "error-context", "suggestions"] }
 clap_complete = { version = "4.5.0", default-features = false, features = ["unstable-dynamic"] }
 comfy-table = { version = "7.1", default-features = false }
 composefs = { workspace = true, features = ["varlink"] }
