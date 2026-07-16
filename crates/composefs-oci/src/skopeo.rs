@@ -614,19 +614,80 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
             .with_context(|| format!("Unable to pull container image {imgref}"))?
     };
 
+    // Supplement the skopeo-based pull by fetching referrer artifacts
+    // (composefs signature artifacts) directly from the registry via
+    // oci-client. Skopeo doesn't support the OCI Referrers API, so without
+    // this, --require-signature always fails after pulling.
+    //
+    // This must happen *before* EROFS generation below: kernel fs-verity
+    // signature enrollment needs the referrer-mode signature bytes to be
+    // available locally while the EROFS image is being written, not
+    // afterwards. We only have the *registry* manifest digest at this
+    // point (EROFS generation hasn't rewritten anything yet), which is
+    // exactly what the Referrers API query needs.
+    #[cfg(feature = "oci-client")]
+    let referrer_artifacts = if image_ref.transport == Transport::Registry {
+        match crate::referrers::fetch_referrer_artifacts(
+            repo,
+            imgref,
+            result.manifest_digest.as_ref(),
+        )
+        .await
+        {
+            Ok(artifacts) => artifacts,
+            Err(e) => {
+                tracing::warn!("Failed to fetch referrer artifacts: {e:#}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    #[cfg(not(feature = "oci-client"))]
+    let referrer_artifacts: Vec<crate::OciDigest> = Vec::new();
+
     // Generate the composefs EROFS image and link it to the config splitstream.
     // For container images this rewrites the config+manifest with the EROFS ref
     // and tags the final manifest. Artifacts are skipped and tagged as-is.
-    let erofs = crate::ensure_oci_composefs_erofs(
+    // Any inline or referrer-mode signatures found above are enrolled with
+    // the kernel via FS_IOC_ENABLE_VERITY as the image is stored.
+    let erofs = crate::ensure_oci_composefs_erofs_with_sig(
         repo,
         &result.manifest_digest,
         Some(&result.manifest_verity),
         reference,
+        &referrer_artifacts,
     )?;
     if erofs.is_none() {
         // Not a container image (artifact) — tag the manifest directly
         if let Some(name) = reference {
             tag_image(repo, &result.manifest_digest, name)?;
+        }
+    }
+
+    // Now that EROFS generation (if any) has settled the final local
+    // manifest digest, register the referrer relationship so the imported
+    // artifacts become discoverable via `cfsctl oci verify`.
+    #[cfg(feature = "oci-client")]
+    if !referrer_artifacts.is_empty() {
+        // ensure_oci_composefs_erofs_with_sig may rewrite the manifest, so
+        // the local manifest digest can differ from the registry digest.
+        // Use the local (post-EROFS-rewrite) digest here so referrers
+        // remain discoverable from the tag/digest actually stored locally.
+        let local_digest = if let Some(name) = reference {
+            crate::oci_image::resolve_ref(repo, name)
+                .map(|(d, _)| d)
+                .unwrap_or_else(|_| result.manifest_digest.clone())
+        } else {
+            result.manifest_digest.clone()
+        };
+        match crate::referrers::register_referrers(repo, local_digest.as_ref(), &referrer_artifacts)
+        {
+            Ok(count) if count > 0 => {
+                tracing::info!("Imported {count} referrer artifact(s) from registry");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("Failed to register referrer artifacts: {e:#}"),
         }
     }
 

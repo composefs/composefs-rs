@@ -316,6 +316,20 @@ impl Algorithm {
         }
     }
 
+    /// The Merkle-tree block size in bytes (e.g. 4096 for lg_blocksize 12).
+    pub const fn block_size(&self) -> u32 {
+        1u32 << self.lg_blocksize()
+    }
+
+    /// The digest size in bytes for this algorithm's hash
+    /// (32 for SHA-256, 64 for SHA-512).
+    pub const fn digest_size(&self) -> usize {
+        match self {
+            Self::Sha256 { .. } => 32,
+            Self::Sha512 { .. } => 64,
+        }
+    }
+
     /// Check whether this algorithm is compatible with the given hash type.
     pub fn is_compatible<H: FsVerityHashValue>(&self) -> bool {
         std::mem::discriminant(self) == std::mem::discriminant(&H::ALGORITHM)

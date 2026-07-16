@@ -17,6 +17,8 @@ use xshell::{Shell, cmd};
 use composefs_oci::composefs::fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue};
 use composefs_oci::composefs::repository::{Repository, RepositoryConfig};
 
+use crate::tests::cli::{create_oci_layout, init_insecure_repo};
+use crate::tests::varlink::VarlinkService;
 use crate::{cfsctl, create_test_rootfs, integration_test};
 
 /// Ensure we're running in a privileged environment, or re-exec this test inside a VM.
@@ -1258,3 +1260,489 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
     Ok(())
 }
 integration_test!(privileged_fuse_dumpfile_roundtrip);
+
+// ============================================================================
+// Kernel fs-verity signature enrollment via the varlink `Pull` API.
+//
+// `Pull` is the only code path that enrolls PKCS#7 signatures with the
+// kernel (`FS_IOC_ENABLE_VERITY`), as part of committing the EROFS image
+// for the very first time (`ensure_oci_composefs_erofs_with_sig`). `Seal`
+// and `Sign` only rewrite manifest annotations on an already-pulled image;
+// they don't re-trigger enrollment. So these tests bake a signature into a
+// *source* OCI layout (via a throwaway scratch repo) before doing the real,
+// verity-backed `Pull` that these tests actually exercise.
+// ============================================================================
+
+/// Returns whether the kernel exposes a `.fs-verity` keyring, i.e. supports
+/// `FS_IOC_ENABLE_VERITY` with builtin PKCS#7 signature verification
+/// (`CONFIG_FS_VERITY_BUILTIN_SIGNATURES`).
+///
+/// Kernels built without this option never create the keyring
+/// (`fsverity_init_signature()` is a no-op stub) and silently accept any
+/// signature bytes, which makes the correct/wrong/no-cert distinction these
+/// tests exist to check unobservable. Reads `/proc/keys` directly (rather
+/// than going through `cfsctl keyring add-cert`) so the probe has no side
+/// effects — the no-cert scenario below needs to observe a genuinely empty
+/// keyring.
+fn fsverity_keyring_exists() -> Result<bool> {
+    let proc_keys = std::fs::read_to_string("/proc/keys").context("reading /proc/keys")?;
+    Ok(proc_keys.lines().any(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        fields.get(7) == Some(&"keyring")
+            && fields.get(8).map(|desc| desc.trim_end_matches(':')) == Some(".fs-verity")
+    }))
+}
+
+/// Builds an OCI layout directory whose manifest carries an inline PKCS#7
+/// signature (`SignatureType::Merged`) over the composed EROFS image,
+/// signed with `key_pem`/`cert_pem`.
+///
+/// Pulls the standard test fixture into a scratch insecure repo, seals and
+/// signs it inline there (which only computes digests/signatures and
+/// rewrites manifest annotations — no filesystem verity needed), then
+/// exports it back out to a fresh OCI layout. Only top-level manifest
+/// annotations survive that export round-trip
+/// (`export_image_to_oci_layout` doesn't copy per-descriptor annotations),
+/// but that's exactly where the "Merged" signature lives, so it's
+/// preserved.
+fn build_signed_oci_layout(
+    sh: &Shell,
+    cfsctl_bin: &Path,
+    parent: &Path,
+    cert_pem: &Path,
+    key_pem: &Path,
+) -> Result<PathBuf> {
+    let fixture_dir = tempfile::tempdir()?;
+    let layout = create_oci_layout(fixture_dir.path())?;
+
+    let scratch_repo_dir = init_insecure_repo(sh, cfsctl_bin)?;
+    let scratch_repo = scratch_repo_dir.path();
+    cmd!(
+        sh,
+        "{cfsctl_bin} --insecure --repo {scratch_repo} oci pull oci:{layout} fixture"
+    )
+    .read()?;
+    cmd!(
+        sh,
+        "{cfsctl_bin} --insecure --repo {scratch_repo} oci seal fixture --inline"
+    )
+    .read()?;
+    cmd!(
+        sh,
+        "{cfsctl_bin} --insecure --repo {scratch_repo} oci sign fixture --cert {cert_pem} --key {key_pem} --inline"
+    )
+    .read()?;
+
+    let signed_layout = parent.join("signed-oci-layout");
+    cmd!(
+        sh,
+        "{cfsctl_bin} --insecure --repo {scratch_repo} oci push fixture oci:{signed_layout}"
+    )
+    .read()?;
+
+    Ok(signed_layout)
+}
+
+/// Observes whether the kernel actually enrolled a fs-verity signature on
+/// `image`'s EROFS object, by opening the underlying object file directly
+/// and calling `has_verity_signature()` — a repository may fall back to
+/// enabling plain verity (no signature) when no keyring certificate can
+/// verify it, so this is the only way to distinguish that from real
+/// enrollment.
+fn image_has_verity_signature(svc: &VarlinkService, repo: &Path, image: &str) -> Result<bool> {
+    let reply = svc
+        .proxy_inspect(image)
+        .context("Inspect transport error")?
+        .map_err(|e| anyhow::anyhow!("Inspect error: {e:?}"))?;
+    let erofs_hex = reply
+        .composefs_erofs
+        .context("image has no composefs_erofs id")?;
+    let id = Sha256HashValue::from_hex(&erofs_hex).context("parsing EROFS object id")?;
+    let object_path = repo.join("objects").join(id.to_object_pathname());
+    let file = std::fs::File::open(&object_path)
+        .with_context(|| format!("opening EROFS object {}", object_path.display()))?;
+    Ok(composefs_oci::composefs::fsverity::has_verity_signature(
+        &file,
+    )?)
+}
+
+/// A certificate that actually verifies the enrolled signature: the kernel
+/// should accept it, and the EROFS object should end up with a real
+/// kernel-verified signature (not just plain verity).
+fn privileged_varlink_kernel_sig_correct_cert() -> Result<()> {
+    if require_privileged("privileged_varlink_kernel_sig_correct_cert")?.is_some() {
+        return Ok(());
+    }
+    if !fsverity_keyring_exists()? {
+        println!(
+            "SKIP: kernel lacks CONFIG_FS_VERITY_BUILTIN_SIGNATURES support (.fs-verity keyring not found)"
+        );
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl_bin = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+
+    let (cert_pem, key_pem) = composefs_oci::signing::generate_test_keypair();
+    let cert_path = fixture_dir.path().join("cert.pem");
+    let key_path = fixture_dir.path().join("key.pem");
+    std::fs::write(&cert_path, &cert_pem)?;
+    std::fs::write(&key_path, &key_pem)?;
+
+    let layout =
+        build_signed_oci_layout(&sh, &cfsctl_bin, fixture_dir.path(), &cert_path, &key_path)?;
+
+    cmd!(sh, "{cfsctl_bin} keyring add-cert {cert_path}").read()?;
+
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+    cmd!(sh, "{cfsctl_bin} --repo {repo} init").run()?;
+
+    let svc = VarlinkService::oci(&repo)?;
+    svc.proxy_pull(
+        &format!("oci:{}", layout.display()),
+        Some("signed-image"),
+        false,
+    )
+    .context("Pull transport error")?
+    .map_err(|e| anyhow::anyhow!("Pull with a correctly-enrolled cert should succeed: {e:?}"))?;
+
+    ensure!(
+        image_has_verity_signature(&svc, &repo, "signed-image")?,
+        "expected the kernel to have enrolled the signature"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_varlink_kernel_sig_correct_cert);
+
+/// A certificate enrolled in the keyring that does *not* verify the
+/// signature: the kernel must reject it (`EKEYREJECTED`), which should
+/// surface as a hard `Pull` failure rather than a silent fallback.
+fn privileged_varlink_kernel_sig_wrong_cert() -> Result<()> {
+    if require_privileged("privileged_varlink_kernel_sig_wrong_cert")?.is_some() {
+        return Ok(());
+    }
+    if !fsverity_keyring_exists()? {
+        println!(
+            "SKIP: kernel lacks CONFIG_FS_VERITY_BUILTIN_SIGNATURES support (.fs-verity keyring not found)"
+        );
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl_bin = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+
+    // The image is signed with this keypair...
+    let (cert_pem, key_pem) = composefs_oci::signing::generate_test_keypair();
+    let cert_path = fixture_dir.path().join("cert.pem");
+    let key_path = fixture_dir.path().join("key.pem");
+    std::fs::write(&cert_path, &cert_pem)?;
+    std::fs::write(&key_path, &key_pem)?;
+
+    // ...but an unrelated certificate is the one enrolled in the keyring.
+    let (wrong_cert_pem, _wrong_key_pem) = composefs_oci::signing::generate_test_keypair();
+    let wrong_cert_path = fixture_dir.path().join("wrong-cert.pem");
+    std::fs::write(&wrong_cert_path, &wrong_cert_pem)?;
+
+    let layout =
+        build_signed_oci_layout(&sh, &cfsctl_bin, fixture_dir.path(), &cert_path, &key_path)?;
+
+    cmd!(sh, "{cfsctl_bin} keyring add-cert {wrong_cert_path}").read()?;
+
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+    cmd!(sh, "{cfsctl_bin} --repo {repo} init").run()?;
+
+    let svc = VarlinkService::oci(&repo)?;
+    let err = svc
+        .proxy_pull(
+            &format!("oci:{}", layout.display()),
+            Some("signed-image"),
+            false,
+        )
+        .context("Pull transport error")?
+        .expect_err("Pull with a non-matching enrolled cert must fail");
+    let message = match &err {
+        composefs_ctl::varlink::oci::OciError::InternalError { message } => message.clone(),
+        other => bail!("expected OciError::InternalError, got: {other:?}"),
+    };
+    ensure!(
+        message.contains("signature rejected by kernel"),
+        "expected a kernel signature-rejection error, got: {message}"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_varlink_kernel_sig_wrong_cert);
+
+/// No certificate at all is enrolled in the keyring: the kernel reports
+/// `ENOKEY`, and the repository should gracefully fall back to enabling
+/// plain verity without a signature rather than failing the pull.
+fn privileged_varlink_kernel_sig_no_cert() -> Result<()> {
+    if require_privileged("privileged_varlink_kernel_sig_no_cert")?.is_some() {
+        return Ok(());
+    }
+    if !fsverity_keyring_exists()? {
+        println!(
+            "SKIP: kernel lacks CONFIG_FS_VERITY_BUILTIN_SIGNATURES support (.fs-verity keyring not found)"
+        );
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl_bin = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+
+    let (cert_pem, key_pem) = composefs_oci::signing::generate_test_keypair();
+    let cert_path = fixture_dir.path().join("cert.pem");
+    let key_path = fixture_dir.path().join("key.pem");
+    std::fs::write(&cert_path, &cert_pem)?;
+    std::fs::write(&key_path, &key_pem)?;
+
+    let layout =
+        build_signed_oci_layout(&sh, &cfsctl_bin, fixture_dir.path(), &cert_path, &key_path)?;
+
+    // Deliberately do not add any certificate to the keyring.
+
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+    cmd!(sh, "{cfsctl_bin} --repo {repo} init").run()?;
+
+    let svc = VarlinkService::oci(&repo)?;
+    svc.proxy_pull(
+        &format!("oci:{}", layout.display()),
+        Some("signed-image"),
+        false,
+    )
+    .context("Pull transport error")?
+    .map_err(|e| anyhow::anyhow!("Pull with an empty keyring should still succeed: {e:?}"))?;
+
+    ensure!(
+        !image_has_verity_signature(&svc, &repo, "signed-image")?,
+        "expected no signature to be enrolled with an empty keyring"
+    );
+
+    Ok(())
+}
+integration_test!(privileged_varlink_kernel_sig_no_cert);
+
+/// Attaches a detached mount fd (as returned by the `OciMount`/`Mount`
+/// varlink methods) at a fresh temporary directory, and detaches it again
+/// on drop so the test doesn't leak mounts.
+struct AttachedMount {
+    dir: tempfile::TempDir,
+}
+
+impl AttachedMount {
+    fn new(fs_fd: std::os::fd::OwnedFd) -> Result<Self> {
+        let dir = tempfile::tempdir()?;
+        composefs_oci::composefs::mount::mount_at(fs_fd, rustix::fs::CWD, dir.path())
+            .context("Attaching detached mount fd")?;
+        Ok(Self { dir })
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for AttachedMount {
+    fn drop(&mut self) {
+        let _ = rustix::mount::unmount(self.dir.path(), rustix::mount::UnmountFlags::DETACH);
+    }
+}
+
+/// Extract the fd at `index` from a `return_fds` reply's fd vector.
+fn take_fd(mut fds: Vec<std::os::fd::OwnedFd>, index: u32) -> Result<std::os::fd::OwnedFd> {
+    let index = index as usize;
+    ensure!(
+        index < fds.len(),
+        "fd_index {index} out of range ({} fds returned)",
+        fds.len()
+    );
+    Ok(fds.remove(index))
+}
+
+/// `OciMount`'s `require_signature` option: mounting a kernel-signature-
+/// enrolled image with the flag set succeeds and yields a real, working
+/// mount; mounting an unsigned image with the same flag is refused with
+/// `SignatureRequired`; and the flag is opt-in — the unsigned image mounts
+/// fine when it's left unset.
+///
+/// This is the varlink-layer building block for out-of-tree
+/// container-lifecycle clients (e.g. composefs-run) that want "only give me
+/// a mount if the kernel actually verified a fs-verity signature was
+/// enrolled" without re-implementing that check themselves on top of the
+/// existing `Mount`/`OciMount` methods.
+fn privileged_varlink_require_signature() -> Result<()> {
+    if require_privileged("privileged_varlink_require_signature")?.is_some() {
+        return Ok(());
+    }
+    if !fsverity_keyring_exists()? {
+        println!(
+            "SKIP: kernel lacks CONFIG_FS_VERITY_BUILTIN_SIGNATURES support (.fs-verity keyring not found)"
+        );
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl_bin = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+
+    let (cert_pem, key_pem) = composefs_oci::signing::generate_test_keypair();
+    let cert_path = fixture_dir.path().join("cert.pem");
+    let key_path = fixture_dir.path().join("key.pem");
+    std::fs::write(&cert_path, &cert_pem)?;
+    std::fs::write(&key_path, &key_pem)?;
+
+    // A real signed-and-enrolled image, and a plain image that was never
+    // signed at all (so it can never get a kernel signature regardless of
+    // keyring state).
+    let signed_layout =
+        build_signed_oci_layout(&sh, &cfsctl_bin, fixture_dir.path(), &cert_path, &key_path)?;
+    let unsigned_layout = create_oci_layout(fixture_dir.path())?;
+
+    cmd!(sh, "{cfsctl_bin} keyring add-cert {cert_path}").read()?;
+
+    let verity_dir = VerityTempDir::new()?;
+    let repo = verity_dir.path().join("repo");
+    cmd!(sh, "{cfsctl_bin} --repo {repo} init").run()?;
+
+    let svc = VarlinkService::oci(&repo)?;
+
+    svc.proxy_pull(
+        &format!("oci:{}", signed_layout.display()),
+        Some("signed-image"),
+        false,
+    )
+    .context("Pull (signed) transport error")?
+    .map_err(|e| anyhow::anyhow!("Pull of signed image should succeed: {e:?}"))?;
+    ensure!(
+        image_has_verity_signature(&svc, &repo, "signed-image")?,
+        "expected the kernel to have enrolled the signature on the signed image"
+    );
+
+    svc.proxy_pull(
+        &format!("oci:{}", unsigned_layout.display()),
+        Some("unsigned-image"),
+        false,
+    )
+    .context("Pull (unsigned) transport error")?
+    .map_err(|e| anyhow::anyhow!("Pull of unsigned image should succeed: {e:?}"))?;
+    ensure!(
+        !image_has_verity_signature(&svc, &repo, "unsigned-image")?,
+        "expected no signature to be enrolled on the never-signed image"
+    );
+
+    // Attaches a successful OciMount reply and checks it's a real, working
+    // mount of the shared `hello.txt` fixture (see `create_oci_layout`).
+    const HELLO_CONTENTS: &str = "hello from test layer\n";
+    let assert_mount_works =
+        |reply: composefs_ctl::varlink::MountReply, fds: Vec<std::os::fd::OwnedFd>| -> Result<()> {
+            let mount = AttachedMount::new(take_fd(fds, reply.fd_index)?)?;
+            let hello = std::fs::read_to_string(mount.path().join("hello.txt"))?;
+            ensure!(
+                hello == HELLO_CONTENTS,
+                "unexpected mounted file content: {hello:?}"
+            );
+            Ok(())
+        };
+
+    // `require_signature: true` on the signed image succeeds and yields a
+    // real, working mount.
+    {
+        let (result, fds) = svc
+            .proxy_oci_mount("signed-image", false, Some(true))
+            .context("OciMount (signed, required) transport error")?;
+        let reply = result.map_err(|e| {
+            anyhow::anyhow!(
+                "OciMount with require_signature on a signed image should succeed: {e:?}"
+            )
+        })?;
+        assert_mount_works(reply, fds)?;
+    }
+
+    // `require_signature: true` on the unsigned image must be refused with
+    // the specific `SignatureRequired` error, not just any error.
+    {
+        let (result, fds) = svc
+            .proxy_oci_mount("unsigned-image", false, Some(true))
+            .context("OciMount (unsigned, required) transport error")?;
+        ensure!(fds.is_empty(), "expected no fds on a refused mount");
+        match result {
+            Err(composefs_ctl::varlink::oci::OciError::SignatureRequired { image }) => {
+                ensure!(
+                    image == "unsigned-image",
+                    "unexpected image in SignatureRequired: {image}"
+                );
+            }
+            other => bail!("expected OciError::SignatureRequired, got: {other:?}"),
+        }
+    }
+
+    // `require_signature` is opt-in: leaving it unset still mounts the
+    // unsigned image successfully.
+    {
+        let (result, fds) = svc
+            .proxy_oci_mount("unsigned-image", false, None)
+            .context("OciMount (unsigned, not required) transport error")?;
+        let reply = result.map_err(|e| {
+            anyhow::anyhow!("OciMount without require_signature should succeed: {e:?}")
+        })?;
+        assert_mount_works(reply, fds)?;
+    }
+
+    Ok(())
+}
+integration_test!(privileged_varlink_require_signature);
+
+/// `cfsctl keyring add-cert` on its own, independent of any OCI pull flow.
+/// Branches on kernel support rather than skipping, since both outcomes
+/// (success, or a clear `KeyringNotFound` error) are meaningful and worth
+/// asserting on.
+fn privileged_keyring_add_cert() -> Result<()> {
+    if require_privileged("privileged_keyring_add_cert")?.is_some() {
+        return Ok(());
+    }
+
+    let sh = Shell::new()?;
+    let cfsctl_bin = cfsctl()?;
+    let fixture_dir = tempfile::tempdir()?;
+
+    let (cert_pem, _key_pem) = composefs_oci::signing::generate_test_keypair();
+    let cert_path = fixture_dir.path().join("cert.pem");
+    std::fs::write(&cert_path, &cert_pem)?;
+
+    let supported = fsverity_keyring_exists()?;
+    let output = cmd!(sh, "{cfsctl_bin} keyring add-cert {cert_path}")
+        .ignore_status()
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if supported {
+        ensure!(
+            output.status.success(),
+            "add-cert should succeed on a kernel with fs-verity signature support: {stderr}"
+        );
+        ensure!(
+            stdout.contains("Certificate added to .fs-verity keyring"),
+            "unexpected add-cert output: {stdout}"
+        );
+    } else {
+        ensure!(
+            !output.status.success(),
+            "add-cert should fail on a kernel without fs-verity signature support"
+        );
+        ensure!(
+            stderr.contains("the .fs-verity keyring does not exist"),
+            "expected a KeyringNotFound error, got: {stderr}"
+        );
+    }
+
+    Ok(())
+}
+integration_test!(privileged_keyring_add_cert);

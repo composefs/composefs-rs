@@ -67,12 +67,14 @@ use composefs_boot::cmdline::ComposefsCmdline;
 #[cfg(feature = "oci")]
 use composefs_boot::write_boot;
 
-use composefs::erofs::format::FormatVersion;
 #[cfg(feature = "oci")]
 use composefs::shared_internals::IO_BUF_CAPACITY;
 use composefs::{
     dumpfile::{dump_single_dir, dump_single_file},
-    erofs::reader::erofs_to_filesystem,
+    erofs::{
+        format::{FormatConfig, FormatVersion},
+        reader::erofs_to_filesystem,
+    },
     fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue},
     generic_tree::{FileSystem, Inode},
     mount::MountOptions,
@@ -216,6 +218,9 @@ pub struct App {
     #[clap(long)]
     pub no_repo: bool,
 
+    // TODO: Add a `--verbose` flag to control debug output. Currently,
+    // errors like "Layer has incorrect checksum" give no context about
+    // which layer failed or what the expected vs actual digests were.
     #[clap(subcommand)]
     cmd: Command,
 }
@@ -232,13 +237,10 @@ pub enum HashType {
 /// The EROFS format version used when generating images.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
 pub enum ErofsVersion {
-    /// Format V0: compact inodes, BFS, C-compatible (composefs_version auto-detects 0 or 1).
-    #[clap(name = "0")]
-    V0,
-    /// Format V1: same layout as V0, composefs_version always 1.
+    /// Format V1: compact inodes, BFS, C-compatible.
     #[clap(name = "1")]
     V1,
-    /// Format V2: extended inodes, DFS (composefs_version=2).
+    /// Format V2: extended inodes, DFS, current default.
     #[clap(name = "2")]
     V2,
 }
@@ -246,9 +248,29 @@ pub enum ErofsVersion {
 impl From<ErofsVersion> for composefs::erofs::format::FormatVersion {
     fn from(v: ErofsVersion) -> Self {
         match v {
-            ErofsVersion::V0 => Self::V0,
             ErofsVersion::V1 => Self::V1,
             ErofsVersion::V2 => Self::V2,
+        }
+    }
+}
+
+/// EROFS format generation mode for `cfsctl init --erofs`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
+pub enum ErofsMode {
+    /// Generate only V1 EROFS (default; compatible with C `mkcomposefs`/`composefs-info` 1.0.8).
+    V1,
+    /// Generate both V1 and V2 EROFS (dual mode, used by bootc and other multi-format consumers).
+    Dual,
+}
+
+impl From<ErofsMode> for FormatConfig {
+    fn from(m: ErofsMode) -> Self {
+        match m {
+            ErofsMode::V1 => FormatConfig::single(FormatVersion::V1),
+            ErofsMode::Dual => FormatConfig {
+                default: FormatVersion::V1,
+                extra: [FormatVersion::V2].into(),
+            },
         }
     }
 }
@@ -352,6 +374,11 @@ struct OCIConfigOptions {
     config_verity: Option<String>,
 }
 
+// TODO: Inconsistent argument naming across OCI subcommands. Some use
+// `image: String` (Seal, Sign, Verify, Push), some `name: String` (Mount,
+// LsLayer), and others use `config_name` via OCIConfigOptions (Dump,
+// CreateImage). They also differ in whether they accept tag names,
+// manifest digests, or both. Standardize on a consistent convention.
 #[cfg(feature = "oci")]
 #[derive(Debug, Subcommand)]
 enum OciCommand {
@@ -361,6 +388,11 @@ enum OciCommand {
         digest: composefs_oci::OciDigest,
         /// Optional human-readable name for the layer
         name: Option<String>,
+    },
+    /// List the contents of a stored tar layer
+    LsLayer {
+        /// Layer content digest, e.g. sha256:a1b2c3...
+        name: composefs_oci::OciDigest,
     },
     /// Dump the rootfs of a stored OCI image as a composefs dumpfile to stdout
     ///
@@ -386,6 +418,12 @@ enum OciCommand {
         /// import path with zero-copy reflink/hardlink support.
         #[arg(long, value_enum, default_value_t = LocalFetchCli::Disabled)]
         local_fetch: LocalFetchCli,
+        /// Require a valid signature artifact for the pulled image
+        #[clap(long)]
+        require_signature: bool,
+        /// Path to PEM-encoded trusted certificate for signature verification
+        #[clap(long)]
+        trust_cert: Option<PathBuf>,
     },
     /// Copy an OCI image (and its layers) from another composefs repository
     /// into this repository.
@@ -483,6 +521,12 @@ enum OciCommand {
         bootable: bool,
         #[clap(flatten)]
         mount_opts: MountOpts,
+        /// Require a valid signature artifact for the image before mounting
+        #[clap(long)]
+        require_signature: bool,
+        /// Path to PEM-encoded trusted certificate for signature verification
+        #[clap(long)]
+        trust_cert: Option<PathBuf>,
     },
     /// Compute the composefs image ID of a stored OCI image's rootfs
     ///
@@ -492,6 +536,37 @@ enum OciCommand {
     ComputeId {
         #[clap(flatten)]
         config_opts: OCIConfigFilesystemOptions,
+    },
+    /// Seal a stored OCI image by creating a cloned manifest with embedded verity digest (a.k.a. composefs image object ID)
+    /// in the repo, then prints the stream and verity digest of the new sealed manifest
+    Seal {
+        /// Image reference (tag name or manifest digest)
+        image: String,
+        /// Seal the image with inline metadata annotations
+        #[clap(long)]
+        inline: bool,
+    },
+
+    /// Compute the composefs boot image karg for a stored OCI image.
+    ///
+    /// Applies the bootable transformation (SELinux relabeling, empty /boot and /sysroot),
+    /// computes the V1 EROFS digest, and prints the full kernel argument string:
+    ///
+    ///   composefs.digest=<hex>
+    ///
+    /// This is intended for use in UKI Containerfile builds where no composefs
+    /// repository is available.  The output can be written directly to
+    /// /etc/kernel/cmdline:
+    ///
+    ///   cfsctl oci composefs-digest-karg @sha256:abc... > /etc/kernel/cmdline
+    ///
+    /// The image can be specified by ref name or @digest:
+    ///   cfsctl oci composefs-digest-karg myimage:latest
+    ///   cfsctl oci composefs-digest-karg @sha256:a1b2c3...
+    #[clap(name = "composefs-digest-karg")]
+    ComposefsDigestKarg {
+        #[clap(flatten)]
+        config_opts: OCIConfigOptions,
     },
 
     /// Create the composefs image of the rootfs of a stored OCI image, perform bootable transformation, commit it to the repo,
@@ -524,11 +599,48 @@ enum OciCommand {
         #[clap(long)]
         json: bool,
     },
-    /// Serve the varlink RPC API on a Unix socket or systemd socket.
+    /// Create a composefs PKCS#7 signature artifact for an image
+    Sign {
+        /// Image reference (tag name)
+        image: String,
+        /// Path to PEM-encoded signing certificate
+        #[clap(long)]
+        cert: PathBuf,
+        /// Path to PEM-encoded private key
+        #[clap(long)]
+        key: PathBuf,
+        /// Sign the image with inline annotations
+        #[clap(long)]
+        inline: bool,
+    },
+    /// Verify composefs signature artifacts for an image
+    Verify {
+        /// Image reference (tag name)
+        image: String,
+        /// Path to PEM-encoded trusted certificate for verification
+        #[clap(long)]
+        cert: Option<PathBuf>,
+    },
+    /// Export an OCI image to an OCI layout directory
+    Push {
+        /// Image reference (tag name)
+        image: String,
+        /// Destination OCI layout path (optionally prefixed with oci:)
+        destination: String,
+        /// Also export signature/composefs artifacts
+        #[clap(long)]
+        signatures: bool,
+    },
+    /// Export signature artifacts for an image to an OCI layout directory
+    ExportSignatures {
+        /// Image reference (tag name)
+        image: String,
+        /// Path to the OCI layout directory (must already exist)
+        oci_layout_path: PathBuf,
+    },
+    /// Serve the varlink RPC API (alias: same service as top-level `varlink`).
     ///
-    /// Equivalent to `cfsctl varlink`: a single service answers both the
-    /// `org.composefs.Repository` and `org.composefs.Oci` interfaces on one
-    /// socket. Kept for discoverability under the `oci` subcommand.
+    /// Kept for discoverability under the `oci` subcommand.
     Varlink {
         /// Unix socket path to listen on (omit when using systemd socket activation).
         #[clap(long, value_hint = clap::ValueHint::AnyPath)]
@@ -657,6 +769,16 @@ enum OstreeCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum KeyringCommand {
+    /// Add a CA certificate to the kernel's .fs-verity keyring.
+    /// Requires CAP_SYS_ADMIN (root).
+    AddCert {
+        /// Path to a PEM-encoded X.509 certificate file
+        cert: PathBuf,
+    },
+}
+
 /// Common options for reading a filesystem from a path
 #[derive(Debug, Parser)]
 struct FsReadOptions {
@@ -760,6 +882,15 @@ enum Command {
         /// If omitted, falls back to the global `--erofs-version` flag, then defaults to V1.
         #[clap(long)]
         erofs_version: Option<ErofsVersion>,
+        /// EROFS format generation mode.
+        ///
+        /// Controls which EROFS format versions are produced when committing images:
+        ///   v1    Generate only V1 EROFS (default; C-tool compatible)
+        ///   dual  Generate both V1 and V2 EROFS (used by bootc)
+        ///
+        /// If omitted, defaults to `v1`.
+        #[clap(long, value_enum)]
+        erofs: Option<ErofsMode>,
     },
     /// Take a transaction lock on the repository.
     /// This prevents garbage collection from occurring.
@@ -888,10 +1019,11 @@ enum Command {
         /// Output results as JSON (always exits 0 unless the check itself fails)
         #[clap(long)]
         json: bool,
-        /// Skip per-object fs-verity verification; check only metadata and
-        /// symlink structure (much faster on large repositories)
-        #[clap(long)]
-        metadata_only: bool,
+    },
+    /// Commands for managing the kernel keyring (requires root)
+    Keyring {
+        #[clap(subcommand)]
+        cmd: KeyringCommand,
     },
     #[cfg(feature = "http")]
     Fetch {
@@ -927,6 +1059,26 @@ enum Command {
     },
 }
 
+fn run_keyring_cmd(cmd: &KeyringCommand) -> Result<()> {
+    match cmd {
+        // TODO: Check for CAP_SYS_ADMIN before attempting to inject
+        // the certificate. Currently the kernel returns an opaque error.
+        // A clear "keyring add-cert requires root privileges" message
+        // would be much more helpful.
+        KeyringCommand::AddCert { cert } => {
+            let cert_pem = std::fs::read(cert).context("failed to read certificate file")?;
+            composefs::fsverity::inject_fsverity_cert(&cert_pem)?;
+            println!("Certificate added to .fs-verity keyring");
+        }
+    }
+    Ok(())
+}
+
+/// Run the CLI using `std::env::args()`, as if invoked from the command line.
+pub async fn run_from_args() -> Result<()> {
+    run_app(App::parse()).await
+}
+
 /// Acts as a proxy for the `cfsctl` CLI by executing the CLI logic programmatically
 ///
 /// This function behaves the same as invoking the `cfsctl` binary from the
@@ -940,7 +1092,6 @@ where
     let args = App::parse_from(
         std::iter::once(OsString::from("cfsctl")).chain(args.into_iter().map(Into::into)),
     );
-
     run_app(args).await
 }
 
@@ -988,7 +1139,7 @@ fn get_mount_options(
 use fuse::{FuseMode, MountMode, detect_mount_mode, run_fuse_mount};
 
 #[cfg(feature = "oci")]
-pub(crate) fn verity_opt<ObjectID>(opt: &Option<String>) -> Result<Option<ObjectID>>
+fn verity_opt<ObjectID>(opt: &Option<String>) -> Result<Option<ObjectID>>
 where
     ObjectID: FsVerityHashValue,
 {
@@ -1015,7 +1166,7 @@ pub(crate) fn default_repo_path() -> Result<PathBuf> {
 ///
 /// Uses [`user_path`] and [`system_path`] to avoid duplicating
 /// path constants.
-pub(crate) fn resolve_repo_path(args: &App) -> Result<PathBuf> {
+fn resolve_repo_path(args: &App) -> Result<PathBuf> {
     if let Some(path) = &args.repo {
         Ok(path.clone())
     } else if args.system {
@@ -1038,7 +1189,7 @@ pub(crate) fn resolve_repo_path(args: &App) -> Result<PathBuf> {
 /// Note: we read the metadata file directly here (rather than via
 /// `Repository::metadata`) because this runs *before* we know which
 /// generic `ObjectID` type to use — that's exactly what we're deciding.
-pub(crate) fn resolve_hash_type(
+fn resolve_hash_type(
     repo_path: &Path,
     cli_hash: Option<HashType>,
     upgrade: bool,
@@ -1093,23 +1244,9 @@ pub(crate) fn resolve_hash_type(
     Ok(detected)
 }
 
-/// If the process was started *bare* via systemd socket activation, serve the
-/// varlink API on the activated socket and return `Ok(true)`. Otherwise return
-/// `Ok(false)` so the caller falls through to normal CLI parsing.
-///
-/// This runs *before* clap to support a truly argument-less invocation —
-/// notably `varlinkctl exec:cfsctl`, which hands us the connected socket on fd
-/// 3 but passes no subcommand for clap to parse. A client selects a repository
-/// at runtime via the `OpenRepository` method.
-///
-/// The shortcut is taken *only* when there are no command-line arguments
-/// (`argv` is just the program name). When any argument is present — e.g. a
-/// systemd unit running `cfsctl varlink` — we fall through to clap; the
-/// `varlink`/`oci varlink` subcommand's [`serve`](crate::varlink::serve)
-/// detects and serves on the activation fd itself. We must NOT call
-/// [`try_activated_listener`](crate::varlink::try_activated_listener) on that
-/// path: it consumes `LISTEN_FDS`/`LISTEN_PID` (via `receive_descriptors`),
-/// which would prevent `serve` from finding the fd later.
+/// If this process was launched via systemd socket activation with no arguments,
+/// serve the varlink API on the activated socket and return `true`.
+/// Otherwise return `false` (the caller should proceed with normal CLI parsing).
 pub async fn run_if_socket_activated() -> Result<bool> {
     // Only take the pre-clap shortcut for a bare invocation (`argv[0]` only).
     // Check argv before touching the activation env so the latter is consumed
@@ -1131,7 +1268,7 @@ pub async fn run_if_socket_activated() -> Result<bool> {
     }
 }
 
-/// Top-level dispatch: handle init specially, otherwise open repo and run.
+/// Top-level dispatch: handle init and keyring specially, otherwise open repo and run.
 pub async fn run_app(args: App) -> Result<()> {
     // Hidden compat subcommands: forward all trailing args to the respective tool.
     if let Command::Mkcomposefs { args: extra } = args.cmd {
@@ -1141,6 +1278,11 @@ pub async fn run_app(args: App) -> Result<()> {
         return composefs_info::run_from_args(extra);
     }
 
+    // Handle commands that don't need a repository first
+    if let Command::Keyring { ref cmd } = args.cmd {
+        return run_keyring_cmd(cmd);
+    }
+
     // Init is handled before opening a repo since it creates one
     if let Command::Init {
         ref algorithm,
@@ -1148,8 +1290,13 @@ pub async fn run_app(args: App) -> Result<()> {
         insecure,
         reset_metadata,
         erofs_version: ref init_erofs_version,
+        erofs: init_erofs,
     } = args.cmd
     {
+        // --erofs controls the FormatConfig (which versions to generate); default V1-only.
+        let erofs_formats = init_erofs
+            .map(FormatConfig::from)
+            .unwrap_or(FormatConfig::single(FormatVersion::V1));
         // Prefer the subcommand-level --erofs-version; fall back to global flag; default V1.
         let erofs_version = init_erofs_version
             .or(args.erofs_version)
@@ -1161,20 +1308,16 @@ pub async fn run_app(args: App) -> Result<()> {
             insecure || args.insecure,
             reset_metadata,
             erofs_version,
+            erofs_formats,
             &args,
         );
     }
 
-    // The varlink service opens repositories on demand via `OpenRepository`
-    // (handling both hash types), so it bypasses the generic repo-open dispatch
-    // below. A single `CfsctlService` answers both the `org.composefs.Repository`
-    // and (when the `oci` feature is enabled) `org.composefs.Oci` interfaces, so
-    // `cfsctl varlink` and `cfsctl oci varlink` serve the same combined service.
+    // Varlink serve commands: dispatch before opening a repo (service opens repos lazily).
     if let Command::Varlink { ref address } = args.cmd {
         let service = crate::varlink::CfsctlService::from_app(&args);
         return crate::varlink::serve(service, address.as_deref()).await;
     }
-
     #[cfg(feature = "oci")]
     if let Command::Oci {
         cmd: OciCommand::Varlink { ref address },
@@ -1230,6 +1373,7 @@ fn run_init(
     insecure: bool,
     reset_metadata: bool,
     erofs_version: composefs::erofs::format::FormatVersion,
+    erofs_formats: FormatConfig,
     args: &App,
 ) -> Result<()> {
     let repo_path = if let Some(p) = path {
@@ -1252,7 +1396,11 @@ fn run_init(
     // different algorithm is an error.
     let config = {
         let mut c = RepositoryConfig::new(*algorithm);
-        c.erofs_formats = composefs::erofs::format::FormatConfig::single(erofs_version);
+        // erofs_version is the default format; fold it into the FormatConfig.
+        c.erofs_formats = FormatConfig {
+            default: erofs_version,
+            ..erofs_formats
+        };
         if insecure { c.set_insecure() } else { c }
     };
     let created = match algorithm {
@@ -1437,7 +1585,7 @@ pub async fn copy_image(
 
 /// Resolve an [`OciReference`] to an [`OciImage`].
 #[cfg(feature = "oci")]
-pub(crate) fn resolve_oci_image<ObjectID: FsVerityHashValue>(
+fn resolve_oci_image<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     reference: &OciReference,
 ) -> Result<composefs_oci::oci_image::OciImage<ObjectID>> {
@@ -1454,7 +1602,7 @@ pub(crate) fn resolve_oci_image<ObjectID: FsVerityHashValue>(
 /// When resolving via a named ref, the verity override is ignored since
 /// the image metadata provides the correct verity.
 #[cfg(feature = "oci")]
-pub(crate) fn resolve_oci_config<ObjectID: FsVerityHashValue>(
+fn resolve_oci_config<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     reference: &OciReference,
     verity_override: Option<ObjectID>,
@@ -1602,11 +1750,9 @@ pub async fn run_cmd_without_repo<ObjectID: FsVerityHashValue>(args: App) -> Res
         Command::ComputeId { fs_opts } => {
             let fs = load_filesystem_from_ondisk_fs::<ObjectID>(&fs_opts, None).await?;
             let version = erofs_version.unwrap_or_default();
+            let vfs = composefs::erofs::writer::ValidatedFileSystem::new(fs)?;
             let id = composefs::fsverity::compute_verity::<ObjectID>(
-                &composefs::erofs::writer::mkfs_erofs_versioned(
-                    &composefs::erofs::writer::ValidatedFileSystem::new(fs)?,
-                    version,
-                ),
+                &composefs::erofs::writer::mkfs_erofs_versioned(&vfs, version),
             );
             println!("{}", id.to_hex());
         }
@@ -1684,6 +1830,9 @@ where
                 .await?;
                 println!("{}", object_id.to_id());
             }
+            OciCommand::LsLayer { ref name } => {
+                composefs_oci::ls_layer(&repo, name, std::io::stdout())?;
+            }
             OciCommand::Dump { config_opts } => {
                 let fs = load_filesystem_from_oci_image(&repo, config_opts)?;
                 fs.print_dumpfile()?;
@@ -1693,7 +1842,13 @@ where
                 ref mountpoint,
                 bootable,
                 ref mount_opts,
+                require_signature,
+                ref trust_cert,
             } => {
+                if require_signature && trust_cert.is_none() {
+                    anyhow::bail!("--require-signature requires --trust-cert");
+                }
+
                 let img = if image.starts_with("sha256:") {
                     let digest: composefs_oci::OciDigest =
                         image.parse().context("Parsing manifest digest")?;
@@ -1701,6 +1856,20 @@ where
                 } else {
                     composefs_oci::oci_image::OciImage::open_ref(&repo, image)?
                 };
+
+                if require_signature {
+                    let cert_path = trust_cert.as_ref().unwrap();
+                    let cert_pem = std::fs::read(cert_path)
+                        .with_context(|| format!("failed to read certificate: {cert_path:?}"))?;
+                    let verifier =
+                        composefs_oci::signing::FsVeritySignatureVerifier::from_pem(&cert_pem)?;
+                    let report = composefs_oci::verify_image_report(&repo, image, Some(&verifier))?;
+                    println!(
+                        "Signature verification passed ({} signatures verified)",
+                        report.verified_count
+                    );
+                }
+
                 let erofs_id = if bootable {
                     match img.boot_image_ref(repo.erofs_version()) {
                         Some(id) => id,
@@ -1723,12 +1892,38 @@ where
                 let id = fs.compute_image_id(repo.erofs_version());
                 println!("{}", id.to_hex());
             }
+            OciCommand::ComposefsDigestKarg { config_opts } => {
+                let verity = verity_opt(&config_opts.config_verity)?;
+                let (config_digest, config_verity) =
+                    resolve_oci_config(&repo, &config_opts.config_name, verity)?;
+                let mut fs = composefs_oci::image::create_filesystem(
+                    &repo,
+                    &config_digest,
+                    config_verity.as_ref(),
+                )?;
+                fs.transform_for_boot(&repo)?;
+                let vfs = composefs::erofs::writer::ValidatedFileSystem::new(fs)?;
+                let digest = composefs::fsverity::compute_verity::<ObjectID>(
+                    &composefs::erofs::writer::mkfs_erofs_versioned(
+                        &vfs,
+                        composefs::erofs::format::FormatVersion::V1,
+                    ),
+                );
+                let karg = ComposefsCmdline::new_v1(digest, repo.is_insecure());
+                println!("{}", karg.to_cmdline_arg());
+            }
             OciCommand::Pull {
                 ref image,
                 name,
                 bootable,
                 local_fetch,
+                require_signature,
+                ref trust_cert,
             } => {
+                if require_signature && trust_cert.is_none() {
+                    anyhow::bail!("--require-signature requires --trust-cert");
+                }
+
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
 
@@ -1748,9 +1943,33 @@ where
                 println!("objects  {}", result.stats);
 
                 if bootable {
-                    let image_verity =
-                        composefs_oci::generate_boot_image(&repo, &result.manifest_digest)?;
+                    // Resolve the tag to get the current manifest (already
+                    // rewritten with image_ref_v1 populated by the pull) so
+                    // generate_boot_image can preserve it in the boot manifest.
+                    // This equals result.manifest_digest, which now also
+                    // reflects the post-rewrite digest.
+                    let (current_manifest_digest, _) =
+                        composefs_oci::oci_image::resolve_ref(&repo, tag_name)?;
+                    let image_verity = composefs_oci::generate_boot_image(
+                        &repo,
+                        &current_manifest_digest,
+                        Some(tag_name),
+                    )?;
                     println!("Boot image: {}", image_verity.to_hex());
+                }
+
+                if require_signature {
+                    let cert_path = trust_cert.as_ref().unwrap();
+                    let cert_pem = std::fs::read(cert_path)
+                        .with_context(|| format!("failed to read certificate: {cert_path:?}"))?;
+                    let verifier =
+                        composefs_oci::signing::FsVeritySignatureVerifier::from_pem(&cert_pem)?;
+                    let report =
+                        composefs_oci::verify_image_report(&repo, tag_name, Some(&verifier))?;
+                    println!(
+                        "Signature verification passed ({} signatures verified)",
+                        report.verified_count
+                    );
                 }
             }
             OciCommand::Copy {
@@ -1891,10 +2110,13 @@ where
                 } else {
                     // Default: output combined JSON with manifest, config, and referrers
                     let output = crate::varlink::OciInspectReply::from_image(&repo, &img)?;
-                    serde_json::to_writer_pretty(std::io::stdout().lock(), &output)?;
-                    println!();
+                    println!("{}", serde_json::to_string_pretty(&output)?);
                 }
             }
+            // TODO: This only accepts a raw manifest digest (sha256:...),
+            // not a tag name. If a user provides a tag name as the source,
+            // tag_image creates a broken symlink. Consider resolving tag
+            // names to digests here, like Seal/Sign/Verify do.
             OciCommand::Tag {
                 ref manifest_digest,
                 ref name,
@@ -1913,8 +2135,7 @@ where
             } => {
                 if json {
                     let info = composefs_oci::layer_info(&repo, layer)?;
-                    serde_json::to_writer_pretty(std::io::stdout().lock(), &info)?;
-                    println!();
+                    println!("{}", serde_json::to_string_pretty(&info)?);
                 } else if dumpfile {
                     composefs_oci::layer_dumpfile(&repo, layer, &mut std::io::stdout())?;
                 } else {
@@ -1929,7 +2150,12 @@ where
                     composefs_oci::layer_tar(&repo, layer, &mut out)?;
                 }
             }
-
+            OciCommand::Seal { ref image, inline } => {
+                let reply = crate::varlink::run_seal(&repo, image.clone(), inline)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("Sealed {image} -> {}", reply.manifest_digest);
+            }
             OciCommand::PrepareBoot {
                 config_opts:
                     OCIConfigOptions {
@@ -2013,8 +2239,163 @@ where
                     }
                 }
             }
+            OciCommand::Sign {
+                ref image,
+                ref cert,
+                ref key,
+                inline,
+            } => {
+                let cert_pem =
+                    std::fs::read_to_string(cert).context("failed to read certificate file")?;
+                let key_pem =
+                    std::fs::read_to_string(key).context("failed to read private key file")?;
+                let reply =
+                    crate::varlink::run_sign(&repo, image.clone(), cert_pem, key_pem, inline)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("{}", reply.artifact_digest);
+            }
+            OciCommand::Verify {
+                ref image,
+                ref cert,
+            } => {
+                let cert_pem = match cert {
+                    Some(cert_path) => {
+                        let content = std::fs::read_to_string(cert_path).with_context(|| {
+                            format!("failed to read certificate: {cert_path:?}")
+                        })?;
+                        Some(content)
+                    }
+                    None => None,
+                };
+
+                let res = crate::varlink::run_verify(&repo, image.clone(), cert_pem).await;
+                match res {
+                    Err(e) => {
+                        anyhow::bail!("{e}");
+                    }
+                    Ok(reply) => {
+                        let cert_supplied = reply.cert_supplied;
+                        if let Some(ref alg) = reply.algorithm {
+                            println!("Signature artifact (algorithm: {alg})");
+                        }
+                        for entry in &reply.entries {
+                            let role = &entry.role;
+                            let label = if role.starts_with("layer") {
+                                format!("  {role}:")
+                            } else {
+                                format!("  {role}:  ")
+                            };
+                            if entry.expected_digest.is_none() {
+                                println!("{label} no expected digest - SKIP");
+                            } else if !entry.digest_ok {
+                                println!("{label} digest MISMATCH");
+                            } else if cert_supplied {
+                                if entry.signature_verified {
+                                    println!("{label} signature verified");
+                                } else {
+                                    let maybe_detail = match &entry.detail {
+                                        Some(detail) => format!(": {detail}"),
+                                        None => "".to_string(),
+                                    };
+                                    println!("{label} not verified by this cert{maybe_detail}");
+                                }
+                            } else {
+                                println!("{label} digest matches");
+                            }
+                        }
+
+                        if cert_supplied {
+                            println!(
+                                "\nVerification passed ({} signatures verified)",
+                                reply.verified_count
+                            );
+                        } else {
+                            println!(
+                                "\nDigest check passed. NOTE: no certificate provided, signatures were NOT cryptographically verified."
+                            );
+                            println!(
+                                "To verify signatures, use: cfsctl oci verify {image} --cert <certificate.pem>"
+                            );
+                        }
+                    }
+                }
+            }
+            OciCommand::Push {
+                ref image,
+                ref destination,
+                signatures,
+            } => {
+                // Parse destination: strip "oci:" prefix, handle "oci:/path:tag" syntax
+                let dest = destination.strip_prefix("oci:").unwrap_or(destination);
+
+                // Parse optional tag from path — only split on the last colon if
+                // it isn't part of an absolute path (i.e. not position 0 like "/tmp/foo")
+                let (path_str, dest_tag) = if let Some(colon_pos) = dest.rfind(':') {
+                    // Don't split on the colon right after a drive letter or at position 0
+                    if colon_pos > 0
+                        && !dest[..colon_pos].ends_with('/')
+                        && !dest[colon_pos + 1..].contains('/')
+                    {
+                        (&dest[..colon_pos], Some(&dest[colon_pos + 1..]))
+                    } else {
+                        (dest, None)
+                    }
+                } else {
+                    (dest, None)
+                };
+
+                let oci_layout_path = std::path::Path::new(path_str);
+                std::fs::create_dir_all(oci_layout_path).with_context(|| {
+                    format!(
+                        "creating destination directory: {}",
+                        oci_layout_path.display()
+                    )
+                })?;
+
+                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
+                let tag = dest_tag.or(Some(image));
+
+                composefs_oci::export_image_to_oci_layout(
+                    &repo,
+                    &img,
+                    oci_layout_path,
+                    tag,
+                    signatures,
+                )
+                .context("exporting image to OCI layout")?;
+
+                println!("Exported {} to {}", image, oci_layout_path.display());
+                if let Some(t) = tag {
+                    println!("Tagged as {t}");
+                }
+            }
+            OciCommand::ExportSignatures {
+                ref image,
+                ref oci_layout_path,
+            } => {
+                let img = composefs_oci::OciImage::open_ref(&repo, image)?;
+                let manifest_digest = img.manifest_digest();
+
+                let count = composefs_oci::export_referrers_to_oci_layout(
+                    &repo,
+                    manifest_digest,
+                    oci_layout_path,
+                    None,
+                )
+                .context("exporting signatures to OCI layout")?;
+
+                if count == 0 {
+                    println!("No signature artifacts found for {image}");
+                } else {
+                    println!(
+                        "Exported {count} signature artifact(s) to {}",
+                        oci_layout_path.display()
+                    );
+                }
+            }
             OciCommand::Varlink { .. } => {
-                unreachable!("oci varlink is handled before opening a repository");
+                unreachable!("varlink is handled before opening a repository")
             }
         },
         #[cfg(feature = "ostree")]
@@ -2283,15 +2664,8 @@ where
         } => {
             dump_files(&repo, &image_name, &files, backing_path_only)?;
         }
-        Command::Fsck {
-            json,
-            metadata_only,
-        } => {
-            let result = if metadata_only {
-                repo.fsck_metadata_only().await?
-            } else {
-                repo.fsck().await?
-            };
+        Command::Fsck { json } => {
+            let result = repo.fsck().await?;
             if json {
                 let output = crate::varlink::FsckReply::from(&result);
                 serde_json::to_writer_pretty(std::io::stdout().lock(), &output)?;
@@ -2303,9 +2677,14 @@ where
                 }
             }
         }
+        Command::Keyring { .. } => {
+            unreachable!("keyring commands are handled before opening a repository")
+        }
+        Command::Mkcomposefs { .. } | Command::ComposefsInfo { .. } => {
+            unreachable!("mkcomposefs/composefs-info are handled before opening a repository")
+        }
         Command::Varlink { .. } => {
-            // Handled in run_app before opening the repo.
-            unreachable!("varlink is handled before opening a repository");
+            unreachable!("varlink is handled before opening a repository")
         }
         #[cfg(feature = "http")]
         Command::Fetch { url, name } => {
@@ -2321,10 +2700,6 @@ where
             .await?;
             println!("content {digest}");
             println!("verity {}", verity.to_hex());
-        }
-        Command::Mkcomposefs { .. } | Command::ComposefsInfo { .. } => {
-            // Dispatched in run_app before a repository is opened
-            unreachable!("mkcomposefs/composefs-info are dispatched before opening a repository");
         }
     }
     Ok(())

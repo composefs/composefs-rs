@@ -45,9 +45,13 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use composefs_ctl::varlink::oci::{OciError, OciInspectReply, PullProgress};
+use composefs_ctl::varlink::oci::{
+    OciError, OciInspectReply, PullProgress, SealReply, SignReply, VerifyReply,
+};
 use composefs_ctl::varlink::proxy::{OciProxy, RepositoryProxy};
-use composefs_ctl::varlink::{ImageObjectsReply, InitRepositoryReply, RepositoryError};
+use composefs_ctl::varlink::{
+    ImageObjectsReply, InitRepositoryReply, MountParams, MountReply, RepositoryError,
+};
 use serde_json::{Value, json};
 use xshell::{Shell, cmd};
 use zlink::futures_util::TryStreamExt;
@@ -57,7 +61,7 @@ use crate::{cfsctl, create_test_rootfs, integration_test};
 
 /// A `cfsctl` varlink service spawned on a Unix socket for the duration of a
 /// test. Killed on drop.
-struct VarlinkService {
+pub(crate) struct VarlinkService {
     child: std::process::Child,
     socket: std::path::PathBuf,
     /// Handle for the test repository, opened via `OpenRepository` at spawn and
@@ -157,7 +161,7 @@ impl VarlinkService {
     /// entry point). Kept so tests that call this entry point continue to
     /// exercise a real service spawn; identical to [`Self::repository`] under
     /// socket activation.
-    fn oci(repo: &Path) -> Result<Self> {
+    pub(crate) fn oci(repo: &Path) -> Result<Self> {
         Self::spawn(repo)
     }
 
@@ -221,7 +225,10 @@ impl VarlinkService {
     }
 
     /// `org.composefs.Oci.Inspect` via the typed proxy, using the cached handle.
-    fn proxy_inspect(&self, image: &str) -> zlink::Result<Result<OciInspectReply, OciError>> {
+    pub(crate) fn proxy_inspect(
+        &self,
+        image: &str,
+    ) -> zlink::Result<Result<OciInspectReply, OciError>> {
         self.rt.block_on(async {
             let mut conn = self.connect().await?;
             conn.inspect(self.handle, image).await
@@ -252,10 +259,78 @@ impl VarlinkService {
         })
     }
 
+    /// `org.composefs.Oci.Seal` via the typed proxy.
+    fn proxy_seal(
+        &self,
+        image: &str,
+        inline: Option<bool>,
+    ) -> zlink::Result<Result<SealReply, OciError>> {
+        self.rt.block_on(async {
+            let mut conn = self.connect().await?;
+            conn.seal(self.handle, image, inline).await
+        })
+    }
+
+    /// `org.composefs.Oci.Sign` via the typed proxy.
+    fn proxy_sign(
+        &self,
+        image: &str,
+        cert_pem: &str,
+        key_pem: &str,
+        inline: Option<bool>,
+    ) -> zlink::Result<Result<SignReply, OciError>> {
+        self.rt.block_on(async {
+            let mut conn = self.connect().await?;
+            conn.sign(self.handle, image, cert_pem, key_pem, inline)
+                .await
+        })
+    }
+
+    /// `org.composefs.Oci.Verify` via the typed proxy.
+    fn proxy_verify(
+        &self,
+        image: &str,
+        cert_pem: Option<&str>,
+    ) -> zlink::Result<Result<VerifyReply, OciError>> {
+        self.rt.block_on(async {
+            let mut conn = self.connect().await?;
+            conn.verify(self.handle, image, cert_pem).await
+        })
+    }
+
+    /// `org.composefs.Oci.OciMount` via the typed proxy.
+    ///
+    /// Returns the typed reply/error alongside the fd vector received via
+    /// SCM_RIGHTS; on success the detached mount fd is at index
+    /// `reply.fd_index` within it. No overlay upper/work fds are sent (an
+    /// empty fd array), so `require_signature` is the only option this
+    /// helper exercises.
+    pub(crate) fn proxy_oci_mount(
+        &self,
+        image: &str,
+        bootable: bool,
+        require_signature: Option<bool>,
+    ) -> zlink::Result<(Result<MountReply, OciError>, Vec<std::os::fd::OwnedFd>)> {
+        self.rt.block_on(async {
+            let mut conn = self.connect().await?;
+            conn.oci_mount(
+                self.handle,
+                image,
+                bootable,
+                MountParams {
+                    require_signature,
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+        })
+    }
+
     /// `org.composefs.Oci.Pull` via the typed streaming proxy. Collects all
     /// `PullProgress` frames into a `Vec`, surfacing the first error (transport
     /// or typed) encountered.
-    fn proxy_pull(
+    pub(crate) fn proxy_pull(
         &self,
         image: &str,
         name: Option<&str>,
@@ -1385,3 +1460,381 @@ fn test_varlink_init_repository_proxy() -> Result<()> {
     Ok(())
 }
 integration_test!(test_varlink_init_repository_proxy);
+
+// ============================================================================
+// OCI sealing / signing / verification varlink tests
+// ============================================================================
+
+/// Pull, then seal the image; verify the reply manifest_digest looks like a
+/// real OCI digest.
+fn test_varlink_oci_seal() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+
+    let fixture_dir = tempfile::tempdir()?;
+    let layout = create_oci_layout(fixture_dir.path())?;
+
+    let svc = VarlinkService::oci(repo)?;
+    // Pull first.
+    let frames = svc.call_more(
+        "org.composefs.Oci.Pull",
+        json!({
+            "image": format!("oci:{}", layout.display()),
+            "name": "seal-test",
+            "local_fetch": "disabled",
+            "storage_root": null,
+            "bootable": false,
+        }),
+    )?;
+    assert!(frames.last().unwrap()["completed"].is_object());
+
+    // Seal.
+    let reply = svc
+        .proxy_seal("seal-test", None)
+        .context("transport/protocol error calling Seal")?
+        .map_err(|e| anyhow::anyhow!("Seal returned error: {e:?}"))?;
+
+    assert!(
+        !reply.manifest_digest.is_empty(),
+        "manifest_digest should be non-empty"
+    );
+    assert!(
+        reply.manifest_digest.starts_with("sha256:"),
+        "manifest_digest should start with 'sha256:', got: {}",
+        reply.manifest_digest
+    );
+
+    Ok(())
+}
+integration_test!(test_varlink_oci_seal);
+
+/// Pull, seal, sign, then verify with the same cert.
+fn test_varlink_oci_sign_then_verify() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+
+    let fixture_dir = tempfile::tempdir()?;
+    let layout = create_oci_layout(fixture_dir.path())?;
+
+    let svc = VarlinkService::oci(repo)?;
+    let frames = svc.call_more(
+        "org.composefs.Oci.Pull",
+        json!({
+            "image": format!("oci:{}", layout.display()),
+            "name": "sign-verify-test",
+            "local_fetch": "disabled",
+            "storage_root": null,
+            "bootable": false,
+        }),
+    )?;
+    assert!(frames.last().unwrap()["completed"].is_object());
+
+    svc.proxy_seal("sign-verify-test", None)
+        .context("Seal transport error")?
+        .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
+
+    let (cert_pem, key_pem) = composefs_oci::signing::generate_test_keypair();
+    let cert_pem_str = String::from_utf8(cert_pem).unwrap();
+    let key_pem_str = String::from_utf8(key_pem).unwrap();
+
+    let sign_reply = svc
+        .proxy_sign("sign-verify-test", &cert_pem_str, &key_pem_str, None)
+        .context("Sign transport error")?
+        .map_err(|e| anyhow::anyhow!("Sign error: {e:?}"))?;
+    assert!(
+        !sign_reply.artifact_digest.is_empty(),
+        "artifact_digest should be non-empty"
+    );
+
+    let verify_reply = svc
+        .proxy_verify("sign-verify-test", Some(&cert_pem_str))
+        .context("Verify transport error")?
+        .map_err(|e| anyhow::anyhow!("Verify error: {e:?}"))?;
+    assert!(verify_reply.ok, "verify should be ok");
+    assert!(
+        verify_reply.verified_count >= 1,
+        "at least one signature should verify"
+    );
+    assert!(verify_reply.cert_supplied, "cert_supplied should be true");
+
+    Ok(())
+}
+integration_test!(test_varlink_oci_sign_then_verify);
+
+/// Pull, seal, sign with certA, then verify with certB — must produce
+/// `SignatureVerificationFailed`, not `InternalError` or a success.
+fn test_varlink_oci_verify_wrong_cert() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+
+    let fixture_dir = tempfile::tempdir()?;
+    let layout = create_oci_layout(fixture_dir.path())?;
+
+    let svc = VarlinkService::oci(repo)?;
+    let frames = svc.call_more(
+        "org.composefs.Oci.Pull",
+        json!({
+            "image": format!("oci:{}", layout.display()),
+            "name": "wrong-cert-test",
+            "local_fetch": "disabled",
+            "storage_root": null,
+            "bootable": false,
+        }),
+    )?;
+    assert!(frames.last().unwrap()["completed"].is_object());
+
+    svc.proxy_seal("wrong-cert-test", None)
+        .context("Seal transport error")?
+        .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
+
+    let (cert_a, key_a) = composefs_oci::signing::generate_test_keypair();
+    let (cert_b, _key_b) = composefs_oci::signing::generate_test_keypair();
+    let cert_a_str = String::from_utf8(cert_a).unwrap();
+    let key_a_str = String::from_utf8(key_a).unwrap();
+    let cert_b_str = String::from_utf8(cert_b).unwrap();
+
+    // Sign with certA / keyA.
+    svc.proxy_sign("wrong-cert-test", &cert_a_str, &key_a_str, None)
+        .context("Sign transport error")?
+        .map_err(|e| anyhow::anyhow!("Sign error: {e:?}"))?;
+
+    // Verify with certB — must fail with SignatureVerificationFailed.
+    let err = svc
+        .proxy_verify("wrong-cert-test", Some(&cert_b_str))
+        .context("Verify transport error")?
+        .expect_err("Verify with wrong cert must fail");
+    assert!(
+        matches!(err, OciError::SignatureVerificationFailed { .. }),
+        "expected SignatureVerificationFailed, got: {err:?}"
+    );
+
+    Ok(())
+}
+integration_test!(test_varlink_oci_verify_wrong_cert);
+
+/// Pull, seal but do NOT sign, then verify with a cert — must produce
+/// `SignatureVerificationFailed` (no artifacts).
+fn test_varlink_oci_verify_no_artifacts() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+
+    let fixture_dir = tempfile::tempdir()?;
+    let layout = create_oci_layout(fixture_dir.path())?;
+
+    let svc = VarlinkService::oci(repo)?;
+    let frames = svc.call_more(
+        "org.composefs.Oci.Pull",
+        json!({
+            "image": format!("oci:{}", layout.display()),
+            "name": "no-artifacts-test",
+            "local_fetch": "disabled",
+            "storage_root": null,
+            "bootable": false,
+        }),
+    )?;
+    assert!(frames.last().unwrap()["completed"].is_object());
+
+    svc.proxy_seal("no-artifacts-test", None)
+        .context("Seal transport error")?
+        .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
+
+    let (cert_pem, _key_pem) = composefs_oci::signing::generate_test_keypair();
+    let cert_pem_str = String::from_utf8(cert_pem).unwrap();
+
+    // Verify without signing — should fail with SignatureVerificationFailed.
+    let err = svc
+        .proxy_verify("no-artifacts-test", Some(&cert_pem_str))
+        .context("Verify transport error")?
+        .expect_err("Verify without signing must fail");
+    assert!(
+        matches!(err, OciError::SignatureVerificationFailed { .. }),
+        "expected SignatureVerificationFailed, got: {err:?}"
+    );
+
+    Ok(())
+}
+integration_test!(test_varlink_oci_verify_no_artifacts);
+
+/// Pull, seal, sign, then verify with `cert_pem = None` (digest-only check).
+fn test_varlink_oci_verify_digest_only() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+
+    let fixture_dir = tempfile::tempdir()?;
+    let layout = create_oci_layout(fixture_dir.path())?;
+
+    let svc = VarlinkService::oci(repo)?;
+    let frames = svc.call_more(
+        "org.composefs.Oci.Pull",
+        json!({
+            "image": format!("oci:{}", layout.display()),
+            "name": "digest-only-test",
+            "local_fetch": "disabled",
+            "storage_root": null,
+            "bootable": false,
+        }),
+    )?;
+    assert!(frames.last().unwrap()["completed"].is_object());
+
+    svc.proxy_seal("digest-only-test", None)
+        .context("Seal transport error")?
+        .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
+
+    let (cert_pem, key_pem) = composefs_oci::signing::generate_test_keypair();
+    let cert_pem_str = String::from_utf8(cert_pem).unwrap();
+    let key_pem_str = String::from_utf8(key_pem).unwrap();
+
+    svc.proxy_sign("digest-only-test", &cert_pem_str, &key_pem_str, None)
+        .context("Sign transport error")?
+        .map_err(|e| anyhow::anyhow!("Sign error: {e:?}"))?;
+
+    // Verify without a cert — digest-only.
+    let verify_reply = svc
+        .proxy_verify("digest-only-test", None)
+        .context("Verify transport error")?
+        .map_err(|e| anyhow::anyhow!("Verify digest-only error: {e:?}"))?;
+    assert!(verify_reply.ok, "digest-only verify should be ok");
+    assert_eq!(
+        verify_reply.verified_count, 0,
+        "digest-only verify should report 0 crypto verifications"
+    );
+    assert!(
+        !verify_reply.cert_supplied,
+        "cert_supplied should be false for digest-only"
+    );
+
+    Ok(())
+}
+integration_test!(test_varlink_oci_verify_digest_only);
+
+/// Pull, seal, then sign with garbage cert/key — must produce `InvalidCertificate`.
+fn test_varlink_oci_sign_bad_key() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+
+    let fixture_dir = tempfile::tempdir()?;
+    let layout = create_oci_layout(fixture_dir.path())?;
+
+    let svc = VarlinkService::oci(repo)?;
+    let frames = svc.call_more(
+        "org.composefs.Oci.Pull",
+        json!({
+            "image": format!("oci:{}", layout.display()),
+            "name": "bad-key-test",
+            "local_fetch": "disabled",
+            "storage_root": null,
+            "bootable": false,
+        }),
+    )?;
+    assert!(frames.last().unwrap()["completed"].is_object());
+
+    svc.proxy_seal("bad-key-test", None)
+        .context("Seal transport error")?
+        .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
+
+    let err = svc
+        .proxy_sign("bad-key-test", "garbage", "garbage", None)
+        .context("Sign transport error")?
+        .expect_err("Sign with garbage cert/key must fail");
+    assert!(
+        matches!(err, OciError::InvalidCertificate { .. }),
+        "expected InvalidCertificate, got: {err:?}"
+    );
+
+    Ok(())
+}
+integration_test!(test_varlink_oci_sign_bad_key);
+
+/// Seal a non-existent image — must produce `NoSuchImage`.
+fn test_varlink_oci_seal_missing_image() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+
+    let svc = VarlinkService::oci(repo)?;
+
+    let err = svc
+        .proxy_seal("nope", None)
+        .context("Seal transport error")?
+        .expect_err("Seal of missing image must fail");
+    assert!(
+        matches!(err, OciError::NoSuchImage { .. }),
+        "expected NoSuchImage, got: {err:?}"
+    );
+
+    Ok(())
+}
+integration_test!(test_varlink_oci_seal_missing_image);
+
+/// Pull, seal inline, sign inline, then verify.
+fn test_varlink_oci_sign_then_verify_inline() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    let repo_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let repo = repo_dir.path();
+
+    let fixture_dir = tempfile::tempdir()?;
+    let layout = create_oci_layout(fixture_dir.path())?;
+
+    let svc = VarlinkService::oci(repo)?;
+    let frames = svc.call_more(
+        "org.composefs.Oci.Pull",
+        json!({
+            "image": format!("oci:{}", layout.display()),
+            "name": "sign-verify-test-inline",
+            "local_fetch": "disabled",
+            "storage_root": null,
+            "bootable": false,
+        }),
+    )?;
+    assert!(frames.last().unwrap()["completed"].is_object());
+
+    svc.proxy_seal("sign-verify-test-inline", Some(true))
+        .context("Seal transport error")?
+        .map_err(|e| anyhow::anyhow!("Seal error: {e:?}"))?;
+
+    let (cert_pem, key_pem) = composefs_oci::signing::generate_test_keypair();
+    let cert_pem_str = String::from_utf8(cert_pem).unwrap();
+    let key_pem_str = String::from_utf8(key_pem).unwrap();
+
+    let sign_reply = svc
+        .proxy_sign(
+            "sign-verify-test-inline",
+            &cert_pem_str,
+            &key_pem_str,
+            Some(true),
+        )
+        .context("Sign transport error")?
+        .map_err(|e| anyhow::anyhow!("Sign error: {e:?}"))?;
+    assert!(
+        !sign_reply.artifact_digest.is_empty(),
+        "artifact_digest should be non-empty"
+    );
+
+    let verify_reply = svc
+        .proxy_verify("sign-verify-test-inline", Some(&cert_pem_str))
+        .context("Verify transport error")?
+        .map_err(|e| anyhow::anyhow!("Verify error: {e:?}"))?;
+    assert!(verify_reply.ok, "verify should be ok");
+    assert!(
+        verify_reply.verified_count >= 1,
+        "at least one signature should verify"
+    );
+    assert!(verify_reply.cert_supplied, "cert_supplied should be true");
+
+    Ok(())
+}
+integration_test!(test_varlink_oci_sign_then_verify_inline);

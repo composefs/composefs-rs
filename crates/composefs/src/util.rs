@@ -190,7 +190,7 @@ impl<T> ErrnoFilter<T> for ErrnoResult<T> {
     }
 }
 
-fn generate_tmpname(prefix: &str) -> String {
+pub(crate) fn generate_tmpname(prefix: &str) -> String {
     let rand_string: String = rand::rng()
         .sample_iter(&Alphanumeric)
         .take(12)

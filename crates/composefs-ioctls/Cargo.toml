@@ -13,8 +13,11 @@ version.workspace = true
 [features]
 default = []
 loop-device = []
+keyring = ["dep:openssl", "dep:keyutils"]
 
 [dependencies]
+keyutils = { version = "0.4", optional = true }
+openssl = { version = "0.10", optional = true }
 rustix = { version = "1.0.0", features = ["fs"] }
 thiserror = "2"
 
