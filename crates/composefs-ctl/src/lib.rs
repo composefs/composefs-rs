@@ -34,7 +34,7 @@ pub mod varlink;
 
 #[cfg(any(feature = "oci", feature = "http"))]
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 #[cfg(any(feature = "oci", feature = "http"))]
 use std::sync::Mutex;
@@ -1531,7 +1531,7 @@ pub fn dump_files<ObjectID: FsVerityHashValue>(
     image_name: &str,
     files: &Vec<PathBuf>,
     backing_path_only: bool,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let (img_fd, _) = repo.open_image(image_name)?;
 
     let mut img_buf = Vec::new();
@@ -1567,13 +1567,20 @@ pub fn dump_files<ObjectID: FsVerityHashValue>(
                     let leaf = fs.leaf(*leaf_id);
                     match &leaf.content {
                         Regular(f) => match f {
-                            Inline(..) | Sparse(..) => println!("{} inline", file_path.display()),
+                            Inline(..) | Sparse(..) => {
+                                writeln!(&mut out, "{} inline", file_path.display())?;
+                            }
                             External(id, _) | ExternalNoVerity(id, _) => {
-                                println!("{} {}", file_path.display(), id.to_object_pathname());
+                                writeln!(
+                                    &mut out,
+                                    "{} {}",
+                                    file_path.display(),
+                                    id.to_object_pathname()
+                                )?;
                             }
                         },
                         _ => {
-                            println!("{} inline", file_path.display())
+                            writeln!(&mut out, "{} inline", file_path.display())?;
                         }
                     }
 
@@ -1585,12 +1592,7 @@ pub fn dump_files<ObjectID: FsVerityHashValue>(
         };
     }
 
-    if !out.is_empty() {
-        let out_str = std::str::from_utf8(&out).unwrap();
-        println!("{}", out_str);
-    }
-
-    Ok(())
+    Ok(out)
 }
 
 /// Run commands that don't require a repository.
@@ -2281,7 +2283,12 @@ where
             files,
             backing_path_only,
         } => {
-            dump_files(&repo, &image_name, &files, backing_path_only)?;
+            let out = dump_files(&repo, &image_name, &files, backing_path_only)?;
+
+            if !out.is_empty() {
+                let out_str = std::str::from_utf8(&out).unwrap();
+                print!("{}", out_str);
+            }
         }
         Command::Fsck {
             json,
