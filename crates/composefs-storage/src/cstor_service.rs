@@ -76,12 +76,16 @@ pub struct StorageLocator {
 ///
 /// This is the wire-format counterpart of `composefs_oci::varlink_types::GetLayerParams`.
 /// The `diff_id` field is ignored by this service; only `storage` is used.
-#[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, zlink::introspect::Type)]
 pub struct GetLayerParams {
     /// Ignored by the cstor service (used by the repo service).
     pub diff_id: Option<String>,
     /// Location of the layer in containers-storage (required).
     pub storage: Option<StorageLocator>,
+    /// Whether the consumer can bypass file DAC permissions.
+    /// See `composefs_oci::varlink_types::GetLayerParams` for details.
+    #[serde(default)]
+    pub consumer_has_cap_dac_override: bool,
 }
 
 /// Reply from `GetInfo`.
@@ -139,11 +143,18 @@ pub struct CstorLayerService;
 ///
 /// `link_id_to_dirfd` maps each layer's link ID to the *sparse* dirfd slot
 /// index where its pre-opened diff-directory fd was placed.
+///
+/// `consumer_has_cap_dac_override` controls how non-world-readable files
+/// are transported: when `true`, every file is emitted as `FileBackedData`
+/// (dirfd + filename reference) regardless of its permission bits, since the
+/// consumer is trusted to open it directly; when `false`, non-world-readable
+/// files are still read into memory and sent as `InlineData`, as before.
 pub(crate) fn produce_splitdirfdstream<W: Write>(
     storage: &Storage,
     layer: &Layer,
     link_id_to_dirfd: &HashMap<String, u32>,
     real_indices: &std::collections::HashSet<u32>,
+    consumer_has_cap_dac_override: bool,
     out: W,
 ) -> crate::Result<()> {
     let mut stream = TarSplitFdStream::new(storage, layer)?;
@@ -192,7 +203,7 @@ pub(crate) fn produce_splitdirfdstream<W: Write>(
                     ))
                 })?;
                 let world_readable = stat.st_mode & 0o004 != 0;
-                if world_readable {
+                if world_readable || consumer_has_cap_dac_override {
                     writer
                         .write_file_backed_data(dirfd_index, size, relpath.as_bytes())
                         .map_err(|e| {
@@ -339,6 +350,8 @@ mod service_impl {
                 };
             }
 
+            let consumer_has_cap_dac_override = params.consumer_has_cap_dac_override;
+
             // Extract storage locator (required).
             let locator = match params.storage {
                 Some(l) => l,
@@ -433,9 +446,14 @@ mod service_impl {
             // Phase 3: drop lock (releases shared flock).
             let keepalive_read = layout.keepalive_read;
             spawn_self_reaping_producer(write_fd, keepalive_read, lock, move |wf| {
-                if let Err(e) =
-                    produce_splitdirfdstream(&storage, &layer, &link_id_to_dirfd, &real_indices, wf)
-                {
+                if let Err(e) = produce_splitdirfdstream(
+                    &storage,
+                    &layer,
+                    &link_id_to_dirfd,
+                    &real_indices,
+                    consumer_has_cap_dac_override,
+                    wf,
+                ) {
                     tracing::warn!("cstor producer error: {e:#}");
                 }
             });
@@ -726,8 +744,15 @@ mod tests {
         assert_ne!(child_idx, parent_idx, "real layers occupy distinct slots");
 
         let mut buf = Vec::<u8>::new();
-        produce_splitdirfdstream(&storage, &layer, &link_id_to_dirfd, &real_indices, &mut buf)
-            .unwrap();
+        produce_splitdirfdstream(
+            &storage,
+            &layer,
+            &link_id_to_dirfd,
+            &real_indices,
+            false,
+            &mut buf,
+        )
+        .unwrap();
 
         let mut reader = SplitdirfdstreamReader::new(buf.as_slice());
 
@@ -796,8 +821,15 @@ mod tests {
         let seed = seed_from_id("child-layer-001");
         let (_, link_id_to_dirfd, real_indices) = build_test_layout(&storage, &layer, seed);
         let mut buf = Vec::<u8>::new();
-        produce_splitdirfdstream(&storage, &layer, &link_id_to_dirfd, &real_indices, &mut buf)
-            .unwrap();
+        produce_splitdirfdstream(
+            &storage,
+            &layer,
+            &link_id_to_dirfd,
+            &real_indices,
+            false,
+            &mut buf,
+        )
+        .unwrap();
 
         let mut reader = SplitdirfdstreamReader::new(buf.as_slice());
         let mut saw_file_content = false;
@@ -818,6 +850,60 @@ mod tests {
             }
         }
         assert!(saw_file_content, "expected InlineData chunk for child.txt");
+    }
+
+    /// When the consumer can bypass file permissions, even non-world-readable
+    /// files should be emitted as `FileBackedData` (dirfd + filename reference)
+    /// rather than `InlineData`, enabling zero-copy transport.
+    #[test]
+    fn test_non_world_readable_file_with_bypass_uses_file_backed_data() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let storage = create_two_layer_mock(tmp.path());
+
+        let child_txt = tmp
+            .path()
+            .join("overlay/child-layer-001/diff/etc/child.txt");
+        std::fs::set_permissions(&child_txt, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let layer = Layer::open(&storage, "child-layer-001").unwrap();
+        let seed = seed_from_id("child-layer-001");
+        let (_, link_id_to_dirfd, real_indices) = build_test_layout(&storage, &layer, seed);
+        let mut buf = Vec::<u8>::new();
+        produce_splitdirfdstream(
+            &storage,
+            &layer,
+            &link_id_to_dirfd,
+            &real_indices,
+            true,
+            &mut buf,
+        )
+        .unwrap();
+
+        let mut reader = SplitdirfdstreamReader::new(buf.as_slice());
+        let mut saw_file_backed = false;
+        while let Some(chunk) = reader.next_chunk().unwrap() {
+            match chunk {
+                composefs_splitdirfdstream::Chunk::Metadata(_) => {}
+                composefs_splitdirfdstream::Chunk::FileBackedData { filename, .. } => {
+                    if filename == b"etc/child.txt" {
+                        saw_file_backed = true;
+                        break;
+                    }
+                }
+                composefs_splitdirfdstream::Chunk::InlineData(_) => {
+                    panic!(
+                        "with consumer_has_cap_dac_override=true, non-world-readable \
+                         files must produce FileBackedData, got InlineData"
+                    );
+                }
+            }
+        }
+        assert!(
+            saw_file_backed,
+            "expected FileBackedData chunk for child.txt"
+        );
     }
 
     #[test]
@@ -876,8 +962,15 @@ mod tests {
         assert_eq!(layout.dir_count, EXPECTED_DIR_COUNT);
 
         let mut buf = Vec::<u8>::new();
-        produce_splitdirfdstream(&storage, &layer, &link_id_to_dirfd, &real_indices, &mut buf)
-            .unwrap();
+        produce_splitdirfdstream(
+            &storage,
+            &layer,
+            &link_id_to_dirfd,
+            &real_indices,
+            false,
+            &mut buf,
+        )
+        .unwrap();
 
         // The dirfds region in fds_all starts at index 1.
         let dir_count = layout.dir_count as usize;
@@ -940,6 +1033,7 @@ mod tests {
                 storage_path: storage_path.to_owned(),
                 layer_id: layer_id.to_owned(),
             }),
+            ..Default::default()
         };
 
         let mut stream = std::pin::pin!(client.get_layer(0, params).await.unwrap());

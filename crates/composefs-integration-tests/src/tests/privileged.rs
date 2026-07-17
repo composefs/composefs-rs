@@ -686,7 +686,8 @@ impl Drop for LoopTempDir {
 }
 
 /// Create a minimal OCI directory image with files large enough to exercise
-/// the `ensure_object_from_file` path (> 64 bytes, the inline threshold).
+/// the `ensure_object_from_file` path (> 64 bytes, the inline threshold),
+/// including one non-world-readable file (see bootc-dev/bootc#2324).
 ///
 /// Returns the path to the OCI directory.
 pub(super) fn create_oci_layout_with_large_files(parent: &Path) -> Result<PathBuf> {
@@ -742,6 +743,27 @@ pub(super) fn create_oci_layout_with_large_files(parent: &Path) -> Result<PathBu
         header.set_mtime(1234567890);
         header.set_cksum();
         layer_builder.append_data(&mut header, &name, &data[..])?;
+    }
+
+    // Also add a non-world-readable file (mode 0o600).  This regression-tests
+    // bootc-dev/bootc#2324: without `consumer_has_cap_dac_override` wired up,
+    // cstor import would inline this file's content into the varlink stream,
+    // materialize it into a memfd on the consumer side, and then crash with
+    // EXDEV when zerocopy mode tried to reflink/hardlink the memfd (memfds
+    // can never be zero-copied to a real filesystem).  With the fix, the
+    // privileged (direct, in-process) import path recognizes that it can
+    // bypass DAC checks and emits a real dirfd+filename reference instead,
+    // so this file is hardlinked/reflinked just like the world-readable ones.
+    {
+        let data = vec![0xffu8; 4096];
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o600);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(1234567890);
+        header.set_cksum();
+        layer_builder.append_data(&mut header, "usr/restricted_file.bin", &data[..])?;
     }
     let layer = layer_builder.into_inner()?.complete()?;
 

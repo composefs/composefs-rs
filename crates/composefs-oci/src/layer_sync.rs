@@ -158,8 +158,15 @@ fn drain_splitdirfdstream_inner<ObjectID: FsVerityHashValue>(
                     stats.bytes_inlined += length;
                     writer.write_inline(data);
                 } else {
-                    // Large file: store as an external object. A memfd is the
-                    // lightest way to hand an fd to process_file_content.
+                    // Large payload received as Chunk::InlineData (producer
+                    // determined the consumer can't safely open this file by
+                    // name — see consumer_has_cap_dac_override in
+                    // GetLayerParams), so unlike Chunk::FileBackedData below,
+                    // there's no real on-disk file backing this data. We
+                    // materialise it into a memfd purely to hand
+                    // process_file_content an fd; that memfd can never be
+                    // zero-copyable (reflink/hardlink), regardless of the
+                    // caller's `zerocopy` flag, so always pass `false` here.
                     process_file_content(
                         repo,
                         writer,
@@ -168,7 +175,7 @@ fn drain_splitdirfdstream_inner<ObjectID: FsVerityHashValue>(
                         file_content_to_memfd(data)?,
                         length,
                         "<file-content>",
-                        zerocopy,
+                        false,
                         inline_buf,
                     )?;
                 }
@@ -755,6 +762,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression test: a memfd-backed fd must not error under the copy
+    /// fallback path when the caller correctly identifies it as
+    /// non-zerocopy-able (`zerocopy=false`), since memfds live on tmpfs
+    /// where reflink/hardlink are structurally impossible.
+    #[test]
+    fn test_memfd_file_content_uses_copy_fallback() {
+        let (repo, _tempdir) = create_test_repo();
+        let size: usize = INLINE_CONTENT_MAX_V0 + 1; // just above inline threshold
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+
+        let memfd = file_content_to_memfd(&data).unwrap();
+
+        let mut writer = repo.create_stream(TAR_LAYER_CONTENT_TYPE).unwrap();
+        let mut stats = ImportStats::default();
+        let mut ctx = ImportContext::default();
+        let mut inline_buf = Vec::new();
+
+        process_file_content(
+            &repo,
+            &mut writer,
+            &mut stats,
+            &mut ctx,
+            memfd,
+            size as u64,
+            "memfd-test",
+            false,
+            &mut inline_buf,
+        )
+        .unwrap();
+
+        assert_eq!(stats.objects_copied, 1, "memfd content should be copied");
+        assert_eq!(stats.bytes_copied, size as u64);
     }
 
     // -------------------------------------------------------------------------

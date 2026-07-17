@@ -1382,6 +1382,7 @@ pub async fn copy_image(
             let get_params = GetLayerParams {
                 diff_id: Some(diff_id.to_string()),
                 storage: None,
+                ..Default::default()
             };
             let mut get_stream = std::pin::pin!(
                 conn_src
