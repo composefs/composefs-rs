@@ -43,6 +43,8 @@ pub mod varlink_types;
 pub mod test_util;
 
 #[cfg(doc)]
+pub mod canonical_tar_spec;
+#[cfg(doc)]
 pub mod design;
 #[cfg(doc)]
 pub mod sealing_spec;
