@@ -44,12 +44,19 @@ pub struct StorageLocator {
 ///
 /// Both fields are `Option` for forward-compatibility: new locator kinds can
 /// be added in future without breaking old clients.
-#[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, zlink::introspect::Type)]
 pub struct GetLayerParams {
     /// OCI diff-id (`sha256:…`) identifying the layer in a composefs repo.
     pub diff_id: Option<String>,
     /// Location of a specific layer inside a containers-storage store.
     pub storage: Option<StorageLocator>,
+    /// Whether the consumer of this layer's bytes can bypass file DAC
+    /// permissions (real root or `CAP_DAC_OVERRIDE`).  When `true`, the cstor
+    /// service may emit `FileBackedData` chunks even for non-world-readable
+    /// files, since the consumer can open them directly.  Defaults to `false`
+    /// for backward compatibility.
+    #[serde(default)]
+    pub consumer_has_cap_dac_override: bool,
 }
 
 // ── Reply types ───────────────────────────────────────────────────────────────

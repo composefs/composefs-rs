@@ -311,6 +311,7 @@ async fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
                 storage_layer_id,
                 diff_id,
                 zerocopy,
+                true, // direct path: only entered when can_bypass_file_permissions()
                 &mut ctx,
             )
             .await?;
@@ -362,6 +363,7 @@ async fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
 /// collects all frames, then drains the `splitdirfdstream` pipe in a
 /// `spawn_blocking` closure while the server-side producer fills the pipe
 /// concurrently on its own thread.
+#[allow(clippy::too_many_arguments)]
 async fn import_layer_via_transfer<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     client: &mut zlink::unix::Connection,
@@ -369,6 +371,7 @@ async fn import_layer_via_transfer<ObjectID: FsVerityHashValue>(
     storage_layer_id: &str,
     diff_id: &OciDigest,
     zerocopy: bool,
+    consumer_has_cap_dac_override: bool,
     ctx: &mut ImportContext,
 ) -> Result<(ObjectID, ImportStats)> {
     // Call get_layer with the storage locator (handle=0; cstor service ignores it).
@@ -378,6 +381,7 @@ async fn import_layer_via_transfer<ObjectID: FsVerityHashValue>(
             storage_path: storage_path.to_owned(),
             layer_id: storage_layer_id.to_owned(),
         }),
+        consumer_has_cap_dac_override,
     };
     let stream = client
         .get_layer(0, params)
@@ -509,6 +513,7 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
                 storage_layer_id,
                 diff_id,
                 zerocopy,
+                false, // proxied path: consumer cannot bypass file permissions
                 &mut ctx,
             )
             .await?;

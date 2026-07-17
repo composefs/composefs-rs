@@ -2934,6 +2934,7 @@ mod layer_sync_tests {
         let params = GetLayerParams {
             diff_id: Some(diff_id.to_owned()),
             storage: None,
+            ..Default::default()
         };
         let mut stream = std::pin::pin!(
             client
