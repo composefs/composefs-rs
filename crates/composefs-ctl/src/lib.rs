@@ -740,7 +740,7 @@ enum Command {
     Init {
         /// The fs-verity algorithm identifier.
         /// Format: fsverity-<hash>-<lg_blocksize>, e.g. fsverity-sha512-12
-        #[clap(long, value_parser = clap::value_parser!(Algorithm), default_value = "fsverity-sha512-12")]
+        #[clap(long, value_parser = clap::value_parser!(Algorithm), default_value_t = Algorithm::SHA512)]
         algorithm: Algorithm,
         /// Path to the repository directory (created if it doesn't exist).
         /// If omitted, uses --repo/--user/--system location.
@@ -755,6 +755,13 @@ enum Command {
         /// re-imported after migration.
         #[clap(long)]
         reset_metadata: bool,
+        /// Ensure the repository exists, opening it as-is if one is already
+        /// present instead of failing when its on-disk configuration (e.g.
+        /// EROFS format version) differs from the requested one. Useful for
+        /// idempotent invocations from unit files or automation. Has no effect
+        /// on the first initialization of a repository.
+        #[clap(long)]
+        ensure: bool,
         /// Default EROFS format version for images in this repository.
         /// V1 is compatible with C `mkcomposefs` 1.0.8; V2 is the legacy composefs-rs format.
         /// If omitted, falls back to the global `--erofs-version` flag, then defaults to V1.
@@ -1147,6 +1154,7 @@ pub async fn run_app(args: App) -> Result<()> {
         ref path,
         insecure,
         reset_metadata,
+        ensure,
         erofs_version: ref init_erofs_version,
     } = args.cmd
     {
@@ -1160,6 +1168,7 @@ pub async fn run_app(args: App) -> Result<()> {
             path.as_deref(),
             insecure || args.insecure,
             reset_metadata,
+            ensure,
             erofs_version,
             &args,
         );
@@ -1229,6 +1238,7 @@ fn run_init(
     path: Option<&Path>,
     insecure: bool,
     reset_metadata: bool,
+    ensure: bool,
     erofs_version: composefs::erofs::format::FormatVersion,
     args: &App,
 ) -> Result<()> {
@@ -1240,6 +1250,36 @@ fn run_init(
 
     if reset_metadata {
         composefs::repository::reset_metadata(&repo_path)?;
+    }
+
+    if ensure {
+        let formats = composefs::erofs::format::FormatConfig::single(erofs_version);
+        let status =
+            crate::varlink::run_ensure_repository(&repo_path, *algorithm, insecure, Some(formats))?;
+        match status {
+            composefs::repository::EnsureStatus::Created => {
+                println!(
+                    "Initialized composefs repository at {}",
+                    repo_path.display()
+                );
+                println!("  algorithm: {algorithm}");
+                if insecure {
+                    println!("  verity:    not required (insecure)");
+                } else {
+                    println!("  verity:    required");
+                }
+            }
+            composefs::repository::EnsureStatus::Opened => {
+                println!(
+                    "Repository already initialized at {} (existing configuration preserved)",
+                    repo_path.display()
+                );
+            }
+            composefs::repository::EnsureStatus::Upgraded => {
+                println!("Upgraded legacy repository at {}", repo_path.display());
+            }
+        }
+        return Ok(());
     }
 
     // Ensure parent directories exist (init_path only creates the final dir).

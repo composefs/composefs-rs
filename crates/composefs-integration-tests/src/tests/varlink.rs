@@ -1385,3 +1385,133 @@ fn test_varlink_init_repository_proxy() -> Result<()> {
     Ok(())
 }
 integration_test!(test_varlink_init_repository_proxy);
+
+// ============================================================================
+// EnsureRepository tests
+// ============================================================================
+
+/// Read the on-disk EROFS format version recorded in a repository's
+/// `meta.json` (the `erofs_formats.default` field), to check what
+/// `EnsureRepository`/`InitRepository` actually left on disk without relying
+/// on the library API directly (this crate only talks to `cfsctl` as a
+/// separate process).
+fn read_erofs_default_version(repo: &Path) -> Result<u64> {
+    let meta_json = std::fs::read_to_string(repo.join("meta.json"))
+        .context("reading meta.json to check the on-disk EROFS format")?;
+    let meta: Value = serde_json::from_str(&meta_json).context("parsing meta.json")?;
+    meta["erofs_formats"]["default"]
+        .as_u64()
+        .context("meta.json missing erofs_formats.default")
+}
+
+/// `EnsureRepository` on a completely fresh path (parent directories missing
+/// too) creates a new repository using the crate's default EROFS format
+/// (V1), and returns status `Created`.
+fn test_varlink_ensure_repository_creates_new() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    // We need a running service — use an existing insecure repo for that.
+    let existing_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let svc = VarlinkService::repository(existing_dir.path())?;
+
+    // Point EnsureRepository at a brand-new, nested path (parent directories
+    // missing too).
+    let new_repo_dir = tempfile::tempdir()?;
+    let new_repo_path = new_repo_dir.path().join("nested").join("repo");
+    let path_str = new_repo_path.to_str().context("repo path not UTF-8")?;
+
+    let reply = svc.call_raw(
+        "org.composefs.Repository.EnsureRepository",
+        json!({"path": path_str, "insecure": true}),
+    )?;
+    assert_eq!(
+        reply["status"], "Created",
+        "expected status=Created for a fresh repo, got: {reply}"
+    );
+
+    // A fresh repository must get the crate's default EROFS format (V1).
+    assert_eq!(
+        read_erofs_default_version(&new_repo_path)?,
+        1,
+        "freshly-created repository should use the crate's default EROFS format (V1)"
+    );
+
+    Ok(())
+}
+integration_test!(test_varlink_ensure_repository_creates_new);
+
+/// `EnsureRepository` on a repository that already exists with a non-default
+/// EROFS format (V2, vs. the crate's V1 default) must open it as-is rather
+/// than failing — this is the regression test for the bug `EnsureRepository`
+/// exists to fix.
+fn test_varlink_ensure_repository_preserves_existing_format() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    // We need a running service — use a throwaway insecure repo for that.
+    let existing_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let svc = VarlinkService::repository(existing_dir.path())?;
+
+    // Pre-initialize a *different* repository with a non-default EROFS
+    // format (V2). `init_insecure_repo` uses `--erofs-version 2`.
+    let target_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let target = target_dir.path();
+    let path_str = target.to_str().context("repo path not UTF-8")?;
+
+    let reply = svc.call_raw(
+        "org.composefs.Repository.EnsureRepository",
+        json!({"path": path_str, "insecure": true}),
+    )?;
+    assert_eq!(
+        reply["status"], "Opened",
+        "expected status=Opened for an existing repo despite format mismatch, got: {reply}"
+    );
+
+    // The on-disk format must still be V2, not silently reset to the
+    // crate's V1 default.
+    assert_eq!(
+        read_erofs_default_version(target)?,
+        2,
+        "EnsureRepository must not alter an existing repository's on-disk EROFS format"
+    );
+
+    Ok(())
+}
+integration_test!(test_varlink_ensure_repository_preserves_existing_format);
+
+/// `InitRepository`'s existing strict behavior must be unchanged:
+/// re-initializing a repository whose on-disk EROFS format differs from the
+/// requested default is still a hard error, and the existing repository is
+/// left untouched.
+fn test_varlink_init_repository_still_bails_on_config_mismatch() -> Result<()> {
+    let sh = Shell::new()?;
+    let cfsctl = cfsctl()?;
+    // We need a running service — use a throwaway insecure repo for that.
+    let existing_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let svc = VarlinkService::repository(existing_dir.path())?;
+
+    // Pre-initialize a *different* repository with a non-default EROFS
+    // format (V2).
+    let target_dir = init_insecure_repo(&sh, &cfsctl)?;
+    let target = target_dir.path();
+    let path_str = target.to_str().context("repo path not UTF-8")?;
+
+    let err = svc.call_expect_err(
+        "org.composefs.Repository.InitRepository",
+        json!({"path": path_str, "insecure": true}),
+    )?;
+    assert!(
+        err.contains("InternalError"),
+        "expected InternalError for a config mismatch, got: {err}"
+    );
+
+    // The failed call must not have touched the existing repository's
+    // on-disk format.
+    assert_eq!(
+        read_erofs_default_version(target)?,
+        2,
+        "a failed InitRepository call must not alter the existing repository's format"
+    );
+
+    Ok(())
+}
+integration_test!(test_varlink_init_repository_still_bails_on_config_mismatch);
