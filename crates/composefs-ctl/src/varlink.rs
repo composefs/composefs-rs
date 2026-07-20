@@ -184,6 +184,13 @@ pub struct InitRepositoryReply {
     pub created: bool,
 }
 
+/// Reply from ensuring a repository exists.
+#[derive(Debug, Clone, Serialize, Deserialize, zlink::introspect::Type)]
+pub struct EnsureRepositoryReply {
+    /// What happened when ensuring the repository.
+    pub status: composefs::repository::EnsureStatus,
+}
+
 /// An opened repository, monomorphized over its detected hash algorithm.
 ///
 /// Stored as an [`Arc`] so streaming methods can clone an owned handle into a
@@ -646,6 +653,17 @@ fn run_oci_mount<ObjectID: composefs::fsverity::FsVerityHashValue>(
     Ok((MountReply { fd_index: 0 }, vec![mount_fd]))
 }
 
+/// Parse a wire-format algorithm string (e.g. `"fsverity-sha512-12"`),
+/// falling back to the service default ([`Algorithm::SHA512`]) when omitted.
+fn parse_algorithm(algorithm: Option<&str>) -> std::result::Result<Algorithm, RepositoryError> {
+    match algorithm {
+        Some(s) => s.parse().map_err(|e| RepositoryError::InvalidSpec {
+            message: format!("invalid algorithm: {e}"),
+        }),
+        None => Ok(Algorithm::SHA512),
+    }
+}
+
 /// Initialize (or verify) a repository at `path` with the given algorithm.
 ///
 /// Creates parent directories if needed, then delegates to
@@ -691,6 +709,43 @@ fn run_init_repository(
         }
     };
     Ok(InitRepositoryReply { created })
+}
+
+/// Ensure a repository exists at `path`: create parent directories, then
+/// delegate to [`Repository::ensure_path`]. Unlike [`run_init_repository`],
+/// this never bails when a repository already exists with a different
+/// on-disk configuration (e.g. EROFS format version) — the existing
+/// repository is simply opened as-is. `erofs_formats`, if given, is only
+/// applied when a brand-new repository is created; it has no effect when an
+/// existing repository is opened or an old-format one is upgraded.
+pub(crate) fn run_ensure_repository(
+    path: &Path,
+    algorithm: Algorithm,
+    insecure: bool,
+    erofs_formats: Option<composefs::erofs::format::FormatConfig>,
+) -> anyhow::Result<composefs::repository::EnsureStatus> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directories for {}", path.display()))?;
+    }
+
+    let mut config = RepositoryConfig::new(algorithm);
+    if insecure {
+        config = config.set_insecure();
+    }
+    if let Some(formats) = erofs_formats {
+        config.erofs_formats = formats;
+    }
+
+    let status = match algorithm {
+        Algorithm::Sha256 { .. } => {
+            Repository::<Sha256HashValue>::ensure_path(CWD, path, config)?.1
+        }
+        Algorithm::Sha512 { .. } => {
+            Repository::<Sha512HashValue>::ensure_path(CWD, path, config)?.1
+        }
+    };
+    Ok(status)
 }
 
 /// OCI helper functions backing the `org.composefs.Oci` interface, gated behind
@@ -863,12 +918,12 @@ mod service_impl {
     #![allow(missing_docs)]
 
     use super::{
-        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply,
-        ListImageRefsReply, MountParams, MountReply, OpenRepo, OpenRepositoryReply,
-        RepositoryError, run_fsck, run_gc, run_image_objects, run_init_repository,
-        run_list_image_refs, run_mount,
+        CfsctlService, EnsureRepositoryReply, FsckReply, GcReply, ImageObjectsReply,
+        InitRepositoryReply, ListImageRefsReply, MountParams, MountReply, OpenRepo,
+        OpenRepositoryReply, RepositoryError, parse_algorithm, run_ensure_repository, run_fsck,
+        run_gc, run_image_objects, run_init_repository, run_list_image_refs, run_mount,
     };
-    use composefs::fsverity::{Algorithm, Sha256HashValue, Sha512HashValue};
+    use composefs::fsverity::{Sha256HashValue, Sha512HashValue};
 
     #[zlink::service(
         interface = "org.composefs.Repository",
@@ -893,15 +948,36 @@ mod service_impl {
             algorithm: Option<String>,
             insecure: Option<bool>,
         ) -> std::result::Result<InitRepositoryReply, RepositoryError> {
-            let algorithm: Algorithm = algorithm
-                .as_deref()
-                .unwrap_or("fsverity-sha512-12")
-                .parse()
-                .map_err(|e| RepositoryError::InvalidSpec {
-                    message: format!("invalid algorithm: {e}"),
-                })?;
+            let algorithm = parse_algorithm(algorithm.as_deref())?;
             let insecure = insecure.unwrap_or(self.open_opts.insecure);
             run_init_repository(std::path::Path::new(&path), algorithm, insecure)
+        }
+
+        /// Ensure a repository exists at the given path: open it as-is if it
+        /// already exists (preserving its on-disk configuration even if it
+        /// differs from the crate's current defaults), initialize a fresh one
+        /// if none exists, or upgrade an old-format (pre-`meta.json`) repository
+        /// in place.
+        ///
+        /// Unlike [`init_repository`](Self::init_repository), this never fails
+        /// due to a configuration mismatch with an existing repository — it is
+        /// the appropriate method for idempotent "make sure this repo exists"
+        /// callers (e.g. a service ensuring its repository is available at
+        /// startup).
+        async fn ensure_repository(
+            &mut self,
+            path: String,
+            algorithm: Option<String>,
+            insecure: Option<bool>,
+        ) -> std::result::Result<EnsureRepositoryReply, RepositoryError> {
+            let algorithm = parse_algorithm(algorithm.as_deref())?;
+            let insecure = insecure.unwrap_or(self.open_opts.insecure);
+            let status =
+                run_ensure_repository(std::path::Path::new(&path), algorithm, insecure, None)
+                    .map_err(|e| RepositoryError::InternalError {
+                        message: format!("{e:#}"),
+                    })?;
+            Ok(EnsureRepositoryReply { status })
         }
 
         /// Open and validate a repository, returning an opaque handle.
@@ -1032,13 +1108,14 @@ mod service_impl {
         parse_local_fetch, pull_stream,
     };
     use super::{
-        CfsctlService, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply,
-        ListImageRefsReply, MountParams, MountReply, OpenRepo, OpenRepositoryReply,
-        RepositoryError, run_compute_id, run_fsck, run_gc, run_image_objects, run_init_repository,
+        CfsctlService, EnsureRepositoryReply, FsckReply, GcReply, ImageObjectsReply,
+        InitRepositoryReply, ListImageRefsReply, MountParams, MountReply, OpenRepo,
+        OpenRepositoryReply, RepositoryError, parse_algorithm, run_compute_id,
+        run_ensure_repository, run_fsck, run_gc, run_image_objects, run_init_repository,
         run_inspect, run_list_image_refs, run_list_images, run_mount, run_oci_fsck, run_oci_mount,
         run_tag, run_untag,
     };
-    use composefs::fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue};
+    use composefs::fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue};
     use composefs_oci::layer_transport::{RepoLayerSource, serve_get_layer};
     use composefs_oci::varlink_types::GetLayerParams;
     use composefs_splitdirfdstream::seed_from_id;
@@ -1068,15 +1145,36 @@ mod service_impl {
             algorithm: Option<String>,
             insecure: Option<bool>,
         ) -> std::result::Result<InitRepositoryReply, RepositoryError> {
-            let algorithm: Algorithm = algorithm
-                .as_deref()
-                .unwrap_or("fsverity-sha512-12")
-                .parse()
-                .map_err(|e| RepositoryError::InvalidSpec {
-                    message: format!("invalid algorithm: {e}"),
-                })?;
+            let algorithm = parse_algorithm(algorithm.as_deref())?;
             let insecure = insecure.unwrap_or(self.open_opts.insecure);
             run_init_repository(std::path::Path::new(&path), algorithm, insecure)
+        }
+
+        /// Ensure a repository exists at the given path: open it as-is if it
+        /// already exists (preserving its on-disk configuration even if it
+        /// differs from the crate's current defaults), initialize a fresh one
+        /// if none exists, or upgrade an old-format (pre-`meta.json`) repository
+        /// in place.
+        ///
+        /// Unlike [`init_repository`](Self::init_repository), this never fails
+        /// due to a configuration mismatch with an existing repository — it is
+        /// the appropriate method for idempotent "make sure this repo exists"
+        /// callers (e.g. a service ensuring its repository is available at
+        /// startup).
+        async fn ensure_repository(
+            &mut self,
+            path: String,
+            algorithm: Option<String>,
+            insecure: Option<bool>,
+        ) -> std::result::Result<EnsureRepositoryReply, RepositoryError> {
+            let algorithm = parse_algorithm(algorithm.as_deref())?;
+            let insecure = insecure.unwrap_or(self.open_opts.insecure);
+            let status =
+                run_ensure_repository(std::path::Path::new(&path), algorithm, insecure, None)
+                    .map_err(|e| RepositoryError::InternalError {
+                        message: format!("{e:#}"),
+                    })?;
+            Ok(EnsureRepositoryReply { status })
         }
 
         /// Open and validate a repository, returning an opaque handle.
@@ -2657,8 +2755,8 @@ pub mod proxy {
         ListImagesReply, OciComputeIdReply, OciError, OciFsckReply, OciInspectReply, PullProgress,
     };
     use super::{
-        FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply, OpenRepositoryReply,
-        RepositoryError,
+        EnsureRepositoryReply, FsckReply, GcReply, ImageObjectsReply, InitRepositoryReply,
+        OpenRepositoryReply, RepositoryError,
     };
     #[cfg(feature = "oci")]
     pub use composefs_oci::varlink_types::GetLayerParams;
@@ -2675,6 +2773,14 @@ pub mod proxy {
             algorithm: Option<&str>,
             insecure: Option<bool>,
         ) -> zlink::Result<Result<InitRepositoryReply, RepositoryError>>;
+
+        /// Ensure a repository exists (open as-is, initialize, or upgrade).
+        async fn ensure_repository(
+            &mut self,
+            path: &str,
+            algorithm: Option<&str>,
+            insecure: Option<bool>,
+        ) -> zlink::Result<Result<EnsureRepositoryReply, RepositoryError>>;
 
         /// Open and validate a repository, returning an opaque handle.
         async fn open_repository(

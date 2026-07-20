@@ -184,6 +184,22 @@ impl From<std::io::Error> for RepositoryOpenError {
     }
 }
 
+/// Outcome of [`Repository::ensure_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "varlink",
+    derive(serde::Serialize, serde::Deserialize, zlink_core::introspect::Type),
+    zlink(crate = "zlink_core")
+)]
+pub enum EnsureStatus {
+    /// An existing (modern, meta.json-based) repository was opened as-is.
+    Opened,
+    /// No repository existed; a fresh one was initialized with the caller's config.
+    Created,
+    /// An old-format (pre-meta.json) repository was upgraded in place.
+    Upgraded,
+}
+
 /// The current repository format version.
 ///
 /// This is a simple integer that is bumped only for fundamental,
@@ -1447,6 +1463,66 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     .context("opening repository after writing meta.json")?;
 
                 Ok((repo, true))
+            }
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    /// Open a repository if it exists, initialize it if none exists, or
+    /// upgrade it in place if it is an old-format (pre-`meta.json`) repository.
+    ///
+    /// This is a convenience wrapper combining [`open_path`](Self::open_path),
+    /// [`init_path`](Self::init_path), and [`open_upgrade`](Self::open_upgrade):
+    ///
+    /// - If a modern repository already exists, it is opened as-is via
+    ///   [`open_path`](Self::open_path). Its on-disk configuration (including
+    ///   `erofs_formats`) is preserved; the caller's `config` is ignored for an
+    ///   existing repository except that algorithm mismatches are still a hard
+    ///   error (see [`open_path`](Self::open_path)).
+    /// - If no repository exists yet (`meta.json` is missing and there is no
+    ///   `objects/` directory), a fresh repository is initialized with `config`
+    ///   via [`init_path`](Self::init_path).
+    /// - If an old-format repository (pre-`meta.json`) is found, it is
+    ///   non-destructively upgraded via [`open_upgrade`](Self::open_upgrade).
+    ///
+    /// This is useful for callers (e.g. bootc) that want to preserve whatever
+    /// format an existing repository was created with, even if the crate's
+    /// default `RepositoryConfig` has since changed (e.g. a change in the
+    /// default EROFS format version), while still bootstrapping a sensible
+    /// configuration for brand-new repositories.
+    ///
+    /// Like [`init_path`](Self::init_path), the target directory itself is
+    /// created if it doesn't exist (though any missing *parent* directories
+    /// are still the caller's responsibility).
+    ///
+    /// Returns the repository along with an [`EnsureStatus`] describing which
+    /// of the three code paths was taken.
+    #[context("Ensuring repository at {}", path.as_ref().display())]
+    pub fn ensure_path(
+        dirfd: impl AsFd,
+        path: impl AsRef<Path>,
+        config: RepositoryConfig,
+    ) -> Result<(Self, EnsureStatus)> {
+        let path = path.as_ref();
+
+        // Unlike open_path, ensure_path may create the target directory
+        // itself: without this, a completely fresh path (as opposed to an
+        // existing-but-empty directory) would fail open_path's initial
+        // openat() with a plain ENOENT rather than the MetadataMissing this
+        // function matches on below.
+        mkdirat(&dirfd, path, Mode::from_raw_mode(0o700))
+            .or_else(|e| if e == Errno::EXIST { Ok(()) } else { Err(e) })
+            .with_context(|| format!("creating repository directory {}", path.display()))?;
+
+        match Self::open_path(&dirfd, path) {
+            Ok(repo) => Ok((repo, EnsureStatus::Opened)),
+            Err(RepositoryOpenError::MetadataMissing) => {
+                let (repo, _) = Self::init_path(&dirfd, path, config)?;
+                Ok((repo, EnsureStatus::Created))
+            }
+            Err(RepositoryOpenError::OldFormatRepository) => {
+                let (repo, _) = Self::open_upgrade(&dirfd, path)?;
+                Ok((repo, EnsureStatus::Upgraded))
             }
             Err(other) => Err(other.into()),
         }
@@ -5457,6 +5533,43 @@ mod tests {
     }
 
     #[test]
+    fn test_init_path_erofs_version_mismatch_v2_to_v1() -> Result<()> {
+        // Symmetric counterpart of `test_init_path_erofs_version_mismatch`:
+        // a repo initialized as V2 must also bail if `init_path` is later
+        // called with a V1 config (e.g. because the crate's default
+        // erofs_version changed after the repo was created).
+        let tmp = tempdir();
+        let path = tmp.path().join("repo");
+
+        // First init: V2
+        let config_v2 = RepositoryConfig {
+            algorithm: Algorithm::SHA256,
+            erofs_formats: FormatConfig::single(FormatVersion::V2),
+            ..RepositoryConfig::default().set_insecure()
+        };
+        Repository::<Sha256HashValue>::init_path(CWD, &path, config_v2)?;
+
+        // Second init: V1 — should fail because meta.json already exists with V2 config
+        let config_v1 = RepositoryConfig {
+            algorithm: Algorithm::SHA256,
+            erofs_formats: FormatConfig::single(FormatVersion::V1),
+            ..RepositoryConfig::default().set_insecure()
+        };
+        let result = Repository::<Sha256HashValue>::init_path(CWD, &path, config_v1);
+        assert!(
+            result.is_err(),
+            "re-initializing with different erofs_version must fail"
+        );
+        let err = result.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("erofs_version"),
+            "error message must mention erofs_version, got: {msg}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_init_path_same_erofs_version_is_idempotent() -> Result<()> {
         let tmp = tempdir();
         let path = tmp.path().join("repo");
@@ -5472,6 +5585,105 @@ mod tests {
         let (repo, was_new) = Repository::<Sha256HashValue>::init_path(CWD, &path, config)?;
         assert!(!was_new, "second init with same config must be idempotent");
         assert_eq!(repo.erofs_version(), FormatVersion::V1);
+        Ok(())
+    }
+
+    // ---- ensure_path tests ----
+
+    #[test]
+    fn test_ensure_path_preserves_existing_format() -> Result<()> {
+        let tmp = tempdir();
+        let path = tmp.path().join("repo");
+
+        let config_v2 = RepositoryConfig {
+            algorithm: Algorithm::SHA256,
+            erofs_formats: FormatConfig::single(FormatVersion::V2),
+            ..RepositoryConfig::default().set_insecure()
+        };
+        Repository::<Sha256HashValue>::init_path(CWD, &path, config_v2)?;
+
+        // ensure_path with a V1-only config must not overwrite the
+        // existing V2 repository; it should simply be opened as-is.
+        let config_v1 = RepositoryConfig {
+            algorithm: Algorithm::SHA256,
+            erofs_formats: FormatConfig::single(FormatVersion::V1),
+            ..RepositoryConfig::default().set_insecure()
+        };
+        let (repo, status) = Repository::<Sha256HashValue>::ensure_path(CWD, &path, config_v1)?;
+        assert_eq!(status, EnsureStatus::Opened);
+        assert_eq!(repo.erofs_version(), FormatVersion::V2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_ensure_path_creates_fresh() -> Result<()> {
+        // Unlike open_path/init_path, ensure_path creates the target
+        // directory itself, so a completely fresh path (nothing exists yet)
+        // is expected to work here.
+        let tmp = tempdir();
+        let path = tmp.path().join("repo");
+
+        let config_v2 = RepositoryConfig {
+            algorithm: Algorithm::SHA256,
+            erofs_formats: FormatConfig::single(FormatVersion::V2),
+            ..RepositoryConfig::default().set_insecure()
+        };
+        let (repo, status) = Repository::<Sha256HashValue>::ensure_path(CWD, &path, config_v2)?;
+        assert_eq!(status, EnsureStatus::Created);
+        assert_eq!(repo.erofs_version(), FormatVersion::V2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_ensure_path_upgrades_legacy() -> Result<()> {
+        let tmp = tempdir();
+        let path = tmp.path().join("repo");
+
+        // Create a repo, store an object, then remove meta.json to
+        // simulate an old-format repository (mirrors test_open_upgrade_sha256).
+        let (repo, _) = Repository::<Sha256HashValue>::init_path(
+            CWD,
+            &path,
+            RepositoryConfig::default().set_insecure(),
+        )?;
+        let data = b"hello world";
+        let obj_id = repo.ensure_object(data)?;
+        drop(repo);
+        std::fs::remove_file(path.join(REPO_METADATA_FILENAME))?;
+
+        let (repo, status) = Repository::<Sha256HashValue>::ensure_path(
+            CWD,
+            &path,
+            RepositoryConfig::default().set_insecure(),
+        )?;
+        assert_eq!(status, EnsureStatus::Upgraded);
+        assert!(path.join(REPO_METADATA_FILENAME).exists());
+        assert_eq!(&repo.read_object(&obj_id)?[..], data);
+        Ok(())
+    }
+
+    #[test]
+    fn test_ensure_path_algorithm_mismatch_is_hard_error() -> Result<()> {
+        // Init a sha256 repo, then ensure_path as sha512 — an algorithm
+        // mismatch must propagate as a hard error, not silently fall
+        // back to init or upgrade.
+        let tmp = tempdir();
+        let path = tmp.path().join("repo");
+        Repository::<Sha256HashValue>::init_path(
+            CWD,
+            &path,
+            RepositoryConfig::default().set_insecure(),
+        )?;
+
+        let result = Repository::<Sha512HashValue>::ensure_path(
+            CWD,
+            &path,
+            RepositoryConfig::new(Algorithm::SHA512).set_insecure(),
+        );
+        assert!(
+            result.is_err(),
+            "algorithm mismatch must be a hard error, not fall back to init/upgrade"
+        );
         Ok(())
     }
 
