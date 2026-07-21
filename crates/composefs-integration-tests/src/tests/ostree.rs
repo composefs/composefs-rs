@@ -370,6 +370,11 @@ impl HttpServer {
                 "-m",
                 "http.server",
                 &port.to_string(),
+                // Bind explicitly to 127.0.0.1: without this, Python may bind
+                // dual-stack/all-interfaces instead, which some sandboxed
+                // network environments then refuse loopback connections to.
+                "--bind",
+                "127.0.0.1",
                 "--directory",
                 directory.to_str().unwrap(),
             ])
