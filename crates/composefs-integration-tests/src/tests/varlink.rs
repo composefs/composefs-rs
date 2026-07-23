@@ -216,8 +216,8 @@ impl VarlinkService {
     // bare `is_err()` (that also catches transport failures) could not.
 
     /// Connect a fresh zlink client to the service socket.
-    async fn connect(&self) -> zlink::Result<zlink::unix::Connection> {
-        zlink::unix::connect(&self.socket).await
+    async fn connect(&self) -> zlink::Result<zlink::tokio::unix::Connection> {
+        zlink::tokio::unix::connect(&self.socket).await
     }
 
     /// `org.composefs.Oci.Inspect` via the typed proxy, using the cached handle.

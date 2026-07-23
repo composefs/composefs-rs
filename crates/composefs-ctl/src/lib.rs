@@ -1373,8 +1373,8 @@ where
 /// Copy an OCI image (and all its layers) from one repository to another using varlink connections.
 #[cfg(feature = "oci")]
 pub async fn copy_image(
-    conn_src: &mut zlink::unix::Connection,
-    conn_dest: &mut zlink::unix::Connection,
+    conn_src: &mut zlink::tokio::unix::Connection,
+    conn_dest: &mut zlink::tokio::unix::Connection,
     handle_src: u64,
     handle_dest: u64,
     image: &OciReference,

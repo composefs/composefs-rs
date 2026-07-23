@@ -152,7 +152,7 @@ pub fn init_if_helper() {
 ///
 /// When the caller cannot bypass file permissions, `StorageProxy::spawn()`
 /// starts a helper process inside a user namespace using `podman unshare` and
-/// returns a connected [`zlink::unix::Connection`] the caller can use with the
+/// returns a connected [`zlink::tokio::unix::Connection`] the caller can use with the
 /// [`composefs_oci::varlink_types::OciProxy`] trait to stream layers.
 ///
 /// # Dependency on `podman`
@@ -174,7 +174,7 @@ pub struct StorageProxy {
     /// `shutdown` can take ownership and call `wait()` without fighting the
     /// `Drop` impl.
     child: Option<Child>,
-    conn: zlink::unix::Connection,
+    conn: zlink::tokio::unix::Connection,
 }
 
 impl std::fmt::Debug for StorageProxy {
@@ -238,7 +238,7 @@ impl StorageProxy {
         parent_sock.set_nonblocking(true)?;
         let tok = tokio::net::UnixStream::from_std(parent_sock)
             .map_err(|e| HelperError::Ipc(format!("failed to convert socket: {e}")))?;
-        let zs = zlink::unix::Stream::try_from(tok).map_err(std::io::Error::other)?;
+        let zs = zlink::tokio::unix::Stream::try_from(tok).map_err(std::io::Error::other)?;
         let conn = zlink::Connection::new(zs);
 
         Ok(Self {
@@ -252,7 +252,7 @@ impl StorageProxy {
     /// Callers use this with the `OciProxy` trait (from
     /// `composefs_oci::varlink_types`) to drive `GetLayer` calls over the
     /// helper connection.
-    pub fn connection(&mut self) -> &mut zlink::unix::Connection {
+    pub fn connection(&mut self) -> &mut zlink::tokio::unix::Connection {
         &mut self.conn
     }
 

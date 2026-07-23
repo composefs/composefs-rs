@@ -278,7 +278,7 @@ impl VarlinkProc {
 /// Open `repo_path` over an existing connection and return the handle.
 ///
 /// The handle is reused for all subsequent calls on the same connection.
-async fn open_repo(conn: &mut zlink::unix::Connection, repo_path: &Path) -> Result<u64> {
+async fn open_repo(conn: &mut zlink::tokio::unix::Connection, repo_path: &Path) -> Result<u64> {
     let path_str = repo_path.to_str().context("repo path is not valid UTF-8")?;
     let reply = conn
         .open_repository(Some(path_str), None, None)
@@ -325,10 +325,10 @@ fn test_copy_image_via_varlink() -> Result<()> {
     let image: composefs_ctl::OciReference = "copyme:v1".parse()?;
 
     let finalize_reply = rt.block_on(async {
-        let mut conn_a = zlink::unix::connect(svc_a.socket())
+        let mut conn_a = zlink::tokio::unix::connect(svc_a.socket())
             .await
             .context("connecting to server A")?;
-        let mut conn_b = zlink::unix::connect(svc_b.socket())
+        let mut conn_b = zlink::tokio::unix::connect(svc_b.socket())
             .await
             .context("connecting to server B")?;
 
@@ -432,8 +432,8 @@ fn test_copy_image_cross_algorithm() -> Result<()> {
     let image: composefs_ctl::OciReference = "copyme:v1".parse()?;
 
     let finalize_reply = rt.block_on(async {
-        let mut conn_a = zlink::unix::connect(svc_a.socket()).await?;
-        let mut conn_b = zlink::unix::connect(svc_b.socket()).await?;
+        let mut conn_a = zlink::tokio::unix::connect(svc_a.socket()).await?;
+        let mut conn_b = zlink::tokio::unix::connect(svc_b.socket()).await?;
 
         let handle_a = open_repo(&mut conn_a, &repo_a_path).await?;
         let handle_b = open_repo(&mut conn_b, &repo_b_path).await?;
