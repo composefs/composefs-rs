@@ -44,8 +44,8 @@ composefs-ostree = { version = "0.7.0", path = "crates/composefs-ostree", defaul
 cap-std-ext = "5.1.2"
 ocidir = "0.8.0"
 
-zlink = { version = "0.6", default-features = false, features = ["tokio", "introspection", "proxy", "server", "service", "tracing"] }
-zlink-core = { version = "0.6", default-features = false, features = ["introspection", "std", "tracing"] }
+zlink = { version = "0.7", default-features = false, features = ["tokio", "introspection", "proxy", "server", "service", "tracing"] }
+zlink-core = { version = "0.7", default-features = false, features = ["introspection", "std", "tracing"] }
 
 [profile.dev.package.sha2]
 # this is *really* slow otherwise
