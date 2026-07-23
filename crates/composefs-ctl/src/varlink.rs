@@ -1888,11 +1888,11 @@ mod service_impl {
 #[derive(Debug)]
 pub(crate) struct ActivatedListener {
     /// The connection to yield on the first accept(), consumed after use.
-    conn: Option<zlink::Connection<zlink::unix::Stream>>,
+    conn: Option<zlink::Connection<zlink::tokio::unix::Stream>>,
 }
 
 impl zlink::Listener for ActivatedListener {
-    type Socket = zlink::unix::Stream;
+    type Socket = zlink::tokio::unix::Stream;
 
     async fn accept(&mut self) -> zlink::Result<Option<zlink::Connection<Self::Socket>>> {
         match self.conn.take() {
@@ -1909,7 +1909,7 @@ pub(crate) enum ActivatedSocket {
     Connected(ActivatedListener),
     /// A listening socket (systemd `.socket` with `Accept=no`, or the test
     /// harness): served with a normal accept loop.
-    Listening(zlink::unix::Listener),
+    Listening(zlink::tokio::unix::Listener),
 }
 
 /// Try to classify a socket-activation fd inherited from the service manager.
@@ -1949,7 +1949,7 @@ pub(crate) fn try_activated_listener() -> Result<Option<ActivatedSocket>> {
     if is_listening {
         // The fd is a bound, listening Unix socket.  Hand it to zlink's
         // Listener adapter, which calls set_nonblocking and wraps it in tokio.
-        let listener = zlink::unix::Listener::try_from(owned)
+        let listener = zlink::tokio::unix::Listener::try_from(owned)
             .context("converting listening activation fd to zlink Listener")?;
         Ok(Some(ActivatedSocket::Listening(listener)))
     } else {
@@ -1962,7 +1962,7 @@ pub(crate) fn try_activated_listener() -> Result<Option<ActivatedSocket>> {
         let tokio_stream = tokio::net::UnixStream::from_std(std_stream)
             .context("converting systemd UnixStream to tokio")?;
         let zlink_stream =
-            zlink::unix::Stream::try_from(tokio_stream).map_err(|e| anyhow::anyhow!(e))?;
+            zlink::tokio::unix::Stream::try_from(tokio_stream).map_err(|e| anyhow::anyhow!(e))?;
         let conn = zlink::Connection::new(zlink_stream);
         Ok(Some(ActivatedSocket::Connected(ActivatedListener {
             conn: Some(conn),
@@ -1981,7 +1981,7 @@ pub(crate) fn try_activated_listener() -> Result<Option<ActivatedSocket>> {
 /// wrap exactly one `LocalSet`.
 pub(crate) async fn serve_activated<S>(service: S, listener: ActivatedListener) -> Result<()>
 where
-    S: zlink::Service<zlink::unix::Stream>,
+    S: zlink::Service<zlink::tokio::unix::Stream>,
 {
     log::info!("Listening on systemd-activated socket");
     let server = zlink::Server::new(listener, service);
@@ -1991,14 +1991,17 @@ where
         .context("running varlink server (activated)")
 }
 
-/// Serve `service` on a listening [`zlink::unix::Listener`] inside a
+/// Serve `service` on a listening [`zlink::tokio::unix::Listener`] inside a
 /// [`tokio::task::LocalSet`].
 ///
 /// Used for both the socket-activated listening fd path and the normal
 /// `bind`-a-fresh-socket path (see [`serve`]).
-pub(crate) async fn serve_on_listener<S>(service: S, listener: zlink::unix::Listener) -> Result<()>
+pub(crate) async fn serve_on_listener<S>(
+    service: S,
+    listener: zlink::tokio::unix::Listener,
+) -> Result<()>
 where
-    S: zlink::Service<zlink::unix::Stream>,
+    S: zlink::Service<zlink::tokio::unix::Stream>,
 {
     let server = zlink::Server::new(listener, service);
     tokio::task::LocalSet::new()
@@ -2016,7 +2019,7 @@ where
 /// 2. A freshly bound socket at `address` (which must be `Some`).
 pub(crate) async fn serve<S>(service: S, address: Option<&Path>) -> Result<()>
 where
-    S: zlink::Service<zlink::unix::Stream>,
+    S: zlink::Service<zlink::tokio::unix::Stream>,
 {
     match try_activated_listener()? {
         Some(ActivatedSocket::Connected(l)) => return serve_activated(service, l).await,
@@ -2027,7 +2030,7 @@ where
         None => {}
     }
     let address = address.context("no --address given and not socket-activated")?;
-    let listener = zlink::unix::bind(address)
+    let listener = zlink::tokio::unix::bind(address)
         .with_context(|| format!("binding varlink socket at {}", address.display()))?;
     log::info!("Listening on {}", address.display());
     serve_on_listener(service, listener).await
@@ -2937,7 +2940,7 @@ pub(crate) use oci::*;
 
 /// Spawn a `CfsctlService` in-process over a Unix socket pair for testing.
 ///
-/// Returns a connected client [`zlink::unix::Connection`] and a
+/// Returns a connected client [`zlink::tokio::unix::Connection`] and a
 /// [`std::thread::JoinHandle`] for the server thread.
 ///
 /// Mirrors the pattern in `composefs-storage`'s `spawn_in_process`: the zlink
@@ -2948,14 +2951,14 @@ pub(crate) use oci::*;
 #[cfg(feature = "oci")]
 pub(crate) fn spawn_in_process(
     service: CfsctlService,
-) -> std::io::Result<(zlink::unix::Connection, std::thread::JoinHandle<()>)> {
+) -> std::io::Result<(zlink::tokio::unix::Connection, std::thread::JoinHandle<()>)> {
     let (client_std, server_std) = std::os::unix::net::UnixStream::pair()?;
     client_std.set_nonblocking(true)?;
     server_std.set_nonblocking(true)?;
 
     let client_stream = tokio::net::UnixStream::from_std(client_std)?;
     let client_zlink =
-        zlink::unix::Stream::try_from(client_stream).map_err(std::io::Error::other)?;
+        zlink::tokio::unix::Stream::try_from(client_stream).map_err(std::io::Error::other)?;
     let client_conn = zlink::Connection::new(client_zlink);
 
     let handle = std::thread::Builder::new()
@@ -2980,7 +2983,7 @@ pub(crate) fn spawn_in_process(
                         return;
                     }
                 };
-                let server_zlink = match zlink::unix::Stream::try_from(server_stream) {
+                let server_zlink = match zlink::tokio::unix::Stream::try_from(server_stream) {
                     Ok(s) => s,
                     Err(e) => {
                         log::error!("CfsctlService server zlink stream conversion failed: {e:#?}");

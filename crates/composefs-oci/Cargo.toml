@@ -21,7 +21,7 @@ varlink = ['dep:zlink', 'dep:zlink-core', 'composefs/varlink']
 anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
 async-compression = { version = "0.4.0", default-features = false, features = ["tokio", "zstd", "gzip"] }
-base64 = { version = "0.22", default-features = false, features = ["std"], optional = true }
+base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.7.0", features = ["tokio"] }
 bytes = { version = "1", default-features = false }
 composefs = { workspace = true }

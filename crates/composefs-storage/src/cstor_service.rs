@@ -504,18 +504,18 @@ impl Drop for InProcessServer {
 
 /// Spawn a [`CstorLayerService`] in-process over a Unix socket pair.
 ///
-/// Returns a connected `zlink::unix::Connection` and an [`InProcessServer`]
+/// Returns a connected `zlink::tokio::unix::Connection` and an [`InProcessServer`]
 /// handle for shutdown.
 pub fn spawn_in_process(
     service: CstorLayerService,
-) -> std::io::Result<(zlink::unix::Connection, InProcessServer)> {
+) -> std::io::Result<(zlink::tokio::unix::Connection, InProcessServer)> {
     let (client_std, server_std) = std::os::unix::net::UnixStream::pair()?;
     client_std.set_nonblocking(true)?;
     server_std.set_nonblocking(true)?;
 
     let client_stream = tokio::net::UnixStream::from_std(client_std)?;
     let client_zlink =
-        zlink::unix::Stream::try_from(client_stream).map_err(std::io::Error::other)?;
+        zlink::tokio::unix::Stream::try_from(client_stream).map_err(std::io::Error::other)?;
     let client_conn = zlink::Connection::new(client_zlink);
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -544,7 +544,7 @@ pub fn spawn_in_process(
                         return;
                     }
                 };
-                let server_zlink = match zlink::unix::Stream::try_from(server_stream) {
+                let server_zlink = match zlink::tokio::unix::Stream::try_from(server_stream) {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::error!(
@@ -596,7 +596,7 @@ pub fn serve_on_socket_blocking(socket: std::os::unix::net::UnixStream) -> std::
     local.block_on(&rt, async move {
         // `from_std` must be called inside the runtime context.
         let stream = tokio::net::UnixStream::from_std(socket)?;
-        let zs = zlink::unix::Stream::try_from(stream).map_err(std::io::Error::other)?;
+        let zs = zlink::tokio::unix::Stream::try_from(stream).map_err(std::io::Error::other)?;
         let listener = zlink::ReadyListener::new(zs);
         let server = zlink::Server::new(listener, CstorLayerService);
         server
@@ -1021,7 +1021,7 @@ mod tests {
 
     /// Collect all frames from a streaming get_layer call.
     async fn collect_get_layer(
-        client: &mut zlink::unix::Connection,
+        client: &mut zlink::tokio::unix::Connection,
         storage_path: &str,
         layer_id: &str,
     ) -> (GetLayerReply, Vec<OwnedFd>, usize) {

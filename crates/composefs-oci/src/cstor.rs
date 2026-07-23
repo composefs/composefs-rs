@@ -366,7 +366,7 @@ async fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
 #[allow(clippy::too_many_arguments)]
 async fn import_layer_via_transfer<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
-    client: &mut zlink::unix::Connection,
+    client: &mut zlink::tokio::unix::Connection,
     storage_path: &str,
     storage_layer_id: &str,
     diff_id: &OciDigest,
