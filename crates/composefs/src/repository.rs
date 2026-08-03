@@ -3384,6 +3384,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                         ObjectID::from_object_dir_and_basename(first_byte, filename.to_bytes())
                             .context("Parsing object ID from directory entry")?;
                     if !live_objects.contains(&id) {
+                        if let Ok(obj_fd) = openat(
+                            &dirfd,
+                            filename,
+                            OFlags::RDONLY | OFlags::CLOEXEC,
+                            Mode::empty(),
+                        ) {
+                            if flock(&obj_fd, FlockOperation::NonBlockingLockExclusive).is_err() {
+                                debug!("objects/{first_byte:02x}/{filename:?} is locked, skipping");
+                                continue;
+                            }
+                        }
+
                         // Get file size before removing
                         if let Ok(stat) = statat(&dirfd, filename, AtFlags::empty()) {
                             result.objects_bytes += stat.st_size as u64;
