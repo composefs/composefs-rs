@@ -3318,12 +3318,13 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .into_iter()
             .chain(
                 all_images
-                    .into_iter()
-                    .filter(|(_, name)| extra_roots.contains(name)),
+                    .iter()
+                    .filter(|(_, name)| extra_roots.contains(name))
+                    .cloned(),
             )
             .collect();
 
-        for ref image in root_images {
+        for ref image in &root_images {
             trace!("{image:?} lives as an image");
             live_objects.insert(image.0.clone());
             self.objects_for_image(&image.1)
@@ -3333,6 +3334,41 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     trace!("   with {id:?}");
                     live_objects.insert(id.clone());
                 });
+        }
+
+        // Images that are currently mounted hold a shared flock on their
+        // object file.  Treat them as roots so their objects stay alive.
+        for (id, name) in &all_images {
+            if live_objects.contains(id) {
+                continue;
+            }
+            let object_path = format!("objects/{}", id.to_object_pathname());
+            let obj_fd = match self.openat(&object_path, OFlags::RDONLY) {
+                Ok(fd) => fd,
+                Err(Errno::NOENT) => {
+                    log::warn!("{object_path} for image {name} does not exist, skipping");
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("Opening {object_path}"));
+                }
+            };
+            match flock(&obj_fd, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => {}
+                Err(Errno::WOULDBLOCK) => {
+                    debug!("{object_path} is locked, keeping image {name} alive");
+                    live_objects.insert(id.clone());
+                    self.objects_for_image(name)
+                        .with_context(|| format!("Collecting objects for locked image {name}"))?
+                        .iter()
+                        .for_each(|id| {
+                            live_objects.insert(id.clone());
+                        });
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("Locking {object_path}"));
+                }
+            }
         }
 
         // Collect all streams for the name map, then filter to roots
@@ -3384,15 +3420,36 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                         ObjectID::from_object_dir_and_basename(first_byte, filename.to_bytes())
                             .context("Parsing object ID from directory entry")?;
                     if !live_objects.contains(&id) {
-                        if let Ok(obj_fd) = openat(
+                        // Keep the lock held until the object is unlinked.
+                        let obj_lock = match openat(
                             &dirfd,
                             filename,
                             OFlags::RDONLY | OFlags::CLOEXEC,
                             Mode::empty(),
                         ) {
-                            if flock(&obj_fd, FlockOperation::NonBlockingLockExclusive).is_err() {
+                            Ok(fd) => fd,
+                            Err(Errno::NOENT) => {
+                                log::warn!(
+                                    "objects/{first_byte:02x}/{filename:?} disappeared, skipping"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(e).with_context(|| {
+                                    format!("Opening object {first_byte:02x}/{filename:?}")
+                                });
+                            }
+                        };
+                        match flock(&obj_lock, FlockOperation::NonBlockingLockExclusive) {
+                            Ok(()) => {}
+                            Err(Errno::WOULDBLOCK) => {
                                 debug!("objects/{first_byte:02x}/{filename:?} is locked, skipping");
                                 continue;
+                            }
+                            Err(e) => {
+                                return Err(e).with_context(|| {
+                                    format!("Locking object {first_byte:02x}/{filename:?}")
+                                });
                             }
                         }
 
@@ -4723,6 +4780,47 @@ mod tests {
         assert!(result.objects_bytes > 0);
         assert_eq!(result.images_pruned, 1);
         assert_eq!(result.streams_pruned, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_gc_keeps_locked_image() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+
+        let obj1 = generate_test_data(32 * 1024, 0xAE);
+        let obj2_size: u64 = 64 * 1024;
+        let obj2 = generate_test_data(obj2_size, 0xEA);
+        let obj1_id = repo.ensure_object(&obj1)?;
+        let obj2_id = repo.ensure_object(&obj2)?;
+
+        let fs = make_test_fs(&obj2_id, obj2_size);
+        let image = fs.commit_image(&repo, None)?;
+        repo.sync()?;
+
+        // Hold a shared lock on the image object, as erofs_mount() does while mounted.
+        let image_object = tmp
+            .path()
+            .join("repo/objects")
+            .join(image.to_object_pathname());
+        let lock = std::fs::File::open(&image_object)?;
+        flock(&lock, FlockOperation::LockShared)?;
+
+        // The image is unreferenced but locked: it and the objects it refers to survive.
+        let result = repo.gc(&[])?;
+        assert!(!test_object_exists(&tmp, &obj1_id)?);
+        assert!(test_object_exists(&tmp, &obj2_id)?);
+        assert!(image_object.exists());
+        assert_eq!(result.objects_removed, 1);
+        assert_eq!(result.images_pruned, 0);
+
+        // Once the lock is gone, the next GC collects everything.
+        drop(lock);
+        let result = repo.gc(&[])?;
+        assert!(!test_object_exists(&tmp, &obj2_id)?);
+        assert!(!image_object.exists());
+        assert_eq!(result.objects_removed, 2);
+        assert_eq!(result.images_pruned, 1);
         Ok(())
     }
 
