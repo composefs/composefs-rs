@@ -71,8 +71,15 @@ fn build_and_import_test_image(
     let manifest_json = make_manifest_json(&config_json, config_digest.as_ref(), &diff_ids);
 
     let layer_refs = vec![(diff_id1, verity1), (diff_id2, verity2)];
-    finalize_oci_image(repo, &manifest_json, &config_json, &layer_refs, Some(name))
-        .context("finalize_oci_image")?;
+    finalize_oci_image(
+        repo,
+        &manifest_json,
+        &config_json,
+        &layer_refs,
+        Some(name),
+        None,
+    )
+    .context("finalize_oci_image")?;
 
     Ok((manifest_json, config_json, diff_id2_str))
 }
@@ -642,6 +649,7 @@ fn test_copy_artifact() -> Result<()> {
         config_json,
         &layer_refs,
         Some("artifact:v1"),
+        None,
     )
     .context("finalize artifact")?;
 

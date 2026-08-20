@@ -588,12 +588,18 @@ impl<ObjectID: FsVerityHashValue> crate::delta::DeltaBlobReader for ProxyBlobRea
 ///
 /// Note: For backward compatibility, use `.into_config()` on the result to get
 /// the (config_digest, config_verity) tuple that was previously returned.
+///
+/// If `boot_options` is `Some`, the boot-transformed EROFS variant is also
+/// generated and linked in the same pass over the OCI layers, avoiding the
+/// extra tar walk a separate `boot::generate_boot_image()` call would
+/// otherwise require.
 pub async fn pull_image<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     imgref: &str,
     reference: Option<&str>,
     img_proxy_config: Option<ImageProxyConfig>,
     reporter: SharedReporter,
+    boot_options: Option<&composefs::generic_tree::OciTransformOptions>,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
     // Fail fast if the repository is not writable, before doing any I/O.
     repo.ensure_writable()?;
@@ -622,6 +628,7 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
         &result.manifest_digest,
         Some(&result.manifest_verity),
         reference,
+        boot_options,
     )?;
     if erofs.is_none() {
         // Not a container image (artifact) — tag the manifest directly
@@ -646,7 +653,8 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
     img_proxy_config: Option<ImageProxyConfig>,
 ) -> Result<(OciDigest, ObjectID, ImportStats)> {
     let reporter = Arc::new(crate::progress::NullReporter);
-    let (result, stats) = pull_image(repo, imgref, reference, img_proxy_config, reporter).await?;
+    let (result, stats) =
+        pull_image(repo, imgref, reference, img_proxy_config, reporter, None).await?;
     let (config_digest, config_verity) = result.into_config();
     Ok((config_digest, config_verity, stats))
 }

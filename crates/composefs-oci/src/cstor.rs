@@ -82,10 +82,13 @@ type CstorImportResult<ObjectID> = (ContentAndVerity<ObjectID>, ContentAndVerity
 /// * `zerocopy` - If true, error instead of falling back to copy (reflink or hardlink required)
 /// * `storage_root` - Explicit storage root; skips auto-discovery when set
 /// * `additional_image_stores` - Additional read-only image stores (appended after the primary store)
+/// * `boot_options` - When `Some`, also generate and link the boot-transformed
+///   EROFS variant for the requested xattr mode (see `ensure_oci_composefs_erofs`)
 ///
 /// # Returns
 /// A tuple of ((manifest_digest, manifest_verity), (config_digest, config_verity))
 /// plus import stats.
+#[allow(clippy::too_many_arguments)]
 pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     image_id: &str,
@@ -93,6 +96,7 @@ pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
     zerocopy: bool,
     storage_root: Option<&std::path::Path>,
     additional_image_stores: &[&std::path::Path],
+    boot_options: Option<&composefs::generic_tree::OciTransformOptions>,
     reporter: SharedReporter,
 ) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
     // Check if we can access files directly or need a proxy
@@ -111,6 +115,7 @@ pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
             zerocopy,
             storage_root.as_deref(),
             &additional_image_stores,
+            boot_options,
             reporter,
         )
         .await
@@ -123,7 +128,15 @@ pub async fn import_from_containers_storage<ObjectID: FsVerityHashValue>(
                 "storage_root and additional_image_stores are not supported in rootless mode"
             );
         }
-        import_from_containers_storage_proxied(repo, image_id, reference, zerocopy, reporter).await
+        import_from_containers_storage_proxied(
+            repo,
+            image_id,
+            reference,
+            zerocopy,
+            boot_options,
+            reporter,
+        )
+        .await
     }
 }
 
@@ -259,6 +272,7 @@ fn storage_search_paths() -> Vec<String> {
 /// Layer discovery is done synchronously via `spawn_blocking`, then each
 /// layer is imported asynchronously through the in-process `CstorLayerService`
 /// (`org.composefs.Oci` zlink interface).
+#[allow(clippy::too_many_arguments)]
 async fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     image_id: &str,
@@ -266,6 +280,7 @@ async fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
     zerocopy: bool,
     storage_root: Option<&std::path::Path>,
     additional_image_stores: &[std::path::PathBuf],
+    boot_options: Option<&composefs::generic_tree::OciTransformOptions>,
     reporter: SharedReporter,
 ) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
     let mut stats = ImportStats::default();
@@ -339,16 +354,20 @@ async fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
     reporter.report(ProgressEvent::Message("Layers imported".to_string()));
 
     // finalize_import does blocking repo work; run it on spawn_blocking.
+    // OciTransformOptions is Clone, so clone it into the 'static closure
+    // rather than fighting the borrow's lifetime across the blocking hand-off.
     let repo2 = Arc::clone(repo);
     let image = resolved.image;
     let reference_owned = reference.map(|s| s.to_owned());
     let reporter2 = reporter.clone();
+    let boot_options_owned = boot_options.cloned();
     tokio::task::spawn_blocking(move || {
         finalize_import(
             &repo2,
             &image,
             &layer_refs,
             reference_owned.as_deref(),
+            boot_options_owned.as_ref(),
             &reporter2,
             stats,
         )
@@ -467,6 +486,7 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
     image_id: &str,
     reference: Option<&str>,
     zerocopy: bool,
+    boot_options: Option<&composefs::generic_tree::OciTransformOptions>,
     reporter: SharedReporter,
 ) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
     let mut stats = ImportStats::default();
@@ -542,12 +562,14 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
     let image = resolved.image;
     let reference_owned = reference.map(|s| s.to_owned());
     let reporter2 = reporter.clone();
+    let boot_options_owned = boot_options.cloned();
     tokio::task::spawn_blocking(move || {
         finalize_import(
             &repo2,
             &image,
             &layer_refs,
             reference_owned.as_deref(),
+            boot_options_owned.as_ref(),
             &reporter2,
             stats,
         )
@@ -568,6 +590,7 @@ fn finalize_import<ObjectID: FsVerityHashValue>(
     image: &Image,
     layer_refs: &[(OciDigest, ObjectID)],
     reference: Option<&str>,
+    boot_options: Option<&composefs::generic_tree::OciTransformOptions>,
     reporter: &SharedReporter,
     stats: ImportStats,
 ) -> Result<(CstorImportResult<ObjectID>, ImportStats)> {
@@ -599,6 +622,7 @@ fn finalize_import<ObjectID: FsVerityHashValue>(
         &config_json,
         layer_refs,
         reference,
+        boot_options,
     )
     .context("finalize_oci_image")?;
 

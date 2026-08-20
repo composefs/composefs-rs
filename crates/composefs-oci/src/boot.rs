@@ -37,30 +37,11 @@ pub fn generate_boot_image<ObjectID: FsVerityHashValue>(
         return Ok(existing);
     }
 
-    let (erofs_id, _) =
-        crate::ensure_oci_composefs_erofs_boot(repo, manifest_digest, None, None, options, false)?
+    let erofs_id =
+        crate::ensure_oci_composefs_erofs_boot(repo, manifest_digest, None, None, options)?
             .expect("container image should produce boot EROFS");
 
     Ok(erofs_id)
-}
-
-/// Exactly the same as [`generate_boot_image`], but also returns the untransformed
-/// filesystem created from splitstreams
-#[cfg(feature = "boot")]
-pub fn generate_boot_image_get_fs<ObjectID: FsVerityHashValue>(
-    repo: &Arc<Repository<ObjectID>>,
-    manifest_digest: &OciDigest,
-    options: &OciTransformOptions,
-) -> Result<(ObjectID, Option<composefs::tree::FileSystem<ObjectID>>)> {
-    if let Some(existing) = boot_image_for_mode(repo, manifest_digest, options.xattrs)? {
-        return Ok((existing, None));
-    }
-
-    let (erofs_id, untransformed_fs) =
-        crate::ensure_oci_composefs_erofs_boot(repo, manifest_digest, None, None, options, true)?
-            .expect("container image should produce boot EROFS");
-
-    Ok((erofs_id, untransformed_fs))
 }
 
 /// Result of [`find_matching_boot_image`].
@@ -415,6 +396,52 @@ mod test {
         let v2 = generate_boot_image(repo, &img.manifest_digest, &OciTransformOptions::default())
             .unwrap();
         assert_eq!(v1, v2);
+    }
+
+    /// Covers `ensure_oci_composefs_erofs(..., boot_options: Some(..))`:
+    /// requesting the boot variant alongside the untransformed one must
+    /// populate both refs from a single pass over the OCI layers (this is
+    /// the `commit_untransformed=true && generate_boot=true` combination of
+    /// `commit_oci_composefs_erofs` that no other test exercises).
+    #[tokio::test]
+    async fn test_ensure_oci_composefs_erofs_with_boot_options() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let img = test_util::create_bootable_image(repo, Some("myapp:v1"), 1).await;
+
+        let erofs_id = crate::ensure_oci_composefs_erofs(
+            repo,
+            &img.manifest_digest,
+            Some(&img.manifest_verity),
+            Some("myapp:v1"),
+            Some(&OciTransformOptions::default()),
+        )
+        .unwrap()
+        .expect("container image should produce EROFS");
+
+        // The untransformed EROFS ref must be populated.
+        let oci = OciImage::open_ref(repo, "myapp:v1").unwrap();
+        assert_eq!(
+            oci.image_ref(repo.erofs_version()),
+            Some(&erofs_id),
+            "config should reference the untransformed EROFS image"
+        );
+
+        // The boot EROFS ref (default xattr mode) must *also* be populated,
+        // from the same call.
+        let boot_id = boot_image(repo, &img.manifest_digest)
+            .unwrap()
+            .expect("boot EROFS should have been generated in the same pass");
+        assert_ne!(
+            erofs_id, boot_id,
+            "boot-transformed image should differ from the untransformed one"
+        );
+        assert_eq!(
+            oci.boot_image_ref(repo.erofs_version()),
+            Some(&boot_id),
+            "config should reference the boot EROFS image"
+        );
     }
 
     /// Each xattr filtering mode is cached under its own named ref: generating

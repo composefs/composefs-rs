@@ -626,29 +626,28 @@ fn run_oci_mount<ObjectID: composefs::fsverity::FsVerityHashValue>(
         image: format!("{image}: {e:#}"),
     })?;
 
-    let erofs_id = if bootable {
-        img.boot_image_ref(repo.erofs_version())
-    } else {
-        img.image_ref(repo.erofs_version())
-    }
-    .ok_or_else(|| oci::OciError::InternalError {
-        message: if bootable {
-            "No boot EROFS image linked".into()
-        } else {
-            "No composefs EROFS image linked".into()
-        },
-    })?;
-
     let options = params
         .to_mount_options(fds)
         .map_err(|e| oci::OciError::InternalError {
             message: format!("{e:?}"),
         })?;
-    let mount_fd = repo
-        .mount_with_options(&erofs_id.to_hex(), &options)
-        .map_err(|e| oci::OciError::InternalError {
-            message: format!("{e:#}"),
-        })?;
+
+    let mount_fd = img.mount(repo, bootable, &options).map_err(|e| {
+        match e.downcast_ref::<composefs_oci::oci_image::OciErofsNotFound>() {
+            // Preserve the exact varlink-facing message from before this was
+            // deduplicated through `OciImage::mount`.
+            Some(_) => oci::OciError::InternalError {
+                message: if bootable {
+                    "No boot EROFS image linked".into()
+                } else {
+                    "No composefs EROFS image linked".into()
+                },
+            },
+            None => oci::OciError::InternalError {
+                message: format!("{e:#}"),
+            },
+        }
+    })?;
 
     Ok((MountReply { fd_index: 0 }, vec![mount_fd]))
 }
@@ -1868,6 +1867,10 @@ mod service_impl {
                         config_json.as_bytes(),
                         &layer_refs,
                         name.as_deref(),
+                        // This RPC backs repo-to-repo layer sync (`oci copy`),
+                        // not a bootable pull; boot EROFS generation is not
+                        // requested here.
+                        None,
                     )
                 })
                 .await
@@ -2448,6 +2451,65 @@ pub mod oci {
         }
     }
 
+    /// Whether an initial `pull()` call (from [`pull_stream`] or `cfsctl`'s
+    /// `OciCommand::Pull` handler) should request the boot-transformed EROFS
+    /// variant via `PullOptions::bootable`, so it's produced in the same pass
+    /// over the OCI layers instead of a subsequent `generate_boot_image` call
+    /// re-walking them.
+    ///
+    /// `false` whenever that wouldn't actually save the second walk:
+    /// - `bootable` is not requested at all.
+    /// - `has_expected_digest`: the digest-recovery search path must run
+    ///   with `generate_boot_image` not yet having generated anything, so
+    ///   its search over every mode/version combination stays meaningful.
+    /// - `xattrs` requests a non-default mode: `PullOptions::bootable` only
+    ///   supports [`composefs::generic_tree::OciTransformOptions::default()`].
+    ///
+    /// `pub(crate)` so `cfsctl`'s own `OciCommand::Pull` handler in `lib.rs`
+    /// can share this decision table instead of duplicating it.
+    pub(crate) fn want_bootable_pull(
+        bootable: bool,
+        has_expected_digest: bool,
+        xattrs: Option<composefs_oci::XattrFiltering>,
+    ) -> bool {
+        bootable
+            && !has_expected_digest
+            && xattrs.unwrap_or_default() == composefs_oci::XattrFiltering::default()
+    }
+
+    #[cfg(test)]
+    mod want_bootable_pull_tests {
+        use super::want_bootable_pull;
+        use composefs_oci::XattrFiltering;
+
+        #[test]
+        fn matches_expected_decision_table() {
+            let default_mode = XattrFiltering::default();
+            let non_default_mode = XattrFiltering::KeepUserXattrs;
+            assert_ne!(default_mode, non_default_mode, "test fixture sanity check");
+
+            // (bootable, has_expected_digest, xattrs, expected)
+            let cases = [
+                (false, false, None, false),
+                (false, false, Some(default_mode), false),
+                (true, false, None, true),
+                (true, false, Some(default_mode), true),
+                (true, false, Some(non_default_mode), false),
+                (true, true, None, false),
+                (true, true, Some(default_mode), false),
+                (false, true, None, false),
+            ];
+            for (bootable, has_expected_digest, xattrs, expected) in cases {
+                assert_eq!(
+                    want_bootable_pull(bootable, has_expected_digest, xattrs),
+                    expected,
+                    "bootable={bootable} has_expected_digest={has_expected_digest} \
+                     xattrs={xattrs:?}"
+                );
+            }
+        }
+    }
+
     /// Run a streaming pull against an already-opened repository, returning a
     /// boxed stream of [`PullProgress`] frames.
     ///
@@ -2467,7 +2529,8 @@ pub mod oci {
     /// `expected_digest` requires `bootable` and is mutually exclusive with
     /// `xattrs` (searching for an unknown mode and pinning one are
     /// contradictory requests); both are rejected up front with
-    /// [`OciError::InvalidRequest`].
+    /// [`OciError::InvalidRequest`]. See [`want_bootable_pull`] for how the
+    /// initial `pull()` call decides whether to also request the boot variant.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn pull_stream<ObjectID: FsVerityHashValue>(
         repo: Arc<Repository<ObjectID>>,
@@ -2533,11 +2596,13 @@ pub mod oci {
         // and sends it through the channel before the sender drops.  Pull errors
         // are carried out via the task's `JoinHandle` return value.
         let task_tx = tx.clone();
+        let use_bootable_opt = want_bootable_pull(bootable, expected_digest.is_some(), xattrs);
         let handle = tokio::task::spawn_local(async move {
             let opts = composefs_oci::PullOptions {
                 local_fetch,
                 storage_root: storage_root.as_deref(),
                 progress: reporter,
+                bootable: use_bootable_opt,
                 ..Default::default()
             };
             let result = composefs_oci::pull(&repo, &image, name.as_deref(), opts)

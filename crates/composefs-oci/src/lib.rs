@@ -138,9 +138,7 @@ pub(crate) fn take_boot_image_refs<ObjectID>(
 
 // Re-export key types for convenience
 #[cfg(feature = "boot")]
-pub use boot::{
-    BootImageMatch, find_matching_boot_image, generate_boot_image, generate_boot_image_get_fs,
-};
+pub use boot::{BootImageMatch, find_matching_boot_image, generate_boot_image};
 pub use boot::{boot_image, remove_boot_image};
 pub use composefs::generic_tree::{OciTransformOptions, XattrFiltering};
 pub use oci_image::{
@@ -335,6 +333,16 @@ pub struct PullOptions<'a> {
     /// [`SharedReporter`] implementation (e.g. an `indicatif`-backed renderer)
     /// to receive [`ProgressEvent`]s as the pull proceeds.
     pub progress: Option<SharedReporter>,
+
+    /// When `true`, also generates and links the boot-transformed EROFS
+    /// variant in the same pass over the OCI layers, using
+    /// [`composefs::generic_tree::OciTransformOptions::default()`] for the
+    /// transform. Use [`crate::boot::generate_boot_image`] afterward instead
+    /// if you need a non-default xattr filtering mode.
+    ///
+    /// Supported uniformly across transports, including `containers-storage:`
+    /// imports (see [`LocalFetchOpt`]).
+    pub bootable: bool,
 }
 
 impl<'a> std::fmt::Debug for PullOptions<'a> {
@@ -352,6 +360,7 @@ impl<'a> std::fmt::Debug for PullOptions<'a> {
                     &"None"
                 },
             )
+            .field("bootable", &self.bootable)
             .finish()
     }
 }
@@ -472,6 +481,10 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         .progress
         .unwrap_or_else(|| std::sync::Arc::new(NullReporter));
 
+    let boot_options = opts
+        .bootable
+        .then(composefs::generic_tree::OciTransformOptions::default);
+
     #[cfg(feature = "containers-storage")]
     if opts.local_fetch != LocalFetchOpt::Disabled
         && let Some(image_id) = cstor::parse_containers_storage_ref(imgref)
@@ -485,6 +498,7 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
                 zerocopy,
                 opts.storage_root,
                 opts.additional_image_stores,
+                boot_options.as_ref(),
                 reporter,
             )
             .await?;
@@ -497,8 +511,15 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         });
     }
 
-    let (result, stats) =
-        skopeo::pull_image(repo, imgref, reference, opts.img_proxy_config, reporter).await?;
+    let (result, stats) = skopeo::pull_image(
+        repo,
+        imgref,
+        reference,
+        opts.img_proxy_config,
+        reporter,
+        boot_options.as_ref(),
+    )
+    .await?;
     Ok(crate::PullResult {
         manifest_digest: result.manifest_digest,
         manifest_verity: result.manifest_verity,
@@ -737,6 +758,7 @@ pub fn upgrade_repo<ObjectID: FsVerityHashValue>(
             &manifest_digest,
             Some(img.manifest_verity()),
             Some(&tag),
+            None,
         )
         .with_context(|| format!("generating EROFS for image {tag}"))?;
 
@@ -824,6 +846,197 @@ pub fn write_config_raw<ObjectID: FsVerityHashValue>(
     Ok((config_digest, id))
 }
 
+/// Applies [`composefs_boot::BootOps::transform_for_boot`] to `fs`.
+///
+/// Split out of [`commit_oci_composefs_erofs`] so that only this one call
+/// site needs to be feature-gated: everything else in that function (the
+/// EROFS commit bookkeeping, the boot image named-ref map) is plain
+/// `composefs` code that doesn't need the `boot` feature. Taking `fs` by
+/// `&mut` here (in both the real and stub implementations below) is also
+/// what lets `commit_oci_composefs_erofs` declare its `fs` binding `mut`
+/// unconditionally, since the borrow-checker only cares that *some* call
+/// site takes `&mut fs`, not whether the callee is compiled to actually
+/// mutate it.
+#[cfg(feature = "boot")]
+fn transform_for_boot<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    fs: &mut composefs::tree::FileSystem<ObjectID>,
+) -> Result<()> {
+    use composefs_boot::BootOps;
+    fs.transform_for_boot(repo)?;
+    Ok(())
+}
+
+/// Stub used when the `boot` feature is disabled. Reachable via
+/// [`ensure_oci_composefs_erofs`] when called with `boot_options: Some(..)`
+/// — that function is not itself feature-gated on `boot`, so on a build
+/// without the feature this surfaces the error below at runtime via the
+/// normal `?` propagation, which is the desired behavior.
+#[cfg(not(feature = "boot"))]
+fn transform_for_boot<ObjectID: FsVerityHashValue>(
+    _repo: &Arc<Repository<ObjectID>>,
+    _fs: &mut composefs::tree::FileSystem<ObjectID>,
+) -> Result<()> {
+    anyhow::bail!("boot image generation requires the `boot` feature")
+}
+
+/// Result of [`commit_oci_composefs_erofs`].
+struct CommitResult<ObjectID: FsVerityHashValue> {
+    /// The untransformed EROFS image's ObjectID, if `commit_untransformed` was set.
+    untransformed_id: Option<ObjectID>,
+    /// The boot-transformed EROFS image's ObjectID, if `generate_boot` was set.
+    ///
+    /// Only read by [`ensure_oci_composefs_erofs_boot`], which is
+    /// `#[cfg(feature = "boot")]`.
+    #[cfg_attr(not(feature = "boot"), allow(dead_code))]
+    boot_id: Option<ObjectID>,
+}
+
+/// Core single-pass logic shared by [`ensure_oci_composefs_erofs`] and the
+/// boot-variant generator: builds the OCI image's `FileSystem` from its
+/// layers exactly once via [`image::create_filesystem`], then commits the
+/// untransformed and/or boot-transformed EROFS variant(s) as requested,
+/// with a single [`write_config_raw`] and a single manifest rewrite.
+///
+/// Returns `Ok(None)` if the image is not a container image (e.g. an
+/// artifact), matching the existing `ensure_oci_composefs_erofs` contract.
+///
+/// This is a private, single-caller-pair helper: the boolean/option flags
+/// are set once each by [`ensure_oci_composefs_erofs`] and
+/// [`ensure_oci_composefs_erofs_boot`], so splitting them into a builder or
+/// options struct wouldn't reduce complexity at either call site.
+#[allow(clippy::too_many_arguments)]
+fn commit_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    manifest_digest: &OciDigest,
+    manifest_verity: Option<&ObjectID>,
+    tag: Option<&str>,
+    commit_untransformed: bool,
+    generate_boot: bool,
+    transform_options: &composefs::generic_tree::OciTransformOptions,
+) -> Result<Option<CommitResult<ObjectID>>> {
+    let img = oci_image::OciImage::open(repo, manifest_digest, manifest_verity)?;
+    if !img.is_container_image() {
+        return Ok(None);
+    }
+
+    // Build the composefs filesystem from all layers exactly once, shared
+    // by both the untransformed and boot-transformed variants below.
+    let mut fs = image::create_filesystem(
+        repo,
+        img.config_digest(),
+        Some(img.config_verity()),
+        transform_options,
+    )?;
+
+    // Commit the untransformed EROFS image(s), if requested, before any
+    // boot transform mutates `fs`. No named ref — the GC link comes from
+    // the config splitstream ref.
+    let mut untransformed_id = None;
+    let mut image_v2 = None;
+    let mut image_v1 = None;
+    if commit_untransformed {
+        let mut erofs_map = fs.commit_images(repo, None)?;
+        image_v2 = erofs_map.remove(&FormatVersion::V2);
+        image_v1 = erofs_map.remove(&FormatVersion::V1);
+        untransformed_id = Some(
+            match repo.erofs_version().epoch() {
+                FormatEpoch::Epoch1 => image_v1.clone(),
+                FormatEpoch::Epoch2 => image_v2.clone(),
+            }
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "commit_images did not produce the repository's default EROFS format"
+                )
+            })?,
+        );
+    }
+
+    // Preserve all existing boot image refs; only the entries for
+    // `transform_options.xattrs` are updated below if `generate_boot` is set.
+    let mut boot_images = img.boot_image_refs().clone();
+    let mut boot_id = None;
+    if generate_boot {
+        transform_for_boot(repo, &mut fs)?;
+
+        let mut boot_erofs_map = fs.commit_images(repo, None)?;
+        let boot_erofs_id_v2 = boot_erofs_map.remove(&FormatVersion::V2);
+        let boot_erofs_id_v1 = boot_erofs_map.remove(&FormatVersion::V1);
+
+        boot_id = Some(
+            match repo.erofs_version().epoch() {
+                FormatEpoch::Epoch1 => boot_erofs_id_v1.clone(),
+                FormatEpoch::Epoch2 => boot_erofs_id_v2.clone(),
+            }
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "commit_images did not produce the repository's default boot EROFS format"
+                )
+            })?,
+        );
+
+        if let Some(id) = &boot_erofs_id_v2 {
+            boot_images.insert(
+                boot_image_ref_key(FormatVersion::V2, transform_options.xattrs)
+                    .into_owned()
+                    .into_boxed_str(),
+                id.clone(),
+            );
+        }
+        if let Some(id) = &boot_erofs_id_v1 {
+            boot_images.insert(
+                boot_image_ref_key(FormatVersion::V1, transform_options.xattrs)
+                    .into_owned()
+                    .into_boxed_str(),
+                id.clone(),
+            );
+        }
+    }
+
+    // If we didn't (re)commit the untransformed image(s) above, preserve
+    // the existing image refs unchanged (using the explicit V2/V1
+    // accessors to avoid the V1-preferred fallback).
+    if !commit_untransformed {
+        image_v2 = img.image_ref_v2().cloned();
+        image_v1 = img.image_ref_v1().cloned();
+    }
+
+    // Read original config JSON to preserve its exact bytes (and thus its
+    // sha256 digest) when rewriting the splitstream with the new refs.
+    let config_json = img.read_config_json(repo)?;
+    let (_config_digest, new_config_verity) = write_config_raw(
+        repo,
+        &config_json,
+        img.layer_refs().clone(),
+        image_v2.as_ref(),
+        image_v1.as_ref(),
+        &boot_images,
+    )?;
+
+    // Read original manifest JSON for rewriting. The layer_refs from
+    // OciImage are the same as the manifest's layer refs (both ultimately
+    // come from the config's diff_id → verity map).
+    let manifest_json = img.read_manifest_json(repo)?;
+    let layer_verities: Vec<_> = img
+        .layer_refs()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    oci_image::rewrite_manifest(
+        repo,
+        &manifest_json,
+        manifest_digest,
+        &new_config_verity,
+        &layer_verities,
+        tag,
+    )?;
+
+    Ok(Some(CommitResult {
+        untransformed_id,
+        boot_id,
+    }))
+}
+
 /// Ensures a composefs EROFS image exists for the given OCI container image,
 /// linking it to the config splitstream so GC keeps it alive through the tag chain.
 ///
@@ -841,79 +1054,34 @@ pub fn write_config_raw<ObjectID: FsVerityHashValue>(
 /// splitstreams are rewritten. The old splitstream objects become unreferenced
 /// and are collected by the next GC.
 ///
-/// Returns the EROFS image's ObjectID (fs-verity digest).
+/// If `boot_options` is `Some`, the boot-transformed EROFS variant is also
+/// generated and linked in the same pass over the OCI layers (see
+/// [`commit_oci_composefs_erofs`]), avoiding the extra tar walk a separate
+/// `boot::generate_boot_image()` call would otherwise require. The boot
+/// image's ObjectID is not returned here — callers that need it can look
+/// it up afterward (e.g. via `boot::boot_image_for_mode`).
+///
+/// Returns the (untransformed) EROFS image's ObjectID (fs-verity digest).
 pub(crate) fn ensure_oci_composefs_erofs<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     manifest_digest: &OciDigest,
     manifest_verity: Option<&ObjectID>,
     tag: Option<&str>,
+    boot_options: Option<&composefs::generic_tree::OciTransformOptions>,
 ) -> Result<Option<ObjectID>> {
-    let img = oci_image::OciImage::open(repo, manifest_digest, manifest_verity)?;
-    if !img.is_container_image() {
-        return Ok(None);
-    }
-
-    // Build the composefs filesystem from all layers
-    let fs = image::create_filesystem(
+    let result = commit_oci_composefs_erofs(
         repo,
-        img.config_digest(),
-        Some(img.config_verity()),
-        &composefs::generic_tree::OciTransformOptions::default(),
-    )?;
-
-    // Commit as EROFS image(s) for all formats in the repository's default set.
-    // No named ref — the GC link comes from the config splitstream ref.
-    let mut erofs_map = fs.commit_images(repo, None)?;
-    let erofs_id_v2 = erofs_map.remove(&FormatVersion::V2);
-    let erofs_id_v1 = erofs_map.remove(&FormatVersion::V1);
-
-    let erofs_id = match repo.erofs_version().epoch() {
-        FormatEpoch::Epoch1 => erofs_id_v1.clone(),
-        FormatEpoch::Epoch2 => erofs_id_v2.clone(),
-    }
-    .ok_or_else(|| {
-        anyhow::anyhow!("commit_images did not produce the repository's default EROFS format")
-    })?;
-
-    // Read original config JSON to preserve its exact bytes (and thus its
-    // sha256 digest) when rewriting the splitstream with the new EROFS ref.
-    let config_json = img.read_config_json(repo)?;
-
-    // Rewrite config with the EROFS image ref(s), using layer refs from the
-    // OciImage (which already stripped the old image ref if any).
-    // Preserve all existing boot image refs unchanged — this path never
-    // touches boot images.
-    let (_config_digest, new_config_verity) = write_config_raw(
-        repo,
-        &config_json,
-        img.layer_refs().clone(),
-        erofs_id_v2.as_ref(),
-        erofs_id_v1.as_ref(),
-        img.boot_image_refs(),
-    )?;
-
-    // Read original manifest JSON for rewriting
-    let manifest_json = img.read_manifest_json(repo)?;
-
-    // Rewrite manifest with updated config verity, preserving layer verities.
-    // The layer_refs from OciImage are the same as the manifest's layer refs
-    // (both ultimately come from the config's diff_id → verity map).
-    let layer_verities: Vec<_> = img
-        .layer_refs()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-
-    let (_new_manifest_digest, _new_manifest_verity) = oci_image::rewrite_manifest(
-        repo,
-        &manifest_json,
         manifest_digest,
-        &new_config_verity,
-        &layer_verities,
+        manifest_verity,
         tag,
+        /* commit_untransformed */ true,
+        /* generate_boot */ boot_options.is_some(),
+        boot_options.unwrap_or(&Default::default()),
     )?;
-
-    Ok(Some(erofs_id))
+    Ok(result.map(|r| {
+        r.untransformed_id
+            .expect("commit_untransformed=true always produces untransformed_id")
+    }))
 }
 
 /// Boot-variant counterpart to [`ensure_oci_composefs_erofs`]; applies
@@ -925,98 +1093,20 @@ fn ensure_oci_composefs_erofs_boot<ObjectID: FsVerityHashValue>(
     manifest_verity: Option<&ObjectID>,
     tag: Option<&str>,
     options: &composefs::generic_tree::OciTransformOptions,
-    get_untransformed_filesystem: bool,
-) -> Result<Option<(ObjectID, Option<composefs::tree::FileSystem<ObjectID>>)>> {
-    use composefs_boot::BootOps;
-
-    let img = oci_image::OciImage::open(repo, manifest_digest, manifest_verity)?;
-    if !img.is_container_image() {
-        return Ok(None);
-    }
-
-    // Build the composefs filesystem from all layers, then transform for boot
-    let mut fs = image::create_filesystem(
+) -> Result<Option<ObjectID>> {
+    let result = commit_oci_composefs_erofs(
         repo,
-        img.config_digest(),
-        Some(img.config_verity()),
+        manifest_digest,
+        manifest_verity,
+        tag,
+        /* commit_untransformed */ false,
+        /* generate_boot */ true,
         options,
     )?;
-
-    // We want the full filesystem to get boot entries
-    // [`transform_for_boot`] masks /boot which we don't want
-    let untransformed_fs = if get_untransformed_filesystem {
-        Some(fs.clone())
-    } else {
-        None
-    };
-
-    fs.transform_for_boot(repo)?;
-
-    // Commit as EROFS image(s) for all formats in the repository's default set.
-    let mut boot_erofs_map = fs.commit_images(repo, None)?;
-    let boot_erofs_id_v2 = boot_erofs_map.remove(&FormatVersion::V2);
-    let boot_erofs_id_v1 = boot_erofs_map.remove(&FormatVersion::V1);
-
-    let boot_erofs_id = match repo.erofs_version().epoch() {
-        FormatEpoch::Epoch1 => boot_erofs_id_v1.clone(),
-        FormatEpoch::Epoch2 => boot_erofs_id_v2.clone(),
-    }
-    .ok_or_else(|| {
-        anyhow::anyhow!("commit_images did not produce the repository's default boot EROFS format")
-    })?;
-
-    // Read original config JSON to preserve its exact bytes
-    let config_json = img.read_config_json(repo)?;
-
-    // Rewrite config with the boot EROFS image ref(s), preserving the existing
-    // image refs (using explicit V2/V1 accessors to avoid the V1-preferred
-    // fallback) as well as any boot image refs cached under other xattr
-    // filtering modes — only the entries for `options.xattrs` are updated.
-    let mut boot_images = img.boot_image_refs().clone();
-    if let Some(id) = &boot_erofs_id_v2 {
-        boot_images.insert(
-            boot_image_ref_key(FormatVersion::V2, options.xattrs)
-                .into_owned()
-                .into_boxed_str(),
-            id.clone(),
-        );
-    }
-    if let Some(id) = &boot_erofs_id_v1 {
-        boot_images.insert(
-            boot_image_ref_key(FormatVersion::V1, options.xattrs)
-                .into_owned()
-                .into_boxed_str(),
-            id.clone(),
-        );
-    }
-    let (_config_digest, new_config_verity) = write_config_raw(
-        repo,
-        &config_json,
-        img.layer_refs().clone(),
-        img.image_ref_v2(),
-        img.image_ref_v1(),
-        &boot_images,
-    )?;
-
-    // Read original manifest JSON for rewriting
-    let manifest_json = img.read_manifest_json(repo)?;
-
-    let layer_verities: Vec<_> = img
-        .layer_refs()
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-
-    let (_new_manifest_digest, _new_manifest_verity) = oci_image::rewrite_manifest(
-        repo,
-        &manifest_json,
-        manifest_digest,
-        &new_config_verity,
-        &layer_verities,
-        tag,
-    )?;
-
-    Ok(Some((boot_erofs_id, untransformed_fs)))
+    Ok(result.map(|r| {
+        r.boot_id
+            .expect("generate_boot=true always produces boot_id")
+    }))
 }
 
 #[cfg(test)]
@@ -1487,6 +1577,7 @@ mod test {
             &img.manifest_digest,
             Some(&img.manifest_verity),
             Some("test:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");
@@ -1571,6 +1662,7 @@ mod test {
             &img.manifest_digest,
             Some(&img.manifest_verity),
             Some("dual:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");
@@ -1663,6 +1755,7 @@ mod test {
             &img.manifest_digest,
             Some(&img.manifest_verity),
             Some("gctest:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");
@@ -1810,6 +1903,7 @@ mod test {
             &new_manifest_digest,
             Some(&new_manifest_verity),
             Some("nc:v1"),
+            None,
         )
         .unwrap()
         .expect("should produce EROFS");
@@ -2106,6 +2200,7 @@ mod test {
             &manifest_digest,
             Some(&manifest_verity),
             Some("whiteout-test:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");
@@ -2207,6 +2302,7 @@ mod test {
             &img.manifest_digest,
             Some(&img.manifest_verity),
             Some("old:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");
@@ -2261,6 +2357,7 @@ mod test {
             &img.manifest_digest,
             Some(&img.manifest_verity),
             Some("upgrade:v1"),
+            None,
         )
         .unwrap()
         .expect("container image should produce EROFS");

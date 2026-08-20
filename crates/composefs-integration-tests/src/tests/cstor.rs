@@ -98,6 +98,7 @@ fn privileged_test_cstor_vs_skopeo_equivalence() -> Result<()> {
             None,
             None,
             std::sync::Arc::new(composefs_oci::NullReporter),
+            None,
         )
         .await?;
         let (skopeo_config_digest, skopeo_config_verity) = skopeo_pull_result.into_config();

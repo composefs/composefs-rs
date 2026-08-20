@@ -837,6 +837,7 @@ mod tests {
             &pull_result.manifest_digest,
             Some(&pull_result.manifest_verity),
             None,
+            None,
         )
         .expect("generating EROFS");
 

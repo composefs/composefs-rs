@@ -989,6 +989,7 @@ pub fn ensure_erofs_for_image(
         oci.manifest_digest(),
         Some(oci.manifest_verity()),
         Some(tag),
+        None,
     )?
     .ok_or_else(|| anyhow::anyhow!("image is not a container image"))?;
     Ok(erofs_id)

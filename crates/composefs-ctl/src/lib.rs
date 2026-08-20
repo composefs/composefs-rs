@@ -1832,10 +1832,20 @@ where
                 // If no explicit name provided, use the image reference as the tag
                 let tag_name = name.as_deref().unwrap_or(image);
 
+                // `cfsctl` has no `--xattr-mode` flag, so `xattrs` is always
+                // `None` here; see `want_bootable_pull` for the full decision
+                // table (shared with the varlink `pull_stream` path).
+                let use_bootable_opt = crate::varlink::oci::want_bootable_pull(
+                    bootable,
+                    expected_digest.is_some(),
+                    None,
+                );
+
                 let reporter: SharedReporter = IndicatifReporter::new().into_shared();
                 let opts = composefs_oci::PullOptions {
                     local_fetch: local_fetch.into(),
                     progress: Some(reporter),
+                    bootable: use_bootable_opt,
                     ..Default::default()
                 };
 
@@ -1879,7 +1889,27 @@ where
                             );
                         }
                     }
+                } else if bootable && use_bootable_opt {
+                    // The boot variant was already produced in the same pass
+                    // as the pull above (via `PullOptions::bootable`), so
+                    // just look up what was generated/linked instead of
+                    // re-walking the layers with `generate_boot_image`.
+                    let image_verity =
+                        composefs_oci::boot::boot_image(&repo, &result.manifest_digest)?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "pull() reported a container image but no boot image was \
+                                 linked for it — this indicates an internal inconsistency"
+                                )
+                            })?;
+                    println!("Boot image: {}", image_verity.to_hex());
                 } else if bootable {
+                    // Unreachable today: `cfsctl` has no `--xattr-mode` flag,
+                    // and `expected_digest` (handled above) is the only other
+                    // thing that can make `want_bootable_pull` return `false`
+                    // while `bootable` is `true`. Kept for symmetry with
+                    // `pull_stream` and in case a future xattr-mode flag is
+                    // added here.
                     let image_verity = composefs_oci::generate_boot_image(
                         &repo,
                         &result.manifest_digest,

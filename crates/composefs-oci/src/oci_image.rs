@@ -75,6 +75,16 @@ pub struct OciImageNotFound {
     pub digest: String,
 }
 
+/// Error marker: the requested EROFS variant has not been generated for this image.
+#[derive(Debug, thiserror::Error)]
+#[error("no {} EROFS image linked for {digest}", if *bootable { "boot" } else { "composefs" })]
+pub struct OciErofsNotFound {
+    /// The manifest digest of the image that was queried.
+    pub digest: String,
+    /// Whether the boot variant (`true`) or untransformed variant (`false`) was requested.
+    pub bootable: bool,
+}
+
 /// Data and named refs from a splitstream with external object storage.
 type ExternalData<ObjectID> = (Vec<u8>, HashMap<Box<str>, ObjectID>);
 
@@ -342,6 +352,76 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
     /// named-ref key.
     pub(crate) fn boot_image_refs(&self) -> &HashMap<Box<str>, ObjectID> {
         &self.boot_image_refs
+    }
+
+    /// Resolves the committed EROFS object ID for this image, picking the
+    /// untransformed or boot-transformed variant per `bootable`, at the
+    /// repository's default [`FormatVersion`] (see [`Repository::erofs_version`]).
+    ///
+    /// Returns [`OciErofsNotFound`] if that variant was never generated for
+    /// this image (e.g. it was pulled without `PullOptions::bootable` and
+    /// `boot::generate_boot_image` was never called).
+    pub fn erofs_image_ref(
+        &self,
+        repo: &Repository<ObjectID>,
+        bootable: bool,
+    ) -> Result<&ObjectID> {
+        let version = repo.erofs_version();
+        if bootable {
+            self.boot_image_ref(version)
+        } else {
+            self.image_ref(version)
+        }
+        .ok_or_else(|| {
+            OciErofsNotFound {
+                digest: self.manifest_digest.to_string(),
+                bootable,
+            }
+            .into()
+        })
+    }
+
+    /// Reads the already-committed EROFS image for this OCI image back into a
+    /// `FileSystem`, in-process — no kernel mount, and no re-walk of the OCI
+    /// tar layers (this decodes the EROFS binary format directly via
+    /// [`composefs::erofs::reader::erofs_to_filesystem`]).
+    ///
+    /// This is the primary way to inspect a bootable image's original,
+    /// untransformed `/boot` contents (`bootable: false`) without the kernel
+    /// mount privileges `mount`/`mount_at` require, and without bootc-style
+    /// synthetic sub-images.
+    pub fn read_filesystem(
+        &self,
+        repo: &Repository<ObjectID>,
+        bootable: bool,
+    ) -> Result<composefs::tree::FileSystem<ObjectID>> {
+        let id = self.erofs_image_ref(repo, bootable)?;
+        let data = repo.read_object(id)?;
+        composefs::erofs::reader::erofs_to_filesystem(&data)
+    }
+
+    /// Creates a detached kernel mount of the resolved EROFS variant. See
+    /// [`Repository::mount_with_options`].
+    pub fn mount(
+        &self,
+        repo: &Repository<ObjectID>,
+        bootable: bool,
+        options: &composefs::mount::MountOptions,
+    ) -> Result<std::os::fd::OwnedFd> {
+        let id = self.erofs_image_ref(repo, bootable)?;
+        repo.mount_with_options(&id.to_hex(), options)
+    }
+
+    /// Mounts the resolved EROFS variant at `path`. See [`Repository::mount_at`].
+    pub fn mount_at(
+        &self,
+        repo: &Repository<ObjectID>,
+        bootable: bool,
+        path: impl AsRef<std::path::Path>,
+        options: &composefs::mount::MountOptions,
+    ) -> Result<()> {
+        let id = self.erofs_image_ref(repo, bootable)?;
+        repo.mount_at(&id.to_hex(), path, options)
     }
 
     /// Returns the image architecture (empty string for artifacts).
@@ -3842,6 +3922,99 @@ mod test {
                 .any(|e| e.to_string().contains("layer-ref-missing")),
             "errors should mention config missing layer reference: {:?}",
             result.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn test_erofs_image_ref_and_read_filesystem_untransformed() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let img = crate::test_util::create_base_image(repo, Some("app:v1")).await;
+        crate::test_util::ensure_erofs_for_image(repo, "app:v1").unwrap();
+
+        let oci = OciImage::open_ref(repo, "app:v1").unwrap();
+
+        let id = oci.erofs_image_ref(repo, false).unwrap();
+        assert_eq!(id, oci.image_ref(repo.erofs_version()).unwrap());
+
+        let fs = oci.read_filesystem(repo, false).unwrap();
+        assert!(
+            fs.as_dir().get_directory_ref("usr".as_ref()).is_ok(),
+            "/usr should exist in the untransformed filesystem"
+        );
+
+        // No boot variant was ever generated for this image.
+        let err = oci.erofs_image_ref(repo, true).unwrap_err();
+        let not_found = err.downcast_ref::<OciErofsNotFound>().unwrap_or_else(|| {
+            panic!("expected OciErofsNotFound, got: {err:#}");
+        });
+        assert_eq!(not_found.digest, img.manifest_digest.to_string());
+        assert!(not_found.bootable);
+
+        assert!(oci.read_filesystem(repo, true).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_mount_propagates_erofs_not_found_without_generation() {
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        crate::test_util::create_base_image(repo, Some("app:v1")).await;
+        crate::test_util::ensure_erofs_for_image(repo, "app:v1").unwrap();
+
+        let oci = OciImage::open_ref(repo, "app:v1").unwrap();
+        let options = composefs::mount::MountOptions::default();
+
+        let err = oci.mount(repo, true, &options).unwrap_err();
+        assert!(err.downcast_ref::<OciErofsNotFound>().is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = oci.mount_at(repo, true, dir.path(), &options).unwrap_err();
+        assert!(err.downcast_ref::<OciErofsNotFound>().is_some());
+    }
+
+    #[cfg(feature = "boot")]
+    #[tokio::test]
+    async fn test_read_filesystem_boot_variant_differs_from_untransformed() {
+        use std::ffi::OsStr;
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+
+        let img = crate::test_util::create_bootable_image(repo, Some("os:v1"), 1).await;
+        crate::test_util::ensure_erofs_for_image(repo, "os:v1").unwrap();
+        crate::boot::generate_boot_image(
+            repo,
+            &img.manifest_digest,
+            &composefs::generic_tree::OciTransformOptions::default(),
+        )
+        .unwrap();
+
+        let oci = OciImage::open_ref(repo, "os:v1").unwrap();
+
+        let untransformed = oci.read_filesystem(repo, false).unwrap();
+        let boot = oci.read_filesystem(repo, true).unwrap();
+
+        let untransformed_root = untransformed.as_dir();
+        let untransformed_boot_dir = untransformed_root
+            .get_directory_ref(OsStr::new("boot"))
+            .unwrap();
+        let untransformed_boot_entries: Vec<_> = untransformed_boot_dir
+            .entries()
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        assert!(
+            untransformed_boot_entries.contains(&std::ffi::OsString::from("EFI")),
+            "untransformed /boot should contain the UKI directory structure: {untransformed_boot_entries:?}"
+        );
+
+        let boot_root = boot.as_dir();
+        let boot_boot_dir = boot_root.get_directory_ref(OsStr::new("boot")).unwrap();
+        let boot_entries: Vec<_> = boot_boot_dir.entries().collect();
+        assert!(
+            boot_entries.is_empty(),
+            "boot-transformed /boot should have been emptied: {boot_entries:?}"
         );
     }
 }

@@ -551,6 +551,10 @@ pub type FinalizeResult<ObjectID> = (
 /// this writes the config and manifest splitstreams, generates the composefs
 /// EROFS image, and optionally tags the manifest under `name`. Idempotent.
 ///
+/// If `boot_options` is `Some`, the boot-transformed EROFS variant for that
+/// xattr mode is generated and linked alongside the plain one (see
+/// `ensure_oci_composefs_erofs`).
+///
 /// Returns `((manifest_digest, manifest_verity), (config_digest, config_verity))`.
 pub fn finalize_oci_image<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
@@ -558,6 +562,7 @@ pub fn finalize_oci_image<ObjectID: FsVerityHashValue>(
     config_json: &[u8],
     layer_refs: &[(OciDigest, ObjectID)],
     name: Option<&str>,
+    boot_options: Option<&composefs::generic_tree::OciTransformOptions>,
 ) -> anyhow::Result<FinalizeResult<ObjectID>> {
     use crate::oci_image::manifest_identifier;
     use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE};
@@ -601,19 +606,31 @@ pub fn finalize_oci_image<ObjectID: FsVerityHashValue>(
     };
 
     // Generate the composefs EROFS image and tag the manifest.
-    // Skip if the image already has an EROFS ref (idempotent re-finalize).
+    //
+    // Skip generation only if the plain EROFS already exists *and* either no
+    // boot variant was requested, or the requested boot variant already
+    // exists too — otherwise a plain-then-`--bootable` re-finalize of the
+    // same manifest would wrongly skip generating the boot image just
+    // because the plain one is already present.
     let existing_erofs = crate::composefs_erofs_for_manifest(
         repo,
         &manifest_digest,
         Some(&manifest_verity),
         repo.erofs_version(),
     )?;
-    if existing_erofs.is_none() {
+    let existing_boot_erofs = boot_options
+        .map(|opts| crate::boot::boot_image_for_mode(repo, &manifest_digest, opts.xattrs))
+        .transpose()?
+        .flatten();
+    let needs_generation =
+        existing_erofs.is_none() || (boot_options.is_some() && existing_boot_erofs.is_none());
+    if needs_generation {
         let erofs = crate::ensure_oci_composefs_erofs(
             repo,
             &manifest_digest,
             Some(&manifest_verity),
             name,
+            boot_options,
         )?;
         if erofs.is_none() {
             // Not a container image (e.g. an artifact) — tag directly.
@@ -1183,6 +1200,7 @@ mod tests {
                 &config_json,
                 &layer_refs,
                 Some("test:v1"),
+                None,
             )
             .expect("finalize_oci_image");
 
@@ -1246,9 +1264,95 @@ mod tests {
             &config_json,
             &layer_refs,
             Some("test:v1"),
+            None,
         )
         .expect("finalize_oci_image idempotent");
         assert_eq!(manifest_digest, md2, "idempotent call: manifest_digest");
         assert_eq!(out_config_digest, cd2, "idempotent call: config_digest");
+    }
+
+    /// A plain (non-bootable) `finalize_oci_image` followed by a re-finalize
+    /// of the *same* manifest with `boot_options: Some(..)` must still
+    /// generate the boot EROFS variant, rather than skipping generation just
+    /// because the plain EROFS is already present (see the comment above the
+    /// `needs_generation` check in `finalize_oci_image`).
+    #[tokio::test]
+    async fn test_finalize_oci_image_generates_boot_on_reimport() {
+        let (repo, _tempdir) = create_test_repo();
+
+        // `transform_for_boot` requires /usr, /boot and /sysroot to exist
+        // (see `composefs_boot::REQUIRED_TOPLEVEL_TO_EMPTY_DIRS`), so the
+        // layer needs those, unlike the plain `build_oci_tar_layer` fixture
+        // used by `test_finalize_oci_image` above.
+        const DUMPFILE: &str = "\
+/ 0 40755 4 0 0 0 0.0 - - -
+/usr 0 40755 2 0 0 0 0.0 - - -
+/boot 0 40755 2 0 0 0 0.0 - - -
+/sysroot 0 40755 2 0 0 0 0.0 - - -
+";
+        let tar1 = crate::test_util::dumpfile_to_tar(DUMPFILE);
+        let diff_id1 = crate::sha256_content_digest(&tar1);
+        let (verity1, _) = crate::import_layer(&repo, &diff_id1, None, tar1.as_slice())
+            .await
+            .expect("import layer 1");
+
+        let diff_ids = vec![diff_id1.to_string()];
+        let config_json = crate::test_util::make_config_json(&diff_ids);
+        let config_digest = crate::sha256_content_digest(&config_json);
+        let manifest_json =
+            crate::test_util::make_manifest_json(&config_json, config_digest.as_ref(), &diff_ids);
+        let layer_refs = vec![(diff_id1.clone(), verity1)];
+
+        // First finalize: plain, no boot variant requested.
+        let ((manifest_digest, manifest_verity), _) =
+            finalize_oci_image(&repo, &manifest_json, &config_json, &layer_refs, None, None)
+                .expect("finalize_oci_image (plain)");
+
+        assert!(
+            crate::composefs_erofs_for_manifest(
+                &repo,
+                &manifest_digest,
+                Some(&manifest_verity),
+                repo.erofs_version(),
+            )
+            .expect("composefs_erofs_for_manifest")
+            .is_some(),
+            "plain EROFS must exist after the first finalize"
+        );
+        assert!(
+            crate::boot::boot_image_for_mode(
+                &repo,
+                &manifest_digest,
+                composefs::generic_tree::XattrFiltering::default(),
+            )
+            .expect("boot_image_for_mode")
+            .is_none(),
+            "no boot EROFS should exist before it was ever requested"
+        );
+
+        // Re-finalize the same manifest, this time requesting the boot
+        // variant. The plain EROFS already existing must not cause this to
+        // be skipped.
+        let boot_options = composefs::generic_tree::OciTransformOptions::default();
+        finalize_oci_image(
+            &repo,
+            &manifest_json,
+            &config_json,
+            &layer_refs,
+            None,
+            Some(&boot_options),
+        )
+        .expect("finalize_oci_image (bootable re-finalize)");
+
+        assert!(
+            crate::boot::boot_image_for_mode(
+                &repo,
+                &manifest_digest,
+                composefs::generic_tree::XattrFiltering::default(),
+            )
+            .expect("boot_image_for_mode")
+            .is_some(),
+            "boot EROFS must exist after re-finalizing with boot_options: Some(..)"
+        );
     }
 }
