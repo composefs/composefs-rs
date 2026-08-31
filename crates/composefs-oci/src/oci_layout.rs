@@ -128,7 +128,9 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
     let (config_digest, config_verity, layer_refs, stats) =
         import_config_and_layers(repo, &ocidir, layers, config_descriptor, &reporter)
             .await
-            .with_context(|| format!("Failed to import config {}", config_descriptor.digest()))?;
+            .with_context(|| {
+                format!("Failed to import image content for manifest {manifest_digest}")
+            })?;
 
     reporter.report(ProgressEvent::Message("Storing manifest".to_string()));
 
@@ -193,7 +195,8 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
             &content_id,
             Some(&config_id),
             Some(OCI_CONFIG_CONTENT_TYPE),
-        )?;
+        )
+        .with_context(|| format!("Failed to read cached config {config_digest}"))?;
         let named_refs_map: HashMap<&str, ObjectID> = named_refs
             .iter()
             .map(|(k, v)| (k.as_ref(), v.clone()))
@@ -203,7 +206,8 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
             config_descriptor.media_type(),
             data.as_slice(),
             manifest_layers,
-        )?;
+        )
+        .with_context(|| format!("Failed to parse config {config_digest}"))?;
 
         let layer_refs: Vec<(OciDigest, ObjectID)> = diff_ids
             .into_iter()
@@ -238,13 +242,15 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
     let mut raw_config = Vec::with_capacity(config_descriptor.size() as usize);
     ocidir
         .read_blob(config_descriptor)
-        .context("Reading config blob")?
-        .read_to_end(&mut raw_config)?;
+        .with_context(|| format!("Failed to read config {config_digest}"))?
+        .read_to_end(&mut raw_config)
+        .with_context(|| format!("Failed to read config {config_digest}"))?;
     let diff_ids = crate::extract_diff_ids(
         config_descriptor.media_type(),
         raw_config.as_slice(),
         manifest_layers,
-    )?;
+    )
+    .with_context(|| format!("Failed to parse config {config_digest}"))?;
 
     // Sort layers by size for parallel fetching (largest first)
     let mut layers: Vec<_> = manifest_layers.iter().zip(&diff_ids).collect();
@@ -266,6 +272,7 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
 
         let media_type = descriptor.media_type().clone();
         let layer_size = descriptor.size();
+        let layer_digest = descriptor.digest().clone();
 
         layer_tasks.spawn(async move {
             let _permit = permit;
@@ -277,7 +284,8 @@ async fn import_config_and_layers<ObjectID: FsVerityHashValue>(
                 layer_size,
                 &reporter,
             )
-            .await?;
+            .await
+            .with_context(|| format!("Failed to import layer {layer_digest}"))?;
             anyhow::Ok((idx, diff_id, verity, layer_stats))
         });
     }

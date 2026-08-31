@@ -306,14 +306,16 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 &content_id,
                 Some(&config_id),
                 Some(OCI_CONFIG_CONTENT_TYPE),
-            )?;
+            )
+            .with_context(|| format!("Failed to read cached config {config_digest}"))?;
             let named_refs_map: std::collections::HashMap<&str, ObjectID> = named_refs
                 .iter()
                 .map(|(k, v)| (k.as_ref(), v.clone()))
                 .collect();
 
             let diff_ids =
-                crate::extract_diff_ids(descriptor.media_type(), data.as_slice(), manifest_layers)?;
+                crate::extract_diff_ids(descriptor.media_type(), data.as_slice(), manifest_layers)
+                    .with_context(|| format!("Failed to parse config {config_digest}"))?;
 
             let layer_refs: Vec<(OciDigest, ObjectID)> = diff_ids
                 .into_iter()
@@ -344,15 +346,19 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 "Fetching config {config_digest}"
             )));
 
-            let (mut config, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
-            let config = async move {
-                let mut s = Vec::new();
-                config.read_to_end(&mut s).await?;
-                anyhow::Ok(s)
-            };
-            let (config, driver) = tokio::join!(config, driver);
-            let _: () = driver?;
-            let raw_config = config?;
+            let raw_config = async {
+                let (mut config, driver) = self.proxy.get_descriptor(&self.img, descriptor).await?;
+                let config = async move {
+                    let mut s = Vec::new();
+                    config.read_to_end(&mut s).await?;
+                    anyhow::Ok(s)
+                };
+                let (config, driver) = tokio::join!(config, driver);
+                let _: () = driver?;
+                config
+            }
+            .await
+            .with_context(|| format!("Failed to fetch config {config_digest}"))?;
 
             // Per the OCI artifacts guidance [1], artifact configs use the
             // empty descriptor (`application/vnd.oci.empty.v1+json`) or a
@@ -363,7 +369,8 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                 descriptor.media_type(),
                 raw_config.as_slice(),
                 manifest_layers,
-            )?;
+            )
+            .with_context(|| format!("Failed to parse config {config_digest}"))?;
 
             // Sort layers by size for parallel fetching
             let mut layers: Vec<_> = zip(manifest_layers, &diff_ids).collect();
@@ -397,7 +404,10 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
                     let _permit = permit;
                     let (verity, layer_stats) = self_
                         .ensure_layer(&diff_id, &descriptor, uncompressed_layer_info, layer_idx)
-                        .await?;
+                        .await
+                        .with_context(|| {
+                            format!("Failed to import layer {}", descriptor.digest())
+                        })?;
                     anyhow::Ok((idx, diff_id, verity, layer_stats))
                 });
             }
@@ -466,7 +476,9 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         let (config_digest, config_verity, layer_refs, stats) = self
             .ensure_config_with_layers(layers, config_descriptor)
             .await
-            .with_context(|| format!("Failed to pull config {config_descriptor:?}"))?;
+            .with_context(|| {
+                format!("Failed to pull image content for manifest {manifest_digest}")
+            })?;
 
         let manifest_content_id = manifest_identifier(&manifest_digest);
         let manifest_verity = if let Some(verity) = self.repo.has_stream(&manifest_content_id)? {
