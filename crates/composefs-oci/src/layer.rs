@@ -18,11 +18,6 @@ use composefs::shared_internals::IO_BUF_CAPACITY;
 use crate::skopeo::TAR_LAYER_CONTENT_TYPE;
 use crate::tar::split_async;
 
-/// Sync blob streams accepted by [`crate::delta::DeltaBlobReader`].
-pub(crate) trait BlobStream: std::io::Read + Send {}
-
-impl<T: std::io::Read + Send> BlobStream for T {}
-
 /// Check if a media type represents a tar-based layer.
 pub fn is_tar_media_type(media_type: &MediaType) -> bool {
     matches!(

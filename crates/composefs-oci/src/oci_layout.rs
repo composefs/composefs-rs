@@ -39,14 +39,13 @@ use tracing::debug;
 use composefs::fsverity::FsVerityHashValue;
 use composefs::repository::{ObjectStoreMethod, Repository};
 
-use crate::layer::{
-    BlobStream, decompress_async, import_tar_async, is_tar_media_type, store_blob_async,
-};
+use crate::layer::{decompress_async, import_tar_async, is_tar_media_type, store_blob_async};
 use crate::oci_image::manifest_identifier;
 use crate::progress::{ComponentId, ProgressEvent, ProgressRead, ProgressUnit, SharedReporter};
 use crate::skopeo::OCI_BLOB_CONTENT_TYPE;
 use crate::skopeo::{OCI_CONFIG_CONTENT_TYPE, OCI_MANIFEST_CONTENT_TYPE};
 use crate::{ImportStats, config_identifier, layer_identifier};
+use oci_delta::BlobStream;
 
 use crate::skopeo::PullResult;
 
@@ -116,7 +115,7 @@ fn detect_delta_manifest(oci: &impl OciRead) -> Result<Option<ImageManifest>> {
     let mut manifest_data = Vec::new();
     oci.read_blob(desc)?.read_to_end(&mut manifest_data)?;
     match ImageManifest::from_reader(&manifest_data[..]) {
-        Ok(manifest) if crate::delta::is_delta_artifact(&manifest) => Ok(Some(manifest)),
+        Ok(manifest) if oci_delta::is_delta_artifact(&manifest) => Ok(Some(manifest)),
         Ok(_) => Ok(None),
         Err(err) => {
             debug!("Ignoring unparseable manifest {}: {err}", desc.digest());
@@ -529,8 +528,8 @@ async fn import_layer_from_blob<ObjectID: FsVerityHashValue>(
 /// Blob reader that owns an [`OciRead`] backend, for use with delta imports.
 struct OciBlobReader<T: OciRead + Send + Sync>(T);
 
-impl<T: OciRead + Send + Sync> crate::delta::DeltaBlobReader for OciBlobReader<T> {
-    fn open_blob(&self, desc: &Descriptor) -> crate::delta::BlobStreamFuture<'_> {
+impl<T: OciRead + Send + Sync> oci_delta::DeltaBlobReader for OciBlobReader<T> {
+    fn open_blob(&self, desc: &Descriptor) -> oci_delta::BlobStreamFuture<'_> {
         let result = self
             .0
             .read_blob(desc)
