@@ -469,7 +469,7 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
         )?;
 
         // Delta artifact detection
-        if crate::delta::is_delta_artifact(&manifest) {
+        if oci_delta::is_delta_artifact(&manifest) {
             return self.pull_delta(&manifest).await;
         }
 
@@ -543,8 +543,8 @@ struct ProxyBlobReader<ObjectID: FsVerityHashValue> {
     image_op: Arc<ImageOp<ObjectID>>,
 }
 
-impl<ObjectID: FsVerityHashValue> crate::delta::DeltaBlobReader for ProxyBlobReader<ObjectID> {
-    fn open_blob(&self, desc: &Descriptor) -> crate::delta::BlobStreamFuture<'_> {
+impl<ObjectID: FsVerityHashValue> oci_delta::DeltaBlobReader for ProxyBlobReader<ObjectID> {
+    fn open_blob(&self, desc: &Descriptor) -> oci_delta::BlobStreamFuture<'_> {
         let desc = desc.clone();
         Box::pin(async move {
             let (reader, driver) = self
@@ -565,7 +565,7 @@ impl<ObjectID: FsVerityHashValue> crate::delta::DeltaBlobReader for ProxyBlobRea
                 let mut std_file = async_dst.into_std().await;
                 use std::io::Seek;
                 std_file.seek(std::io::SeekFrom::Start(0))?;
-                anyhow::Ok(Box::new(std_file) as Box<dyn crate::layer::BlobStream>)
+                anyhow::Ok(Box::new(std_file) as Box<dyn oci_delta::BlobStream>)
             };
             let (file_result, driver_result) = tokio::join!(copy_fut, driver);
             let _: () = driver_result?;
