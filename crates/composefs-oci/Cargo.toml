@@ -43,7 +43,9 @@ tar = { version = "0.4.38", default-features = false, optional = true }
 tar-core = "0.1.0"
 tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io", "io-util"] }
-tracing = { version = "0.1", default-features = false }
+# "log" makes tracing events fall back to `log` records when no tracing
+# subscriber is installed, so they reach composefs-ctl's env_logger.
+tracing = { version = "0.1", default-features = false, features = ["log"] }
 zstd = { version = "0.14.0", default-features = false }
 cap-std-ext = { workspace = true }
 ocidir = { workspace = true }
