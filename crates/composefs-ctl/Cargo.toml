@@ -47,7 +47,7 @@ hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.18.0", default-features = false }
 libsystemd = { version = "0.7" }
 log = { version = "0.4", default-features = false }
-rustix = { version = "1.0.0", default-features = false, features = ["fs", "net", "pipe", "process", "thread"] }
+rustix = { version = "1.1.5", default-features = false, features = ["fs", "net", "pipe", "process", "thread"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tokio = { version = "1.24.2", default-features = false, features = ["io-std", "io-util", "net", "rt", "rt-multi-thread", "sync"] }

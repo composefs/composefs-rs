@@ -33,7 +33,7 @@ containers-image-proxy = { version = "0.11", default-features = false }
 cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.9.2", optional = true }
 hex = { version = "0.4.0", default-features = false }
 indicatif = { version = "0.18.0", default-features = false }
-rustix = { version = "1.0.0", features = ["fs"] }
+rustix = { version = "1.1.5", features = ["fs"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 thiserror = { version = "2.0.0", default-features = false }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

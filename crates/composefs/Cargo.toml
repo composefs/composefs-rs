@@ -26,7 +26,7 @@ fn-error-context = "0.2"
 hex = { version = "0.4.0", default-features = false, features = ["std"] }
 log = { version = "0.4.8", default-features = false }
 once_cell = { version = "1.21.3", default-features = false, features = ["std"] }
-rustix = { version = "1.0.0", default-features = false, features = ["fs", "mount", "process", "std", "thread"] }
+rustix = { version = "1.1.5", default-features = false, features = ["fs", "mount", "process", "std", "thread"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 openssl = { version = "0.10", default-features = false }
 thiserror = { version = "2.0.0", default-features = false }
