@@ -283,7 +283,7 @@ pub fn get_cmdline_buffered<R: Read + Seek>(image: &mut R) -> Result<String, Uki
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use core::mem::size_of;
 
     use similar_asserts::assert_eq;
@@ -338,6 +338,31 @@ mod test {
                 ..Default::default()
             }],
             &[osrel],
+        )
+    }
+
+    pub(crate) fn uki_with_linux_initrd() -> Vec<u8> {
+        let linux = b"linux";
+        let initrd = b"initrd";
+        let linux_offset = data_offset(2);
+        let initrd_offset = linux_offset + linux.len();
+        peify(
+            b"",
+            &[
+                SectionHeader {
+                    name: *b".linux\0\0",
+                    virtual_size: U32::new(linux.len() as u32),
+                    pointer_to_raw_data: U32::new(linux_offset as u32),
+                    ..Default::default()
+                },
+                SectionHeader {
+                    name: *b".initrd\0",
+                    virtual_size: U32::new(initrd.len() as u32),
+                    pointer_to_raw_data: U32::new(initrd_offset as u32),
+                    ..Default::default()
+                },
+            ],
+            &[linux, initrd],
         )
     }
 

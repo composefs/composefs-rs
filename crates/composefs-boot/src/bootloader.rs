@@ -2,16 +2,17 @@
 //!
 //! This module provides functionality to parse and manipulate Boot Loader Specification
 //! entries and Unified Kernel Images (UKIs). It supports Type 1 BLS entries with separate
-//! kernel and initrd files, Type 2 UKI files, and traditional vmlinuz/initramfs pairs
-//! from /usr/lib/modules. Key types include `BootLoaderEntryFile` for parsing BLS
-//! configuration files and `BootEntry` enum for representing different boot entry types.
+//! kernel and initrd files, Type 2 UKI files, traditional vmlinuz/initramfs pairs,
+//! and aboot payloads. Key types include `BootLoaderEntryFile` for parsing BLS
+//! configuration files and `BootEntry` for representing boot entry types.
 
 use core::ops::Range;
 use std::{
-    collections::HashMap, ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf, str::from_utf8,
+    collections::HashMap, ffi::OsStr, io::Cursor, os::unix::ffi::OsStrExt, path::Path,
+    path::PathBuf, str::from_utf8,
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use composefs::{
     fsverity::FsVerityHashValue,
@@ -19,7 +20,7 @@ use composefs::{
     tree::{DirectoryRef, FileSystem, ImageError, Inode, LeafContent, RegularFile},
 };
 
-use crate::cmdline::split_cmdline;
+use crate::{android_boot::AndroidBootImage, cmdline::split_cmdline, uki};
 
 /// Strips the key (if it matches) plus the following whitespace from a single line in a "Type #1
 /// Boot Loader Specification Entry" file.
@@ -563,10 +564,194 @@ initrd /{id}/initramfs.img
     }
 }
 
+/// Encoding of an aboot partition payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbootEncoding {
+    /// Android boot image version 2.
+    AndroidV2,
+    /// Unified Kernel Image written to a ukiboot partition.
+    Uki,
+}
+
+/// File backing an aboot artifact.
+#[derive(Debug, Clone)]
+pub struct AbootArtifact<ObjectID: FsVerityHashValue> {
+    /// Source path in the image.
+    pub path: PathBuf,
+    /// Artifact contents.
+    pub file: RegularFile<ObjectID>,
+}
+
+/// An aboot payload and its optional matching vbmeta image.
+#[derive(Debug)]
+pub struct AbootEntry<ObjectID: FsVerityHashValue> {
+    /// Kernel version associated with the payload.
+    pub kver: Box<str>,
+    /// Payload encoding.
+    pub encoding: AbootEncoding,
+    /// Android boot image or ukiboot UKI.
+    pub payload: AbootArtifact<ObjectID>,
+    /// Matching vbmeta image for Android boot payloads.
+    pub vbmeta: Option<AbootArtifact<ObjectID>>,
+}
+
+fn aboot_encoding<ObjectID: FsVerityHashValue>(
+    file: &RegularFile<ObjectID>,
+    repo: &Repository<ObjectID>,
+) -> Result<AbootEncoding> {
+    let data = composefs::fs::read_file(file, repo)?;
+    if data.starts_with(b"ANDROID!") {
+        let mut image = Cursor::new(&data);
+        AndroidBootImage::parse(&mut image).context("Parsing Android boot image")?;
+        return Ok(AbootEncoding::AndroidV2);
+    }
+
+    uki::get_section(&data, ".linux")
+        .ok_or(uki::UkiError::PortableExecutableError)?
+        .context("Parsing aboot payload as UKI")?;
+    uki::get_section(&data, ".initrd")
+        .ok_or(uki::UkiError::PortableExecutableError)?
+        .context("Parsing aboot payload as UKI")?;
+    Ok(AbootEncoding::Uki)
+}
+
+fn optional_file<'a, ObjectID: FsVerityHashValue>(
+    dir: DirectoryRef<'a, ObjectID>,
+    name: &OsStr,
+) -> Result<Option<&'a RegularFile<ObjectID>>> {
+    match dir.get_file(name) {
+        Ok(file) => Ok(Some(file)),
+        Err(ImageError::NotFound(..)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+impl<ObjectID: FsVerityHashValue> AbootEntry<ObjectID> {
+    fn load(
+        kver: Box<str>,
+        payload_path: &Path,
+        payload: &RegularFile<ObjectID>,
+        vbmeta_path: &Path,
+        vbmeta: Option<&RegularFile<ObjectID>>,
+        repo: &Repository<ObjectID>,
+    ) -> Result<Self> {
+        let encoding = aboot_encoding(payload, repo)
+            .with_context(|| format!("Identifying aboot payload {payload_path:?}"))?;
+        if encoding == AbootEncoding::Uki && vbmeta.is_some() {
+            bail!("ukiboot payload {payload_path:?} must not have a vbmeta image");
+        }
+        Ok(Self {
+            kver,
+            encoding,
+            payload: AbootArtifact {
+                path: payload_path.to_path_buf(),
+                file: payload.clone(),
+            },
+            vbmeta: vbmeta.map(|file| AbootArtifact {
+                path: vbmeta_path.to_path_buf(),
+                file: file.clone(),
+            }),
+        })
+    }
+
+    /// Discover aboot artifacts in `/boot` and `/usr/lib/modules`.
+    pub fn load_all(fs: &FileSystem<ObjectID>, repo: &Repository<ObjectID>) -> Result<Vec<Self>> {
+        let root = fs.as_dir();
+        let mut entries = Vec::new();
+
+        match root.get_directory_ref("/boot".as_ref()) {
+            Ok(boot) => {
+                for (filename, inode) in boot.entries() {
+                    let name = filename.as_bytes();
+                    let Some(kver) = name
+                        .strip_prefix(b"aboot-")
+                        .and_then(|name| name.strip_suffix(b".img"))
+                    else {
+                        continue;
+                    };
+                    if kver.is_empty() {
+                        bail!("aboot payload has no kernel version");
+                    }
+                    let Inode::Leaf(leaf_id, _) = inode else {
+                        bail!("/boot/{filename:?} is a directory");
+                    };
+                    let LeafContent::Regular(payload) = &fs.leaf(*leaf_id).content else {
+                        bail!("/boot/{filename:?} is not a regular file");
+                    };
+                    let kver = from_utf8(kver)?;
+                    let vbmeta_name = format!("vbmeta-{kver}.img");
+                    let vbmeta = optional_file(boot, vbmeta_name.as_ref())?;
+                    entries.push(Self::load(
+                        kver.into(),
+                        &PathBuf::from("/boot").join(filename),
+                        payload,
+                        &PathBuf::from("/boot").join(&vbmeta_name),
+                        vbmeta,
+                        repo,
+                    )?);
+                }
+                for (filename, _) in boot.entries() {
+                    let name = filename.as_bytes();
+                    let Some(kver) = name
+                        .strip_prefix(b"vbmeta-")
+                        .and_then(|name| name.strip_suffix(b".img"))
+                    else {
+                        continue;
+                    };
+                    let payload_name = format!("aboot-{}.img", from_utf8(kver)?);
+                    if optional_file(boot, payload_name.as_ref())?.is_none() {
+                        bail!("vbmeta image /boot/{filename:?} has no matching aboot payload");
+                    }
+                }
+            }
+            Err(ImageError::NotFound(..)) => {}
+            Err(error) => Err(error)?,
+        }
+
+        match root.get_directory_ref("/usr/lib/modules".as_ref()) {
+            Ok(modules) => {
+                for (kver, inode) in modules.entries() {
+                    let Inode::Directory(dir) = inode else {
+                        continue;
+                    };
+                    let dir = DirectoryRef::from_parts(dir, root.leaves());
+                    let payload = optional_file(dir, "aboot.img".as_ref())?;
+                    let vbmeta = optional_file(dir, "vbmeta.img".as_ref())?;
+                    let Some(payload) = payload else {
+                        if vbmeta.is_some() {
+                            bail!(
+                                "vbmeta image /usr/lib/modules/{kver:?}/vbmeta.img has no matching aboot payload"
+                            );
+                        }
+                        continue;
+                    };
+                    let kver = from_utf8(kver.as_bytes())?;
+                    let base = PathBuf::from("/usr/lib/modules").join(kver);
+                    entries.push(Self::load(
+                        kver.into(),
+                        &base.join("aboot.img"),
+                        payload,
+                        &base.join("vbmeta.img"),
+                        vbmeta,
+                        repo,
+                    )?);
+                }
+            }
+            Err(ImageError::NotFound(..)) => {}
+            Err(error) => Err(error)?,
+        }
+
+        if entries.len() > 1 {
+            bail!("multiple aboot payloads found");
+        }
+        Ok(entries)
+    }
+}
+
 /// Represents any type of boot entry found in the filesystem.
 ///
-/// This enum unifies the three types of boot entries that can be discovered:
-/// Type 1 BLS entries, Type 2 UKIs, and traditional vmlinuz/initramfs pairs.
+/// This enum unifies Type 1 BLS entries, Type 2 UKIs, traditional
+/// vmlinuz/initramfs pairs, and aboot payloads.
 #[derive(Debug)]
 pub enum BootEntry<ObjectID: FsVerityHashValue> {
     /// Boot Loader Specification Type 1 entry
@@ -575,13 +760,14 @@ pub enum BootEntry<ObjectID: FsVerityHashValue> {
     Type2(Type2Entry<ObjectID>),
     /// Traditional vmlinuz from /usr/lib/modules
     UsrLibModulesVmLinuz(UsrLibModulesVmlinuz<ObjectID>),
+    /// Android boot or ukiboot partition payload.
+    Aboot(AbootEntry<ObjectID>),
 }
 
 /// Extracts all boot resources from a filesystem image.
 ///
-/// Scans the filesystem for all types of boot entries: Type 1 BLS entries in
-/// /boot/loader/entries, Type 2 UKIs in /boot/EFI/Linux, and traditional vmlinuz
-/// files in /usr/lib/modules.
+/// Scans the filesystem for Type 1 BLS entries, Type 2 UKIs, traditional
+/// vmlinuz files, and aboot payloads.
 ///
 /// # Arguments
 ///
@@ -606,6 +792,18 @@ pub fn get_boot_resources<ObjectID: FsVerityHashValue>(
     for e in UsrLibModulesVmlinuz::load_all(image)? {
         entries.push(BootEntry::UsrLibModulesVmLinuz(e));
     }
+    let aboot_entries = AbootEntry::load_all(image, repo)?;
+    let has_other_primary = entries.iter().any(|entry| match entry {
+        BootEntry::Type1(_) | BootEntry::UsrLibModulesVmLinuz(_) => true,
+        BootEntry::Type2(entry) => matches!(entry.pe_type, PEType::Uki),
+        BootEntry::Aboot(_) => unreachable!(),
+    });
+    if !aboot_entries.is_empty() && has_other_primary {
+        bail!("aboot payload cannot be combined with other boot artifacts");
+    }
+    for entry in aboot_entries {
+        entries.push(BootEntry::Aboot(entry));
+    }
 
     Ok(entries)
 }
@@ -613,10 +811,191 @@ pub fn get_boot_resources<ObjectID: FsVerityHashValue>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use composefs::{fsverity::Sha256HashValue, tree::RegularFile};
+    use composefs::{
+        fsverity::Sha256HashValue,
+        test::TestRepo,
+        tree::{Directory, FileSystem, Inode, LeafContent, RegularFile, Stat},
+    };
 
     fn fake_file() -> RegularFile<Sha256HashValue> {
         RegularFile::Inline(Default::default())
+    }
+
+    fn boot_filesystem() -> FileSystem<Sha256HashValue> {
+        let mut fs = FileSystem::new(Stat::uninitialized());
+        fs.root.insert(
+            "boot".as_ref(),
+            Inode::Directory(Box::new(Directory::new(Stat::uninitialized()))),
+        );
+        fs
+    }
+
+    fn add_external(
+        fs: &mut FileSystem<Sha256HashValue>,
+        repo: &Repository<Sha256HashValue>,
+        directory: &str,
+        name: &str,
+        data: &[u8],
+    ) {
+        let object_id = repo.ensure_object(data).unwrap();
+        let leaf = fs.push_leaf(
+            Stat::uninitialized(),
+            LeafContent::Regular(RegularFile::External(object_id, data.len() as u64)),
+        );
+        fs.root
+            .get_directory_mut(directory.as_ref())
+            .unwrap()
+            .insert(name.as_ref(), Inode::leaf(leaf));
+    }
+
+    fn add_modules_vmlinuz(fs: &mut FileSystem<Sha256HashValue>) {
+        let leaf = fs.push_leaf(
+            Stat::uninitialized(),
+            LeafContent::Regular(RegularFile::Inline(Box::from(&b"kernel"[..]))),
+        );
+        let mut kver = Directory::new(Stat::uninitialized());
+        kver.insert("vmlinuz".as_ref(), Inode::leaf(leaf));
+        let mut modules = Directory::new(Stat::uninitialized());
+        modules.insert("1.0".as_ref(), Inode::Directory(Box::new(kver)));
+        let mut lib = Directory::new(Stat::uninitialized());
+        lib.insert("modules".as_ref(), Inode::Directory(Box::new(modules)));
+        let mut usr = Directory::new(Stat::uninitialized());
+        usr.insert("lib".as_ref(), Inode::Directory(Box::new(lib)));
+        fs.root
+            .insert("usr".as_ref(), Inode::Directory(Box::new(usr)));
+    }
+
+    #[test]
+    fn test_aboot_android_discovery() {
+        let repo = TestRepo::<Sha256HashValue>::new();
+        let mut fs = boot_filesystem();
+        let image = crate::android_boot::tests::image(b"kernel", b"initrd", b"dtb");
+        add_external(&mut fs, &repo.repo, "/boot", "aboot-1.0.img", &image);
+        add_external(&mut fs, &repo.repo, "/boot", "vbmeta-1.0.img", b"vbmeta");
+
+        let entries = get_boot_resources(&fs, &repo.repo).unwrap();
+        let [BootEntry::Aboot(entry)] = entries.as_slice() else {
+            panic!("unexpected entries: {entries:?}");
+        };
+        assert_eq!(entry.kver.as_ref(), "1.0");
+        assert_eq!(entry.encoding, AbootEncoding::AndroidV2);
+        assert_eq!(entry.payload.path, PathBuf::from("/boot/aboot-1.0.img"));
+        assert!(entry.vbmeta.is_some());
+    }
+
+    #[test]
+    fn test_aboot_uki_discovery() {
+        let repo = TestRepo::<Sha256HashValue>::new();
+        let mut fs = boot_filesystem();
+        let image = crate::uki::test::uki_with_linux_initrd();
+        add_external(&mut fs, &repo.repo, "/boot", "aboot-1.0.img", &image);
+
+        let entries = get_boot_resources(&fs, &repo.repo).unwrap();
+        let [BootEntry::Aboot(entry)] = entries.as_slice() else {
+            panic!("unexpected entries: {entries:?}");
+        };
+        assert_eq!(entry.encoding, AbootEncoding::Uki);
+        assert!(entry.vbmeta.is_none());
+    }
+
+    #[test]
+    fn test_aboot_rejects_multiple_payloads() {
+        let repo = TestRepo::<Sha256HashValue>::new();
+        let mut fs = boot_filesystem();
+        let image = crate::android_boot::tests::image(b"kernel", b"initrd", b"");
+        add_external(&mut fs, &repo.repo, "/boot", "aboot-1.0.img", &image);
+        add_external(&mut fs, &repo.repo, "/boot", "aboot-2.0.img", &image);
+
+        let error = get_boot_resources(&fs, &repo.repo).unwrap_err();
+        assert!(error.to_string().contains("multiple aboot payloads"));
+    }
+
+    #[test]
+    fn test_aboot_rejects_mixed_artifacts() {
+        let repo = TestRepo::<Sha256HashValue>::new();
+        let mut fs = boot_filesystem();
+        let image = crate::android_boot::tests::image(b"kernel", b"initrd", b"");
+        add_external(&mut fs, &repo.repo, "/boot", "aboot-1.0.img", &image);
+        add_modules_vmlinuz(&mut fs);
+
+        let error = get_boot_resources(&fs, &repo.repo).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("aboot payload cannot be combined")
+        );
+    }
+
+    #[test]
+    fn test_ukiboot_rejects_vbmeta() {
+        let repo = TestRepo::<Sha256HashValue>::new();
+        let mut fs = boot_filesystem();
+        let image = crate::uki::test::uki_with_linux_initrd();
+        add_external(&mut fs, &repo.repo, "/boot", "aboot-1.0.img", &image);
+        add_external(&mut fs, &repo.repo, "/boot", "vbmeta-1.0.img", b"vbmeta");
+
+        let error = get_boot_resources(&fs, &repo.repo).unwrap_err();
+        assert!(error.to_string().contains("must not have a vbmeta image"));
+    }
+
+    #[test]
+    fn test_aboot_inline_artifacts() {
+        for external_payload in [false, true] {
+            let repo = TestRepo::<Sha256HashValue>::new();
+            let mut fs = boot_filesystem();
+            let image = crate::android_boot::tests::image(b"kernel", b"initrd", b"");
+            if external_payload {
+                add_external(&mut fs, &repo.repo, "/boot", "aboot-1.0.img", &image);
+            } else {
+                let leaf = fs.push_leaf(
+                    Stat::uninitialized(),
+                    LeafContent::Regular(RegularFile::Inline(image.clone().into_boxed_slice())),
+                );
+                fs.root
+                    .get_directory_mut("/boot".as_ref())
+                    .unwrap()
+                    .insert("aboot-1.0.img".as_ref(), Inode::leaf(leaf));
+            }
+            let leaf = fs.push_leaf(
+                Stat::uninitialized(),
+                LeafContent::Regular(RegularFile::Inline(b"vbmeta".as_slice().into())),
+            );
+            fs.root
+                .get_directory_mut("/boot".as_ref())
+                .unwrap()
+                .insert("vbmeta-1.0.img".as_ref(), Inode::leaf(leaf));
+
+            let entries = get_boot_resources(&fs, &repo.repo).unwrap();
+            let [BootEntry::Aboot(entry)] = entries.as_slice() else {
+                panic!("unexpected entries: {entries:?}");
+            };
+            assert_eq!(entry.encoding, AbootEncoding::AndroidV2);
+            assert_eq!(
+                composefs::fs::read_file(&entry.payload.file, &repo.repo)
+                    .unwrap()
+                    .as_ref(),
+                image.as_slice(),
+            );
+            let vbmeta = entry.vbmeta.as_ref().unwrap();
+            assert_eq!(vbmeta.path, PathBuf::from("/boot/vbmeta-1.0.img"));
+            assert!(matches!(vbmeta.file, RegularFile::Inline(_)));
+            assert_eq!(
+                composefs::fs::read_file(&vbmeta.file, &repo.repo)
+                    .unwrap()
+                    .as_ref(),
+                b"vbmeta",
+            );
+        }
+    }
+
+    #[test]
+    fn test_aboot_rejects_orphan_vbmeta() {
+        let repo = TestRepo::<Sha256HashValue>::new();
+        let mut fs = boot_filesystem();
+        add_external(&mut fs, &repo.repo, "/boot", "vbmeta-1.0.img", b"vbmeta");
+
+        let error = get_boot_resources(&fs, &repo.repo).unwrap_err();
+        assert!(error.to_string().contains("has no matching aboot payload"));
     }
 
     #[test]
