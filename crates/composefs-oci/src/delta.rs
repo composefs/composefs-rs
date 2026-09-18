@@ -4,14 +4,12 @@
 //! Its layers contain the target image manifest, config, and changed layer
 //! blobs (as tar-diff patches or original gzip layers). Layers identical
 //! between source and target (by diff_id) are omitted from the delta.
-//! For more information, see https://github.com/containers/oci-delta
+//! For more information, see <https://github.com/containers/oci-delta>
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::future::Future;
-use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::available_parallelism;
@@ -22,70 +20,19 @@ use composefs::fsverity::FsVerityHashValue;
 use composefs::repository::Repository;
 use composefs::tree::RegularFile;
 use containers_image_proxy::oci_spec::image::{
-    Descriptor, Digest as OciDigest, DigestAlgorithm, ImageConfiguration, ImageManifest, MediaType,
+    Digest as OciDigest, ImageConfiguration, ImageManifest, MediaType,
 };
 
+use oci_delta::{
+    BlobStream, DeltaBlobReader, DeltaDataSource, parse_delta_manifest, reconstruct_layer_to,
+};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::layer::BlobStream;
 use crate::oci_image;
 use crate::progress::{ComponentId, ProgressEvent, ProgressUnit, SharedReporter};
 use crate::skopeo::PullResult;
 use crate::{ImportStats, layer_identifier};
-
-pub(crate) const MEDIA_TYPE_DELTA: &str = "application/vnd.io.github.containers.oci-delta.v1";
-fn media_type_tar_diff() -> MediaType {
-    MediaType::Other("application/vnd.tar-diff".to_string())
-}
-const ANNOTATION_DELTA_SOURCE_CONFIG: &str = "io.github.containers.delta.source-config";
-const ANNOTATION_DELTA_TO: &str = "io.github.containers.delta.to";
-const ANNOTATION_DELTA_CONTENT: &str = "io.github.containers.delta.content";
-
-const TAR_DIFF_HEADER_V1: &[u8; 8] = b"tardf1\n\0";
-const TAR_DIFF_HEADER_V2: &[u8; 8] = b"tardf2\n\0";
-
-// tar-diff opcodes
-const OP_DATA: u8 = 0;
-const OP_OPEN: u8 = 1;
-const OP_COPY: u8 = 2;
-const OP_ADD_DATA: u8 = 3;
-const OP_SEEK: u8 = 4;
-const OP_ZSTD_DICT: u8 = 5;
-
-// DoS protection limits from the Go tar-patch reference implementation
-const MAX_FILENAME_SIZE: u64 = 4 * 1024;
-const MAX_ADD_DATA_SIZE: u64 = 100 * 1024 * 1024;
-
-/// Bump max dict size to the generator max so that we accept all generated ones
-/// but no more.
-const MAX_ZSTD_DICT_WINDOW_LOG: u32 = 29;
-const MAX_ZSTD_DICT_SIZE: u64 = 1 << MAX_ZSTD_DICT_WINDOW_LOG;
-
-// ─── Blob reader trait ──────────────────────────────────────────────────────
-
-/// The future returned by [`DeltaBlobReader::open_blob`].
-pub(crate) type BlobStreamFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Box<dyn BlobStream>>> + Send + 'a>>;
-
-/// Read blobs from a delta artifact by digest.
-///
-/// Implemented for OCI layout directories and pre-fetched blob maps
-/// (used by the skopeo proxy path which fetches blobs asynchronously).
-pub(crate) trait DeltaBlobReader: Send + Sync {
-    /// Open a blob for reading by digest.
-    /// For local storage this opens the file directly. For remote transports
-    /// this fetches the blob to a local temp file first.
-    fn open_blob(&self, desc: &Descriptor) -> BlobStreamFuture<'_>;
-}
-
-/// Check whether an OCI manifest is a delta artifact.
-pub(crate) fn is_delta_artifact(manifest: &ImageManifest) -> bool {
-    manifest
-        .artifact_type()
-        .as_ref()
-        .is_some_and(|t| t.to_string() == MEDIA_TYPE_DELTA)
-}
 
 // ─── Composefs-backed data source for tar-patch ─────────────────────────────
 
@@ -124,7 +71,7 @@ struct ComposeFsDataSource<ObjectID: FsVerityHashValue> {
     current: Option<CurrentFile>,
 }
 
-impl<ObjectID: FsVerityHashValue> ComposeFsDataSource<ObjectID> {
+impl<ObjectID: FsVerityHashValue> DeltaDataSource for ComposeFsDataSource<ObjectID> {
     fn set_current_file(&mut self, path: &str) -> Result<()> {
         let path = Path::new(path);
         let (dir, filename) = self
@@ -191,7 +138,7 @@ impl<ObjectID: FsVerityHashValue> ComposeFsDataSource<ObjectID> {
         Ok(data)
     }
 
-    fn copy_to(&mut self, dst: &mut impl Write, n: u64) -> Result<()> {
+    fn copy_to(&mut self, dst: &mut dyn Write, n: u64) -> Result<()> {
         let current = self
             .current
             .as_mut()
@@ -207,202 +154,8 @@ impl<ObjectID: FsVerityHashValue> ComposeFsDataSource<ObjectID> {
 
 // ─── Tar-patch apply ────────────────────────────────────────────────────────
 
-fn read_uvarint(r: &mut impl io::BufRead) -> Result<u64> {
-    let mut result: u64 = 0;
-    let mut shift: u8 = 0;
-    loop {
-        let mut byte = [0u8; 1];
-        r.read_exact(&mut byte)?;
-        let bits = (byte[0] & 0x7f) as u64;
-        ensure!(
-            shift < 64 && bits <= (u64::MAX >> shift),
-            "uvarint overflow"
-        );
-        result |= bits << shift;
-        if byte[0] & 0x80 == 0 {
-            return Ok(result);
-        }
-        shift = shift.checked_add(7).context("uvarint overflow")?;
-    }
-}
-
-enum OciHasher {
-    Sha256(composefs::digest::Sha256),
-    Sha384(composefs::digest::Sha384),
-    Sha512(composefs::digest::Sha512),
-}
-
-impl OciHasher {
-    fn new(algorithm: &DigestAlgorithm) -> Result<Self> {
-        use composefs::digest::Digest;
-        match algorithm {
-            &DigestAlgorithm::Sha256 => Ok(Self::Sha256(composefs::digest::Sha256::new())),
-            &DigestAlgorithm::Sha384 => Ok(Self::Sha384(composefs::digest::Sha384::new())),
-            &DigestAlgorithm::Sha512 => Ok(Self::Sha512(composefs::digest::Sha512::new())),
-            other => bail!("Unsupported digest algorithm: {other}"),
-        }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        use composefs::digest::Digest;
-        match self {
-            Self::Sha256(h) => h.update(data),
-            Self::Sha384(h) => h.update(data),
-            Self::Sha512(h) => h.update(data),
-        }
-    }
-
-    fn finalize(self) -> Result<OciDigest> {
-        use composefs::digest::Digest;
-        let (algorithm, hex) = match self {
-            Self::Sha256(h) => ("sha256", hex::encode(h.finalize())),
-            Self::Sha384(h) => ("sha384", hex::encode(h.finalize())),
-            Self::Sha512(h) => ("sha512", hex::encode(h.finalize())),
-        };
-        format!("{algorithm}:{hex}")
-            .parse()
-            .context("Constructed digest")
-    }
-}
-
-struct HashingWriter<'a, W: Write> {
-    inner: &'a mut W,
-    hasher: &'a mut OciHasher,
-}
-
-impl<W: Write> Write for HashingWriter<'_, W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.hasher.update(&buf[..n]);
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-fn tar_patch_apply<ObjectID: FsVerityHashValue>(
-    delta: impl Read,
-    data_source: &mut ComposeFsDataSource<ObjectID>,
-    mut dst: impl Write,
-) -> Result<()> {
-    let mut header_buf = [0u8; 8];
-    let mut reader = io::BufReader::new(delta);
-    reader.read_exact(&mut header_buf)?;
-    let is_v2 = if header_buf == *TAR_DIFF_HEADER_V2 {
-        true
-    } else if header_buf == *TAR_DIFF_HEADER_V1 {
-        false
-    } else {
-        bail!("Invalid tar-diff header");
-    };
-
-    let decoder =
-        zstd::stream::read::Decoder::new(reader).context("Creating zstd decoder for tar-diff")?;
-    let mut r = io::BufReader::new(decoder);
-
-    loop {
-        let buf = r.fill_buf()?;
-        if buf.is_empty() {
-            break;
-        }
-        let op = buf[0];
-        r.consume(1);
-        let size = read_uvarint(&mut r)?;
-
-        match op {
-            OP_DATA => {
-                let copied = io::copy(&mut (&mut r).take(size), &mut dst)?;
-                ensure!(
-                    copied == size,
-                    "Short OP_DATA: expected {size}, got {copied}"
-                );
-            }
-            OP_OPEN => {
-                ensure!(
-                    size <= MAX_FILENAME_SIZE,
-                    "Filename size {size} exceeds limit"
-                );
-                let mut name_buf = vec![0u8; size as usize];
-                r.read_exact(&mut name_buf)?;
-                let name =
-                    String::from_utf8(name_buf).context("Invalid UTF-8 in tar-diff filename")?;
-                data_source.set_current_file(&name)?;
-            }
-            OP_COPY => {
-                data_source.copy_to(&mut dst, size)?;
-            }
-            OP_ADD_DATA => {
-                ensure!(
-                    size <= MAX_ADD_DATA_SIZE,
-                    "AddData size {size} exceeds limit"
-                );
-                let mut delta_bytes = vec![0u8; size as usize];
-                r.read_exact(&mut delta_bytes)?;
-                let mut source_bytes = vec![0u8; size as usize];
-                data_source
-                    .read_exact_current(&mut source_bytes)
-                    .context("Reading source data for AddData")?;
-                let n = source_bytes.len();
-                for i in 0..n {
-                    delta_bytes[i] = delta_bytes[i].wrapping_add(source_bytes[i]);
-                }
-                dst.write_all(&delta_bytes)?;
-            }
-            OP_SEEK => {
-                data_source.seek_current(size)?;
-            }
-            OP_ZSTD_DICT => {
-                ensure!(is_v2, "ZstdDict op requires a tardf2 delta");
-                // The dictionary is the whole source file, read it all
-                let dict = data_source
-                    .read_current_to_end(MAX_ZSTD_DICT_SIZE)
-                    .context("Reading source file as zstd dictionary")?;
-                let mut frame = Read::by_ref(&mut r).take(size);
-                {
-                    let mut decoder =
-                        zstd::stream::read::Decoder::with_ref_prefix(&mut frame, &dict)
-                            .context("Creating zstd decoder for ZstdDict op")?
-                            .single_frame();
-                    decoder
-                        .window_log_max(MAX_ZSTD_DICT_WINDOW_LOG)
-                        .context("Setting zstd window limit for ZstdDict op")?;
-                    io::copy(&mut decoder, &mut dst).context("Applying ZstdDict op")?;
-                }
-                // Skip any unread data from the delta stream to ensure the underlying
-                // delta stream is at the end of the op.
-                io::copy(&mut frame, &mut io::sink())
-                    .context("Skipping trailing bytes after ZstdDict frame")?;
-            }
-            _ => bail!("Unexpected tar-diff op {op}"),
-        }
-    }
-
-    Ok(())
-}
-
-// ─── Delta layer reconstruction ─────────────────────────────────────────────
-
 /// Reconstruct a single layer's uncompressed tar from a delta blob.
 /// Returns a seeked-to-start temp file with diff_id already verified.
-fn decompress_layer(
-    reader: impl BlobStream + 'static,
-    media_type: &MediaType,
-) -> Result<Box<dyn BlobStream>> {
-    let buf = BufReader::new(reader);
-    match media_type {
-        MediaType::ImageLayer | MediaType::ImageLayerNonDistributable => Ok(Box::new(buf)),
-        MediaType::ImageLayerGzip | MediaType::ImageLayerNonDistributableGzip => {
-            Ok(Box::new(BufReader::new(flate2::read::GzDecoder::new(buf))))
-        }
-        MediaType::ImageLayerZstd | MediaType::ImageLayerNonDistributableZstd => Ok(Box::new(
-            BufReader::new(zstd::stream::read::Decoder::new(buf)?),
-        )),
-        _ => bail!("Unsupported layer media type: {media_type}"),
-    }
-}
-
 fn reconstruct_layer<ObjectID: FsVerityHashValue>(
     repo: &Repository<ObjectID>,
     source_image: &Arc<SourceImage<ObjectID>>,
@@ -414,132 +167,21 @@ fn reconstruct_layer<ObjectID: FsVerityHashValue>(
         .create_object_tmpfile()
         .context("Creating temp file for layer reconstruction")?;
     let mut tmpfile = File::from(tmpfile_fd);
-    let mut hasher = OciHasher::new(expected_diff_id.algorithm())?;
+    let mut data_source = ComposeFsDataSource {
+        source: Arc::clone(source_image),
+        current: None,
+    };
 
-    if *media_type == media_type_tar_diff() {
-        let mut data_source = ComposeFsDataSource {
-            source: Arc::clone(source_image),
-            current: None,
-        };
-        let mut hashing_writer = HashingWriter {
-            inner: &mut tmpfile,
-            hasher: &mut hasher,
-        };
-        tar_patch_apply(blob_reader, &mut data_source, &mut hashing_writer)?;
-    } else {
-        let mut decoder = decompress_layer(blob_reader, media_type)?;
-        let mut hashing_writer = HashingWriter {
-            inner: &mut tmpfile,
-            hasher: &mut hasher,
-        };
-        io::copy(&mut decoder, &mut hashing_writer)?;
-    }
-
-    let computed_diff_id = hasher.finalize()?;
-    ensure!(
-        computed_diff_id == *expected_diff_id,
-        "Layer diff_id mismatch: expected {expected_diff_id}, got {computed_diff_id}",
-    );
+    reconstruct_layer_to(
+        blob_reader,
+        media_type,
+        &mut data_source,
+        expected_diff_id,
+        &mut tmpfile,
+    )?;
 
     tmpfile.seek(SeekFrom::Start(0))?;
     Ok(tmpfile)
-}
-
-// ─── Delta manifest parsing ─────────────────────────────────────────────────
-
-struct ParsedDelta {
-    target_manifest: ImageManifest,
-    target_manifest_descriptor: Descriptor,
-    target_manifest_raw: Vec<u8>,
-    target_config_descriptor: Descriptor,
-    target_config_raw: Vec<u8>,
-    source_config_digest: OciDigest,
-    delta_layer_by_to: HashMap<OciDigest, Descriptor>,
-}
-
-/// Parse a delta artifact's manifest and extract the embedded target image
-/// manifest, config, and layer mapping. Blobs are fetched via `blob_reader`.
-async fn parse_delta_manifest(
-    delta_manifest: &ImageManifest,
-    blob_reader: &dyn DeltaBlobReader,
-) -> Result<ParsedDelta> {
-    let annotations = delta_manifest
-        .annotations()
-        .as_ref()
-        .context("Delta manifest has no annotations")?;
-
-    let source_config_digest: OciDigest = annotations
-        .get(ANNOTATION_DELTA_SOURCE_CONFIG)
-        .context("Delta missing source config digest annotation")?
-        .parse()
-        .context("Invalid source config digest")?;
-
-    let mut target_manifest_descriptor = None;
-    let mut target_config_descriptor = None;
-    let mut delta_layer_by_to = HashMap::new();
-
-    for layer in delta_manifest.layers() {
-        let layer_annotations = layer.annotations();
-        let content = layer_annotations
-            .as_ref()
-            .and_then(|a| a.get(ANNOTATION_DELTA_CONTENT))
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        match content {
-            "image-manifest" => {
-                target_manifest_descriptor = Some(layer.clone());
-            }
-            "image-config" => {
-                target_config_descriptor = Some(layer.clone());
-            }
-            "image-layer" => {
-                if let Some(to_str) = layer_annotations
-                    .as_ref()
-                    .and_then(|a| a.get(ANNOTATION_DELTA_TO))
-                    .filter(|s| !s.is_empty())
-                {
-                    let to_digest: OciDigest = to_str.parse().context("Invalid delta.to digest")?;
-                    delta_layer_by_to.insert(to_digest, layer.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let target_manifest_descriptor =
-        target_manifest_descriptor.context("Delta manifest has no embedded image manifest")?;
-    let target_config_descriptor =
-        target_config_descriptor.context("Delta manifest has no embedded image config")?;
-
-    let mut target_manifest_raw = Vec::new();
-    blob_reader
-        .open_blob(&target_manifest_descriptor)
-        .await
-        .context("Fetching embedded image manifest")?
-        .read_to_end(&mut target_manifest_raw)?;
-    let target_manifest = ImageManifest::from_reader(&target_manifest_raw[..])
-        .context("Parsing embedded image manifest")?;
-
-    let mut target_config_raw = Vec::new();
-    blob_reader
-        .open_blob(&target_config_descriptor)
-        .await
-        .context("Fetching embedded image config")?
-        .read_to_end(&mut target_config_raw)?;
-    // Validate it parses
-    ImageConfiguration::from_reader(&target_config_raw[..])
-        .context("Parsing embedded image config")?;
-
-    Ok(ParsedDelta {
-        target_manifest,
-        target_manifest_descriptor,
-        target_manifest_raw,
-        target_config_descriptor,
-        target_config_raw,
-        source_config_digest,
-        delta_layer_by_to,
-    })
 }
 
 // ─── Import delta ───────────────────────────────────────────────────────────
@@ -801,60 +443,32 @@ mod tests {
     use composefs::test::TestRepo;
     use std::path::PathBuf;
 
-    fn uvarint(bytes: &[u8]) -> Result<u64> {
-        read_uvarint(&mut io::BufReader::new(bytes))
-    }
-
-    fn write_uvarint(out: &mut Vec<u8>, mut value: u64) {
-        while value >= 0x80 {
-            out.push(value as u8 | 0x80);
-            value >>= 7;
+    const TAR_DIFF_HEADER_V1: &[u8; 8] = b"tardf1\n\0";
+    const TAR_DIFF_HEADER_V2: &[u8; 8] = b"tardf2\n\0";
+    const OP_COPY: u8 = 2;
+    const OP_ADD_DATA: u8 = 3;
+    const OP_SEEK: u8 = 4;
+    const OP_ZSTD_DICT: u8 = 5;
+    fn read_uvarint(r: &mut impl io::BufRead) -> Result<u64> {
+        let mut result: u64 = 0;
+        let mut shift: u8 = 0;
+        loop {
+            let mut byte = [0u8; 1];
+            r.read_exact(&mut byte)?;
+            let bits = (byte[0] & 0x7f) as u64;
+            ensure!(
+                shift < 64 && bits <= (u64::MAX >> shift),
+                "uvarint overflow"
+            );
+            result |= bits << shift;
+            if byte[0] & 0x80 == 0 {
+                return Ok(result);
+            }
+            shift = shift.checked_add(7).context("uvarint overflow")?;
         }
-        out.push(value as u8);
-    }
-
-    /// Assemble a tar-diff stream from `(op, size, data)` triples. Ops without
-    /// a payload (Copy, Seek) carry their operand in `size` and empty `data`.
-    fn build_tar_diff(header: &[u8; 8], ops: &[(u8, u64, &[u8])]) -> Vec<u8> {
-        let mut body = Vec::new();
-        for (op, size, data) in ops {
-            body.push(*op);
-            write_uvarint(&mut body, *size);
-            body.extend_from_slice(data);
-        }
-        let mut out = header.to_vec();
-        out.extend_from_slice(&zstd::stream::encode_all(&body[..], 3).unwrap());
-        out
-    }
-
-    /// A zstd frame compressing `target` against `source` as a raw dictionary,
-    /// as `zstd --patch-from` and tar-diff's zstd backend produce.
-    fn zstd_patch_from(source: &[u8], target: &[u8]) -> Vec<u8> {
-        zstd_patch_from_with_window_log(source, target, None)
-    }
-
-    /// As [`zstd_patch_from`], but able to declare a window larger than the
-    /// libzstd encoder default. tar-diff's Go encoder sizes the window to the
-    /// source file, so real deltas of sources over 128 MiB only decode with a
-    /// raised `window_log_max`.
-    fn zstd_patch_from_with_window_log(
-        source: &[u8],
-        target: &[u8],
-        window_log: Option<u32>,
-    ) -> Vec<u8> {
-        let mut encoder =
-            zstd::stream::write::Encoder::with_ref_prefix(Vec::new(), 3, source).unwrap();
-        if let Some(window_log) = window_log {
-            encoder
-                .set_parameter(zstd::stream::raw::CParameter::WindowLog(window_log))
-                .unwrap();
-        }
-        encoder.write_all(target).unwrap();
-        encoder.finish().unwrap()
     }
 
     const SOURCE_NAME: &str = "data/blob.bin";
-
     /// A composefs data source with content from a tar file
     async fn tar_to_compose(
         repo: &Arc<Repository<Sha256HashValue>>,
@@ -886,63 +500,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tar_patch_zstd_dict() {
-        let test_repo = TestRepo::<Sha256HashValue>::new();
-        let (source, target) = similar_blobs();
-        let patch = zstd_patch_from(&source, &target);
-        assert!(patch.len() < target.len() / 4, "patch should be small");
-
-        let delta = build_tar_diff(
-            TAR_DIFF_HEADER_V2,
-            &[
-                (OP_OPEN, SOURCE_NAME.len() as u64, SOURCE_NAME.as_bytes()),
-                (OP_ZSTD_DICT, patch.len() as u64, &patch),
-            ],
-        );
-
-        let mut data_source = tar_to_compose(&test_repo.repo, &blob_layer_tar(&source)).await;
-        let mut out = Vec::new();
-        tar_patch_apply(&delta[..], &mut data_source, &mut out).expect("applying zstd-dict delta");
-        assert_eq!(out, target);
-    }
-
-    /// libzstd refuses windows above 128 MiB by default, so a frame declaring
-    /// the 512 MiB window that tar-diff allows only decodes because
-    /// [`MAX_ZSTD_DICT_WINDOW_LOG`] raises the cap — and anything beyond it is
-    /// still refused.
-    #[tokio::test]
-    async fn test_tar_patch_zstd_dict_window_log() {
-        let test_repo = TestRepo::<Sha256HashValue>::new();
-        let (source, target) = similar_blobs();
-
-        for (window_log, accepted) in [
-            (MAX_ZSTD_DICT_WINDOW_LOG, true),
-            (MAX_ZSTD_DICT_WINDOW_LOG + 1, false),
-        ] {
-            let patch = zstd_patch_from_with_window_log(&source, &target, Some(window_log));
-            let delta = build_tar_diff(
-                TAR_DIFF_HEADER_V2,
-                &[
-                    (OP_OPEN, SOURCE_NAME.len() as u64, SOURCE_NAME.as_bytes()),
-                    (OP_ZSTD_DICT, patch.len() as u64, &patch),
-                ],
-            );
-
-            let mut data_source = tar_to_compose(&test_repo.repo, &blob_layer_tar(&source)).await;
-            let mut out = Vec::new();
-            let result = tar_patch_apply(&delta[..], &mut data_source, &mut out);
-            assert_eq!(
-                result.is_ok(),
-                accepted,
-                "windowLog {window_log}: {result:?}"
-            );
-            if accepted {
-                assert_eq!(out, target);
-            }
-        }
-    }
-
-    #[tokio::test]
     async fn test_read_current_to_end_size_limit() {
         let test_repo = TestRepo::<Sha256HashValue>::new();
         let mut data_source = tar_to_compose(&test_repo.repo, &blob_layer_tar(b"0123456789")).await;
@@ -956,54 +513,6 @@ mod tests {
             "unexpected error: {err:#}"
         );
         assert_eq!(data_source.read_current_to_end(10).unwrap(), b"0123456789");
-    }
-
-    #[tokio::test]
-    async fn test_tar_patch_rejects_unknown_header() {
-        let test_repo = TestRepo::<Sha256HashValue>::new();
-        let delta = build_tar_diff(b"tardf3\n\0", &[(OP_DATA, 5, b"hello")]);
-
-        let mut data_source = tar_to_compose(&test_repo.repo, &blob_layer_tar(b"")).await;
-        tar_patch_apply(&delta[..], &mut data_source, &mut Vec::new())
-            .expect_err("unknown tar-diff version must be rejected");
-    }
-
-    #[test]
-    fn test_read_uvarint() {
-        assert_eq!(uvarint(&[0]).unwrap(), 0);
-        assert_eq!(uvarint(&[1]).unwrap(), 1);
-        assert_eq!(uvarint(&[0x7f]).unwrap(), 127);
-        assert_eq!(uvarint(&[0x80, 0x01]).unwrap(), 128);
-        assert_eq!(uvarint(&[0xac, 0x02]).unwrap(), 300);
-        assert_eq!(uvarint(&[0xff, 0x7f]).unwrap(), 16383);
-        assert_eq!(uvarint(&[0x80, 0x80, 0x01]).unwrap(), 16384);
-        // u64::MAX = 0xffff_ffff_ffff_ffff
-        assert_eq!(
-            uvarint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]).unwrap(),
-            u64::MAX,
-        );
-    }
-
-    #[test]
-    fn test_read_uvarint_overflow() {
-        // 10 bytes with all continuation bits set overflows shift
-        assert!(uvarint(&[0x80; 10]).is_err());
-        // 11 continuation bytes
-        assert!(uvarint(&[0x80; 11]).is_err());
-        // 10th byte value > 1 overflows u64 (2 << 63 > u64::MAX)
-        assert!(uvarint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02]).is_err());
-        // 10th byte value == 1 is the last valid encoding (1 << 63 fits)
-        assert_eq!(
-            uvarint(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]).unwrap(),
-            u64::MAX,
-        );
-    }
-
-    #[test]
-    fn test_read_uvarint_truncated() {
-        // Continuation bit set but no more bytes
-        assert!(uvarint(&[0x80]).is_err());
-        assert!(uvarint(&[]).is_err());
     }
 
     bitflags::bitflags! {

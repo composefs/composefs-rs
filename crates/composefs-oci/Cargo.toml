@@ -18,6 +18,7 @@ containers-storage = ["dep:cstorage", "dep:base64", "varlink", "cstorage/layer-t
 varlink = ['dep:zlink', 'dep:zlink-core', 'composefs/varlink']
 
 [dependencies]
+oci-delta = "0.1.0"
 anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
 async-compression = { version = "0.4.43", default-features = false, features = ["tokio", "zstd", "gzip"] }
