@@ -28,6 +28,7 @@ pub mod oci_image;
 pub mod oci_layout;
 /// Re-exported from [`composefs::progress`]; use that path directly in new code.
 pub mod progress;
+pub mod retry;
 pub mod skopeo;
 /// Import container images via skopeo's JSON proxy + varlink socket.
 ///
@@ -156,6 +157,7 @@ pub use oci_image::{
     untag_image,
 };
 pub use progress::{ComponentId, NullReporter, ProgressEvent, ProgressReporter, SharedReporter};
+pub use retry::RetryPolicy;
 pub use skopeo::pull_image;
 
 /// Statistics from an image import operation.
@@ -351,6 +353,11 @@ pub struct PullOptions<'a> {
     /// Supported uniformly across transports, including `containers-storage:`
     /// imports (see [`LocalFetchOpt`]).
     pub bootable: bool,
+
+    /// How to retry transient registry failures, as classified by the image
+    /// proxy.  Only applies to registry (`docker://`) pulls; use
+    /// [`RetryPolicy::none()`] to disable retrying.
+    pub retry: RetryPolicy,
 }
 
 impl<'a> std::fmt::Debug for PullOptions<'a> {
@@ -369,6 +376,7 @@ impl<'a> std::fmt::Debug for PullOptions<'a> {
                 },
             )
             .field("bootable", &self.bootable)
+            .field("retry", &self.retry)
             .finish()
     }
 }
@@ -541,13 +549,14 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         });
     }
 
-    let (result, stats) = skopeo::pull_image(
+    let (result, stats) = skopeo::pull_image_with_retry(
         repo,
         imgref,
         reference,
         opts.img_proxy_config,
         reporter,
         boot_options.as_ref(),
+        &opts.retry,
     )
     .await?;
     Ok(crate::PullResult {

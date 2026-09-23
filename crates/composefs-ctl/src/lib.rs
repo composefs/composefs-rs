@@ -145,7 +145,10 @@ impl ProgressReporter for IndicatifReporter {
                         .progress_chars("##-"),
                 );
                 bar.set_message(id.to_string());
-                self.bars.lock().unwrap().insert(id, bar);
+                // A retried component is started again; replace its bar.
+                if let Some(old) = self.bars.lock().unwrap().insert(id, bar) {
+                    old.finish_and_clear();
+                }
             }
             ProgressEvent::Progress { id, fetched, .. } => {
                 if let Some(bar) = self.bars.lock().unwrap().get(&id) {
