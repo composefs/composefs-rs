@@ -87,7 +87,8 @@ use composefs::{
 ///
 /// Renders per-component progress bars via [`MultiProgress`].  When a component
 /// completes or is skipped the bar is removed; human-readable messages are
-/// printed above the bar group via [`MultiProgress::println`].
+/// printed above the bar group via [`MultiProgress::println`], or directly to
+/// stderr when it is not a terminal.
 #[cfg(any(feature = "oci", feature = "http", feature = "ostree"))]
 struct IndicatifReporter {
     multi: MultiProgress,
@@ -162,7 +163,14 @@ impl ProgressReporter for IndicatifReporter {
                 }
             }
             ProgressEvent::Message(msg) => {
-                let _ = self.multi.println(msg);
+                // Progress bars are hidden when stderr is not a terminal (e.g. in
+                // CI logs), and `println` then discards the message; print it
+                // directly instead so that e.g. retry warnings stay visible.
+                if self.multi.is_hidden() {
+                    eprintln!("{msg}");
+                } else {
+                    let _ = self.multi.println(msg);
+                }
             }
             // `ProgressEvent` is #[non_exhaustive]: new variants added to the library
             // will be silently ignored here until cfsctl is updated to handle them.
