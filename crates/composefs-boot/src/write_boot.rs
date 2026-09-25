@@ -10,7 +10,7 @@ use std::{
     path::Path,
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use composefs::{fsverity::FsVerityHashValue, repository::Repository};
 
@@ -160,6 +160,7 @@ pub fn write_boot_simple<ObjectID: FsVerityHashValue>(
             }
             write_t1_simple(t1, boot_partition, boot_subdir, karg, cmdline_extra, repo)?;
         }
+        BootEntry::Aboot(_) => bail!("writing aboot payloads is not supported"),
     };
 
     Ok(())
