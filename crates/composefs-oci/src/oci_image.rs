@@ -41,6 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
+use composefs::ImageNotFound;
 use containers_image_proxy::oci_spec::image::{
     Descriptor, Digest as OciDigest, ImageConfiguration, ImageManifest, MediaType,
 };
@@ -743,7 +744,7 @@ pub fn linked_erofs_images<ObjectID: FsVerityHashValue>(
         }
     }
 
-    Err(anyhow::anyhow!("No EROFS image found {}", id.to_hex()))
+    Err(anyhow::Error::new(ImageNotFound { name: id.to_hex() }))
 }
 
 // =============================================================================
