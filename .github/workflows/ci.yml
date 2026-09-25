@@ -19,14 +19,14 @@ permissions:
 
 jobs:
   nightly:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
     - uses: dtolnay/rust-toolchain@nightly
     - uses: actions/checkout@v7
     - run: cargo +nightly -Z package-workspace package
 
   fedora:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     container:
       image: quay.io/fedora/fedora:latest
       options: "--privileged --pid=host -v /var/tmp:/var/tmp --tmpfs /tmp:rw,exec,nosuid,nodev -v /:/run/host"
@@ -46,7 +46,7 @@ jobs:
   # directly on the runner (no container image, no root required).
   smoke:
     name: Unprivileged smoke test
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Enable fs-verity on /
         run: sudo tune2fs -O verity $(findmnt -vno SOURCE /)
@@ -63,7 +63,7 @@ jobs:
   # on malformed input.  The extended run only fires on pushes to main.
   fuzz:
     name: Fuzz smoke test
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -95,7 +95,7 @@ jobs:
   capi:
     name: C API compatibility
     needs: smoke
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -110,7 +110,7 @@ jobs:
   integration:
     name: Integration tests (${{ matrix.name }})
     needs: smoke
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -150,7 +150,7 @@ jobs:
 
   examples:
     name: Example tests (${{ matrix.example.dir }}/${{ matrix.example.os }})
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     strategy:
       matrix:
