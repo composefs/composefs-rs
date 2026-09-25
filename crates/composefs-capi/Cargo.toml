@@ -9,8 +9,16 @@ description = "C-compatible shared library (libcomposefs) backed by Rust compose
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+# Like the other binaries, support older kernels by default; the C
+# library handled them at runtime.
+default = ['pre-6.15']
+rhel9 = ['composefs/rhel9']
+'pre-6.15' = ['composefs/pre-6.15']
+
 [dependencies]
 composefs = { workspace = true }
+hex = { version = "0.4.0", default-features = false, features = ["std"] }
 libc = "0.2"
 anyhow = "1"
 rustix = { version = "1", features = ["fs", "mm", "process", "mount"] }

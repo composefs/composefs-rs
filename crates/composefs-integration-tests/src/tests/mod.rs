@@ -1,5 +1,6 @@
 //! Integration test modules, organized by execution environment.
 
+pub mod capi;
 pub mod cli;
 pub mod copy_image;
 pub mod cstor;

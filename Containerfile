@@ -36,17 +36,30 @@ RUN --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/root/.cargo/git \
     cargo fetch
 
-# Build cfsctl and integration test binary
-# Two separate invocations: features are scoped to composefs-ctl and must not
+# Build cfsctl, the integration test binary and libcomposefs.
+# Separate invocations: features are scoped to composefs-ctl and must not
 # be passed to composefs-integration-tests, which has no optional features.
+# libcomposefs only gets rhel9 (pre-6.15 is its default).
 RUN --network=none \
     --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     cargo build --release -p composefs-ctl --features="${cfsctl_features}" && \
     cargo build --release -p composefs-integration-tests && \
+    capi_features=$(echo "${cfsctl_features}" | tr ', ' '\n\n' | grep -x rhel9 || true) && \
+    cargo build --release -p composefs-capi --features="${capi_features}" && \
     cp /src/target/release/cfsctl /usr/bin/cfsctl && \
-    cp /src/target/release/cfsctl-integration-tests /usr/bin/cfsctl-integration-tests
+    cp /src/target/release/cfsctl-integration-tests /usr/bin/cfsctl-integration-tests && \
+    mkdir -p /usr/lib/composefs-rs-test && \
+    cp /src/target/release/libcomposefs_capi.so /usr/lib/composefs-rs-test/libcomposefs.so.1
+
+# A C program calling our libcomposefs (not the distribution's), for the
+# privileged libcomposefs tests
+RUN --network=none \
+    ln -s libcomposefs.so.1 /usr/lib/composefs-rs-test/libcomposefs.so && \
+    gcc -o /usr/bin/lcfs-mount-test /src/crates/composefs-capi/tests/lcfs-mount-test.c \
+        -I/src/crates/composefs-capi/include -L/usr/lib/composefs-rs-test -lcomposefs \
+        -Wl,-rpath,/usr/lib/composefs-rs-test
 
 # -- final bootable image --
 FROM ${base_image}
@@ -56,3 +69,5 @@ RUN /src/contrib/packaging/install-test-deps.sh && rm -rf /src
 
 COPY --from=build /usr/bin/cfsctl /usr/bin/cfsctl
 COPY --from=build /usr/bin/cfsctl-integration-tests /usr/bin/cfsctl-integration-tests
+COPY --from=build /usr/lib/composefs-rs-test /usr/lib/composefs-rs-test
+COPY --from=build /usr/bin/lcfs-mount-test /usr/bin/lcfs-mount-test

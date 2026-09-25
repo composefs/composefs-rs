@@ -126,13 +126,13 @@ pub fn require_userns(test_name: &str) -> Result<Option<()>> {
 /// (i.e. running cfsctl without `--insecure`) must use a real filesystem.
 /// This creates a sparse file, formats it as ext4 with the verity feature,
 /// and loop-mounts it to a temp directory.
-struct VerityTempDir {
+pub(crate) struct VerityTempDir {
     mountpoint: PathBuf,
     _backing: tempfile::TempDir,
 }
 
 impl VerityTempDir {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         let backing = tempfile::tempdir()?;
         let img = backing.path().join("fs.img");
         let mountpoint = backing.path().join("mnt");
@@ -152,7 +152,7 @@ impl VerityTempDir {
         })
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.mountpoint
     }
 }
