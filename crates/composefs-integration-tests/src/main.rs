@@ -126,6 +126,7 @@ fn main() {
         .map(|t| {
             let f = t.f;
             Trial::test(t.name, move || f().map_err(|e| format!("{e:?}").into()))
+                .with_ignored_flag(t.is_ignored())
         })
         .collect();
 

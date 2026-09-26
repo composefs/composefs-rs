@@ -2,7 +2,8 @@
 //!
 //! These tests require an old version of cfsctl to create a repo with
 //! old-format splitstream headers (pre-repr(C)). Set `CFSCTL_PATH_OLD`
-//! to the path of an old cfsctl binary to enable these tests.
+//! to the path of an old cfsctl binary to run these tests (they're
+//! ignored otherwise).
 //!
 //! Build an old binary from the bootc-pinned rev:
 //! ```sh
@@ -12,16 +13,14 @@
 //! export CFSCTL_PATH_OLD=/tmp/composefs-rs-old/target/release/cfsctl
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 use xshell::{Shell, cmd};
 
 use crate::{cfsctl, integration_test};
 
-/// Returns the path to the old cfsctl binary, or None if not configured.
-fn cfsctl_old() -> Option<PathBuf> {
-    std::env::var_os("CFSCTL_PATH_OLD").map(PathBuf::from)
-}
+/// Environment variable naming the old cfsctl binary.
+const CFSCTL_PATH_OLD: &str = "CFSCTL_PATH_OLD";
 
 /// Returns true if skopeo is available on the system.
 fn have_skopeo() -> bool {
@@ -35,13 +34,10 @@ fn have_skopeo() -> bool {
 }
 
 fn test_read_old_format_repo() -> Result<()> {
-    let old_cfsctl = match cfsctl_old() {
-        Some(p) => p,
-        None => {
-            eprintln!("CFSCTL_PATH_OLD not set, skipping old-format test");
-            return Ok(());
-        }
-    };
+    let old_cfsctl = PathBuf::from(
+        std::env::var_os(CFSCTL_PATH_OLD)
+            .with_context(|| format!("{CFSCTL_PATH_OLD} is not set"))?,
+    );
     if !have_skopeo() {
         eprintln!("skopeo not found, skipping old-format test");
         return Ok(());
@@ -118,4 +114,4 @@ fn test_read_old_format_repo() -> Result<()> {
 
     Ok(())
 }
-integration_test!(test_read_old_format_repo);
+integration_test!(test_read_old_format_repo, requires_env = CFSCTL_PATH_OLD);

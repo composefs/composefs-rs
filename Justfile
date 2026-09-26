@@ -72,6 +72,26 @@ test-integration *ARGS: build
         cargo test -p composefs-integration-tests --test cfsctl-integration-tests -- --skip privileged_ {{ ARGS }}
     fi
 
+# Released cfsctl that `test-upgrade` creates repositories with: the
+# oldest composefs-ctl release on crates.io.
+upgrade_from_version := "0.7.0"
+
+# Test that repositories created by a released cfsctl keep working with
+# this one (and still work with the release afterwards).
+test-upgrade: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    root=target/cfsctl-{{upgrade_from_version}}
+    if ! test -x "$root/bin/cfsctl"; then
+        # --locked pins its dependencies to the release's Cargo.lock; the
+        # toolchain is whatever is installed, so a future rustc could in
+        # principle stop building this old release.
+        cargo install --locked --root "$root" composefs-ctl@={{upgrade_from_version}}
+    fi
+    export CFSCTL_PATH=$(pwd)/target/debug/cfsctl
+    export CFSCTL_PATH_RELEASE=$(pwd)/$root/bin/cfsctl
+    cargo test -p composefs-integration-tests --test cfsctl-integration-tests -- --exact test_upgrade_from_release_repo
+
 # Run mount.composefs shell tests (needs fsverity-utils; mount tests need root)
 test-mount-composefs: build
     crates/composefs-ctl/tests/test-mount-composefs.sh $(pwd)/target/debug/cfsctl

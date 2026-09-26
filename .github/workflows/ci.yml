@@ -58,6 +58,8 @@ jobs:
       - name: Install ostree
         run: sudo apt-get update && sudo apt-get install -y ostree
       - run: just test-integration
+      - name: Upgrade from a released cfsctl
+        run: just test-upgrade
 
   # Fuzz smoke test — runs each fuzz target briefly to catch panics
   # on malformed input.  The extended run only fires on pushes to main.

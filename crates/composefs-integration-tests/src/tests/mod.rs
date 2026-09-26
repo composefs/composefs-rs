@@ -8,5 +8,6 @@ pub mod oci_compat;
 pub mod old_format;
 pub mod ostree;
 pub mod privileged;
+pub mod upgrade;
 pub mod varlink;
 pub mod zstd_chunked;

@@ -25,12 +25,35 @@ pub struct IntegrationTest {
     pub name: &'static str,
     /// Test function to execute.
     pub f: TestFn,
+    /// Environment variable the test needs; it is reported as ignored
+    /// when that is unset.
+    pub requires_env: Option<&'static str>,
 }
 
 impl IntegrationTest {
     /// Create a new integration test with the given name and function.
     pub const fn new(name: &'static str, f: TestFn) -> Self {
-        Self { name, f }
+        Self {
+            name,
+            f,
+            requires_env: None,
+        }
+    }
+
+    /// Like [`Self::new`], for a test that is ignored unless the
+    /// environment variable `var` is set.
+    pub const fn requiring_env(name: &'static str, f: TestFn, var: &'static str) -> Self {
+        Self {
+            name,
+            f,
+            requires_env: Some(var),
+        }
+    }
+
+    /// Whether the test can't run here, for lack of its environment variable.
+    pub fn is_ignored(&self) -> bool {
+        self.requires_env
+            .is_some_and(|var| std::env::var_os(var).is_none())
     }
 }
 
@@ -47,6 +70,8 @@ pub static INTEGRATION_TESTS: [IntegrationTest];
 ///     Ok(())
 /// }
 /// integration_test!(test_something);
+/// // Ignored unless SOME_BINARY is set
+/// integration_test!(test_something_else, requires_env = "SOME_BINARY");
 /// ```
 #[macro_export]
 macro_rules! integration_test {
@@ -55,6 +80,13 @@ macro_rules! integration_test {
             #[::linkme::distributed_slice($crate::INTEGRATION_TESTS)]
             static [<$fn_name:upper>]: $crate::IntegrationTest =
                 $crate::IntegrationTest::new(stringify!($fn_name), $fn_name);
+        }
+    };
+    ($fn_name:ident, requires_env = $var:expr) => {
+        ::paste::paste! {
+            #[::linkme::distributed_slice($crate::INTEGRATION_TESTS)]
+            static [<$fn_name:upper>]: $crate::IntegrationTest =
+                $crate::IntegrationTest::requiring_env(stringify!($fn_name), $fn_name, $var);
         }
     };
 }
