@@ -20,6 +20,7 @@ rhel9 = ['composefs/rhel9']
 composefs = { workspace = true }
 hex = { version = "0.4.0", default-features = false, features = ["std"] }
 libc = "0.2"
+log = { version = "0.4", default-features = false }
 anyhow = "1"
 rustix = { version = "1", features = ["fs", "mm", "process", "mount"] }
 zerocopy = "0.8"
