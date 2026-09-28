@@ -15,7 +15,7 @@ anyhow = { version = "1.0", default-features = false, features = ["std"] }
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 cap-std = { version = "4.0", default-features = false }
 cap-std-ext = { version = "5.0", default-features = false }
-composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.9.2", optional = true, features = ["tokio"] }
+composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.9.3", optional = true, features = ["tokio"] }
 crc = { version = "3.0", default-features = false }
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 oci-spec = { version = "0.10", default-features = false, features = ["image"] }

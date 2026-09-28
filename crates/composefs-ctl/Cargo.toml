@@ -36,9 +36,9 @@ comfy-table = { version = "8.0", default-features = false }
 composefs = { workspace = true, features = ["varlink"] }
 composefs-boot = { workspace = true }
 composefs-oci = { workspace = true, optional = true, features = ["boot"] }
-composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.9.2", optional = true }
+composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.9.3", optional = true }
 composefs-http = { workspace = true, optional = true }
-cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.9.2", features = ["layer-transfer"], optional = true }
+cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.9.3", features = ["layer-transfer"], optional = true }
 cap-std-ext = { workspace = true }
 composefs-fuse = { workspace = true, optional = true }
 composefs-ostree = { workspace = true, optional = true }
