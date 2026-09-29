@@ -3,6 +3,7 @@
 //! This module provides functionality to parse Android boot image format version 2 files
 //! and extract embedded components like kernel, initrd, commandline and dtb.
 
+use std::ffi::CStr;
 use std::io::{Read, Seek, SeekFrom};
 use thiserror::Error;
 use zerocopy::{
@@ -115,12 +116,12 @@ impl AndroidBootImage {
         }
 
         // mkbootimg splits long command lines (with a null terminator for each)
-        let primary_len = nul_terminated_len(&header.cmdline);
-        let extra_len = nul_terminated_len(&header.extra_cmdline);
+        let primary = nul_terminated_bytes(&header.cmdline);
+        let extra = nul_terminated_bytes(&header.extra_cmdline);
         let mut cmdline = [0; TOTAL_CMDLINE_SIZE];
-        cmdline[..primary_len].copy_from_slice(&header.cmdline[..primary_len]);
-        cmdline[primary_len..primary_len + extra_len]
-            .copy_from_slice(&header.extra_cmdline[..extra_len]);
+        for (dst, src) in cmdline.iter_mut().zip(primary.iter().chain(extra)) {
+            *dst = *src;
+        }
 
         Ok(Self {
             page_size,
@@ -179,16 +180,12 @@ impl AndroidBootImage {
 
     /// Return the kernel command line stored in the image header.
     pub fn cmdline(&self) -> Result<&str, AndroidBootError> {
-        let end = nul_terminated_len(&self.cmdline);
-        Ok(std::str::from_utf8(&self.cmdline[..end])?)
+        Ok(std::str::from_utf8(nul_terminated_bytes(&self.cmdline))?)
     }
 }
 
-fn nul_terminated_len(bytes: &[u8]) -> usize {
-    bytes
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(bytes.len())
+fn nul_terminated_bytes(bytes: &[u8]) -> &[u8] {
+    CStr::from_bytes_until_nul(bytes).map_or(bytes, CStr::to_bytes)
 }
 
 fn add_aligned(
@@ -302,6 +299,25 @@ pub(crate) mod tests {
             let image = AndroidBootImage::parse(&mut Cursor::new(bytes))?;
             assert_eq!(image.cmdline()?, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn parses_cmdline_without_nul_terminators() -> Result<(), AndroidBootError> {
+        let mut bytes = image(b"kernel", b"ramdisk", b"");
+        let header = BootImageHeaderV2::mut_from_bytes(&mut bytes[..HEADER_SIZE])
+            .map_err(|_| AndroidBootError::InvalidHeader)?;
+        header.cmdline.fill(b'x');
+        header.extra_cmdline.fill(b'y');
+
+        let image = AndroidBootImage::parse(&mut Cursor::new(bytes))?;
+        let expected = format!(
+            "{}{}",
+            "x".repeat(CMDLINE_SIZE),
+            "y".repeat(EXTRA_CMDLINE_SIZE)
+        );
+        assert_eq!(image.cmdline()?, expected);
+        assert!(CStr::from_bytes_until_nul(&image.cmdline).is_err());
         Ok(())
     }
 
