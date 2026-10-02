@@ -245,41 +245,6 @@ integration_test!(privileged_copy_image_reflink);
 
 // ── Test C: varlink cross-process fd-passing copy ───────────────────────────
 
-/// A running `cfsctl varlink` subprocess bound to a Unix socket.
-///
-/// Kills the child process on drop so a test panic does not leak it.
-struct VarlinkProc {
-    child: std::process::Child,
-    socket: std::path::PathBuf,
-    /// Keep the tempdir holding the socket alive for the process's lifetime.
-    _socket_dir: tempfile::TempDir,
-}
-
-impl Drop for VarlinkProc {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-impl VarlinkProc {
-    /// Spawn `cfsctl` via systemd socket-activation with a pre-bound listening
-    /// socket. The socket is already listening before the child starts, so
-    /// callers may connect immediately — no polling needed.
-    fn spawn() -> Result<Self> {
-        let (child, socket_dir, socket) = crate::spawn_activated_cfsctl()?;
-        Ok(VarlinkProc {
-            child,
-            socket,
-            _socket_dir: socket_dir,
-        })
-    }
-
-    fn socket(&self) -> &Path {
-        &self.socket
-    }
-}
-
 /// Open a repository on a varlink server and return its handle, via the typed
 /// zlink proxy. Connects a fresh client for this single call.
 /// Open `repo_path` over an existing connection and return the handle.
@@ -321,8 +286,8 @@ fn test_copy_image_via_varlink() -> Result<()> {
     }
     drop(repo_a);
 
-    let svc_a = VarlinkProc::spawn().context("spawning varlink server A")?;
-    let svc_b = VarlinkProc::spawn().context("spawning varlink server B")?;
+    let svc_a = crate::spawn_activated_cfsctl().context("spawning varlink server A")?;
+    let svc_b = crate::spawn_activated_cfsctl().context("spawning varlink server B")?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -429,8 +394,8 @@ fn test_copy_image_cross_algorithm() -> Result<()> {
 
     init_sha512_repo(&repo_b_path)?;
 
-    let svc_a = VarlinkProc::spawn().context("spawning server A (sha256)")?;
-    let svc_b = VarlinkProc::spawn().context("spawning server B (sha512)")?;
+    let svc_a = crate::spawn_activated_cfsctl().context("spawning server A (sha256)")?;
+    let svc_b = crate::spawn_activated_cfsctl().context("spawning server B (sha512)")?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

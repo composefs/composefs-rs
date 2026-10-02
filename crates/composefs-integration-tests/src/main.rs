@@ -64,10 +64,9 @@ pub(crate) fn cfsctl() -> Result<PathBuf> {
 /// immediately — no polling needed. The path exists on disk, so `varlinkctl`
 /// (which connects by path) works unchanged.
 ///
-/// Returns the spawned child, the tempdir (keep alive for the socket's
-/// lifetime), and the socket path.
-pub(crate) fn spawn_activated_cfsctl() -> Result<(std::process::Child, tempfile::TempDir, PathBuf)>
-{
+/// Returns a guard that owns the child and the socket tempdir, and kills and
+/// reaps the child when dropped, so no caller can leak it on an early return.
+pub(crate) fn spawn_activated_cfsctl() -> Result<ActivatedCfsctl> {
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixListener;
     use std::sync::Arc;
@@ -93,7 +92,39 @@ pub(crate) fn spawn_activated_cfsctl() -> Result<(std::process::Child, tempfile:
     cmd.take_fds(fds);
     let child = cmd.spawn().context("spawning socket-activated cfsctl")?;
 
-    Ok((child, socket_dir, socket))
+    Ok(ActivatedCfsctl {
+        child,
+        socket,
+        _socket_dir: socket_dir,
+    })
+}
+
+/// A socket-activated `cfsctl` process, killed and reaped on drop.
+///
+/// An orphaned child would inherit the harness's stdout/stderr, so when the
+/// output is piped (`cargo test ... | grep`) the pipeline never sees EOF.
+pub(crate) struct ActivatedCfsctl {
+    child: std::process::Child,
+    socket: PathBuf,
+    // Keep the tempdir holding the socket alive for the process's lifetime.
+    _socket_dir: tempfile::TempDir,
+}
+
+impl ActivatedCfsctl {
+    pub(crate) fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for ActivatedCfsctl {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Create a test rootfs fixture inside `parent` and return its path.

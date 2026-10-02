@@ -44,7 +44,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use composefs_ctl::varlink::oci::{OciError, OciInspectReply, PullProgress};
 use composefs_ctl::varlink::proxy::{OciProxy, RepositoryProxy};
 use composefs_ctl::varlink::{ImageObjectsReply, InitRepositoryReply, RepositoryError};
@@ -53,28 +53,19 @@ use xshell::{Shell, cmd};
 use zlink::futures_util::TryStreamExt;
 
 use crate::tests::cli::{corrupt_one_object, create_oci_layout, init_insecure_repo};
-use crate::{cfsctl, create_test_rootfs, integration_test};
+use crate::{ActivatedCfsctl, cfsctl, create_test_rootfs, integration_test};
 
 /// A `cfsctl` varlink service spawned on a Unix socket for the duration of a
 /// test. Killed on drop.
 struct VarlinkService {
-    child: std::process::Child,
-    socket: std::path::PathBuf,
+    /// Kills the process on drop; also owns the socket tempdir.
+    proc: ActivatedCfsctl,
     /// Handle for the test repository, opened via `OpenRepository` at spawn and
     /// auto-injected into subsequent calls.
     handle: u64,
     /// Current-thread runtime used to drive the async zlink proxy client from
     /// the synchronous test functions.
     rt: tokio::runtime::Runtime,
-    // Keep the tempdir holding the socket alive for the service's lifetime.
-    _socket_dir: tempfile::TempDir,
-}
-
-impl Drop for VarlinkService {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl VarlinkService {
@@ -95,22 +86,28 @@ impl VarlinkService {
     /// (`org.composefs.Repository` + `org.composefs.Oci`) regardless of which
     /// of the historical CLI entry points would have been used.
     fn spawn(repo: &Path) -> Result<Self> {
-        let (child, socket_dir, socket) = crate::spawn_activated_cfsctl()?;
+        Self::spawn_with(repo, |proc, repo| {
+            Self::open_repository(proc.socket(), repo)
+        })
+    }
 
-        let handle = Self::open_repository(&socket, repo)?;
+    /// [`Self::spawn`] with the `OpenRepository` step injectable, so a test
+    /// can make it fail. The process is owned by its guard from the moment it
+    /// is spawned, so a failure here cannot leak it.
+    fn spawn_with(
+        repo: &Path,
+        open: impl FnOnce(&ActivatedCfsctl, &Path) -> Result<u64>,
+    ) -> Result<Self> {
+        let proc = crate::spawn_activated_cfsctl()?;
+
+        let handle = open(&proc, repo)?;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .context("building tokio runtime for zlink client")?;
 
-        Ok(VarlinkService {
-            child,
-            socket,
-            handle,
-            rt,
-            _socket_dir: socket_dir,
-        })
+        Ok(VarlinkService { proc, handle, rt })
     }
 
     /// Open a repository via `OpenRepository` and return its handle value.
@@ -162,7 +159,7 @@ impl VarlinkService {
     }
 
     fn socket_str(&self) -> String {
-        self.socket.to_string_lossy().into_owned()
+        self.proc.socket().to_string_lossy().into_owned()
     }
 
     /// Inject `"handle": self.handle` into a JSON object params value if the
@@ -217,7 +214,7 @@ impl VarlinkService {
 
     /// Connect a fresh zlink client to the service socket.
     async fn connect(&self) -> zlink::Result<zlink::tokio::unix::Connection> {
-        zlink::tokio::unix::connect(&self.socket).await
+        zlink::tokio::unix::connect(self.proc.socket()).await
     }
 
     /// `org.composefs.Oci.Inspect` via the typed proxy, using the cached handle.
@@ -1524,3 +1521,26 @@ fn test_varlink_init_repository_still_bails_on_config_mismatch() -> Result<()> {
     Ok(())
 }
 integration_test!(test_varlink_init_repository_still_bails_on_config_mismatch);
+
+/// If `OpenRepository` fails after the service is spawned, the process must
+/// still be killed and reaped rather than leaked (an orphan holds the
+/// harness's piped stdout open forever).
+fn test_varlink_spawn_failure_kills_child() -> Result<()> {
+    let mut pid = None;
+    let result = VarlinkService::spawn_with(Path::new("/nonexistent"), |proc, _repo| {
+        pid = Some(proc.pid());
+        bail!("forced OpenRepository failure")
+    });
+    ensure!(result.is_err(), "spawn_with unexpectedly succeeded");
+
+    let pid = pid.context("open callback never ran")?;
+    // The guard has reaped the child, so the pid must no longer exist.
+    let pid = rustix::process::Pid::from_raw(pid.try_into()?).context("child pid is zero")?;
+    let alive = rustix::process::test_kill_process(pid);
+    ensure!(
+        alive == Err(rustix::io::Errno::SRCH),
+        "cfsctl child survived a failed spawn: {alive:?}"
+    );
+    Ok(())
+}
+integration_test!(test_varlink_spawn_failure_kills_child);
