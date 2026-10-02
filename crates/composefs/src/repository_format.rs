@@ -2,7 +2,8 @@
 //!
 //! This document describes the current on-disk layout of a composefs repository.
 //!
-//! At this time, the composefs-rs repository format is not declared stable.
+//! The composefs-rs repository format is stable as of composefs-rs 0.8, including
+//! the format of splitstreams, the bit-for-bit generated (v1) EROFS images, etc.
 //!
 //! ## Location
 //!
