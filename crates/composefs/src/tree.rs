@@ -2,6 +2,10 @@
 //! of inlining small files, and having an external fsverity reference for
 //! larger ones.
 
+use std::borrow::Cow;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+
 use crate::fsverity::FsVerityHashValue;
 
 pub use crate::generic_tree::{self, ImageError, Stat};
@@ -19,10 +23,23 @@ pub enum RegularFile<ObjectID: FsVerityHashValue> {
     /// The tuple contains (fsverity hash, file size in bytes).
     /// The fsverity digest is embedded in the overlay metacopy xattr.
     External(ObjectID, u64),
-    /// Like `External`, but without embedding the fsverity digest in the
-    /// overlay metacopy xattr.  Used by the C API when the caller set a
-    /// content-address payload but did not explicitly set a verified digest.
-    ExternalNoVerity(ObjectID, u64),
+    /// File stored externally at an explicit path, as libcomposefs models it.
+    ///
+    /// Unlike `External`, the overlay redirect isn't derived from a digest.
+    /// This is what the C API produces for a node with a payload, e.g. ostree's
+    /// `xx/<checksum>.file` objects.  Build it with [`RegularFile::external`],
+    /// which keeps the cases `External` and `Sparse` cover out of it.
+    ExternalPath {
+        /// The backing file's path relative to the object store root, written
+        /// as `/<redirect>` in the overlay redirect xattr.  Without one, no
+        /// redirect is written and overlayfs looks the file up by its own path
+        /// in the data layers.
+        redirect: Option<Box<OsStr>>,
+        /// The fsverity digest to embed in the overlay metacopy xattr, if any.
+        verity: Option<ObjectID>,
+        /// The file size in bytes.
+        size: u64,
+    },
     /// File with declared size but no content or external reference.
     /// Produces ChunkBased layout with null chunk indices.
     Sparse(u64),
@@ -33,7 +50,72 @@ impl<ObjectID: FsVerityHashValue> RegularFile<ObjectID> {
     pub fn file_size(&self) -> u64 {
         match self {
             Self::Inline(data) => data.len() as u64,
-            Self::External(_, size) | Self::ExternalNoVerity(_, size) | Self::Sparse(size) => *size,
+            Self::External(_, size) | Self::ExternalPath { size, .. } | Self::Sparse(size) => *size,
+        }
+    }
+
+    /// Builds an external file from an overlay redirect and verity digest,
+    /// the way libcomposefs stores them: independently of each other.
+    ///
+    /// An empty redirect counts as none, as in libcomposefs.  The result is
+    /// `External` when the redirect is the digest's object path (the usual
+    /// composefs layout), `Sparse` when there is neither, and `ExternalPath`
+    /// otherwise.
+    pub fn external(redirect: Option<Box<OsStr>>, verity: Option<ObjectID>, size: u64) -> Self {
+        let redirect = redirect.filter(|r| !r.is_empty());
+        match (redirect, verity) {
+            (None, None) => Self::Sparse(size),
+            (Some(redirect), Some(id))
+                if redirect.as_bytes() == id.to_object_pathname().as_bytes() =>
+            {
+                Self::External(id, size)
+            }
+            (redirect, verity) => Self::ExternalPath {
+                redirect,
+                verity,
+                size,
+            },
+        }
+    }
+
+    /// Returns the path of an external file's backing file relative to the
+    /// object store root, which the overlay redirect xattr points at: the
+    /// object path for `External`, the redirect for `ExternalPath`.
+    ///
+    /// This is the libcomposefs payload, which `composefs-info` lists.
+    pub fn backing_path(&self) -> Option<Cow<'_, OsStr>> {
+        match self {
+            Self::External(id, _) => Some(Cow::Owned(id.to_object_pathname().into())),
+            Self::ExternalPath { redirect, .. } => redirect.as_deref().map(Cow::Borrowed),
+            Self::Inline(_) | Self::Sparse(_) => None,
+        }
+    }
+
+    /// Returns the object backing an external file in a composefs repository.
+    ///
+    /// For `ExternalPath`, this is the verity digest if set, otherwise the
+    /// redirect parsed as an object pathname.  Fails for inline and sparse
+    /// files, and for an `ExternalPath` that names no object this way (like
+    /// ostree's `xx/<checksum>.file` without a verity digest).
+    pub fn repo_object_id(&self) -> anyhow::Result<ObjectID> {
+        match self {
+            Self::Inline(_) | Self::Sparse(_) => anyhow::bail!("Not an external file"),
+            Self::External(id, _) => Ok(id.clone()),
+            Self::ExternalPath {
+                verity: Some(id), ..
+            } => Ok(id.clone()),
+            Self::ExternalPath {
+                redirect: Some(redirect),
+                verity: None,
+                ..
+            } => ObjectID::from_object_pathname(redirect.as_bytes()).map_err(|e| {
+                anyhow::anyhow!("External file path {redirect:?} is not an object: {e}")
+            }),
+            Self::ExternalPath {
+                redirect: None,
+                verity: None,
+                ..
+            } => anyhow::bail!("External file has neither a path nor a verity digest"),
         }
     }
 }
@@ -138,5 +220,81 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(retrieved_subdir_opt.stat.st_mtim_sec, 20);
+    }
+
+    #[test]
+    fn test_external() {
+        let id = Sha256HashValue::from_hex(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let other = Sha256HashValue::from_hex(
+            "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+        )
+        .unwrap();
+        let object_path = id.to_object_pathname();
+        const OSTREE: &str = "8a/5d74.file";
+        // (redirect, verity, variant, repo_object_id, backing_path)
+        let cases = [
+            (
+                Some(object_path.as_str()),
+                Some(&id),
+                "External",
+                Some(&id),
+                Some(object_path.as_str()),
+            ),
+            // The verity digest names the repository object, whatever the redirect
+            (
+                Some(OSTREE),
+                Some(&other),
+                "ExternalPath",
+                Some(&other),
+                Some(OSTREE),
+            ),
+            (
+                Some(object_path.as_str()),
+                Some(&other),
+                "ExternalPath",
+                Some(&other),
+                Some(object_path.as_str()),
+            ),
+            (None, Some(&id), "ExternalPath", Some(&id), None),
+            (Some(""), Some(&id), "ExternalPath", Some(&id), None),
+            (
+                Some(object_path.as_str()),
+                None,
+                "ExternalPath",
+                Some(&id),
+                Some(object_path.as_str()),
+            ),
+            // ostree's payload without verity names no repository object
+            (Some(OSTREE), None, "ExternalPath", None, Some(OSTREE)),
+            (None, None, "Sparse", None, None),
+            (Some(""), None, "Sparse", None, None),
+        ];
+        for (redirect, verity, variant, object, backing_path) in cases {
+            let file = RegularFile::external(
+                redirect.map(|r| Box::from(OsStr::new(r))),
+                verity.cloned(),
+                4096,
+            );
+            let found = match &file {
+                RegularFile::External(..) => "External",
+                RegularFile::ExternalPath { .. } => "ExternalPath",
+                RegularFile::Sparse(..) => "Sparse",
+                RegularFile::Inline(..) => "Inline",
+            };
+            assert_eq!(found, variant, "{redirect:?} {verity:?}");
+            assert_eq!(file.file_size(), 4096);
+            assert_eq!(file.repo_object_id().ok().as_ref(), object, "{file:?}");
+            assert_eq!(
+                file.backing_path().as_deref(),
+                backing_path.map(OsStr::new),
+                "{file:?}"
+            );
+        }
+        let inline = RegularFile::<Sha256HashValue>::Inline(Box::new([1]));
+        assert!(inline.repo_object_id().is_err());
+        assert_eq!(inline.backing_path(), None);
     }
 }

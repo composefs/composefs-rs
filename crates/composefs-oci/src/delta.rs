@@ -86,11 +86,11 @@ impl<ObjectID: FsVerityHashValue> DeltaDataSource for ComposeFsDataSource<Object
 
         self.current = Some(match file {
             RegularFile::Inline(data) => CurrentFile::Inline(Cursor::new(data.to_vec())),
-            RegularFile::External(id, _size) | RegularFile::ExternalNoVerity(id, _size) => {
+            RegularFile::External(..) | RegularFile::ExternalPath { .. } => {
                 let fd = self
                     .source
                     .repo
-                    .open_object(id)
+                    .open_object(&file.repo_object_id()?)
                     .with_context(|| format!("Opening source object for {}", path.display()))?;
                 CurrentFile::External(File::from(fd))
             }
