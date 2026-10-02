@@ -57,6 +57,63 @@ pub(crate) fn cfsctl() -> Result<PathBuf> {
     )
 }
 
+/// A skopeo version as `(major, minor, patch)`.
+pub(crate) type SkopeoVersion = (u32, u32, u32);
+
+/// Parse the output of `skopeo --version`, e.g.
+/// `skopeo version 1.22.2 commit: 02c8e50e...`.
+fn parse_skopeo_version(output: &str) -> Option<SkopeoVersion> {
+    let version = output
+        .strip_prefix("skopeo version ")?
+        .split_whitespace()
+        .next()?;
+    // Drop suffixes such as "-dev"
+    let mut parts = version
+        .split(['.', '-', '+'])
+        .map(|p| p.parse::<u32>().ok());
+    Some((
+        parts.next()??,
+        parts.next()??,
+        parts.next().flatten().unwrap_or(0),
+    ))
+}
+
+/// The version of the installed skopeo, or `None` if there is none (or its
+/// version can't be parsed).
+pub(crate) fn skopeo_version() -> Option<SkopeoVersion> {
+    let output = std::process::Command::new("skopeo")
+        .arg("--version")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    parse_skopeo_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Returns true if skopeo is available on the system.
+pub(crate) fn have_skopeo() -> bool {
+    skopeo_version().is_some()
+}
+
+fn test_parse_skopeo_version() -> Result<()> {
+    let cases = [
+        (
+            "skopeo version 1.22.2 commit: 02c8e50e431f9617",
+            Some((1, 22, 2)),
+        ),
+        ("skopeo version 1.13.3\n", Some((1, 13, 3))),
+        ("skopeo version 1.19.0-dev", Some((1, 19, 0))),
+        ("skopeo version 1.20", Some((1, 20, 0))),
+        ("skopeo version banana", None),
+        ("", None),
+    ];
+    for (output, expected) in cases {
+        assert_eq!(parse_skopeo_version(output), expected, "{output:?}");
+    }
+    Ok(())
+}
+integration_test!(test_parse_skopeo_version);
+
 /// Bind a listening Unix socket at a fresh tempdir path and spawn `cfsctl`
 /// against it via the systemd socket-activation protocol (`LISTEN_FDS=1`, the
 /// listening socket on fd 3, `LISTEN_PID` set in the child). The socket is
