@@ -21,10 +21,19 @@ permissions:
 
 jobs:
   bootc-test:
-    name: Build and test bootc with local composefs-rs
+    name: bootc with local composefs-rs (${{ matrix.name }})
     if: never()
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: composefs backend
+            recipe: test
+          # ostree's composefs support running on our libcomposefs
+          - name: ostree backend
+            recipe: test-ostree
 
     steps:
       - name: Checkout repository
@@ -44,4 +53,4 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Build and test bootc with local composefs-rs
-        run: just bootc/test
+        run: just bootc/${{ matrix.recipe }}

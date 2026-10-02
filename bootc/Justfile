@@ -17,8 +17,17 @@ export COMPOSEFS_BOOTC_REF := env("COMPOSEFS_BOOTC_REF", "main")
 # Remote repository for bootc
 export COMPOSEFS_BOOTC_REPO := env("COMPOSEFS_BOOTC_REPO", "https://github.com/bootc-dev/bootc")
 
+# Buildroot image for `package-composefs`; its distribution must match
+# bootc's base image (CentOS Stream 10 by default).
+export COMPOSEFS_BOOTC_BUILDROOT := env("COMPOSEFS_BOOTC_BUILDROOT", "quay.io/centos/centos:stream10")
+
 # Internal: absolute path to the composefs-rs checkout (parent of this Justfile)
 export _COMPOSEFS_SRC := canonicalize(source_directory() + "/..")
+# Internal: scratch clone and output directory for `package-composefs`
+_composefs_rpm_src := COMPOSEFS_BOOTC_PATH + "/target/composefs-rpm-src"
+_composefs_rpms := COMPOSEFS_BOOTC_PATH + "/target/composefs-packages"
+# Internal: bootc's default output image name
+_bootc_image := env("BOOTC_image", "localhost/bootc")
 
 # Clone or update bootc repository
 clone:
@@ -47,18 +56,9 @@ clone:
 # the bind-mounted local source instead of fetching from git.
 #
 # Errors if the composefs-rs tree has uncommitted changes.
-patch: clone
+patch: clone _require-clean
     #!/bin/bash
     set -euo pipefail
-
-    # Require a clean composefs-rs working tree so we test a real commit.
-    # Only tracked files matter; untracked files are allowed.
-    # git diff HEAD already excludes untracked files.
-    if ! git -C "$_COMPOSEFS_SRC" diff --quiet HEAD 2>/dev/null; then
-        echo "error: composefs-rs has uncommitted changes — commit or stash first" >&2
-        git -C "$_COMPOSEFS_SRC" diff --stat HEAD >&2
-        exit 1
-    fi
 
     cfs_path="$_COMPOSEFS_SRC/crates/composefs-ctl"
 
@@ -91,6 +91,79 @@ patch: clone
     _rev=$(git -C "$_COMPOSEFS_SRC" rev-parse HEAD)
     sed -i "s/^# Patched by composefs-rs.*/# Patched by composefs-rs at ${_rev}/" Cargo.toml
     echo "bootc patched for composefs-rs at ${_rev}"
+
+# Require a clean composefs-rs working tree so we test a real commit.
+# Only tracked files matter; untracked files are allowed.
+_require-clean:
+    #!/bin/bash
+    set -euo pipefail
+    # git diff HEAD already excludes untracked files.
+    if ! git -C "$_COMPOSEFS_SRC" diff --quiet HEAD 2>/dev/null; then
+        echo "error: composefs-rs has uncommitted changes — commit or stash first" >&2
+        git -C "$_COMPOSEFS_SRC" diff --stat HEAD >&2
+        exit 1
+    fi
+
+# Build the composefs RPMs from the HEAD commit of this checkout, in a
+# buildroot matching bootc's base image.
+package-composefs: clone _require-clean
+    #!/bin/bash
+    set -euo pipefail
+    rm -rf "{{_composefs_rpm_src}}" "{{_composefs_rpms}}"
+    mkdir -p "{{_composefs_rpms}}"
+    # A scratch clone, so this also works from a git worktree and
+    # leaves the checkout's target/ alone.
+    git clone -q "$_COMPOSEFS_SRC" "{{_composefs_rpm_src}}"
+    podman run --rm --security-opt=label=disable \
+        -v "{{_composefs_rpm_src}}:/src" -v "{{_composefs_rpms}}:/out" \
+        "$COMPOSEFS_BOOTC_BUILDROOT" /src/bootc/build-composefs-rpms /src /out
+    ls -l "{{_composefs_rpms}}"
+
+# Build a bootc image (ostree backend) whose composefs packages come from
+# this checkout, replacing the distribution's C composefs. ostree then
+# generates and mounts composefs images with the Rust libcomposefs.
+build-ostree: patch package-composefs
+    #!/bin/bash
+    set -euo pipefail
+    cd "$COMPOSEFS_BOOTC_PATH"
+    export BOOTC_variant=ostree
+    # bootc's `package` recreates target/packages, so add ours after it.
+    # bootc installs every RPM there from a local repository that takes
+    # priority over the distribution's.
+    just package
+    cp -v "{{_composefs_rpms}}"/*.rpm target/packages/
+    BOOTC_SKIP_PACKAGE=1 just build
+    # Check that the libcomposefs ostree loads is ours, in the image and
+    # in the initramfs (where ostree-prepare-root mounts the composefs).
+    podman run --rm --security-opt=label=disable \
+        -v "{{_composefs_rpms}}:/run/composefs-packages:ro" "{{_bootc_image}}" bash -c '
+        set -euo pipefail
+        lib=$(ldd /usr/lib64/libostree-1.so.1 | awk "/libcomposefs\\.so/ { print \$3 }")
+        lib=$(readlink -f "$lib")
+        owner=$(rpm -qf "$lib")
+        expected=$(rpm -qp /run/composefs-packages/composefs-libs-[0-9]*.rpm)
+        echo "libostree uses $lib from $owner"
+        if [ "$owner" != "$expected" ]; then
+            echo "error: expected libcomposefs from $expected" >&2
+            exit 1
+        fi
+        initramfs=$(ls /usr/lib/modules/*/initramfs.img)
+        tmp=$(mktemp -d)
+        (cd "$tmp" && lsinitrd --unpack "$initramfs" "${lib#/}" 2>/dev/null)
+        if ! cmp "$lib" "$tmp/$lib"; then
+            echo "error: the initramfs has a different $lib" >&2
+            exit 1
+        fi
+        echo "initramfs has the same $lib"'
+
+# Run bootc's ostree backend tests on the image from `build-ostree`: a
+# bootc install and an upgrade with a reboot, so ostree writes composefs
+# images and ostree-prepare-root mounts them through the Rust libcomposefs.
+test-ostree *plans="readonly image-upgrade-reboot": build-ostree
+    #!/bin/bash
+    set -euo pipefail
+    cd "$COMPOSEFS_BOOTC_PATH"
+    BOOTC_variant=ostree BOOTC_SKIP_PACKAGE=1 just test-tmt {{plans}}
 
 # Build sealed bootc image using local composefs-rs
 # The path dependency is auto-detected and bind-mounted by bootc's Justfile
@@ -165,6 +238,7 @@ config:
       just bootc/test                                        # Default: systemd + ext4 + uki + sealed
       just bootc/test grub ext4 bls unsealed                 # grub + ext4 + BLS (unsealed)
       just bootc/test systemd btrfs uki sealed               # systemd-boot + btrfs + UKI (sealed)
+      just bootc/test-ostree                                 # ostree backend with this libcomposefs
 
     Example Usage:
       just bootc/build                                      # Clone main, patch, and build

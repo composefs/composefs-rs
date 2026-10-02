@@ -35,12 +35,33 @@ echo "Version: ${VERSION}"
 # Source tarball from git
 git archive --format=tar --prefix="${PREFIX}" -o "${TAR}" HEAD
 
-# Vendor tarball via cargo-vendor-filterer
-VENDOR_CONFIG=$(cargo vendor-filterer --prefix=vendor --format=tar.zstd "${VENDORTAR}")
-
-# Fix the vendor config to use a relative "vendor" directory
 TMPDIR=$(mktemp -d -p target)
 trap 'rm -rf "${TMPDIR}"' EXIT
+
+# Vendor tarball via cargo-vendor-filterer, or with PACK_VENDOR=cargo via
+# plain `cargo vendor` (larger, as it keeps all platforms, but needs no
+# extra tools).
+case "${PACK_VENDOR:-filterer}" in
+    filterer)
+        VENDOR_CONFIG=$(cargo vendor-filterer --prefix=vendor --format=tar.zstd "${VENDORTAR}")
+        ;;
+    cargo)
+        VENDOR_CONFIG=$(cargo vendor "${TMPDIR}/vendor")
+        tar -C "${TMPDIR}" --zstd -cf "${VENDORTAR}" vendor
+        rm -rf "${TMPDIR}/vendor"
+        ;;
+    *)
+        echo "error: unknown PACK_VENDOR=${PACK_VENDOR}" >&2
+        exit 1
+        ;;
+esac
+
+if test -z "${VENDOR_CONFIG}"; then
+    echo "error: vendoring printed no source replacement config" >&2
+    exit 1
+fi
+
+# Fix the vendor config to use a relative "vendor" directory
 echo "${VENDOR_CONFIG}" | sed 's|^directory = ".*"|directory = "vendor"|' > "${TMPDIR}/vendor-config.toml"
 
 # Embed .cargo/vendor-config.toml into the source tarball
