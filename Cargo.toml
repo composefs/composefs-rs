@@ -37,7 +37,7 @@ composefs = { version = "0.9.3", path = "crates/composefs", default-features = f
 composefs-ctl = { version = "0.9.3", path = "crates/composefs-ctl", default-features = false }
 composefs-ioctls = { version = "0.9.3", path = "crates/composefs-ioctls", default-features = false }
 composefs-oci = { version = "0.9.3", path = "crates/composefs-oci", default-features = false }
-composefs-boot = { version = "0.9.3", path = "crates/composefs-boot", default-features = false }
+composefs-boot = { version = "0.9.3", path = "crates/composefs-boot" }
 composefs-fuse = { version = "0.9.3", path = "crates/composefs-fuse", default-features = false }
 composefs-http = { version = "0.9.3", path = "crates/composefs-http", default-features = false }
 composefs-ostree = { version = "0.9.3", path = "crates/composefs-ostree", default-features = false }

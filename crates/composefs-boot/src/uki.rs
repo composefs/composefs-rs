@@ -341,6 +341,7 @@ pub(crate) mod test {
         )
     }
 
+    #[cfg(feature = "composefs-integration")]
     pub(crate) fn uki_with_linux_initrd() -> Vec<u8> {
         let linux = b"linux";
         let initrd = b"initrd";

@@ -4,124 +4,30 @@
 //! scenarios by extracting boot resources, applying SELinux labels, and preparing
 //! bootloader entries. It supports both Boot Loader Specification (Type 1) entries
 //! and Unified Kernel Images (Type 2) for UEFI boot.
+//!
+//! The `composefs-integration` feature is enabled by default. Disable default features
+//! to use the Android boot image and UKI parsers without the composefs integration dependencies.
 
 #![forbid(unsafe_code)]
 #![deny(missing_debug_implementations)]
 
 pub mod android_boot;
+#[cfg(feature = "composefs-integration")]
 pub mod bootloader;
+#[cfg(feature = "composefs-integration")]
 pub mod cmdline;
 pub mod os_release;
+#[cfg(feature = "composefs-integration")]
 pub mod selabel;
 pub mod uki;
+#[cfg(feature = "composefs-integration")]
 pub mod write_boot;
 
 #[cfg(doc)]
 pub mod design;
 
-use std::ffi::OsStr;
+#[cfg(feature = "composefs-integration")]
+mod integration;
 
-use anyhow::Result;
-use rustix::fd::AsFd;
-
-use composefs::{fsverity::FsVerityHashValue, repository::Repository, tree::FileSystem};
-
-use crate::bootloader::{BootEntry, get_boot_resources};
-
-/// These directories are required to exist in images.
-/// They may have content in the container, but we don't
-/// want to expose them in the final merged root.
-///
-/// # /boot
-///
-/// This is how sealed UKIs are handled; the UKI in /boot has the composefs
-/// digest, so we can't include it in the rendered image.
-///
-/// # /sysroot
-///
-/// See https://github.com/containers/composefs-rs/issues/164
-/// Basically there is only content here in ostree-container cases,
-/// and us traversing there for SELinux labeling will cause problems.
-/// The ostree-container code special cases it in a different way, but
-/// here we can just ignore it.
-const REQUIRED_TOPLEVEL_TO_EMPTY_DIRS: &[&str] = &["boot", "sysroot"];
-
-/// Empty the required top-level directories and set their mtime to match /usr.
-fn empty_toplevel_dirs<ObjectID: FsVerityHashValue>(fs: &mut FileSystem<ObjectID>) -> Result<()> {
-    let usr = fs.root.get_directory(OsStr::new("usr"))?;
-    let usr_mtime_stat_sec = usr.stat.st_mtim_sec;
-    let usr_mtime_stat_nsec = usr.stat.st_mtim_nsec;
-
-    for d in REQUIRED_TOPLEVEL_TO_EMPTY_DIRS {
-        let d = fs.root.get_directory_mut(d.as_ref())?;
-        d.stat.st_mtim_sec = usr_mtime_stat_sec;
-        d.stat.st_mtim_nsec = usr_mtime_stat_nsec;
-        d.clear();
-    }
-
-    Ok(())
-}
-
-/// Trait for transforming filesystem images for boot scenarios.
-///
-/// This trait provides functionality to prepare composefs filesystem images for booting by
-/// extracting boot resources and applying necessary transformations like SELinux labeling.
-pub trait BootOps<ObjectID: FsVerityHashValue> {
-    /// Transforms a filesystem image for boot by extracting boot entries and applying SELinux labels.
-    ///
-    /// This method extracts boot resources from the filesystem, empties required top-level
-    /// directories (/boot, /sysroot), and applies SELinux security contexts.
-    ///
-    /// # Arguments
-    ///
-    /// * `repo` - The composefs repository containing filesystem objects
-    ///
-    /// # Returns
-    ///
-    /// A vector of boot entries extracted from the filesystem (Type 1 BLS entries, Type 2 UKIs, etc.)
-    fn transform_for_boot(
-        &mut self,
-        repo: &Repository<ObjectID>,
-    ) -> Result<Vec<BootEntry<ObjectID>>>;
-
-    /// Apply boot filesystem transformations using an on-disk directory for file content.
-    ///
-    /// This applies the same filesystem transformations as [`BootOps::transform_for_boot`]
-    /// (emptying /boot and /sysroot, SELinux relabeling) but reads SELinux policy files
-    /// directly from the on-disk filesystem via a directory fd rather than from the
-    /// composefs repository.
-    ///
-    /// This does not extract boot entries (Type 1 BLS entries, UKIs, etc.) since those
-    /// are only needed for writing to the boot partition, not for computing the composefs
-    /// digest.
-    ///
-    /// # Arguments
-    ///
-    /// * `rootfs` - A directory fd pointing to the root of the on-disk filesystem
-    fn transform_for_boot_from_dir(&mut self, rootfs: impl AsFd) -> Result<()>;
-}
-
-impl<ObjectID: FsVerityHashValue> BootOps<ObjectID> for FileSystem<ObjectID> {
-    fn transform_for_boot(
-        &mut self,
-        repo: &Repository<ObjectID>,
-    ) -> Result<Vec<BootEntry<ObjectID>>> {
-        let boot_entries = get_boot_resources(self, repo)?;
-        empty_toplevel_dirs(self)?;
-        // Compact the leaves table after clearing directories, so that leaves
-        // which were only referenced by /boot or /sysroot are removed and
-        // don't appear as orphans when the filesystem is validated.
-        self.compact();
-        selabel::selabel(self, repo)?;
-
-        Ok(boot_entries)
-    }
-
-    fn transform_for_boot_from_dir(&mut self, rootfs: impl AsFd) -> Result<()> {
-        empty_toplevel_dirs(self)?;
-        // Same as above: compact to remove leaves orphaned by clearing dirs.
-        self.compact();
-        selabel::selabel_from_dir(self, rootfs)?;
-        Ok(())
-    }
-}
+#[cfg(feature = "composefs-integration")]
+pub use integration::BootOps;
