@@ -622,7 +622,7 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
         (!needs_proxy).then_some((kind, layout_path, layout_tag))
     });
 
-    let (result, stats) = if let Some((kind, layout_path, layout_tag)) = oci_layout {
+    let (mut result, stats) = if let Some((kind, layout_path, layout_tag)) = oci_layout {
         crate::oci_layout::import_oci_layout(repo, kind, layout_path, layout_tag, reporter).await?
     } else {
         // Standard path: use skopeo proxy for other transports
@@ -649,6 +649,14 @@ pub async fn pull_image<ObjectID: FsVerityHashValue>(
         }
     }
 
+    // Finalization rewrites the config and manifest splitstreams with EROFS refs.
+    result.config_verity = repo
+        .has_stream(&config_identifier(&result.config_digest))?
+        .context("config splitstream missing after finalization")?;
+    result.manifest_verity = repo
+        .has_stream(&manifest_identifier(&result.manifest_digest))?
+        .context("manifest splitstream missing after finalization")?;
+
     Ok((result, stats))
 }
 
@@ -669,4 +677,126 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         pull_image(repo, imgref, reference, img_proxy_config, reporter, None).await?;
     let (config_digest, config_verity) = result.into_config();
     Ok((config_digest, config_verity, stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    use cap_std_ext::cap_std;
+    use composefs::{fsverity::Sha256HashValue, test::TestRepo};
+    use containers_image_proxy::oci_spec::image::{
+        Arch, ConfigBuilder, ImageConfigurationBuilder, Os, PlatformBuilder, RootFsBuilder,
+    };
+    use ocidir::OciDir;
+
+    #[tokio::test]
+    async fn test_pull_image_finalized_verities() -> Result<()> {
+        let layout = tempfile::tempdir()?;
+        let dir = cap_std::fs::Dir::open_ambient_dir(layout.path(), cap_std::ambient_authority())?;
+        let oci = OciDir::ensure(dir)?;
+        let mut manifest = oci.new_empty_manifest()?.build()?;
+        let mut config = ImageConfigurationBuilder::default()
+            .architecture(Arch::default())
+            .os(Os::default())
+            .rootfs(
+                RootFsBuilder::default()
+                    .typ("layers")
+                    .diff_ids(Vec::<String>::new())
+                    .build()?,
+            )
+            .config(ConfigBuilder::default().build()?)
+            .build()?;
+
+        // Config order is small then large, opposite the size-sorted fetch order.
+        for dump in [
+            "/usr 0 40755 2 0 0 0 0.0 - - -\n/usr/small 5 100644 1 0 0 0 0.0 - hello -\n",
+            "/usr/large 8192 100644 1 0 0 0 0.0 / - -\n",
+        ] {
+            let mut writer = oci.create_gzip_layer(None)?;
+            writer.write_all(&crate::test_util::dumpfile_to_tar(dump))?;
+            oci.push_layer(
+                &mut manifest,
+                &mut config,
+                writer.complete()?,
+                "layer",
+                None,
+            );
+        }
+        assert!(manifest.layers()[0].size() < manifest.layers()[1].size());
+        let diff_ids = config.rootfs().diff_ids().clone();
+        let platform = PlatformBuilder::default()
+            .architecture(Arch::default())
+            .os(Os::default())
+            .build()?;
+        oci.insert_manifest_and_config(manifest, config, None, platform)?;
+
+        let test_repo = TestRepo::<Sha256HashValue>::new();
+        let repo = &test_repo.repo;
+        let (imported, _) = crate::oci_layout::import_oci_layout(
+            repo,
+            OciLayoutKind::Directory,
+            layout.path(),
+            None,
+            Arc::new(crate::NullReporter),
+        )
+        .await?;
+
+        // Check importer ordering before finalization can reorder the refs.
+        let (json, refs) = crate::oci_image::read_external_splitstream(
+            repo,
+            &config_identifier(&imported.config_digest),
+            Some(&imported.config_verity),
+            Some(OCI_CONFIG_CONTENT_TYPE),
+        )?;
+        let mut expected = repo.create_stream(OCI_CONFIG_CONTENT_TYPE)?;
+        for diff_id in &diff_ids {
+            let verity = repo
+                .has_stream(&layer_identifier(&diff_id.parse()?))?
+                .unwrap();
+            assert_eq!(refs[diff_id.as_str()], verity);
+            expected.add_named_stream_ref(diff_id, &verity);
+        }
+        expected.write_external(&json)?;
+        assert_eq!(
+            expected.done()?,
+            imported.config_verity,
+            "importer config ref order"
+        );
+
+        let imgref = format!("oci:{}", layout.path().display());
+        let mut previous = None;
+        for _ in 0..2 {
+            let (result, _) = pull_image(
+                repo,
+                &imgref,
+                None,
+                None,
+                Arc::new(crate::NullReporter),
+                None,
+            )
+            .await?;
+            assert_eq!(
+                Some(result.config_verity.clone()),
+                repo.has_stream(&config_identifier(&result.config_digest))?,
+                "returned config verity must be finalized",
+            );
+            assert_eq!(
+                Some(result.manifest_verity.clone()),
+                repo.has_stream(&manifest_identifier(&result.manifest_digest))?,
+                "returned manifest verity must be finalized",
+            );
+
+            let current = result.into_config();
+            if let Some(previous) = &previous {
+                assert_eq!(
+                    &current, previous,
+                    "repeated config imports must be deterministic"
+                );
+            }
+            previous = Some(current);
+        }
+        Ok(())
+    }
 }
