@@ -75,27 +75,26 @@ fn process_spec_file(
             Some(regex) => regex,
         };
 
-        /* TODO: https://github.com/rust-lang/rust/issues/51114
-         *  match parts.next() {
-         *      Some(opt) if let Some(ifmt) = opt.strip_prefix("-") => ...
-         */
         let Some(next) = parts.next() else {
             bail!("{line_nr}: missing separator after regex");
         };
-        if let Some(ifmt) = next.strip_prefix("-") {
-            ensure!(
-                ["b", "c", "d", "p", "l", "s", "-"].contains(&ifmt),
-                "{line_nr}: invalid type code -{ifmt}"
-            );
-            let Some(context) = parts.next() else {
-                bail!("{line_nr}: missing context field");
-            };
-            regexps.push(format!("^({regex}){ifmt}$"));
-            contexts.push(context.to_string());
-        } else {
-            let context = next;
-            regexps.push(format!("^({regex}).$"));
-            contexts.push(context.to_string());
+        match next.strip_prefix("-") {
+            Some(ifmt) => {
+                ensure!(
+                    ["b", "c", "d", "p", "l", "s", "-"].contains(&ifmt),
+                    "{line_nr}: invalid type code -{ifmt}"
+                );
+                let Some(context) = parts.next() else {
+                    bail!("{line_nr}: missing context field");
+                };
+                regexps.push(format!("^({regex}){ifmt}$"));
+                contexts.push(context.to_string());
+            }
+            None => {
+                let context = next;
+                regexps.push(format!("^({regex}).$"));
+                contexts.push(context.to_string());
+            }
         }
         ensure!(parts.next().is_none(), "{line_nr}: trailing data");
     }
@@ -679,6 +678,64 @@ mod tests {
     use composefs::generic_tree::LeafId;
     use composefs::test::TestRepo;
     use indoc::indoc;
+
+    #[test]
+    fn process_spec_file_fields() {
+        const CONTEXT: &str = "system_u:object_r:device_t:s0";
+        let cases = [
+            ("/dev -b", Some("0: missing context field"), None),
+            ("/dev", Some("0: missing separator after regex"), None),
+            ("/dev -x", Some("0: invalid type code -x"), None),
+            (
+                "/dev -x context extra",
+                Some("0: invalid type code -x"),
+                None,
+            ),
+            (
+                "/dev -b system_u:object_r:device_t:s0",
+                None,
+                Some("^(/dev)b$"),
+            ),
+            (
+                "/dev -b system_u:object_r:device_t:s0 extra",
+                Some("0: trailing data"),
+                Some("^(/dev)b$"),
+            ),
+            (
+                "/dev system_u:object_r:device_t:s0",
+                None,
+                Some("^(/dev).$"),
+            ),
+            (
+                "/dev system_u:object_r:device_t:s0 extra",
+                Some("0: trailing data"),
+                Some("^(/dev).$"),
+            ),
+        ];
+        for (input, expected_error, expected_regexp) in cases {
+            let mut regexps = vec![];
+            let mut contexts = vec![];
+            let result = process_spec_file(input.as_bytes(), &mut regexps, &mut contexts);
+            assert_eq!(
+                result.err().map(|e| e.to_string()).as_deref(),
+                expected_error,
+                "{input}",
+            );
+            assert_eq!(
+                regexps,
+                expected_regexp.into_iter().collect::<Vec<_>>(),
+                "{input}"
+            );
+            assert_eq!(
+                contexts,
+                expected_regexp
+                    .map(|_| CONTEXT)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{input}",
+            );
+        }
+    }
 
     /// Walk the directory tree and collect every LeafId referenced anywhere in it.
     fn collect_leaf_ids(dir: &Directory<Sha256HashValue>) -> Vec<LeafId> {
