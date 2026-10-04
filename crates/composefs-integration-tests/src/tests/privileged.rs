@@ -1290,6 +1290,7 @@ fn build_test_filesystem(
 }
 
 fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
+    use std::ffi::OsStr;
     use std::os::unix::fs::MetadataExt as _;
     use std::time::{Duration, Instant};
 
@@ -1300,6 +1301,7 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
             writer::{ValidatedFileSystem, mkfs_erofs},
         },
         repository::{Repository, RepositoryConfig},
+        tree::{Directory, Inode, LeafContent, RegularFile},
     };
 
     if require_privileged("privileged_fuse_dumpfile_roundtrip")?.is_some() {
@@ -1324,7 +1326,25 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
     )?;
     repo.set_insecure();
 
-    let synthetic = build_test_filesystem(&repo)?;
+    let mut synthetic = build_test_filesystem(&repo)?;
+    // Exceed both an EROFS directory block and a FUSE directory reply, so
+    // enumeration must resume from the offsets returned by the server.
+    const DIRECTORY_ENTRIES: usize = 1024;
+    let stat = synthetic.root.stat.clone();
+    let entry = synthetic.push_leaf(
+        stat.clone(),
+        LeafContent::Regular(RegularFile::Inline(b"directory entry\n".as_ref().into())),
+    );
+    let mut many = Directory::new(stat);
+    let expected_names: Vec<_> = (0..DIRECTORY_ENTRIES)
+        .map(|i| format!("entry-{i:04}"))
+        .collect();
+    for name in &expected_names {
+        many.insert(OsStr::new(name), Inode::leaf(entry));
+    }
+    synthetic
+        .root
+        .insert(OsStr::new("many"), Inode::Directory(Box::new(many)));
     let erofs_bytes = mkfs_erofs(&ValidatedFileSystem::new(synthetic)?);
     let canonical_fs = erofs_to_filesystem::<Sha256HashValue>(&erofs_bytes)?;
 
@@ -1373,6 +1393,15 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+
+    // Keep duplicates in the comparison: a set could hide repeated entries
+    // caused by incorrect continuation offsets.
+    let mut actual_names = std::fs::read_dir(mountpoint.join("many"))?
+        .map(|entry| entry.map(|e| e.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    actual_names.sort();
+    let expected_names: Vec<_> = expected_names.iter().map(OsStr::new).collect();
+    assert_eq!(actual_names, expected_names);
 
     let bigfile_actual = std::fs::read(mountpoint.join("usr/bin/bigfile"))
         .context("reading bigfile from FUSE mount")?;
