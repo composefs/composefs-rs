@@ -25,6 +25,26 @@ jobs:
     - uses: actions/checkout@v7
     - run: cargo +nightly -Z package-workspace package
 
+  standalone-boot:
+    name: Standalone composefs-boot
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build composefs-boot without composefs integration
+        run: cargo build -p composefs-boot --no-default-features --lib
+      - name: Check that standalone build doesn't pull in composefs dependencies
+        run: |
+          set -euo pipefail
+          # Dev dependencies are excluded because consumers do not build them.
+          cargo tree -p composefs-boot --no-default-features \
+            --edges normal,build --target all --prefix none |
+            awk '$1 ~ /^composefs($|-)/ && $1 != "composefs-boot" {
+              print "Unexpected composefs dependency: " $0
+              failed = 1
+            } END { exit failed }'
+
   fedora:
     runs-on: ubuntu-24.04
     container:
@@ -253,12 +273,13 @@ jobs:
   # repository settings as the single required status check.
   required-checks:
     if: always()
-    needs: [nightly, fedora, smoke, fuzz, capi, integration, examples]
+    needs: [nightly, standalone-boot, fedora, smoke, fuzz, capi, integration, examples]
     runs-on: ubuntu-latest
     steps:
       - run: exit 1
         if: >-
           needs.nightly.result != 'success' ||
+          needs.standalone-boot.result != 'success' ||
           needs.fedora.result != 'success' ||
           needs.smoke.result != 'success' ||
           needs.fuzz.result != 'success' ||
