@@ -38,6 +38,15 @@
 //! Linux page cache.
 //!
 //! See the [`repository_format`] module for the on-disk layout.
+//!
+//! ## Examples
+//!
+//! - [`splitstream::SplitStreamWriter`] demonstrates writing inline and external
+//!   chunks into a temporary repository, reading the combined bytes back, and
+//!   walking chunks while preserving object references.
+//! - [`dumpfile::write_dumpfile`] demonstrates serializing an in-memory
+//!   filesystem with a hardlink to a text dumpfile and parsing it back.
+//! - [`dumpfile_parse::Entry`] demonstrates parsing and serializing one entry.
 
 #![forbid(unsafe_code)]
 // This is a library: emit diagnostics via the `log` crate (or return them),
