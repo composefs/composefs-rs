@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     ffi::{CStr, OsStr},
     fs::File,
-    io::{BufRead, Read, Write},
+    io::{BufRead, Read},
     mem::MaybeUninit,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -237,8 +237,18 @@ impl<ObjectID: FsVerityHashValue> ObjectStore<ObjectID> for FlatDigestStore {
 
 /// Attempt to use O_TMPFILE + rename to atomically set file contents.
 /// Will fall back to a non-atomic write if the target doesn't support O_TMPFILE.
+///
+/// The contents are copied from the current position of `src` to its end
+/// with [`std::io::copy`], which retries on EINTR and, when `src` is a
+/// [`File`] (or a [`Read::take`] of one), uses `copy_file_range()`.
+/// Returns the number of bytes copied.
 #[context("Setting file contents for {}", name.to_string_lossy())]
-fn set_file_contents(dirfd: &OwnedFd, name: &OsStr, stat: &Stat, data: &[u8]) -> Result<()> {
+fn set_file_contents<R: Read>(
+    dirfd: &OwnedFd,
+    name: &OsStr,
+    stat: &Stat,
+    src: &mut R,
+) -> Result<u64> {
     match openat(
         dirfd,
         ".",
@@ -247,8 +257,7 @@ fn set_file_contents(dirfd: &OwnedFd, name: &OsStr, stat: &Stat, data: &[u8]) ->
     ) {
         Ok(tmp) => {
             let mut tmp = File::from(tmp);
-            tmp.write_all(data)
-                .context("Failed to write data to tmpfile")?;
+            let copied = std::io::copy(src, &mut tmp).context("Failed to write data to tmpfile")?;
             tmp.sync_data().context("Failed to sync tmpfile data")?;
             linkat(
                 CWD,
@@ -258,6 +267,7 @@ fn set_file_contents(dirfd: &OwnedFd, name: &OsStr, stat: &Stat, data: &[u8]) ->
                 AtFlags::SYMLINK_FOLLOW,
             )
             .with_context(|| format!("Failed to link tmpfile to {}", name.to_string_lossy()))?;
+            Ok(copied)
         }
         Err(Errno::OPNOTSUPP) => {
             // vfat? yolo...
@@ -269,12 +279,12 @@ fn set_file_contents(dirfd: &OwnedFd, name: &OsStr, stat: &Stat, data: &[u8]) ->
             )
             .with_context(|| format!("Failed to create file {}", name.to_string_lossy()))?;
             let mut f = File::from(fd);
-            f.write_all(data).context("Failed to write file data")?;
+            let copied = std::io::copy(src, &mut f).context("Failed to write file data")?;
             f.sync_data().context("Failed to sync file data")?;
+            Ok(copied)
         }
         Err(e) => Err(e)?,
     }
-    Ok(())
 }
 
 #[context("Writing directory {}", name.to_string_lossy())]
@@ -305,21 +315,24 @@ fn write_leaf<ObjectID: FsVerityHashValue>(
 
     match &leaf.content {
         LeafContent::Regular(RegularFile::Inline(data)) => {
-            set_file_contents(dirfd, name, &leaf.stat, data)?
+            set_file_contents(dirfd, name, &leaf.stat, &mut data.as_ref())?;
         }
         LeafContent::Regular(
             RegularFile::External(id, size) | RegularFile::ExternalNoVerity(id, size),
         ) => {
             let object = repo.open_object(id)?;
-            // TODO: make this better.  At least needs to be EINTR-safe.  Could even do reflink in some cases.
-            // Regardless we shouldn't read the whole file into memory.
-            let size = (*size).try_into().context("size overflow")?;
-            let mut buffer = vec![MaybeUninit::uninit(); size];
-            let (data, _) = read(object, &mut buffer)?;
-            set_file_contents(dirfd, name, &leaf.stat, data)?;
+            // Copy at most the recorded size, like the read() this replaces.
+            let mut object = File::from(object).take(*size);
+            let copied = set_file_contents(dirfd, name, &leaf.stat, &mut object)
+                .with_context(|| format!("Copying object {id:?} to {}", name.to_string_lossy()))?;
+            ensure!(
+                copied == *size,
+                "Object {id:?} copied to {} is {copied} bytes, expected {size}",
+                name.to_string_lossy()
+            );
         }
         LeafContent::Regular(RegularFile::Sparse(..)) => {
-            set_file_contents(dirfd, name, &leaf.stat, &[])?;
+            set_file_contents(dirfd, name, &leaf.stat, &mut std::io::empty())?;
         }
         LeafContent::BlockDevice(rdev) => mknodat(dirfd, name, FileType::BlockDevice, mode, *rdev)?,
         LeafContent::CharacterDevice(rdev) => {
@@ -970,9 +983,77 @@ mod tests {
             st_mtim_nsec: Default::default(),
             xattrs: Default::default(),
         };
-        set_file_contents(&td, OsStr::new("testfile"), &st, b"new contents").unwrap();
+        set_file_contents(&td, OsStr::new("testfile"), &st, &mut &b"new contents"[..]).unwrap();
         drop(td);
         assert_eq!(std::fs::read(testpath)?, b"new contents");
+        Ok(())
+    }
+
+    /// Copy `src` with `set_file_contents` (optionally limited to `limit`
+    /// bytes) and check that the result matches.
+    fn check_copy_file(src: &Path, limit: Option<u64>) -> Result<()> {
+        let td = tempfile::tempdir()?;
+        let dirfd = openat(
+            CWD,
+            td.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0),
+        )?;
+        let st = Stat {
+            st_mode: 0o644,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: Default::default(),
+            st_mtim_nsec: Default::default(),
+            xattrs: Default::default(),
+        };
+        let mut expected = std::fs::read(src)?;
+        let mut src = File::open(src)?;
+        let copied = match limit {
+            Some(limit) => {
+                expected.truncate(limit as usize);
+                set_file_contents(&dirfd, OsStr::new("dest"), &st, &mut src.take(limit))?
+            }
+            None => set_file_contents(&dirfd, OsStr::new("dest"), &st, &mut src)?,
+        };
+        assert_eq!(copied, expected.len() as u64);
+        assert!(std::fs::read(td.path().join("dest"))? == expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_set_file_contents_from_file() -> Result<()> {
+        let td = tempfile::tempdir()?;
+
+        let empty = td.path().join("empty");
+        std::fs::write(&empty, b"")?;
+        check_copy_file(&empty, None)?;
+        check_copy_file(&empty, Some(0))?;
+
+        let small = td.path().join("small");
+        std::fs::write(&small, b"small contents")?;
+        check_copy_file(&small, None)?;
+        check_copy_file(&small, Some(5))?;
+
+        // Several MiB, so the copy takes more than one read() of a buffer
+        let large = td.path().join("large");
+        let data: Vec<u8> = (0..(5 * 1024 * 1024 + 7))
+            .map(|i: u32| (i % 251) as u8)
+            .collect();
+        std::fs::write(&large, &data)?;
+        check_copy_file(&large, None)?;
+        check_copy_file(&large, Some(3 * 1024 * 1024 + 1))?;
+
+        // Holes at the start, middle and end
+        let sparse = td.path().join("sparse");
+        let f = File::create(&sparse)?;
+        f.set_len(16 * 1024 * 1024)?;
+        rustix::io::pwrite(&f, b"middle", 4 * 1024 * 1024)?;
+        rustix::io::pwrite(&f, b"later", 9 * 1024 * 1024)?;
+        drop(f);
+        check_copy_file(&sparse, None)?;
+        check_copy_file(&sparse, Some(4 * 1024 * 1024 + 3))?;
+
         Ok(())
     }
 
