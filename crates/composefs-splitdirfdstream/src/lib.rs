@@ -1,5 +1,5 @@
 //! A data format and IPC protocol for sending a binary stream across local
-//! processes via file descriptor passing (DBus, varlink, etc.).
+//! processes via file descriptor passing (D-Bus, varlink, etc.).
 //!
 //! Designed for sending tar archives of container image layers that are unpacked
 //! into a storage system such as composefs or docker/podman `overlay` storage.
@@ -21,18 +21,18 @@
 //! it reconstructs a byte stream by concatenating each chunk's contribution:
 //!
 //! - **Metadata chunk** — raw stream metadata (tar header/padding) carried verbatim.
-//! - **InlineData chunk** — file content transported inline (for non-world-readable
+//! - **`InlineData` chunk** — file content transported inline (for non-world-readable
 //!   files the producer read through a privileged fd).
-//! - **FileBackedData chunk** — `content_length` bytes of a file, resolved via
+//! - **`FileBackedData` chunk** — `content_length` bytes of a file, resolved via
 //!   `openat2(dirfds[dirfd_index], filename, RESOLVE_BENEATH)` and read from offset 0.
 //!
 //! All integers are little-endian. Each chunk begins with a single type byte:
 //!
-//! | Type byte | Chunk          | Remaining header                                                  | Body                         |
-//! |-----------|----------------|-------------------------------------------------------------------|------------------------------|
-//! | `0x00`    | Metadata       | `u32 LE` — body length                                            | `length` bytes               |
-//! | `0x01`    | InlineData     | `u32 LE` — body length                                            | `length` bytes               |
-//! | `0x02`    | FileBackedData | `u64 LE` content_length, `u32 LE` dirfd_index, `u32 LE` name_len | `name_len` bytes of filename |
+//! | Type byte | Chunk            | Remaining header                                                       | Body                         |
+//! |-----------|------------------|------------------------------------------------------------------------|------------------------------|
+//! | `0x00`    | Metadata         | `u32 LE` — body length                                                 | `length` bytes               |
+//! | `0x01`    | `InlineData`     | `u32 LE` — body length                                                 | `length` bytes               |
+//! | `0x02`    | `FileBackedData` | `u64 LE` `content_length`, `u32 LE` `dirfd_index`, `u32 LE` `name_len` | `name_len` bytes of filename |
 //!
 //! Any other type byte is a hard error ([`Error::UnknownChunkType`]).
 //!
@@ -56,7 +56,7 @@
 //! etc.). Empty writes are silently dropped by the writer; a zero-length Metadata
 //! chunk is never encoded. `length` is bounded by [`MAX_INLINE_CHUNK_SIZE`] (256 MiB).
 //!
-//! ### InlineData
+//! ### `InlineData`
 //!
 //! ```text
 //! +--------+---------------+----------------------------+
@@ -66,15 +66,15 @@
 //!
 //! `length` is both the byte count of the data that follows and the logical file
 //! size the consumer uses for its inline-vs-object storage decision. Unlike
-//! FileBackedData, no directory fd is involved; the producer has already read the
+//! `FileBackedData`, no directory fd is involved; the producer has already read the
 //! content through its own privileged fd.
 //!
-//! A zero-length InlineData **is** written and round-trips correctly — a zero-byte
+//! A zero-length `InlineData` **is** written and round-trips correctly — a zero-byte
 //! non-world-readable file must still be transported. `length` is bounded by
 //! [`MAX_INLINE_CHUNK_SIZE`] (256 MiB), since the data is fully buffered in memory
 //! during transport.
 //!
-//! ### FileBackedData
+//! ### `FileBackedData`
 //!
 //! ```text
 //! +--------+---------------------+--------------------+-----------------+------------------------------+
@@ -87,9 +87,9 @@
 //! boundaries never depend on trusting the backing file's size, which closes a
 //! TOCTOU window if the underlying store is mutated mid-read.
 //!
-//! A FileBackedData chunk always starts at offset 0: it references a whole file,
+//! A `FileBackedData` chunk always starts at offset 0: it references a whole file,
 //! not a byte range. This is deliberate — it lets every external reference reflink
-//! cleanly (`FICLONE`) when materialized on a CoW filesystem. There is no range
+//! cleanly (`FICLONE`) when materialized on a copy-on-write filesystem. There is no range
 //! variant.
 //!
 //! `filename` is a path relative to `dirfds[dirfd_index]`. It may contain `/` to
@@ -100,10 +100,10 @@
 //!
 //! | Constant | Value | Purpose |
 //! |----------|-------|---------|
-//! | [`MAX_INLINE_CHUNK_SIZE`] | 256 MiB | Bounds memory for a single Metadata or InlineData chunk body. |
-//! | [`MAX_FILENAME_LEN`] | 4096 bytes | Bounds the FileBackedData filename length. |
+//! | [`MAX_INLINE_CHUNK_SIZE`] | 256 MiB | Bounds memory for a single Metadata or `InlineData` chunk body. |
+//! | [`MAX_FILENAME_LEN`] | 4096 bytes | Bounds the `FileBackedData` filename length. |
 //!
-//! The reader rejects an out-of-range `dirfd_index`, and Metadata or InlineData
+//! The reader rejects an out-of-range `dirfd_index`, and Metadata or `InlineData`
 //! chunks whose `length` exceeds `MAX_INLINE_CHUNK_SIZE`.
 //!
 //! # Safety
@@ -228,7 +228,7 @@ pub enum Error {
         ///
         /// - **Type byte**: `1` if EOF arrived after 0 bytes (but that is
         ///   returned as `Ok(None)`; this only fires for 0 < n < expected).
-        /// - **Inline body or FileBackedData header/name**: the *full* declared
+        /// - **Inline body or `FileBackedData` header/name**: the *full* declared
         ///   size (i.e. the number passed to `read_exact`), because `read_exact`
         ///   does not report how many bytes it successfully consumed before EOF.
         expected: u64,
@@ -360,6 +360,7 @@ impl<W: Write> SplitdirfdstreamWriter<W> {
     /// Returns [`Error::InlineTooLarge`] if `data.len()` exceeds
     /// [`MAX_INLINE_CHUNK_SIZE`], or propagates I/O errors from the
     /// underlying writer.
+    #[allow(clippy::cast_possible_truncation)] // MAX_INLINE_CHUNK_SIZE fits u32.
     pub fn write_metadata(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -387,6 +388,7 @@ impl<W: Write> SplitdirfdstreamWriter<W> {
     /// Returns [`Error::InlineTooLarge`] if `data.len()` exceeds
     /// [`MAX_INLINE_CHUNK_SIZE`], or propagates I/O errors from the underlying
     /// writer.
+    #[allow(clippy::cast_possible_truncation)] // MAX_INLINE_CHUNK_SIZE fits u32.
     pub fn write_inline_data(&mut self, data: &[u8]) -> Result<()> {
         if data.len() > MAX_INLINE_CHUNK_SIZE {
             return Err(Error::InlineTooLarge {
@@ -412,6 +414,7 @@ impl<W: Write> SplitdirfdstreamWriter<W> {
     ///
     /// Returns any [`Error`] produced by [`validate_filename`], or propagates
     /// I/O errors from the underlying writer.
+    #[allow(clippy::cast_possible_truncation)] // validate_filename bounds the length to 4096.
     pub fn write_file_backed_data(
         &mut self,
         dirfd_index: u32,
@@ -429,6 +432,9 @@ impl<W: Write> SplitdirfdstreamWriter<W> {
     }
 
     /// Consume the writer and return the underlying `Write` impl.
+    ///
+    /// # Errors
+    /// Currently always succeeds; retained as a `Result` for API compatibility.
     pub fn finish(self) -> Result<W> {
         Ok(self.writer)
     }
@@ -489,10 +495,11 @@ impl<R: Read> SplitdirfdstreamReader<R> {
     /// # Errors
     ///
     /// - [`Error::Truncated`] — stream ended mid-chunk
-    /// - [`Error::InlineTooLarge`] — Metadata or InlineData body size exceeds [`MAX_INLINE_CHUNK_SIZE`]
+    /// - [`Error::InlineTooLarge`] — Metadata or `InlineData` body size exceeds [`MAX_INLINE_CHUNK_SIZE`]
     /// - [`Error::FilenameTooLong`] — filename length exceeds [`MAX_FILENAME_LEN`]
     /// - [`Error::UnknownChunkType`] — unrecognised type byte
     /// - [`Error::Io`] — underlying I/O error
+    #[allow(clippy::missing_panics_doc)] // Header slices have statically fixed, matching lengths.
     pub fn next_chunk(&mut self) -> Result<Option<Chunk<'_>>> {
         // Step 1: read the 1-byte type, distinguishing clean EOF from truncation.
         let mut type_byte = [0u8; 1];
@@ -660,6 +667,7 @@ pub fn validate_filename(filename: &[u8]) -> Result<()> {
 ///
 /// Returns any error from [`validate_filename`], or an [`Error::Io`] wrapping
 /// the kernel error (`EXDEV` for escape attempts, etc.).
+#[allow(clippy::missing_panics_doc)] // validate_filename rejects NUL before CString construction.
 pub fn open_beneath(dirfd: BorrowedFd<'_>, filename: &[u8]) -> Result<OwnedFd> {
     validate_filename(filename)?;
 
@@ -718,17 +726,14 @@ pub fn reconstruct<R: Read, W: Write>(
     dirfds: &[BorrowedFd<'_>],
     output: &mut W,
 ) -> Result<u64> {
+    const BUF_SIZE: usize = 128 * 1024;
+
     let mut reader = SplitdirfdstreamReader::new(stream);
     let mut total: u64 = 0;
-    const BUF_SIZE: usize = 128 * 1024;
 
     while let Some(chunk) = reader.next_chunk()? {
         match chunk {
-            Chunk::Metadata(data) => {
-                output.write_all(data)?;
-                total += data.len() as u64;
-            }
-            Chunk::InlineData(data) => {
+            Chunk::Metadata(data) | Chunk::InlineData(data) => {
                 output.write_all(data)?;
                 total += data.len() as u64;
             }
@@ -754,7 +759,9 @@ pub fn reconstruct<R: Read, W: Write>(
                 let mut remaining = length;
                 let mut offset: u64 = 0;
                 while remaining > 0 {
-                    let to_read = (remaining as usize).min(buf.len());
+                    let to_read = usize::try_from(remaining)
+                        .unwrap_or(usize::MAX)
+                        .min(buf.len());
                     let n =
                         rustix::io::pread(&fd, &mut buf[..to_read], offset).map_err(Error::from)?;
                     if n == 0 {
@@ -984,14 +991,18 @@ mod tests {
     #[test]
     fn boundary_inline_sizes() {
         for &size in &[1usize, 7, 8, 9, 255, 256, 257, 4095, 4096, 4097] {
-            let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+            let data: Vec<u8> = (0..size).map(|i| u8::try_from(i % 256).unwrap()).collect();
             let (buf, chunks) = roundtrip_stream(&[WriteCmd::Metadata(&data)]);
 
             // Wire layout: 1-byte type + 4-byte u32 length + `size` bytes
             assert_eq!(buf.len(), 5 + size, "buf.len() for size={size}");
             assert_eq!(buf[0], 0x00u8, "type byte for size={size}");
             let len_field = u32::from_le_bytes(buf[1..5].try_into().unwrap());
-            assert_eq!(len_field, size as u32, "length field for size={size}");
+            assert_eq!(
+                len_field,
+                u32::try_from(size).unwrap(),
+                "length field for size={size}"
+            );
 
             assert_eq!(
                 chunks,
@@ -1037,7 +1048,7 @@ mod tests {
         buf.push(0x02u8);
         buf.extend_from_slice(&0u64.to_le_bytes()); // content_length
         buf.extend_from_slice(&0u32.to_le_bytes()); // dirfd_index
-        buf.extend_from_slice(&(name_len as u32).to_le_bytes()); // name_len
+        buf.extend_from_slice(&u32::try_from(name_len).unwrap().to_le_bytes()); // name_len
         let mut reader = SplitdirfdstreamReader::new(buf.as_slice());
         let err = reader.next_chunk().unwrap_err();
         assert!(
@@ -1131,15 +1142,15 @@ mod tests {
     // validate_filename tests (data-driven)
     // -------------------------------------------------------------------------
 
-    /// Expected outcome for a validate_filename test case.
+    /// Expected outcome for a `validate_filename` test case.
     #[derive(Debug)]
     enum FilenameExpect {
-        /// validate_filename must return Ok(()).
+        /// `validate_filename` must return Ok(()).
         Ok,
-        /// validate_filename must return Err(InvalidFilename { reason }) where
+        /// `validate_filename` must return Err(InvalidFilename { reason }) where
         /// `reason` contains the given substring.
         InvalidFilename(&'static str),
-        /// validate_filename must return Err(FilenameTooLong { .. }).
+        /// `validate_filename` must return Err(FilenameTooLong { .. }).
         TooLong,
     }
 
@@ -1327,16 +1338,16 @@ mod tests {
         );
     }
 
-    /// Build a raw splitdirfdstream buffer containing a single FileBackedData chunk
+    /// Build a raw splitdirfdstream buffer containing a single `FileBackedData` chunk
     /// with a given `length` field and filename, without going through
-    /// the writer (so we can set length=u64::MAX which the writer itself would
+    /// the writer (so we can set `length=u64::MAX` which the writer itself would
     /// also accept).
     fn make_external_chunk_buf(dirfd_index: u32, length: u64, filename: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push(0x02u8); // type byte
         buf.extend_from_slice(&length.to_le_bytes()); // content_length
         buf.extend_from_slice(&dirfd_index.to_le_bytes()); // dirfd_index
-        buf.extend_from_slice(&(filename.len() as u32).to_le_bytes()); // name_len
+        buf.extend_from_slice(&u32::try_from(filename.len()).unwrap().to_le_bytes()); // name_len
         buf.extend_from_slice(filename); // filename
         buf
     }
@@ -1505,7 +1516,7 @@ mod tests {
     #[test]
     fn roundtrip_file_content() {
         for size in [0usize, 1, 64, 65, 4096] {
-            let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+            let data: Vec<u8> = (0..size).map(|i| u8::try_from(i % 256).unwrap()).collect();
             let (buf, chunks) = roundtrip_stream(&[WriteCmd::InlineData(&data)]);
 
             // Wire layout: 1-byte type + 4-byte u32 length + `size` bytes
@@ -1549,7 +1560,7 @@ mod tests {
         use proptest::prelude::*;
 
         /// Strategy: 1–4 path components of [a-z0-9]{1,8} joined by '/',
-        /// always stays below MAX_FILENAME_LEN and never contains `..`.
+        /// always stays below `MAX_FILENAME_LEN` and never contains `..`.
         fn filename_strategy() -> impl Strategy<Value = Vec<u8>> {
             let component = prop::string::string_regex("[a-z0-9]{1,8}").unwrap();
             prop::collection::vec(component, 1..=4).prop_map(|parts| parts.join("/").into_bytes())
@@ -1608,6 +1619,13 @@ mod tests {
             fn proptest_roundtrip(chunks in chunks_strategy()) {
                 use std::collections::HashMap;
 
+                #[derive(Debug)]
+                enum ResolvedChunk {
+                    Metadata(Vec<u8>),
+                    InlineData(Vec<u8>),
+                    FileBackedData { dir_idx: usize, unique_name: Vec<u8>, content: Vec<u8> },
+                }
+
                 let num_dirs = 4usize;
                 let tmpdirs: Vec<tempfile::TempDir> = (0..num_dirs)
                     .map(|_| tempfile::tempdir().unwrap())
@@ -1623,13 +1641,6 @@ mod tests {
                 // references reconstruct the same content, so the expected
                 // output stays well-defined.  This exercises the pread-from-
                 // offset-0 restart property (same file opened twice).
-                #[derive(Debug)]
-                enum ResolvedChunk {
-                    Metadata(Vec<u8>),
-                    InlineData(Vec<u8>),
-                    FileBackedData { dir_idx: usize, unique_name: Vec<u8>, content: Vec<u8> },
-                }
-
                 // Map (dir_idx, unique_name) -> first-seen content.
                 let mut content_map: HashMap<(usize, Vec<u8>), Vec<u8>> = HashMap::new();
 
@@ -1710,7 +1721,7 @@ mod tests {
                             }
                             ResolvedChunk::FileBackedData { dir_idx, unique_name, content } => {
                                 let len = content.len() as u64;
-                                w.write_file_backed_data(*dir_idx as u32, len, unique_name).unwrap();
+                                w.write_file_backed_data(u32::try_from(*dir_idx).unwrap(), len, unique_name).unwrap();
                                 expected_output.extend_from_slice(content);
                             }
                         }
@@ -1742,7 +1753,7 @@ mod tests {
                                 Chunk::FileBackedData { dirfd_index, length, filename },
                                 ResolvedChunk::FileBackedData { dir_idx, unique_name, content },
                             ) => {
-                                prop_assert_eq!(*dirfd_index, *dir_idx as u32);
+                                prop_assert_eq!(*dirfd_index, u32::try_from(*dir_idx).unwrap());
                                 prop_assert_eq!(*length, content.len() as u64);
                                 prop_assert_eq!(*filename, unique_name.as_slice());
                             }

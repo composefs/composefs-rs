@@ -56,7 +56,7 @@ pub(crate) fn split_into_frames(fds: Vec<OwnedFd>, n_frames: usize) -> Vec<Vec<O
     let mut result = Vec::with_capacity(n_frames);
     let mut it = fds.into_iter();
     for i in 0..n_frames {
-        let batch_size = base + if i < remainder { 1 } else { 0 };
+        let batch_size = base + usize::from(i < remainder);
         result.push(it.by_ref().take(batch_size).collect());
     }
     result
@@ -68,6 +68,10 @@ pub(crate) fn split_into_frames(fds: Vec<OwnedFd>, n_frames: usize) -> Vec<Vec<O
 ///
 /// Uses the first 8 bytes of SHA-256(id) interpreted as little-endian u64.
 /// The result is stable across runs for the same id string.
+///
+/// # Panics
+/// Panics if OpenSSL cannot compute SHA-256.
+#[must_use]
 pub fn seed_from_id(id: &str) -> u64 {
     let hash = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), id.as_bytes())
         .expect("SHA-256 hashing should not fail");
@@ -96,7 +100,7 @@ pub(crate) fn n_frames_for(seed: u64, fd_count: usize) -> usize {
     if fd_count < 3 {
         return fd_count.max(1);
     }
-    let raw = (seed % (fd_count as u64 + 1)) as usize;
+    let raw = usize::try_from(seed % (fd_count as u64 + 1)).expect("remainder is at most fd_count");
     raw.max(3).min(fd_count)
 }
 
@@ -106,7 +110,7 @@ pub(crate) fn n_frames_for(seed: u64, fd_count: usize) -> usize {
 /// - the hash-derived minimum ([`n_frames_for`]`(seed, fd_count)`, ≥3 for real
 ///   layers), which exercises multi-frame paths in tests; and
 /// - `ceil(fd_count / MAX_FDS_PER_FRAME)`, the minimum needed so every frame
-///   carries at most [`MAX_FDS_PER_FRAME`] fds (kernel SCM_RIGHTS cap).
+///   carries at most [`MAX_FDS_PER_FRAME`] fds (kernel `SCM_RIGHTS` cap).
 ///
 /// The result is additionally clamped to `[1, fd_count]` so `split_into_frames`
 /// never receives an out-of-range value.
@@ -124,6 +128,9 @@ pub(crate) fn compute_n_frames(seed: u64, fd_count: usize) -> usize {
 /// Open `/dev/null` as an opaque dummy fd.
 ///
 /// Returns a plain [`std::io::Result`] so callers can map it to their own error type.
+///
+/// # Errors
+/// Returns the kernel error if `/dev/null` cannot be opened.
 pub fn open_devnull() -> std::io::Result<OwnedFd> {
     rustix::fs::open(
         c"/dev/null",
@@ -184,23 +191,23 @@ pub(crate) struct SparseLayout {
 /// (ascending, length `n_real`), and `dummy_slot_indices` (ascending).
 pub(crate) fn sparse_dir_slots(n_real: usize, seed: u64) -> SparseLayout {
     // ── 1/2: total slot count (at least 1 dummy) ─────────────────────────────
-    let n_dummy: usize = ((seed >> 8) % (n_real as u64 + 1) + 1) as usize;
+    let n_dummy =
+        usize::try_from((seed >> 8) % (n_real as u64 + 1) + 1).expect("dummy count must fit usize");
     let total_slots = n_real + n_dummy;
+    let slot_count = u32::try_from(total_slots).expect("slot count must fit the wire format");
 
     // ── 3: select real-layer slot positions ──────────────────────────────────
     // Deterministically shuffle all slot indices from the seed, take the first
     // n_real as the real-layer positions, then sort them ascending.
     let mut rng = Pcg64::seed_from_u64(seed);
-    let mut shuffled_slots: Vec<u32> = (0..total_slots as u32).collect();
+    let mut shuffled_slots: Vec<u32> = (0..slot_count).collect();
     shuffled_slots.shuffle(&mut rng);
     let mut real_indices: Vec<u32> = shuffled_slots[..n_real].to_vec();
     real_indices.sort_unstable();
 
     // ── 4: compute dummy indices (complement) ─────────────────────────────────
     let real_set: std::collections::HashSet<u32> = real_indices.iter().copied().collect();
-    let dummy_indices: Vec<u32> = (0..total_slots as u32)
-        .filter(|i| !real_set.contains(i))
-        .collect();
+    let dummy_indices: Vec<u32> = (0..slot_count).filter(|i| !real_set.contains(i)).collect();
 
     SparseLayout {
         total_slots,
@@ -287,7 +294,7 @@ pub struct LayerFdLayout {
 /// 6. Prepends the `pipe_read` fd so `fds_all[0]` is always the data pipe.
 ///
 /// The caller is responsible for:
-/// * Passing the correct `real_fds` (in chain order) — the first real_fd gets
+/// * Passing the correct `real_fds` (in chain order) — the first `real_fd` gets
 ///   slot `real_indices[0]`, the second gets `real_indices[1]`, etc.
 /// * Spawning the producer with `write_fd` (not returned here; the caller opens
 ///   the pipe and passes `write_fd` to the producer separately).
@@ -300,6 +307,9 @@ pub struct LayerFdLayout {
 ///
 /// # Errors
 /// Returns `io::Error` if any dummy-fd or keepalive-pipe creation fails.
+///
+/// # Panics
+/// Panics if the sparse slot count exceeds the wire format's `u32` limit.
 pub fn build_layer_fd_layout(
     pipe_read: OwnedFd,
     real_fds: Vec<OwnedFd>,
@@ -352,7 +362,7 @@ pub fn build_layer_fd_layout(
     //   index 1..=dir_count  : dirfds region
     //   index dir_count+1    : keepalive write end
     //   remaining            : extra lifetime dummies
-    let dir_count = total_slots as u32;
+    let dir_count = u32::try_from(total_slots).expect("sparse layout slot count fits u32");
     let mut fds_all: Vec<OwnedFd> = Vec::with_capacity(1 + total_slots + 1 + n_extra);
     fds_all.push(pipe_read);
     fds_all.extend(dirfd_region);
@@ -382,6 +392,13 @@ pub fn build_layer_fd_layout(
 /// `Ok(Vec<Vec<OwnedFd>>)` — one inner vec per transport frame (1…N frames).
 /// `Err(FdLimitError { fds, .. })` — the original fds are returned so the
 /// caller can drop them; the error contains the count and cap for a diagnostic.
+///
+/// # Errors
+/// Returns the original fds and [`FdLimitError`] if `more` is false and the
+/// fd count exceeds [`MAX_FDS_PER_FRAME`].
+///
+/// # Panics
+/// Panics if `fds` is empty.
 pub fn split_fds_into_frames(
     fds: Vec<OwnedFd>,
     seed: u64,
@@ -486,7 +503,7 @@ mod tests {
     /// Verified: `seed_from_id("child-layer-001") == LAYER_SEED`.
     const LAYER_SEED: u64 = 9_551_015_030_439_334_514;
 
-    /// `compute_n_frames` must ensure every frame holds ≤ MAX_FDS_PER_FRAME fds
+    /// `compute_n_frames` must ensure every frame holds ≤ `MAX_FDS_PER_FRAME` fds
     /// for a large synthetic fd count where the hash-min alone would be too small.
     #[test]
     fn test_compute_n_frames_caps_large_fd_count() {
@@ -507,10 +524,10 @@ mod tests {
 
         // Also verify n is large enough: ceil(1000/240) = 5.
         let cap_min = fd_count.div_ceil(MAX_FDS_PER_FRAME);
-        assert!(n >= cap_min, "n={n} < cap_min={cap_min}",);
+        assert!(n >= cap_min, "n={n} < cap_min={cap_min}");
     }
 
-    /// For small fd counts (≤ MAX_FDS_PER_FRAME) the hash-min should still
+    /// For small fd counts (≤ `MAX_FDS_PER_FRAME`) the hash-min should still
     /// dominate so test-hardening (≥3 frames for real layers) is preserved.
     #[test]
     fn test_compute_n_frames_small_fd_count_preserves_hash_min() {
@@ -555,23 +572,13 @@ mod tests {
         }
     }
 
-    /// A non-streaming (`more=false`) call that would exceed MAX_FDS_PER_FRAME
+    /// A non-streaming (`more=false`) call that would exceed `MAX_FDS_PER_FRAME`
     /// must be detected by the over-cap check before the producer is spawned.
     ///
     /// We test the pure decision logic (`!more && fd_count > MAX_FDS_PER_FRAME`)
     /// without opening real fds, keeping the test deterministic and cheap.
     #[test]
     fn test_more_false_over_cap_decision() {
-        // Verify the threshold is exactly MAX_FDS_PER_FRAME.
-        assert!(
-            !(!false && MAX_FDS_PER_FRAME > MAX_FDS_PER_FRAME),
-            "fd_count == cap should NOT trigger error",
-        );
-        assert!(
-            !false && (MAX_FDS_PER_FRAME + 1) > MAX_FDS_PER_FRAME,
-            "fd_count == cap+1 MUST trigger error",
-        );
-
         // Simulate: if !more and fd_count > MAX_FDS_PER_FRAME → error.
         let should_error =
             |more: bool, fd_count: usize| -> bool { !more && fd_count > MAX_FDS_PER_FRAME };
@@ -639,7 +646,7 @@ mod tests {
         all.sort_unstable();
         assert_eq!(
             all,
-            (0..layout.total_slots as u32).collect::<Vec<_>>(),
+            (0..u32::try_from(layout.total_slots).unwrap()).collect::<Vec<_>>(),
             "real and dummy slots must partition 0..total_slots"
         );
 
