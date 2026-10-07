@@ -319,17 +319,18 @@ async fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
                 total: None,
                 unit: ProgressUnit::Bytes,
             });
-            let (verity, layer_stats) = import_layer_via_transfer(
-                repo,
-                &mut client,
-                store_path,
-                storage_layer_id,
-                diff_id,
-                zerocopy,
-                true, // direct path: only entered when can_bypass_file_permissions()
-                &mut ctx,
-            )
-            .await?;
+            let params = GetLayerParams {
+                diff_id: None,
+                storage: Some(StorageLocator {
+                    storage_path: store_path.clone(),
+                    layer_id: storage_layer_id.clone(),
+                }),
+                // direct path: only entered when can_bypass_file_permissions()
+                consumer_has_cap_dac_override: true,
+            };
+            let (verity, layer_stats) =
+                import_layer_via_transfer(repo, &mut client, params, diff_id, zerocopy, &mut ctx)
+                    .await?;
             let bytes = layer_stats.new_bytes();
             stats.merge(&layer_stats);
             reporter.report(ProgressEvent::Done {
@@ -382,30 +383,28 @@ async fn import_from_containers_storage_direct<ObjectID: FsVerityHashValue>(
 /// collects all frames, then drains the `splitdirfdstream` pipe in a
 /// `spawn_blocking` closure while the server-side producer fills the pipe
 /// concurrently on its own thread.
-#[allow(clippy::too_many_arguments)]
-async fn import_layer_via_transfer<ObjectID: FsVerityHashValue>(
+pub(crate) async fn import_layer_via_transfer<ObjectID: FsVerityHashValue>(
     repo: &Arc<Repository<ObjectID>>,
     client: &mut zlink::tokio::unix::Connection,
-    storage_path: &str,
-    storage_layer_id: &str,
+    params: GetLayerParams,
     diff_id: &OciDigest,
     zerocopy: bool,
-    consumer_has_cap_dac_override: bool,
     ctx: &mut ImportContext,
 ) -> Result<(ObjectID, ImportStats)> {
-    // Call get_layer with the storage locator (handle=0; cstor service ignores it).
-    let params = GetLayerParams {
-        diff_id: None,
-        storage: Some(StorageLocator {
-            storage_path: storage_path.to_owned(),
-            layer_id: storage_layer_id.to_owned(),
-        }),
-        consumer_has_cap_dac_override,
-    };
+    let label = params
+        .storage
+        .as_ref()
+        .map(|s| s.layer_id.clone())
+        .or_else(|| params.diff_id.clone())
+        .unwrap_or_default();
+    tracing::debug!(
+        "Oci.GetLayer -> {label} (diff_id={diff_id}, zerocopy={zerocopy}, cap_dac_override={})",
+        params.consumer_has_cap_dac_override
+    );
     let stream = client
         .get_layer(0, params)
         .await
-        .with_context(|| format!("Oci.GetLayer RPC failed for {storage_layer_id}"))?;
+        .with_context(|| format!("Oci.GetLayer RPC failed for {label}"))?;
 
     // Collect all frames.  Each frame carries a batch of FDs; concatenate them
     // in arrival order to reconstruct the full logical FD array:
@@ -417,10 +416,16 @@ async fn import_layer_via_transfer<ObjectID: FsVerityHashValue>(
     {
         use zlink::futures_util::StreamExt as _;
         let mut stream = std::pin::pin!(stream);
+        let mut frames = 0usize;
         while let Some(item) = stream.next().await {
             let (result, frame_fds) =
-                item.with_context(|| format!("Oci.GetLayer stream error for {storage_layer_id}"))?;
+                item.with_context(|| format!("Oci.GetLayer stream error for {label}"))?;
             let frame_reply = result.map_err(|e| anyhow::anyhow!("Oci.GetLayer error: {e:?}"))?;
+            frames += 1;
+            tracing::debug!(
+                "Oci.GetLayer <- {label}: frame {frames} carrying {} fd(s)",
+                frame_fds.len()
+            );
             reply_opt = Some(frame_reply);
             fds.extend(frame_fds);
         }
@@ -443,6 +448,11 @@ async fn import_layer_via_transfer<ObjectID: FsVerityHashValue>(
     // Opaque lifetime tokens — hold open until drain completes, then drop to
     // signal the server's producer that we are done consuming the layer.
     let lifetime_fds: Vec<OwnedFd> = it.collect();
+    tracing::debug!(
+        "Oci.GetLayer <- {label}: 1 pipe fd, {} dirfd slot(s) delegated, {} lifetime fd(s)",
+        dir_fds.len(),
+        lifetime_fds.len()
+    );
 
     // Drain the pipe in a blocking task (producer runs concurrently on the
     // server's spawn_blocking thread).  ImportContext is threaded through.
@@ -526,14 +536,21 @@ async fn import_from_containers_storage_proxied<ObjectID: FsVerityHashValue>(
                 total: None,
                 unit: ProgressUnit::Bytes,
             });
+            let params = GetLayerParams {
+                diff_id: None,
+                storage: Some(StorageLocator {
+                    storage_path: store_path.clone(),
+                    layer_id: storage_layer_id.clone(),
+                }),
+                // proxied path: consumer cannot bypass file permissions
+                consumer_has_cap_dac_override: false,
+            };
             let (verity, layer_stats) = import_layer_via_transfer(
                 repo,
                 proxy.connection(),
-                store_path,
-                storage_layer_id,
+                params,
                 diff_id,
                 zerocopy,
-                false, // proxied path: consumer cannot bypass file permissions
                 &mut ctx,
             )
             .await?;
