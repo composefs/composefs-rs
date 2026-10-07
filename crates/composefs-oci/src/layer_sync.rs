@@ -138,6 +138,12 @@ fn drain_splitdirfdstream_inner<ObjectID: FsVerityHashValue>(
     inline_buf: &mut Vec<u8>,
     mut hasher: Option<&mut Sha256>,
 ) -> Result<()> {
+    // Counters behind the summary logged below: they record how the layer's
+    // file content actually reached us — opened by us from a delegated
+    // containers-storage dirfd, or handed over as bytes through the pipe.
+    let mut files_opened_from_store = 0u64;
+    let mut files_received_inline = 0u64;
+
     while let Some(chunk) = reader.next_chunk().context("splitdirfdstream read error")? {
         match chunk {
             Chunk::Metadata(data) => {
@@ -154,6 +160,8 @@ fn drain_splitdirfdstream_inner<ObjectID: FsVerityHashValue>(
                     h.update(data);
                 }
                 let length = data.len() as u64;
+                tracing::trace!("received {length} bytes of file content inline over the pipe");
+                files_received_inline += 1;
                 if should_inline(length) {
                     stats.bytes_inlined += length;
                     writer.write_inline(data);
@@ -195,6 +203,10 @@ fn drain_splitdirfdstream_inner<ObjectID: FsVerityHashValue>(
                     )
                 })?;
                 assert_is_dir(dir, dirfd_index, name)?;
+                tracing::trace!(
+                    "opening {name:?} from store dirfd[{dirfd_index}] ({length} bytes)"
+                );
+                files_opened_from_store += 1;
                 let fd = dir
                     .open(name)
                     .map(OwnedFd::from)
@@ -252,6 +264,11 @@ fn drain_splitdirfdstream_inner<ObjectID: FsVerityHashValue>(
             }
         }
     }
+
+    tracing::debug!(
+        "layer drained: {files_opened_from_store} file(s) opened directly from \
+         containers-storage dirfds, {files_received_inline} received inline over the pipe"
+    );
     Ok(())
 }
 
