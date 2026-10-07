@@ -29,6 +29,13 @@ pub mod oci_layout;
 /// Re-exported from [`composefs::progress`]; use that path directly in new code.
 pub mod progress;
 pub mod skopeo;
+/// Import container images via skopeo's JSON proxy + varlink socket.
+///
+/// Available when the `containers-storage` feature is enabled (which
+/// implies `varlink`).  Uses `cstor::import_layer_via_transfer` for
+/// the layer drain path.
+#[cfg(feature = "containers-storage")]
+pub(crate) mod skopeo_varlink;
 pub mod tar;
 /// Shared wire types and client proxy for the `org.composefs.Oci` interface.
 ///
@@ -488,17 +495,17 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
 
     #[cfg(feature = "containers-storage")]
     if opts.local_fetch != LocalFetchOpt::Disabled
-        && let Some(image_id) = cstor::parse_containers_storage_ref(imgref)
+        && cstor::parse_containers_storage_ref(imgref).is_some()
     {
         let zerocopy = opts.local_fetch == LocalFetchOpt::ZeroCopy;
         let (((manifest_digest, manifest_verity), (config_digest, config_verity)), stats) =
-            cstor::import_from_containers_storage(
+            skopeo_varlink::import_via_skopeo_proxy(
                 repo,
-                image_id,
-                reference,
-                zerocopy,
+                imgref,
                 opts.storage_root,
                 opts.additional_image_stores,
+                reference,
+                zerocopy,
                 boot_options.as_ref(),
                 reporter,
             )

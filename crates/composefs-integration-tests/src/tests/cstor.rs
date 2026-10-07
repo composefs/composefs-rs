@@ -11,7 +11,9 @@ use anyhow::Result;
 use tempfile::TempDir;
 use xshell::{Shell, cmd};
 
-use composefs_integration_tests::{build_test_image, cleanup_test_image, create_test_repository};
+use composefs_integration_tests::{
+    build_test_image, cleanup_test_image, containers_storage_ref, create_test_repository,
+};
 
 use crate::integration_test;
 use crate::tests::privileged::{require_privileged, require_userns};
@@ -68,7 +70,7 @@ fn privileged_test_cstor_vs_skopeo_equivalence() -> Result<()> {
         let skopeo_repo = create_test_repository(&skopeo_repo_dir)?;
 
         // Import via containers-storage (reflink path)
-        let cstor_image_ref = format!("containers-storage:{}", test_image);
+        let cstor_image_ref = containers_storage_ref(&test_image);
         println!("Importing via containers-storage: {}", cstor_image_ref);
         let cstor_opts = composefs_oci::PullOptions {
             local_fetch: composefs_oci::LocalFetchOpt::IfPossible,
@@ -173,7 +175,7 @@ fn privileged_test_cstor_idempotent_import() -> Result<()> {
         let repo_dir = TempDir::new()?;
         let repo = create_test_repository(&repo_dir)?;
 
-        let cstor_image_ref = format!("containers-storage:{}", test_image);
+        let cstor_image_ref = containers_storage_ref(&test_image);
 
         // First import
         println!("First import via containers-storage...");
@@ -268,7 +270,7 @@ fn privileged_test_cstor_import_with_reference() -> Result<()> {
         let repo_dir = TempDir::new()?;
         let repo = create_test_repository(&repo_dir)?;
 
-        let cstor_image_ref = format!("containers-storage:{}", test_image);
+        let cstor_image_ref = containers_storage_ref(&test_image);
         let reference_name = "test-ref";
 
         // Import with a reference name
@@ -366,7 +368,7 @@ fn privileged_test_cstor_additional_image_store() -> Result<()> {
 
     let repo_dir = TempDir::new()?;
     let repo = repo_dir.path();
-    let cstor_image_ref = format!("containers-storage:{}", test_image);
+    let cstor_image_ref = containers_storage_ref(&test_image);
 
     // Initialize the repository first
     cmd!(sh, "{cfsctl} --insecure --repo {repo} init").run()?;
@@ -416,7 +418,7 @@ fn privileged_test_cstor_bootable() -> Result<()> {
 
     let repo_dir = TempDir::new()?;
     let repo = repo_dir.path();
-    let cstor_image_ref = format!("containers-storage:{}", test_image);
+    let cstor_image_ref = containers_storage_ref(&test_image);
 
     // Initialize the repository first
     cmd!(sh, "{cfsctl} --insecure --repo {repo} init").run()?;
