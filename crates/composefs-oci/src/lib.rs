@@ -29,6 +29,13 @@ pub mod oci_layout;
 /// Re-exported from [`composefs::progress`]; use that path directly in new code.
 pub mod progress;
 pub mod skopeo;
+/// Import container images via skopeo's JSON proxy + varlink socket.
+///
+/// Available when the `containers-storage` feature is enabled (which
+/// implies `varlink`).  Uses `cstor::import_layer_via_transfer` for
+/// the layer drain path.
+#[cfg(feature = "containers-storage")]
+pub(crate) mod skopeo_varlink;
 pub mod tar;
 /// Shared wire types and client proxy for the `org.composefs.Oci` interface.
 ///
@@ -491,18 +498,40 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         && let Some(image_id) = cstor::parse_containers_storage_ref(imgref)
     {
         let zerocopy = opts.local_fetch == LocalFetchOpt::ZeroCopy;
+        let via_skopeo = skopeo_varlink::import_via_skopeo_proxy(
+            repo,
+            imgref,
+            opts.storage_root,
+            opts.additional_image_stores,
+            reference,
+            zerocopy,
+            boot_options.as_ref(),
+            reporter.clone(),
+        )
+        .await;
+        let imported = match via_skopeo {
+            Err(e) if e.downcast_ref::<skopeo_varlink::SkopeoTooOld>().is_some() => {
+                // TODO: drop this fallback once skopeo with OpenVarlinkSocket is
+                // widely available.
+                tracing::warn!("{e:#}; reading containers-storage directly");
+                // The skopeo path wants an ID spelled `@<id>`; the direct
+                // lookup wants it bare.
+                cstor::import_from_containers_storage(
+                    repo,
+                    image_id.strip_prefix('@').unwrap_or(image_id),
+                    reference,
+                    zerocopy,
+                    opts.storage_root,
+                    opts.additional_image_stores,
+                    boot_options.as_ref(),
+                    reporter,
+                )
+                .await?
+            }
+            other => other?,
+        };
         let (((manifest_digest, manifest_verity), (config_digest, config_verity)), stats) =
-            cstor::import_from_containers_storage(
-                repo,
-                image_id,
-                reference,
-                zerocopy,
-                opts.storage_root,
-                opts.additional_image_stores,
-                boot_options.as_ref(),
-                reporter,
-            )
-            .await?;
+            imported;
         return Ok(PullResult {
             manifest_digest,
             manifest_verity,

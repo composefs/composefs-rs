@@ -38,9 +38,11 @@ pub struct StorageLocator {
 
 /// Parameters for the `GetLayer` method of the `org.composefs.Oci` interface.
 ///
-/// Exactly one of `diff_id` or `storage` must be set:
+/// Exactly one of `diff_id`, `storage` or `layer_index` must be set:
 /// - **Repo service** (`CfsctlService`): reads `diff_id`, errors if `None`.
 /// - **Cstor service** (`CstorLayerService`): reads `storage`, errors if `None`.
+/// - **containers-storage image service** (skopeo's `OpenVarlinkSocket`):
+///   reads `layer_index`, errors if `None`.
 ///
 /// Both fields are `Option` for forward-compatibility: new locator kinds can
 /// be added in future without breaking old clients.
@@ -57,6 +59,16 @@ pub struct GetLayerParams {
     /// for backward compatibility.
     #[serde(default)]
     pub consumer_has_cap_dac_override: bool,
+    /// Position of a layer in the image a service serves, from 0 for the
+    /// base layer, in the order of the config's `rootfs.diff_ids`.
+    ///
+    /// A service bound to one image resolves it with its own record of
+    /// which layers make up the image, so a layer is found even when its
+    /// diff ID was never checked, and a config cannot name a layer of an
+    /// unrelated image.  The client still has to verify what it receives
+    /// against the diff ID it expects.
+    #[serde(default)]
+    pub layer_index: Option<u64>,
 }
 
 // ── Reply types ───────────────────────────────────────────────────────────────
@@ -178,6 +190,11 @@ pub enum OciError {
     NoSuchLayer {
         /// The diff-id that was not found.
         diff_id: String,
+    },
+    /// The image the service serves has no layer at the requested index.
+    NoSuchLayerIndex {
+        /// The index that was not found.
+        layer_index: u64,
     },
     /// A supplied digest/diff-id string was malformed.
     InvalidDigest {
