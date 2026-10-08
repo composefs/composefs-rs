@@ -654,7 +654,7 @@ impl<ObjectID: FsVerityHashValue> AbootEntry<ObjectID> {
         })
     }
 
-    /// Discover aboot artifacts in `/boot` and `/usr/lib/modules`.
+    /// Discover aboot artifacts in `/boot`.
     pub fn load_all(fs: &FileSystem<ObjectID>, repo: &Repository<ObjectID>) -> Result<Vec<Self>> {
         let root = fs.as_dir();
         let mut entries = Vec::new();
@@ -702,39 +702,6 @@ impl<ObjectID: FsVerityHashValue> AbootEntry<ObjectID> {
                     if optional_file(boot, payload_name.as_ref())?.is_none() {
                         bail!("vbmeta image /boot/{filename:?} has no matching aboot payload");
                     }
-                }
-            }
-            Err(ImageError::NotFound(..)) => {}
-            Err(error) => Err(error)?,
-        }
-
-        match root.get_directory_ref("/usr/lib/modules".as_ref()) {
-            Ok(modules) => {
-                for (kver, inode) in modules.entries() {
-                    let Inode::Directory(dir) = inode else {
-                        continue;
-                    };
-                    let dir = DirectoryRef::from_parts(dir, root.leaves());
-                    let payload = optional_file(dir, "aboot.img".as_ref())?;
-                    let vbmeta = optional_file(dir, "vbmeta.img".as_ref())?;
-                    let Some(payload) = payload else {
-                        if vbmeta.is_some() {
-                            bail!(
-                                "vbmeta image /usr/lib/modules/{kver:?}/vbmeta.img has no matching aboot payload"
-                            );
-                        }
-                        continue;
-                    };
-                    let kver = from_utf8(kver.as_bytes())?;
-                    let base = PathBuf::from("/usr/lib/modules").join(kver);
-                    entries.push(Self::load(
-                        kver.into(),
-                        &base.join("aboot.img"),
-                        payload,
-                        &base.join("vbmeta.img"),
-                        vbmeta,
-                        repo,
-                    )?);
                 }
             }
             Err(ImageError::NotFound(..)) => {}
@@ -876,10 +843,8 @@ mod tests {
 
     #[test]
     fn test_aboot_android_discovery() {
-        for (directory, payload_name, vbmeta_name) in [
-            ("/boot", "aboot-1.0.img", "vbmeta-1.0.img"),
-            ("/usr/lib/modules/1.0", "aboot.img", "vbmeta.img"),
-        ] {
+        for (directory, payload_name, vbmeta_name) in [("/boot", "aboot-1.0.img", "vbmeta-1.0.img")]
+        {
             let repo = TestRepo::<Sha256HashValue>::new();
             let mut fs = boot_filesystem();
             if directory != "/boot" {
@@ -908,10 +873,7 @@ mod tests {
 
     #[test]
     fn test_aboot_uki_discovery() {
-        for (directory, payload_name) in [
-            ("/boot", "aboot-1.0.img"),
-            ("/usr/lib/modules/1.0", "aboot.img"),
-        ] {
+        for (directory, payload_name) in [("/boot", "aboot-1.0.img")] {
             let repo = TestRepo::<Sha256HashValue>::new();
             let mut fs = boot_filesystem();
             if directory != "/boot" {
@@ -932,6 +894,21 @@ mod tests {
             );
             assert!(entry.vbmeta.is_none());
         }
+    }
+
+    #[test]
+    fn test_legacy_aboot_is_not_a_boot_artifact() {
+        let repo = TestRepo::<Sha256HashValue>::new();
+        let mut fs = boot_filesystem();
+        add_modules_vmlinuz(&mut fs);
+        for name in ["aboot.img", "vbmeta.img"] {
+            add_external(&mut fs, &repo.repo, "/usr/lib/modules/1.0", name, b"legacy");
+        }
+        let entries = get_boot_resources(&fs, &repo.repo).unwrap();
+        assert!(matches!(
+            entries.as_slice(),
+            [BootEntry::UsrLibModulesVmLinuz(_)]
+        ));
     }
 
     #[test]
