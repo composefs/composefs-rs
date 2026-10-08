@@ -327,9 +327,10 @@ pub(crate) fn open_skopeo_varlink(
     );
     let config = String::from_utf8(config).context("config is not valid UTF-8")?;
 
-    // OpenVarlinkSocket — returns a socket fd via SCM_RIGHTS.  The socket is
-    // only a transport; which layer, and from where, is settled per request.
-    let (_, _, varlink_fd) = proxy_call(sock, "OpenVarlinkSocket", vec![])?;
+    // OpenVarlinkSocket — returns a socket fd via SCM_RIGHTS, serving the
+    // store the image reference names.
+    let store_spec = store_spec(imgref);
+    let (_, _, varlink_fd) = proxy_call(sock, "OpenVarlinkSocket", vec![store_spec.into()])?;
     let varlink_fd = varlink_fd.context("OpenVarlinkSocket did not return an fd")?;
     tracing::debug!("got org.composefs.Oci varlink socket from skopeo for {imgref}");
 
@@ -347,6 +348,19 @@ pub(crate) fn open_skopeo_varlink(
         config,
         guard,
     })
+}
+
+/// Return the `[driver@graphroot+runroot:options]` store specifier at the
+/// start of a `containers-storage:` reference, or `""` (the default store)
+/// if there is none.
+fn store_spec(imgref: &str) -> &str {
+    let rest = crate::cstor::parse_containers_storage_ref(imgref).unwrap_or(imgref);
+    if rest.starts_with('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..=end];
+        }
+    }
+    ""
 }
 
 /// Full result of a skopeo varlink import: manifest and config digests + verities.
@@ -471,4 +485,25 @@ pub(crate) async fn import_via_skopeo_proxy<ObjectID: FsVerityHashValue>(
     .context("spawn_blocking(finalize_oci_image) failed")??;
 
     Ok((result, final_stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::store_spec;
+
+    #[test]
+    fn test_store_spec() {
+        assert_eq!(store_spec("containers-storage:busybox"), "");
+        assert_eq!(store_spec("containers-storage:@abc123"), "");
+        assert_eq!(
+            store_spec("containers-storage:[overlay@/var/lib/containers/storage]busybox"),
+            "[overlay@/var/lib/containers/storage]"
+        );
+        assert_eq!(
+            store_spec("containers-storage:[/srv/storage+/run/storage:opt=1]@abc123"),
+            "[/srv/storage+/run/storage:opt=1]"
+        );
+        // Malformed specifier: leave it for the proxy to reject.
+        assert_eq!(store_spec("containers-storage:[/srv/storage"), "");
+    }
 }
