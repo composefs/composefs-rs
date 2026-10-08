@@ -437,10 +437,8 @@ pub(crate) async fn import_via_skopeo_proxy<ObjectID: FsVerityHashValue>(
             let params = GetLayerParams {
                 diff_id: Some(diff_id.to_string()),
                 storage: None,
-                // Conservative: let the skopeo-side producer inline
-                // non-world-readable files rather than hand us dirfd
-                // references we may not be able to open.
-                consumer_has_cap_dac_override: false,
+                // Without it, the producer inlines files we could not open.
+                consumer_has_cap_dac_override: cstorage::can_bypass_file_permissions(),
             };
             let (verity, layer_stats) = crate::cstor::import_layer_via_transfer(
                 repo, &mut conn, params, diff_id, zerocopy, &mut ctx,
