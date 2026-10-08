@@ -225,16 +225,24 @@ fn privileged_test_cstor_idempotent_import() -> Result<()> {
         println!("First import stats: {:?}", first_stats);
         println!("Second import stats: {:?}", second_stats);
 
-        // The first import should have copied some objects
+        // The first import should have brought the objects in.  Which
+        // mechanism it used depends on the filesystem - a reflink-capable
+        // one copies nothing - so count them all.
         assert!(
-            first_stats.objects_copied > 0,
-            "first import should copy objects"
+            first_stats.objects_copied
+                + first_stats.objects_reflinked
+                + first_stats.objects_hardlinked
+                > 0,
+            "first import should bring objects in"
         );
 
         // The second import should find everything already present
         assert_eq!(
-            second_stats.objects_copied, 0,
-            "second import should not copy any new objects"
+            second_stats.objects_copied
+                + second_stats.objects_reflinked
+                + second_stats.objects_hardlinked,
+            0,
+            "second import should not bring in any new objects"
         );
 
         println!("SUCCESS: Idempotent import produced identical results");
