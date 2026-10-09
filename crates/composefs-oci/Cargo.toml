@@ -41,7 +41,7 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 rand = { version = "0.10.0", default-features = false, optional = true }
 tar = { version = "0.4.38", default-features = false, optional = true }
 tar-core = "0.1.0"
-tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread", "time"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io", "io-util"] }
 tracing = { version = "0.1", default-features = false }
 zstd = { version = "0.14.0", default-features = false }
