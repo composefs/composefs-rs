@@ -18,8 +18,11 @@
 //!   filesystem doesn't support it, matching the C `lcfs_fd_get_fsverity()`
 //!   behaviour.
 
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::{fs::File, io::Read, path::PathBuf};
 
@@ -31,7 +34,7 @@ use composefs::{
     erofs::reader::erofs_to_filesystem,
     fsverity::{FsVerityHashValue, Sha256HashValue, measure_verity_with_fallback},
     generic_tree::{Inode, LeafContent, LeafId},
-    tree::{FileSystem, RegularFile},
+    tree::FileSystem,
 };
 
 /// Query information from composefs images.
@@ -177,9 +180,9 @@ fn ls_print<W: Write>(
                 match &leaf.content {
                     LeafContent::Regular(regular) => {
                         let is_hardlink = !seen_leaf_ids.insert(*leaf_id);
-                        if !is_hardlink && let RegularFile::External(id, _) = regular {
+                        if !is_hardlink && let Some(path) = regular.backing_path() {
                             write!(out, "\t@ ")?;
-                            print_escaped(out, id.to_object_pathname().as_bytes())?;
+                            print_escaped(out, path.as_bytes())?;
                         }
                     }
                     LeafContent::Symlink(target) => {
@@ -239,17 +242,17 @@ fn cmd_dump(_filter: &[String], images: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-/// Collect all external object IDs from a parsed filesystem.
+/// Collect the backing paths of all external files in a parsed filesystem.
 ///
-/// Iterates the leaves table directly — each `RegularFile::External` entry
-/// is a unique content-addressed object.  Because `erofs_to_filesystem`
-/// deduplicates hard-linked inodes into a single leaf, each object appears
-/// exactly once even if it is referenced by multiple paths.
-fn collect_objects_from_fs(fs: &FileSystem<Sha256HashValue>) -> HashSet<Sha256HashValue> {
+/// Like `composefs-info` from libcomposefs, these are the payloads (the
+/// paths the overlay redirects point at, relative to the object store), so
+/// ostree's `xx/<checksum>.file` objects are listed as they are.  Files
+/// with only a verity digest have no backing path and aren't listed.
+fn collect_objects_from_fs(fs: &FileSystem<Sha256HashValue>) -> BTreeSet<OsString> {
     fs.leaves
         .iter()
         .filter_map(|leaf| match &leaf.content {
-            LeafContent::Regular(RegularFile::External(id, _)) => Some(id.clone()),
+            LeafContent::Regular(file) => file.backing_path().map(Cow::into_owned),
             _ => None,
         })
         .collect()
@@ -262,19 +265,27 @@ fn cmd_objects(images: &[PathBuf]) -> Result<()> {
         let fs = erofs_to_filesystem::<Sha256HashValue>(&image_data)
             .with_context(|| format!("Failed to parse image: {image_path:?}"))?;
 
-        let mut objects: Vec<Sha256HashValue> = collect_objects_from_fs(&fs).into_iter().collect();
-        objects.sort_by_key(|id| id.to_hex());
-
-        for obj in objects {
-            println!("{}", obj.to_object_pathname());
+        for obj in collect_objects_from_fs(&fs) {
+            println!("{}", obj.display());
         }
     }
     Ok(())
 }
 
+/// Returns an object's path relative to the object store, without the
+/// leading slashes a payload may have, so that joining it to the base
+/// directory can't replace it (like C's `abs_to_rel_path()`).
+fn object_relative_path(obj: &OsStr) -> &Path {
+    let mut bytes = obj.as_bytes();
+    while let Some(rest) = bytes.strip_prefix(b"/") {
+        bytes = rest;
+    }
+    Path::new(OsStr::from_bytes(bytes))
+}
+
 /// List objects not present in basedir.
 fn cmd_missing_objects(basedir: &Path, images: &[PathBuf]) -> Result<()> {
-    let mut all_objects: HashSet<Sha256HashValue> = HashSet::new();
+    let mut all_objects = BTreeSet::new();
 
     for image_path in images {
         let image_data = read_image(image_path)?;
@@ -283,15 +294,10 @@ fn cmd_missing_objects(basedir: &Path, images: &[PathBuf]) -> Result<()> {
         all_objects.extend(collect_objects_from_fs(&fs));
     }
 
-    let mut missing: Vec<Sha256HashValue> = all_objects
-        .into_iter()
-        .filter(|obj| !basedir.join(obj.to_object_pathname()).exists())
-        .collect();
-
-    missing.sort_by_key(|a| a.to_hex());
-
-    for obj in missing {
-        println!("{}", obj.to_object_pathname());
+    for obj in all_objects {
+        if !basedir.join(object_relative_path(&obj)).exists() {
+            println!("{}", obj.display());
+        }
     }
 
     Ok(())
@@ -315,4 +321,31 @@ fn read_image(path: &PathBuf) -> Result<Vec<u8>> {
     file.read_to_end(&mut data)
         .with_context(|| format!("Failed to read image: {path:?}"))?;
     Ok(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_object_relative_path() {
+        let cases = [
+            ("ab/cdef", "ab/cdef"),
+            ("8a/5d74.file", "8a/5d74.file"),
+            ("/8a/5d74.file", "8a/5d74.file"),
+            ("//8a/5d74.file", "8a/5d74.file"),
+            ("/", ""),
+            ("///", ""),
+            ("", ""),
+        ];
+        for (obj, expected) in cases {
+            let rel = object_relative_path(OsStr::new(obj));
+            assert_eq!(rel, Path::new(expected), "{obj}");
+            assert!(Path::new("/base").join(rel).starts_with("/base"), "{obj}");
+        }
+        assert_eq!(
+            object_relative_path(OsStr::from_bytes(b"//ab/\xff")),
+            Path::new(OsStr::from_bytes(b"ab/\xff"))
+        );
+    }
 }

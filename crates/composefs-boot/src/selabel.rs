@@ -336,9 +336,9 @@ pub fn open_file<H: FsVerityHashValue>(
     match dir.get_file_opt(filename.as_ref())? {
         Some(file) => match file {
             RegularFile::Inline(data) => Ok(Some(Box::new(Cursor::new(data.clone())))),
-            RegularFile::External(id, ..) | RegularFile::ExternalNoVerity(id, ..) => {
-                Ok(Some(Box::new(File::from(repo.open_object(id)?))))
-            }
+            RegularFile::External(..) | RegularFile::ExternalPath { .. } => Ok(Some(Box::new(
+                File::from(repo.open_object(file.repo_object_id()?.as_ref())?),
+            ))),
             RegularFile::Sparse(..) => Ok(None),
         },
         None => Ok(None),
