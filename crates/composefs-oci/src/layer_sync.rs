@@ -13,6 +13,7 @@
 //! * `composefs-ctl` varlink server — repo-to-repo layer synchronisation via
 //!   `GetLayer`/`PutLayer`, and the `oci copy` command.
 
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
@@ -193,9 +194,10 @@ fn drain_splitdirfdstream_inner<ObjectID: FsVerityHashValue>(
                 length,
                 filename,
             } => {
-                let name = std::str::from_utf8(filename).with_context(|| {
-                    format!("non-utf8 filename in splitdirfdstream: {filename:?}")
-                })?;
+                // The name is opened as the bytes it is: a tar entry name
+                // need not be UTF-8.  `name` is only for messages.
+                let path = std::path::Path::new(std::ffi::OsStr::from_bytes(filename));
+                let name = &*String::from_utf8_lossy(filename);
                 let dir = overlay_dirs.get(dirfd_index as usize).with_context(|| {
                     format!(
                         "dirfd_index {dirfd_index} out of range (dir_fds.len={})",
@@ -208,7 +210,7 @@ fn drain_splitdirfdstream_inner<ObjectID: FsVerityHashValue>(
                 );
                 files_opened_from_store += 1;
                 let fd = dir
-                    .open(name)
+                    .open(path)
                     .map(OwnedFd::from)
                     .with_context(|| format!("open {name:?} in overlay dir[{dirfd_index}]"))?;
 
@@ -1050,6 +1052,54 @@ mod tests {
             verity_a, verity_b,
             "verity hash must be identical across repos"
         );
+    }
+
+    /// A tar entry name need not be UTF-8, so neither does the name a
+    /// `FileBackedData` chunk refers to: the consumer opens it as bytes.
+    #[tokio::test]
+    async fn test_verified_drain_non_utf8_filename() {
+        let (repo, _td) = create_test_repo();
+
+        let name: &[u8] = b"caf\xe9";
+        let content = vec![b'x'; 128 * 1024];
+        let store = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            store.path().join(std::ffi::OsStr::from_bytes(name)),
+            &content,
+        )
+        .expect("write file with a non-UTF-8 name");
+
+        let header = b"header";
+        let trailer = b"trailer";
+        let mut stream = SplitdirfdstreamWriter::new(tempfile::tempfile().expect("tempfile"));
+        stream.write_metadata(header).unwrap();
+        stream
+            .write_file_backed_data(0, content.len() as u64, name)
+            .unwrap();
+        stream.write_metadata(trailer).unwrap();
+        let mut stream = stream.finish().unwrap();
+        std::io::Seek::rewind(&mut stream).unwrap();
+
+        let mut layer = header.to_vec();
+        layer.extend_from_slice(&content);
+        layer.extend_from_slice(trailer);
+        let diff_id = crate::sha256_content_digest(&layer);
+
+        let dir = OwnedFd::from(std::fs::File::open(store.path()).expect("open store"));
+        let result = tokio::task::spawn_blocking(move || {
+            drain_splitdirfdstream_verified(
+                repo,
+                OwnedFd::from(stream),
+                vec![dir],
+                &diff_id,
+                false,
+                composefs::repository::ImportContext::default(),
+            )
+        })
+        .await
+        .expect("spawn_blocking");
+        let (_verity, stats, _ctx) = result.expect("verified drain must succeed");
+        assert_eq!(stats.bytes_inlined, (header.len() + trailer.len()) as u64);
     }
 
     /// Negative test: produce → verified drain with a WRONG diff_id.
