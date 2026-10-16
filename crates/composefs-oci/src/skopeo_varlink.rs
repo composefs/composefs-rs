@@ -1,18 +1,18 @@
-//! Import container images via skopeo's JSON proxy + varlink socket.
+//! Import container images via skopeo's image proxy + varlink socket.
 //!
-//! This module spawns a `skopeo experimental-image-proxy` subprocess,
-//! opens a `containers-storage:` image through it, then calls
-//! `OpenVarlinkSocket` to obtain a Unix socket speaking the
-//! `org.composefs.Oci` varlink protocol.  Layers are transferred via
-//! `GetLayer` over that socket, reusing the same `import_layer_via_transfer`
-//! path as the in-process cstor import.
+//! This module starts a `skopeo experimental-image-proxy` through
+//! [`containers_image_proxy`], opens a `containers-storage:` image through it,
+//! then asks for a socket speaking the `org.composefs.Oci` varlink protocol.
+//! Layers are transferred via `GetLayer` over that socket, reusing the same
+//! `import_layer_via_transfer` path as the in-process cstor import.
 
-use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use containers_image_proxy::oci_spec::image::ImageManifest;
+use containers_image_proxy::{ImageProxy, ImageProxyConfig};
+use tokio::io::AsyncReadExt as _;
 
 use composefs::{
     fsverity::FsVerityHashValue,
@@ -23,124 +23,6 @@ use crate::progress::{ComponentId, ProgressEvent, ProgressUnit, SharedReporter};
 use crate::varlink_types::GetLayerParams;
 use crate::{ContentAndVerity, ImportStats, OciDigest, layer_identifier};
 
-const MAX_MSG_SIZE: usize = 32 * 1024;
-
-#[derive(serde::Serialize)]
-struct Request {
-    method: String,
-    args: Vec<serde_json::Value>,
-}
-
-#[derive(serde::Deserialize)]
-struct Reply {
-    success: bool,
-    error: String,
-    pipeid: u32,
-    value: serde_json::Value,
-}
-
-/// Guard that keeps the skopeo child process alive.  Kills the child on drop.
-pub(crate) struct SkopeoGuard {
-    child: std::process::Child,
-    _sock: OwnedFd,
-    /// Run root handed to skopeo for an explicit storage root; removed on
-    /// drop, after the child has been reaped.
-    _runroot: Option<tempfile::TempDir>,
-}
-
-impl Drop for SkopeoGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// Send a JSON request over a `SOCK_SEQPACKET` socket and receive the reply,
-/// optionally receiving a single file descriptor via `SCM_RIGHTS`.
-///
-/// Returns the reply value, the pipe id (meaningful only for methods that
-/// deliver their payload over a pipe) and the received fd, if any.
-fn proxy_call(
-    sock: &OwnedFd,
-    method: &str,
-    args: Vec<serde_json::Value>,
-) -> Result<(serde_json::Value, u32, Option<OwnedFd>)> {
-    tracing::debug!("skopeo proxy -> {method}{args:?}");
-    let req = Request {
-        method: method.to_string(),
-        args,
-    };
-    let sendbuf = serde_json::to_vec(&req)?;
-    rustix::net::send(sock, &sendbuf, rustix::net::SendFlags::empty())?;
-
-    let mut buf = [0u8; MAX_MSG_SIZE];
-    let mut cmsg_space: Vec<std::mem::MaybeUninit<u8>> =
-        vec![std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-    let mut cmsg_buffer = rustix::net::RecvAncillaryBuffer::new(cmsg_space.as_mut_slice());
-    let iov = std::io::IoSliceMut::new(&mut buf);
-    let mut iov = [iov];
-    let nread = rustix::net::recvmsg(
-        sock,
-        &mut iov,
-        &mut cmsg_buffer,
-        rustix::net::RecvFlags::CMSG_CLOEXEC,
-    )?
-    .bytes;
-
-    let received_fd: Option<OwnedFd> = cmsg_buffer
-        .drain()
-        .filter_map(|m| match m {
-            rustix::net::RecvAncillaryMessage::ScmRights(fds) => Some(fds),
-            _ => None,
-        })
-        .flatten()
-        .next();
-
-    let reply: Reply = serde_json::from_slice(&buf[..nread])
-        .with_context(|| format!("parsing reply for {method}"))?;
-    if !reply.success {
-        tracing::debug!("skopeo proxy <- {method} failed: {}", reply.error);
-        anyhow::bail!("skopeo proxy {method} failed: {}", reply.error);
-    }
-    tracing::debug!(
-        "skopeo proxy <- {method} ok ({nread} bytes, fd: {})",
-        if received_fd.is_some() { "yes" } else { "no" }
-    );
-
-    Ok((reply.value, reply.pipeid, received_fd))
-}
-
-/// Perform a proxy call whose payload is delivered over a pipe, and return
-/// that payload.
-///
-/// The proxy only closes the write end of the pipe when `FinishPipe` is
-/// called, so a payload larger than the pipe buffer would deadlock if we read
-/// it to EOF first; the read therefore runs on its own thread, concurrently
-/// with `FinishPipe`.
-fn proxy_call_bytes(sock: &OwnedFd, method: &str, args: Vec<serde_json::Value>) -> Result<Vec<u8>> {
-    use std::io::Read as _;
-
-    let (_value, pipeid, fd) = proxy_call(sock, method, args)?;
-    let fd = fd.with_context(|| format!("{method} did not return a pipe fd"))?;
-
-    let reader = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
-        let mut payload = Vec::new();
-        std::fs::File::from(fd).read_to_end(&mut payload)?;
-        Ok(payload)
-    });
-
-    let finished = proxy_call(sock, "FinishPipe", vec![pipeid.into()]);
-
-    let payload = reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("{method} pipe reader thread panicked"))?
-        .with_context(|| format!("reading {method} payload"))?;
-    finished.with_context(|| format!("FinishPipe after {method}"))?;
-
-    tracing::debug!("skopeo proxy <- {method} payload: {} bytes", payload.len());
-    Ok(payload)
-}
-
 /// An open skopeo image proxy session: the image's manifest and config as
 /// served by the proxy, plus a varlink connection for transferring layers.
 pub(crate) struct SkopeoSession {
@@ -150,12 +32,15 @@ pub(crate) struct SkopeoSession {
     pub manifest: String,
     /// Raw OCI config JSON, converted to OCI format by the proxy.
     pub config: String,
-    /// Keeps the skopeo child process alive for the lifetime of the session.
-    pub guard: SkopeoGuard,
+    /// The proxy; dropping it closes the socket, which makes skopeo exit.
+    pub proxy: ImageProxy,
+    /// Run root handed to skopeo for an explicit storage root.  Declared
+    /// after `proxy` so that it is removed only once the proxy is gone.
+    _runroot: Option<tempfile::TempDir>,
 }
 
-/// Spawn skopeo's image proxy, open the given image, read its manifest and
-/// config, and call `OpenVarlinkSocket` to get a varlink connection.
+/// Start skopeo's image proxy, open the given image, read its manifest and
+/// config, and get a varlink connection to it.
 ///
 /// The manifest and config come from the proxy rather than over varlink: the
 /// proxy sits on top of containers/image, so it knows which instance of a
@@ -171,12 +56,12 @@ pub(crate) struct SkopeoSession {
 /// default one.  An explicit root is spelled into the reference as
 /// `[overlay@root+runroot:options]`; additional stores alone are passed through
 /// `STORAGE_OPTS`, so that the default root is kept.
-pub(crate) fn open_skopeo_varlink(
+pub(crate) async fn open_skopeo_varlink(
     imgref: &str,
     storage_root: Option<&std::path::Path>,
     additional_image_stores: &[&std::path::Path],
 ) -> Result<SkopeoSession> {
-    use std::process::{Command, Stdio};
+    use std::process::Command;
 
     let mut options = Vec::new();
     for store in additional_image_stores {
@@ -219,14 +104,6 @@ pub(crate) fn open_skopeo_varlink(
             imgref.to_owned()
         }
     };
-    let imgref = imgref.as_str();
-
-    let (my_sock, their_sock) = rustix::net::socketpair(
-        rustix::net::AddressFamily::UNIX,
-        rustix::net::SocketType::SEQPACKET,
-        rustix::net::SocketFlags::CLOEXEC,
-        None,
-    )?;
 
     // Rootless, the store can only be read from inside podman's user
     // namespace; see https://github.com/containers/skopeo/issues/2563
@@ -237,101 +114,88 @@ pub(crate) fn open_skopeo_varlink(
         cmd.args(["unshare", "skopeo"]);
         cmd
     };
-    cmd.arg("experimental-image-proxy");
     if let Some(opts) = storage_opts {
-        cmd.env("STORAGE_OPTS", opts);
+        // Setting the variable replaces the inherited one; keep its options.
+        let inherited = std::env::var("STORAGE_OPTS").ok();
+        cmd.env(
+            "STORAGE_OPTS",
+            append_storage_opts(inherited.as_deref(), &opts),
+        );
     }
-    cmd.stdin(Stdio::from(their_sock));
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::piped());
+    let mut config = ImageProxyConfig::default();
+    config.skopeo_cmd = Some(cmd);
 
-    let child = cmd.spawn().context("failed to spawn skopeo")?;
-    // `cmd` still owns a copy of the proxy's end of the socket; drop it so
-    // that we see a disconnect if skopeo exits before replying.
-    drop(cmd);
-    let sock: OwnedFd = my_sock;
-    // Reap the child on every error path from here on.
-    let mut guard = SkopeoGuard {
-        child,
-        _sock: sock,
-        _runroot: runroot,
-    };
-    tracing::debug!(
-        "spawned `skopeo experimental-image-proxy` as pid {}",
-        guard.child.id()
-    );
-
-    // Drain the child's stderr on a thread and forward it to the log.  Nothing
-    // else reads this pipe, so without a drainer skopeo would block once it
-    // filled the pipe buffer — and its diagnostics would be lost either way.
-    if let Some(stderr) = guard.child.stderr.take() {
-        std::thread::spawn(move || {
-            use std::io::BufRead as _;
-            for line in std::io::BufReader::new(stderr)
-                .lines()
-                .map_while(Result::ok)
-            {
-                tracing::debug!("skopeo stderr: {line}");
-            }
-        });
-    }
-
-    let sock = &guard._sock;
-
-    // Initialize — verify protocol version ≥ 0.2.9
-    let (version_val, _, _) = proxy_call(sock, "Initialize", vec![])?;
-    let version_str: String = serde_json::from_value(version_val)?;
-    let version = semver::Version::parse(&version_str)?;
-    let required = semver::VersionReq::parse(">=0.2.9")?;
+    let proxy = ImageProxy::new_with_config(config)
+        .await
+        .context("starting skopeo image proxy")?;
     anyhow::ensure!(
-        required.matches(&version),
-        "skopeo proxy version {version} too old, need >=0.2.9 for OpenVarlinkSocket"
+        proxy.supports_open_varlink_socket(),
+        "skopeo proxy version {} too old, need >=0.2.9 for OpenVarlinkSocket",
+        proxy.protocol_version()
     );
-    tracing::debug!("skopeo proxy protocol version {version}");
 
-    // OpenImage
-    let (img_val, _, _) = proxy_call(sock, "OpenImage", vec![imgref.into()])?;
-    let img_id: u64 = serde_json::from_value(img_val).context("parsing OpenImage reply")?;
+    let img = proxy
+        .open_image(&imgref)
+        .await
+        .with_context(|| format!("opening {imgref}"))?;
 
     // The manifest is normalised to OCI by the proxy, which also rejects
     // schema1 and picks the right instance of a manifest list.
-    let manifest = proxy_call_bytes(sock, "GetManifest", vec![img_id.into()])?;
+    let (_, manifest) = proxy
+        .fetch_manifest_raw_oci(&img)
+        .await
+        .context("fetching manifest")?;
+    let config_descriptor = ImageManifest::from_reader(manifest.as_slice())
+        .context("parsing manifest")?
+        .config()
+        .clone();
     let manifest = String::from_utf8(manifest).context("manifest is not valid UTF-8")?;
 
     // The config has to be the blob the manifest points at, byte for byte:
     // it is stored under its own digest and looked up again by the digest in
-    // the manifest.  GetFullConfig would re-serialize it, so fetch the blob.
-    let config_descriptor = ImageManifest::from_reader(manifest.as_bytes())
-        .context("parsing manifest")?
-        .config()
-        .clone();
-    let config = proxy_call_bytes(
-        sock,
-        "GetBlob",
-        vec![
-            img_id.into(),
-            config_descriptor.digest().to_string().into(),
-            config_descriptor.size().into(),
-        ],
-    )?;
-    // The proxy converts docker schema2 manifests to OCI, which can change
-    // the config bytes (and so its digest), while GetBlob serves the original
-    // blob.  Refuse a mismatch rather than store a config its manifest does
-    // not describe.
-    let actual = crate::sha256_content_digest(&config);
-    anyhow::ensure!(
-        &actual == config_descriptor.digest(),
-        "config blob digest {actual} does not match the manifest's {}; \
-         the image's config was probably altered by the proxy's manifest conversion",
-        config_descriptor.digest()
-    );
+    // the manifest.  For an OCI image that is the blob itself.
+    let digest = config_descriptor.digest();
+    let blob = async {
+        let (mut reader, driver) = proxy
+            .get_blob(&img, digest, config_descriptor.size())
+            .await?;
+        let mut config = Vec::new();
+        let (read, finished) = tokio::join!(reader.read_to_end(&mut config), driver);
+        read?;
+        finished?;
+        anyhow::Ok(config)
+    }
+    .await;
+    let config = match blob {
+        Ok(config) if &crate::sha256_content_digest(&config) == digest => config,
+        blob => {
+            // The proxy converts a docker schema2 image to OCI, and the config
+            // the converted manifest points at is a re-serialization of the
+            // original, which is not a blob of the image and so can only be had
+            // from the proxy.
+            match &blob {
+                Ok(_) => tracing::debug!("config blob does not match {digest}"),
+                Err(e) => tracing::debug!("fetching config blob {digest}: {e:#}"),
+            }
+            let config = proxy
+                .fetch_config_raw(&img)
+                .await
+                .context("fetching config")?;
+            let actual = crate::sha256_content_digest(&config);
+            anyhow::ensure!(
+                &actual == digest,
+                "the image's config has digest {actual}, not the manifest's {digest}"
+            );
+            config
+        }
+    };
     let config = String::from_utf8(config).context("config is not valid UTF-8")?;
 
-    // OpenVarlinkSocket — returns a socket fd via SCM_RIGHTS, serving the
-    // store the image reference names.
-    let store_spec = store_spec(imgref);
-    let (_, _, varlink_fd) = proxy_call(sock, "OpenVarlinkSocket", vec![store_spec.into()])?;
-    let varlink_fd = varlink_fd.context("OpenVarlinkSocket did not return an fd")?;
+    // Serves the layers of the image we opened, by position.
+    let varlink_fd = proxy
+        .open_varlink_socket(&img)
+        .await
+        .context("OpenVarlinkSocket")?;
     tracing::debug!("got org.composefs.Oci varlink socket from skopeo for {imgref}");
 
     // Wrap as a zlink Connection
@@ -346,21 +210,35 @@ pub(crate) fn open_skopeo_varlink(
         conn,
         manifest,
         config,
-        guard,
+        proxy,
+        _runroot: runroot,
     })
 }
 
-/// Return the `[driver@graphroot+runroot:options]` store specifier at the
-/// start of a `containers-storage:` reference, or `""` (the default store)
-/// if there is none.
-fn store_spec(imgref: &str) -> &str {
-    let rest = crate::cstor::parse_containers_storage_ref(imgref).unwrap_or(imgref);
-    if rest.starts_with('[') {
-        if let Some(end) = rest.find(']') {
-            return &rest[..=end];
-        }
+/// `inherited` `STORAGE_OPTS`, if any, followed by `opts`.
+fn append_storage_opts(inherited: Option<&str>, opts: &str) -> String {
+    match inherited.filter(|i| !i.is_empty()) {
+        Some(inherited) => format!("{inherited},{opts}"),
+        None => opts.to_owned(),
     }
-    ""
+}
+
+/// Check that the config lists a diff ID for each layer of the manifest.
+///
+/// Layers are fetched by position and verified against the diff ID at that
+/// position, so a config that lists only some of the layers would otherwise
+/// import just those, and leave an image with layers missing.
+fn ensure_same_layer_count(manifest: &str, diff_ids: &[OciDigest]) -> Result<()> {
+    let layers = ImageManifest::from_reader(manifest.as_bytes())
+        .context("parsing manifest")?
+        .layers()
+        .len();
+    anyhow::ensure!(
+        layers == diff_ids.len(),
+        "the manifest has {layers} layers but the config lists {} diff IDs",
+        diff_ids.len()
+    );
+    Ok(())
 }
 
 /// Full result of a skopeo varlink import: manifest and config digests + verities.
@@ -383,31 +261,23 @@ pub(crate) async fn import_via_skopeo_proxy<ObjectID: FsVerityHashValue>(
     reporter: SharedReporter,
 ) -> Result<(SkopeoImportResult<ObjectID>, ImportStats)> {
     let mut stats = ImportStats::default();
-    let mut ctx = ImportContext::default();
+    // The files belong to containers-storage, which is not ours to hardlink.
+    let mut ctx = ImportContext::default().forbid_hardlinks();
 
-    // Spawn skopeo, open the image and get its manifest, config and the
-    // varlink connection (blocking I/O).
-    let imgref_owned = imgref.to_owned();
-    let storage_root = storage_root.map(|p| p.to_path_buf());
-    let stores: Vec<std::path::PathBuf> = additional_image_stores
-        .iter()
-        .map(|p| p.to_path_buf())
-        .collect();
+    // Start skopeo, open the image and get its manifest, config and the
+    // varlink connection.
     let SkopeoSession {
         mut conn,
         manifest,
         config,
-        guard: _guard,
-    } = tokio::task::spawn_blocking(move || {
-        let stores: Vec<&std::path::Path> = stores.iter().map(|p| p.as_path()).collect();
-        open_skopeo_varlink(&imgref_owned, storage_root.as_deref(), &stores)
-    })
-    .await
-    .context("spawn_blocking(open_skopeo_varlink) failed")??;
+        proxy,
+        _runroot,
+    } = open_skopeo_varlink(imgref, storage_root, additional_image_stores).await?;
 
-    // The OCI diff-ids from the config are what identifies a layer, both to
-    // the server (Oci.GetLayer resolves them against containers-storage) and
-    // to us in the composefs repo.
+    // The OCI diff-ids from the config are what identifies a layer in the
+    // composefs repo.  The server is asked for layers by position instead:
+    // only containers-storage knows which of its layers make up the image,
+    // and each one is verified against its diff-id as it is drained.
     let diff_ids =
         crate::extract_layer_ids(&manifest, &config).context("extracting layer IDs from config")?;
     let diff_ids: Vec<OciDigest> = diff_ids
@@ -415,11 +285,13 @@ pub(crate) async fn import_via_skopeo_proxy<ObjectID: FsVerityHashValue>(
         .map(|s| s.parse::<OciDigest>().context("parsing diff_id"))
         .collect::<Result<_>>()?;
 
+    ensure_same_layer_count(&manifest, &diff_ids)?;
+
     stats.layers = diff_ids.len() as u64;
 
     // Import each layer via the varlink connection.
     let mut layer_refs = Vec::with_capacity(diff_ids.len());
-    for diff_id in diff_ids.iter() {
+    for (layer_index, diff_id) in diff_ids.iter().enumerate() {
         let content_id = layer_identifier(diff_id);
         let id = ComponentId::from(diff_id.to_string());
 
@@ -435,10 +307,11 @@ pub(crate) async fn import_via_skopeo_proxy<ObjectID: FsVerityHashValue>(
                 unit: ProgressUnit::Bytes,
             });
             let params = GetLayerParams {
-                diff_id: Some(diff_id.to_string()),
+                diff_id: None,
                 storage: None,
                 // Without it, the producer inlines files we could not open.
                 consumer_has_cap_dac_override: cstorage::can_bypass_file_permissions(),
+                layer_index: Some(layer_index as u64),
             };
             let (verity, layer_stats) = crate::cstor::import_layer_via_transfer(
                 repo, &mut conn, params, diff_id, zerocopy, &mut ctx,
@@ -457,6 +330,10 @@ pub(crate) async fn import_via_skopeo_proxy<ObjectID: FsVerityHashValue>(
     }
 
     reporter.report(ProgressEvent::Message("Layers imported".to_string()));
+
+    // Done with skopeo: shut it down and reap it before the run root goes away.
+    drop(conn);
+    proxy.finalize().await.context("shutting down skopeo")?;
 
     // Finalize the OCI image
     let repo2 = Arc::clone(repo);
@@ -486,22 +363,47 @@ pub(crate) async fn import_via_skopeo_proxy<ObjectID: FsVerityHashValue>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::store_spec;
+mod layer_count_tests {
+    use super::ensure_same_layer_count;
+    use crate::OciDigest;
+
+    const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn manifest(layers: usize) -> String {
+        let layer = format!(
+            r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{DIGEST}","size":1}}"#
+        );
+        let layers = vec![layer; layers].join(",");
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{DIGEST}","size":1}},"layers":[{layers}]}}"#
+        )
+    }
 
     #[test]
-    fn test_store_spec() {
-        assert_eq!(store_spec("containers-storage:busybox"), "");
-        assert_eq!(store_spec("containers-storage:@abc123"), "");
+    fn test_ensure_same_layer_count() {
+        let ids = |n: usize| -> Vec<OciDigest> { vec![DIGEST.parse().unwrap(); n] };
+        assert!(ensure_same_layer_count(&manifest(2), &ids(2)).is_ok());
+        assert!(ensure_same_layer_count(&manifest(0), &ids(0)).is_ok());
+        // a prefix of the layers
+        let e = ensure_same_layer_count(&manifest(3), &ids(2)).unwrap_err();
+        assert!(e.to_string().contains("3 layers"), "{e}");
+        // more diff IDs than layers
+        assert!(ensure_same_layer_count(&manifest(1), &ids(2)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod storage_opts_tests {
+    use super::append_storage_opts;
+
+    #[test]
+    fn test_append_storage_opts() {
+        let ours = "additionalimagestore=/extra";
+        assert_eq!(append_storage_opts(None, ours), ours);
+        assert_eq!(append_storage_opts(Some(""), ours), ours);
         assert_eq!(
-            store_spec("containers-storage:[overlay@/var/lib/containers/storage]busybox"),
-            "[overlay@/var/lib/containers/storage]"
+            append_storage_opts(Some("additionalimagestore=/host"), ours),
+            "additionalimagestore=/host,additionalimagestore=/extra"
         );
-        assert_eq!(
-            store_spec("containers-storage:[/srv/storage+/run/storage:opt=1]@abc123"),
-            "[/srv/storage+/run/storage:opt=1]"
-        );
-        // Malformed specifier: leave it for the proxy to reject.
-        assert_eq!(store_spec("containers-storage:[/srv/storage"), "");
     }
 }
