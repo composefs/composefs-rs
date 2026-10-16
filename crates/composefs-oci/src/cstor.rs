@@ -463,7 +463,9 @@ pub(crate) async fn import_layer_via_transfer<ObjectID: FsVerityHashValue>(
     let (verity, layer_stats, ctx_returned) = tokio::task::spawn_blocking(move || {
         // Hold all lifetime FDs for the full duration of the drain.
         let _lifetime_fds = lifetime_fds;
-        crate::layer_sync::drain_splitdirfdstream(
+        // The producer is another program reading another store: what it
+        // sends is only trusted once it hashes to the diff ID we asked for.
+        crate::layer_sync::drain_splitdirfdstream_verified(
             repo_clone,
             pipe_read,
             dir_fds,
@@ -473,7 +475,8 @@ pub(crate) async fn import_layer_via_transfer<ObjectID: FsVerityHashValue>(
         )
     })
     .await
-    .context("spawn_blocking(drain_splitdirfdstream) failed")??;
+    .context("spawn_blocking(drain_splitdirfdstream_verified) failed")?
+    .with_context(|| format!("importing layer {label}"))?;
 
     *ctx = ctx_returned;
 
