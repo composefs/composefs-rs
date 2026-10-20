@@ -94,8 +94,9 @@ pub enum Item<'p> {
         size: u64,
         /// Number of links
         nlink: u32,
-        /// The backing store path
-        path: Cow<'p, Path>,
+        /// The backing store path; `None` for a file that only has an
+        /// fsverity digest, which overlayfs looks up by its own path
+        path: Option<Cow<'p, Path>>,
         /// The fsverity digest
         fsverity_digest: Option<String>,
     },
@@ -436,21 +437,22 @@ impl<'p> Entry<'p> {
             match ty {
                 FileType::RegularFile => {
                     Self::check_rdev(rdev)?;
-                    if let Some(path) = payload.as_ref() {
-                        let path = unescape_to_path(path)?;
+                    if payload.is_some() || fsverity_digest.is_some() {
+                        // libcomposefs accepts a digest without a payload,
+                        // and writes it as a metacopy without a redirect.
+                        if payload.is_none() && content.is_some() {
+                            anyhow::bail!("Inline file cannot have fsverity digest");
+                        }
                         Item::Regular {
                             size,
                             nlink,
-                            path,
+                            path: payload.map(unescape_to_path).transpose()?,
                             fsverity_digest: fsverity_digest.map(ToOwned::to_owned),
                         }
                     } else {
                         // A dumpfile entry with no backing path or payload is treated as an empty file
                         let content = content.unwrap_or_default();
                         let content = unescape_limited(content, MAX_INLINE_CONTENT)?;
-                        if fsverity_digest.is_some() {
-                            anyhow::bail!("Inline file cannot have fsverity digest");
-                        }
                         Item::RegularInline {
                             nlink,
                             size,
@@ -560,7 +562,7 @@ impl Item<'_> {
 
     pub(crate) fn payload(&self) -> Option<&Path> {
         match self {
-            Item::Regular { path, .. } => Some(path),
+            Item::Regular { path, .. } => path.as_deref(),
             Item::Symlink { target, .. } => Some(target),
             Item::Hardlink { target } => Some(target),
             _ => None,

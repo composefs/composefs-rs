@@ -305,8 +305,9 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
 
         match &leaf.content {
             LeafContent::Regular(
-                RegularFile::External(obj_id, size) | RegularFile::ExternalNoVerity(obj_id, size),
+                file @ (RegularFile::External(_, size) | RegularFile::ExternalPath { size, .. }),
             ) if !should_inline_file::<ObjectID>(*size as usize) => {
+                let obj_id = &file.repo_object_id()?;
                 // Stream through the hasher without buffering the entire file.
                 let mut hasher = Sha256::new();
                 hasher.update(&*regular_header);
@@ -329,8 +330,8 @@ impl<ObjectID: FsVerityHashValue> CommitWriter<ObjectID> {
                 let content: Option<Vec<u8>> = match &leaf.content {
                     LeafContent::Regular(RegularFile::Inline(data)) => Some(data.to_vec()),
                     LeafContent::Regular(
-                        RegularFile::External(obj_id, _) | RegularFile::ExternalNoVerity(obj_id, _),
-                    ) => Some(repo.read_object(obj_id)?),
+                        file @ (RegularFile::External(..) | RegularFile::ExternalPath { .. }),
+                    ) => Some(repo.read_object(&file.repo_object_id()?)?),
                     LeafContent::Regular(RegularFile::Sparse(_)) => {
                         bail!("Sparse files not supported in ostree commit")
                     }

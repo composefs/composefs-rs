@@ -1,0 +1,39 @@
+#!/bin/bash
+# Build the composefs RPMs (libcomposefs, mkcomposefs, mount.composefs, ...)
+# the same way Packit does: pack.sh generates the source and vendor
+# tarballs, then rpmbuild builds contrib/packaging/composefs.spec.
+#
+# Runs inside a buildroot container matching the bootc base image (see
+# `package-composefs` in the Justfile) on a scratch clone of this
+# repository, so the resulting packages can replace the distribution's
+# C composefs in the bootc test image.
+#
+# Usage: build-composefs-rpms SRC OUTDIR
+set -xeuo pipefail
+
+src=$1
+out=$2
+
+dnf -y install cargo rust gcc git make openssl-devel pkgconf-pkg-config \
+    rpm-build zlib-devel zstd
+git config --global --add safe.directory "$src"
+cd "$src"
+
+# Plain `cargo vendor` with the distribution's cargo, rather than
+# installing cargo-vendor-filterer as the release workflow does.
+PACK_VENDOR=cargo contrib/packaging/pack.sh
+
+# Man pages need pandoc, and %autochangelog rpmautospec, neither of
+# which CentOS Stream ships; the changelog doesn't matter here, and
+# neither do debuginfo packages (the spec's release build has no
+# debug info to split out).
+topdir=$(mktemp -d)
+# Offline, so the build must use the vendored crates, as in Koji.
+CARGO_NET_OFFLINE=true rpmbuild -bb --without man \
+    --define "autochangelog %{nil}" \
+    --define "debug_package %{nil}" \
+    --define "_topdir ${topdir}" \
+    --define "_sourcedir ${src}/target" \
+    target/composefs.spec
+
+cp "${topdir}"/RPMS/*/*.rpm "$out"/

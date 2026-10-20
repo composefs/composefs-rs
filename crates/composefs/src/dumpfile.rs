@@ -191,9 +191,7 @@ pub fn write_leaf(
             data,
             None,
         ),
-        LeafContent::Regular(
-            RegularFile::External(id, size) | RegularFile::ExternalNoVerity(id, size),
-        ) => write_entry(
+        LeafContent::Regular(RegularFile::External(id, size)) => write_entry(
             writer,
             path,
             stat,
@@ -204,6 +202,22 @@ pub fn write_leaf(
             id.to_object_pathname(),
             &[],
             Some(&id.to_hex()),
+        ),
+        LeafContent::Regular(RegularFile::ExternalPath {
+            redirect,
+            verity,
+            size,
+        }) => write_entry(
+            writer,
+            path,
+            stat,
+            FileType::RegularFile,
+            *size,
+            nlink,
+            0,
+            redirect.as_deref().unwrap_or_default(),
+            &[],
+            verity.as_ref().map(|id| id.to_hex()).as_deref(),
         ),
         LeafContent::Regular(RegularFile::Sparse(size)) => write_entry(
             writer,
@@ -487,14 +501,12 @@ pub fn add_entry_to_filesystem<ObjectID: FsVerityHashValue>(
             ..
         } => {
             let stat = entry_to_stat(&entry)?;
-            let leaf_content = if let Some(digest) = fsverity_digest.as_ref() {
-                let object_id = ObjectID::from_hex(digest)?;
-                LeafContent::Regular(RegularFile::External(object_id, size))
-            } else {
-                let object_id = ObjectID::from_object_pathname(path.as_os_str().as_bytes())
-                    .map_err(|e| anyhow::anyhow!("invalid object pathname: {e}"))?;
-                LeafContent::Regular(RegularFile::ExternalNoVerity(object_id, size))
-            };
+            let verity = fsverity_digest
+                .as_deref()
+                .map(ObjectID::from_hex)
+                .transpose()?;
+            let redirect = path.as_deref().map(|p| Box::from(p.as_os_str()));
+            let leaf_content = LeafContent::Regular(RegularFile::external(redirect, verity, size));
             let id = push_leaf(fs, stat, leaf_content);
             Inode::leaf(id)
         }
@@ -759,6 +771,47 @@ mod tests {
         let mut out2 = Vec::new();
         write_dumpfile(&mut out2, &fs2)?;
         assert_eq!(out, out2);
+        Ok(())
+    }
+
+    /// External files keep their payload: only a payload that is the
+    /// digest's object path becomes `External`; anything else, like ostree's
+    /// `xx/<checksum>.file` or no payload at all, is kept as `ExternalPath`.
+    #[test]
+    fn test_external_payload_round_trip() -> Result<()> {
+        const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const OBJECT: &str = "01/23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const OSTREE: &str =
+            "8a/5d74a2f8e3c1a0b9d7e6f5c4b3a2918070605040302010f0e0d0c0b0a09087.file";
+        let cases = [
+            (OBJECT, DIGEST, "External"),
+            (OSTREE, DIGEST, "ExternalPath"),
+            (OSTREE, "-", "ExternalPath"),
+            // A digest without a payload, as libcomposefs dumps it
+            ("-", DIGEST, "ExternalPath"),
+        ];
+        for (payload, digest, variant) in cases {
+            let dumpfile = format!(
+                "/ 0 40755 2 0 0 0 0.0 - - -\n/f 4097 100644 1 0 0 0 0.0 {payload} - {digest}\n"
+            );
+            let fs = dumpfile_to_filesystem::<Sha256HashValue>(&dumpfile)?;
+            let Some(Inode::Leaf(id, _)) = fs.root.lookup(OsStr::new("f")) else {
+                panic!("expected a leaf for {payload}");
+            };
+            let LeafContent::Regular(file) = &fs.leaf(*id).content else {
+                panic!("expected a regular file for {payload}");
+            };
+            let found = match file {
+                RegularFile::External(..) => "External",
+                RegularFile::ExternalPath { .. } => "ExternalPath",
+                other => panic!("unexpected {other:?} for {payload}"),
+            };
+            assert_eq!(found, variant, "{payload} {digest}");
+
+            let mut out = Vec::new();
+            write_dumpfile(&mut out, &fs)?;
+            assert_eq!(std::str::from_utf8(&out).unwrap(), dumpfile);
+        }
         Ok(())
     }
 
