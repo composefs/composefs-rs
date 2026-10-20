@@ -34,6 +34,7 @@ use crate::{
 pub struct FsHandle {
     /// The file descriptor for the filesystem context.
     pub fd: OwnedFd,
+    errors: Vec<Vec<u8>>,
 }
 
 impl FsHandle {
@@ -49,7 +50,59 @@ impl FsHandle {
     pub fn open(name: &str) -> Result<FsHandle> {
         Ok(FsHandle {
             fd: fsopen(name, FsOpenFlags::FSOPEN_CLOEXEC)?,
+            errors: Vec::new(),
         })
+    }
+
+    /// Save currently pending kernel diagnostics for reporting when dropped.
+    ///
+    /// Call this before probing an optional feature so [`Self::discard_errors`]
+    /// can discard the probe's diagnostics while preserving earlier messages.
+    pub fn buffer_errors(&mut self) -> Result<()> {
+        Self::read_errors(&self.fd, |error| self.errors.push(error))
+    }
+
+    /// Discard currently pending kernel diagnostics, logging them at debug level.
+    ///
+    /// Previously buffered diagnostics are retained. Call [`Self::buffer_errors`]
+    /// before an operation whose expected errors should be discarded.
+    pub fn discard_errors(&self) -> Result<()> {
+        Self::read_errors(&self.fd, |error| {
+            log::debug!(
+                "Discarding filesystem context diagnostic: {}",
+                String::from_utf8_lossy(&error)
+            );
+        })
+    }
+
+    fn read_errors(fd: impl AsFd, consume: impl FnMut(Vec<u8>)) -> Result<()> {
+        Self::read_errors_with(|buffer| rustix::io::read(&fd, buffer), consume)
+    }
+
+    fn read_errors_with(
+        mut read: impl FnMut(&mut [u8]) -> rustix::io::Result<usize>,
+        mut consume: impl FnMut(Vec<u8>),
+    ) -> Result<()> {
+        const INITIAL_BUFFER_SIZE: usize = 1024;
+        // An empty fscontext read returns ENODATA if no messages are pending,
+        // or EMSGSIZE without consuming the message. Allocate only on demand.
+        let mut buffer = Vec::new();
+        loop {
+            match read(&mut buffer) {
+                Ok(0) | Err(Errno::NODATA) => return Ok(()),
+                Ok(size) => {
+                    buffer.truncate(size);
+                    consume(std::mem::take(&mut buffer));
+                }
+                Err(Errno::INTR) => continue,
+                // fscontext reads leave an oversized message queued. Grow the
+                // scratch buffer and retry instead of failing the mount.
+                Err(Errno::MSGSIZE) => {
+                    buffer.resize((buffer.len() * 2).max(INITIAL_BUFFER_SIZE), 0);
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 }
 
@@ -60,18 +113,16 @@ impl AsFd for FsHandle {
 }
 
 impl Drop for FsHandle {
+    #[allow(clippy::print_stderr)]
     fn drop(&mut self) {
-        let mut buffer = [0u8; 1024];
-        loop {
-            match rustix::io::read(&self.fd, &mut buffer) {
-                Err(_) => return, // ENODATA, among others?
-                Ok(0) => return,
-                // Surface the kernel's fsopen/fsconfig diagnostic messages,
-                // which are only readable from this fd. We have no error
-                // channel from `drop`, so stderr is the only option.
-                #[allow(clippy::print_stderr)]
-                Ok(size) => eprintln!("{}", String::from_utf8(buffer[0..size].to_vec()).unwrap()),
-            }
+        if let Err(err) = self.buffer_errors() {
+            log::debug!("Reading filesystem context diagnostics: {err}");
+        }
+        for error in &self.errors {
+            // Surface the kernel's fsopen/fsconfig diagnostics. There is no
+            // error channel from Drop, so stderr is the only option.
+            // Kernel messages already have a newline.
+            eprint!("{}", String::from_utf8_lossy(error));
         }
     }
 }
@@ -118,13 +169,15 @@ pub fn erofs_mount(image: OwnedFd) -> Result<OwnedFd> {
     let image = make_erofs_mountable(image)?;
     log::trace!("erofs_mount: flock(LOCK_SH) on {}", proc_self_fd(&image));
     rustix::fs::flock(&image, rustix::fs::FlockOperation::LockShared)?;
-    let erofs = FsHandle::open("erofs")?;
+    let mut erofs = FsHandle::open("erofs")?;
     fsconfig_set_flag(erofs.as_fd(), "ro")?;
     // Passing the fd keeps the flock held by the kernel for the lifetime of the mount.  Kernels
     // without support reject it, in which case use the /proc/self/fd path instead.
+    erofs.buffer_errors()?;
     match fsconfig_set_fd(erofs.as_fd(), "source", image.as_fd()) {
         Ok(()) => {}
         Err(Errno::INVAL | Errno::OPNOTSUPP) => {
+            erofs.discard_errors()?;
             fsconfig_set_string(erofs.as_fd(), "source", proc_self_fd(&image))?;
         }
         Err(err) => return Err(err.into()),
@@ -226,7 +279,7 @@ pub fn composefs_fsmount(
     }
     let erofs_mnt = prepare_mount(erofs_mnt)?;
 
-    let overlayfs = FsHandle::open("overlay")?;
+    let mut overlayfs = FsHandle::open("overlay")?;
     fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
     fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
     fsconfig_set_string(overlayfs.as_fd(), "redirect_dir", "on")?;
@@ -236,9 +289,12 @@ pub fn composefs_fsmount(
             fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
         }
         VerityRequirement::Try => {
+            overlayfs.buffer_errors()?;
             match fsconfig_set_string(overlayfs.as_fd(), "verity", "require") {
                 Ok(()) => {}
-                Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOSYS) => {}
+                Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOSYS) => {
+                    overlayfs.discard_errors()?;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -260,4 +316,95 @@ pub fn composefs_fsmount(
         FsMountFlags::FSMOUNT_CLOEXEC,
         mount_attr,
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+
+    // Model fscontext records: an undersized read leaves the message queued.
+    fn read_message(
+        pending: &mut VecDeque<Vec<u8>>,
+        buffer: &mut [u8],
+    ) -> rustix::io::Result<usize> {
+        let Some(message) = pending.front() else {
+            return Err(Errno::NODATA);
+        };
+        if message.len() > buffer.len() {
+            return Err(Errno::MSGSIZE);
+        }
+        let message = pending.pop_front().unwrap();
+        buffer[..message.len()].copy_from_slice(&message);
+        Ok(message.len())
+    }
+
+    #[test]
+    fn empty_diagnostics() -> Result<()> {
+        for result in [Ok(0), Err(Errno::NODATA)] {
+            FsHandle::read_errors_with(
+                |buffer| {
+                    assert!(buffer.is_empty());
+                    result
+                },
+                |_| panic!("No diagnostic should be consumed"),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_diagnostics() -> Result<()> {
+        for size in [1024, 1025, 8193] {
+            let expected = [
+                b"w before\n".to_vec(),
+                vec![b'x'; size],
+                b"e after\n".to_vec(),
+            ];
+            let mut pending = VecDeque::from(expected.clone());
+            let mut actual = Vec::new();
+            FsHandle::read_errors_with(
+                |buffer| read_message(&mut pending, buffer),
+                |message| actual.push(message),
+            )?;
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn preserve_diagnostics_around_probe() -> Result<()> {
+        for discard_probe in [false, true] {
+            let mut pending = VecDeque::new();
+            let mut saved = Vec::new();
+            let mut drain = |pending: &mut VecDeque<_>, save: bool| {
+                FsHandle::read_errors_with(
+                    |buffer| read_message(pending, buffer),
+                    |message| {
+                        if save {
+                            saved.push(message);
+                        }
+                    },
+                )
+            };
+
+            pending.push_back(b"w before probe\n".to_vec());
+            drain(&mut pending, true)?;
+            pending.push_back(b"e probe failure\n".to_vec());
+            if discard_probe {
+                drain(&mut pending, false)?;
+            }
+            pending.push_back(b"e fallback failure\n".to_vec());
+            drain(&mut pending, true)?;
+
+            let expected = if discard_probe {
+                b"w before probe\ne fallback failure\n".as_slice()
+            } else {
+                b"w before probe\ne probe failure\ne fallback failure\n".as_slice()
+            };
+            assert_eq!(saved.concat(), expected);
+        }
+        Ok(())
+    }
 }
