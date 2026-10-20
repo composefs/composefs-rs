@@ -34,6 +34,7 @@ use crate::{
 pub struct FsHandle {
     /// The file descriptor for the filesystem context.
     pub fd: OwnedFd,
+    errors: Vec<Vec<u8>>,
 }
 
 impl FsHandle {
@@ -49,7 +50,66 @@ impl FsHandle {
     pub fn open(name: &str) -> Result<FsHandle> {
         Ok(FsHandle {
             fd: fsopen(name, FsOpenFlags::FSOPEN_CLOEXEC)?,
+            errors: Vec::new(),
         })
+    }
+
+    /// Save currently pending kernel diagnostics for reporting when dropped.
+    ///
+    /// Call this before probing an optional feature so [`Self::discard_errors`]
+    /// can discard the probe's diagnostics while preserving earlier messages.
+    pub fn buffer_errors(&mut self) -> Result<()> {
+        Self::read_errors(&self.fd, |error| self.errors.push(error.to_vec()))
+    }
+
+    /// Discard currently pending kernel diagnostics, logging them at debug level.
+    ///
+    /// Previously buffered diagnostics are retained. Call [`Self::buffer_errors`]
+    /// before an operation whose expected errors should be discarded.
+    pub fn discard_errors(&self) -> Result<()> {
+        Self::read_errors(&self.fd, |error| {
+            log::debug!(
+                "Discarding filesystem context diagnostic: {}",
+                String::from_utf8_lossy(error)
+            );
+        })
+    }
+
+    fn read_errors(fd: impl AsFd, consume: impl FnMut(&[u8])) -> Result<()> {
+        Self::read_errors_with(|buffer| rustix::io::read(&fd, buffer), consume)
+    }
+
+    fn read_errors_with(
+        mut read: impl FnMut(&mut [u8]) -> rustix::io::Result<usize>,
+        mut consume: impl FnMut(&[u8]),
+    ) -> Result<()> {
+        const INITIAL_BUFFER_SIZE: usize = 1024;
+        // Cover typical diagnostics on the stack, including on older kernels
+        // which consume messages even when the read fails with EMSGSIZE.
+        let mut stack_buffer = [0u8; INITIAL_BUFFER_SIZE];
+        let mut heap_buffer = Vec::new();
+        let mut buffer = stack_buffer.as_mut_slice();
+        loop {
+            match read(buffer) {
+                Ok(0) | Err(Errno::NODATA) => return Ok(()),
+                Ok(size) => consume(&buffer[..size]),
+                Err(Errno::INTR) => continue,
+                Err(Errno::MSGSIZE) => {
+                    // Newer kernels retain the message for a larger read.
+                    // Older kernels have already lost it; keep draining either
+                    // way, retaining the larger buffer for subsequent messages.
+                    // https://github.com/composefs/composefs-rs/pull/421#discussion_r4327805173
+                    log::debug!(
+                        "Filesystem context diagnostic exceeds {} bytes; it may have been lost on an older kernel",
+                        buffer.len()
+                    );
+                    let new_size = buffer.len() * 2;
+                    heap_buffer.resize(new_size, 0);
+                    buffer = heap_buffer.as_mut_slice();
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 }
 
@@ -60,18 +120,15 @@ impl AsFd for FsHandle {
 }
 
 impl Drop for FsHandle {
+    #[allow(clippy::print_stderr)]
     fn drop(&mut self) {
-        let mut buffer = [0u8; 1024];
-        loop {
-            match rustix::io::read(&self.fd, &mut buffer) {
-                Err(_) => return, // ENODATA, among others?
-                Ok(0) => return,
-                // Surface the kernel's fsopen/fsconfig diagnostic messages,
-                // which are only readable from this fd. We have no error
-                // channel from `drop`, so stderr is the only option.
-                #[allow(clippy::print_stderr)]
-                Ok(size) => eprintln!("{}", String::from_utf8(buffer[0..size].to_vec()).unwrap()),
-            }
+        if let Err(err) = self.buffer_errors() {
+            log::debug!("Reading filesystem context diagnostics: {err}");
+        }
+        for error in &self.errors {
+            // Surface the kernel's fsopen/fsconfig diagnostics. There is no
+            // error channel from Drop, so stderr is the only option.
+            eprintln!("{}", String::from_utf8_lossy(error).trim_end_matches('\n'));
         }
     }
 }
@@ -118,13 +175,15 @@ pub fn erofs_mount(image: OwnedFd) -> Result<OwnedFd> {
     let image = make_erofs_mountable(image)?;
     log::trace!("erofs_mount: flock(LOCK_SH) on {}", proc_self_fd(&image));
     rustix::fs::flock(&image, rustix::fs::FlockOperation::LockShared)?;
-    let erofs = FsHandle::open("erofs")?;
+    let mut erofs = FsHandle::open("erofs")?;
     fsconfig_set_flag(erofs.as_fd(), "ro")?;
     // Passing the fd keeps the flock held by the kernel for the lifetime of the mount.  Kernels
     // without support reject it, in which case use the /proc/self/fd path instead.
+    erofs.buffer_errors()?;
     match fsconfig_set_fd(erofs.as_fd(), "source", image.as_fd()) {
         Ok(()) => {}
         Err(Errno::INVAL | Errno::OPNOTSUPP) => {
+            erofs.discard_errors()?;
             fsconfig_set_string(erofs.as_fd(), "source", proc_self_fd(&image))?;
         }
         Err(err) => return Err(err.into()),
@@ -226,7 +285,7 @@ pub fn composefs_fsmount(
     }
     let erofs_mnt = prepare_mount(erofs_mnt)?;
 
-    let overlayfs = FsHandle::open("overlay")?;
+    let mut overlayfs = FsHandle::open("overlay")?;
     fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
     fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
     fsconfig_set_string(overlayfs.as_fd(), "redirect_dir", "on")?;
@@ -236,9 +295,12 @@ pub fn composefs_fsmount(
             fsconfig_set_string(overlayfs.as_fd(), "verity", "require")?;
         }
         VerityRequirement::Try => {
+            overlayfs.buffer_errors()?;
             match fsconfig_set_string(overlayfs.as_fd(), "verity", "require") {
                 Ok(()) => {}
-                Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOSYS) => {}
+                Err(rustix::io::Errno::INVAL) | Err(rustix::io::Errno::NOSYS) => {
+                    overlayfs.discard_errors()?;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -260,4 +322,141 @@ pub fn composefs_fsmount(
         FsMountFlags::FSMOUNT_CLOEXEC,
         mount_attr,
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+
+    // Older kernels consume an oversized record; newer kernels leave it queued.
+    fn read_message(
+        pending: &mut VecDeque<Vec<u8>>,
+        buffer: &mut [u8],
+        consume_oversized: bool,
+    ) -> rustix::io::Result<usize> {
+        let Some(message) = pending.front() else {
+            return Err(Errno::NODATA);
+        };
+        if message.len() > buffer.len() {
+            if consume_oversized {
+                pending.pop_front();
+            }
+            return Err(Errno::MSGSIZE);
+        }
+        let message = pending.pop_front().unwrap();
+        buffer[..message.len()].copy_from_slice(&message);
+        Ok(message.len())
+    }
+
+    #[test]
+    fn empty_diagnostics() -> Result<()> {
+        for result in [Ok(0), Err(Errno::NODATA)] {
+            FsHandle::read_errors_with(
+                |buffer| {
+                    assert!(!buffer.is_empty());
+                    result
+                },
+                |_| panic!("No diagnostic should be consumed"),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_diagnostics() -> Result<()> {
+        for consume_oversized in [false, true] {
+            for size in [1025, 8193] {
+                let mut expected = vec![
+                    b"w before".to_vec(),
+                    vec![b'x'; 1024],
+                    vec![b'y'; size],
+                    b"w between".to_vec(),
+                    vec![b'z'; 2048],
+                    b"e after".to_vec(),
+                ];
+                let mut pending = VecDeque::from(expected.clone());
+                if consume_oversized {
+                    // Only the first oversized record is lost. The enlarged
+                    // buffer must survive the short record that follows it.
+                    expected.remove(2);
+                }
+                let mut actual = Vec::new();
+                FsHandle::read_errors_with(
+                    |buffer| read_message(&mut pending, buffer, consume_oversized),
+                    |message| actual.push(message.to_vec()),
+                )?;
+                assert_eq!(actual, expected);
+                assert!(pending.is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostic_read_errors() -> Result<()> {
+        let mut pending = VecDeque::from([b"e failure".to_vec()]);
+        let mut interrupt = true;
+        let mut actual = Vec::new();
+        FsHandle::read_errors_with(
+            |buffer| {
+                if std::mem::take(&mut interrupt) {
+                    return Err(Errno::INTR);
+                }
+                read_message(&mut pending, buffer, false)
+            },
+            |message| actual.push(message.to_vec()),
+        )?;
+        assert_eq!(actual, [b"e failure".to_vec()]);
+
+        let err = FsHandle::read_errors_with(
+            |_| Err(Errno::IO),
+            |_| panic!("No diagnostic should be consumed"),
+        )
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(Errno::IO.raw_os_error()));
+        Ok(())
+    }
+
+    #[test]
+    fn preserve_diagnostics_around_probe() -> Result<()> {
+        for (consume_oversized, discard_probe) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut pending = VecDeque::new();
+            let mut saved = Vec::new();
+            let mut drain = |pending: &mut VecDeque<_>, save: bool| {
+                FsHandle::read_errors_with(
+                    |buffer| read_message(pending, buffer, consume_oversized),
+                    |message| {
+                        if save {
+                            saved.push(message.to_vec());
+                        }
+                    },
+                )
+            };
+
+            pending.push_back(b"w before probe".to_vec());
+            drain(&mut pending, true)?;
+            pending.push_back(b"e probe failure".to_vec());
+            if discard_probe {
+                drain(&mut pending, false)?;
+            }
+            pending.push_back(b"e fallback failure".to_vec());
+            drain(&mut pending, true)?;
+
+            let expected = if discard_probe {
+                vec![b"w before probe".to_vec(), b"e fallback failure".to_vec()]
+            } else {
+                vec![
+                    b"w before probe".to_vec(),
+                    b"e probe failure".to_vec(),
+                    b"e fallback failure".to_vec(),
+                ]
+            };
+            assert_eq!(saved, expected);
+        }
+        Ok(())
+    }
 }
