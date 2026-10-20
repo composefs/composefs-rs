@@ -56,3 +56,8 @@ debug = true
 platforms = ["*-unknown-linux-gnu"]
 tier = "2"
 all-features = true
+
+# Temporary, for Error::is_retryable(): replace with a version bump once
+# https://github.com/bootc-dev/containers-image-proxy-rs is released with it.
+[patch.crates-io]
+containers-image-proxy = { git = "https://github.com/cgwalters-forge/containers-image-proxy-rs", rev = "a35d1d65e6724d2e8d7cf69e2c8770c28802b760" }

@@ -17,21 +17,10 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use xshell::{Shell, cmd};
 
-use crate::{cfsctl, integration_test};
+use crate::{cfsctl, have_skopeo, integration_test};
 
 /// Environment variable naming the old cfsctl binary.
 const CFSCTL_PATH_OLD: &str = "CFSCTL_PATH_OLD";
-
-/// Returns true if skopeo is available on the system.
-fn have_skopeo() -> bool {
-    std::process::Command::new("skopeo")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 fn test_read_old_format_repo() -> Result<()> {
     let old_cfsctl = PathBuf::from(

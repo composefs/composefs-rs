@@ -8,18 +8,7 @@ use anyhow::Result;
 use xshell::{Shell, cmd};
 
 use crate::tests::cli::{OCI_LAYOUT_COMPOSEFS_ID, create_oci_layout, init_insecure_repo};
-use crate::{cfsctl, integration_test};
-
-/// Returns true if skopeo is available on the system.
-fn have_skopeo() -> bool {
-    std::process::Command::new("skopeo")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
+use crate::{cfsctl, have_skopeo, integration_test};
 
 /// Regression test for multi-frame zstd decoding: before the decode fix,
 /// every `zstd:chunked` pull silently imported a truncated tar because the
