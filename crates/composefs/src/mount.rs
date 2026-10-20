@@ -158,6 +158,8 @@ pub struct MountOptions {
     read_write: bool,
     /// User namespace file descriptor for ID-mapped mounts.
     idmap_fd: Option<OwnedFd>,
+    /// SELinux context applied to all files on the overlay mount.
+    selinux_context: Option<String>,
 }
 
 impl MountOptions {
@@ -176,6 +178,15 @@ impl MountOptions {
     /// Set a user namespace file descriptor for ID-mapped mounts.
     pub fn set_idmap(&mut self, fd: OwnedFd) -> &mut Self {
         self.idmap_fd = Some(fd);
+        self
+    }
+
+    /// Set the SELinux `context` mount option for the overlay filesystem.
+    ///
+    /// This labels all files in the mounted view without modifying the image.
+    /// Writable upper and work directories must also have compatible labels.
+    pub fn set_selinux_context(&mut self, context: &str) -> &mut Self {
+        self.selinux_context = Some(context.to_owned());
         self
     }
 
@@ -228,6 +239,9 @@ pub fn composefs_fsmount(
 
     let overlayfs = FsHandle::open("overlay")?;
     fsconfig_set_string(overlayfs.as_fd(), "source", format!("composefs:{name}"))?;
+    if let Some(context) = &options.selinux_context {
+        fsconfig_set_string(overlayfs.as_fd(), "context", context.as_str())?;
+    }
     fsconfig_set_string(overlayfs.as_fd(), "metacopy", "on")?;
     fsconfig_set_string(overlayfs.as_fd(), "redirect_dir", "on")?;
     match verity {
