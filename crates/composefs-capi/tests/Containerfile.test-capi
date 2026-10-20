@@ -5,6 +5,11 @@ COPY composefs-c /src/composefs-c
 COPY libcomposefs_capi.so /usr/lib64/
 WORKDIR /src/composefs-c
 RUN meson setup build && meson compile -C build
+# Write an ostree-style image with the C libcomposefs, to compare against ours
+COPY ostree-image.c /src/
+RUN gcc -DOSTREE_IMAGE_MAIN -Ilibcomposefs -o /src/ostree-image /src/ostree-image.c \
+        -Lbuild/libcomposefs -lcomposefs && \
+    LD_LIBRARY_PATH=build/libcomposefs /src/ostree-image > /src/ostree-image-c.erofs
 RUN cp /usr/lib64/libcomposefs_capi.so build/libcomposefs/libcomposefs.so.1.4.0 && \
     ln -sf libcomposefs.so.1.4.0 build/libcomposefs/libcomposefs.so.1 && \
     ln -sf libcomposefs.so.1 build/libcomposefs/libcomposefs.so
@@ -12,6 +17,10 @@ RUN export LD_LIBRARY_PATH=/src/composefs-c/build/libcomposefs && \
     ldd build/tools/mkcomposefs | grep composefs && \
     tests/test-checksums.sh build/tools tests/assets \
         "config.dump.gz config-with-hard-link.dump.gz special.dump bigfile.dump bigfile-xattr.dump special_v1.dump honggfuzz-long-symlink.dump honggfuzz-longlink-unterminated.dump honggfuzz-bigfile-with-acl.dump no-newline.dump honggfuzz-chardev-nonzero-size.dump longlink.dump honggfuzz-write-inode-data.dump"
+RUN export LD_LIBRARY_PATH=/src/composefs-c/build/libcomposefs && \
+    /src/ostree-image > /src/ostree-image-rust.erofs && \
+    cmp /src/ostree-image-c.erofs /src/ostree-image-rust.erofs && \
+    echo "ostree-style image matches the C libcomposefs"
 RUN export LD_LIBRARY_PATH=/src/composefs-c/build/libcomposefs && \
     tests/test-units.sh build/tools && \
     echo "=== All C tests passed with Rust libcomposefs ==="
