@@ -972,9 +972,16 @@ fn user_overlay_supported_probe() -> bool {
     let Ok(overlayfs) = FsHandle::open("overlay") else {
         return false;
     };
-    fsconfig_set_flag(overlayfs.as_fd(), "userxattr").is_ok()
+    let supported = fsconfig_set_flag(overlayfs.as_fd(), "userxattr").is_ok()
         && fsconfig_set_string(overlayfs.as_fd(), "lowerdir", &*lowerdir_arg).is_ok()
-        && fsconfig_create(overlayfs.as_fd()).is_ok()
+        && fsconfig_create(overlayfs.as_fd()).is_ok();
+    if !supported {
+        // This filesystem context contains only diagnostics from the probe.
+        if let Err(err) = overlayfs.discard_errors() {
+            log::debug!("Reading overlayfs probe diagnostics: {err}");
+        }
+    }
+    supported
 }
 
 /// Creates an overlayfs on top of a FUSE mount.
