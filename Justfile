@@ -57,8 +57,13 @@ base_image := env("COMPOSEFS_BASE_IMAGE", "ghcr.io/bootcrew/debian-bootc:latest"
 #   centos stream9 (5.14):   rhel9
 cfsctl_features := env("COMPOSEFS_CFSCTL_FEATURES", "pre-6.15")
 
+# Where the test image's skopeo comes from: "build" compiles one with
+# OpenVarlinkSocket, "distro" keeps the distribution's to test the fallback.
+skopeo_source := env("COMPOSEFS_SKOPEO_SOURCE", "build")
+
 # Derive test image name from base_image
-_test_image := if base_image =~ "debian" { "localhost/composefs-rs-test-debian:latest" } else if base_image =~ "stream9" { "localhost/composefs-rs-test-c9s:latest" } else { "localhost/composefs-rs-test:latest" }
+_test_image_base := if base_image =~ "debian" { "localhost/composefs-rs-test-debian" } else if base_image =~ "stream9" { "localhost/composefs-rs-test-c9s" } else { "localhost/composefs-rs-test" }
+_test_image := _test_image_base + (if skopeo_source == "distro" { "-stockskopeo" } else { "" }) + ":latest"
 
 # Run unprivileged integration tests against the cfsctl binary (no root, no VM)
 # Prefers nextest for parallelism control and better UX; falls back to direct harness.
@@ -98,7 +103,7 @@ test-mount-composefs: build
 
 # Build the test container image for VM-based integration tests
 _integration-container-build:
-    podman build --build-arg base_image={{base_image}} --build-arg cfsctl_features={{cfsctl_features}} -t {{_test_image}} .
+    podman build --build-arg base_image={{base_image}} --build-arg cfsctl_features={{cfsctl_features}} --build-arg skopeo_source={{skopeo_source}} -t {{_test_image}} .
 
 # Run all integration tests including privileged VM tests (requires podman + libvirt)
 # Uses nextest with the integration profile for parallelism control of VM tests.

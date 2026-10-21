@@ -15,10 +15,23 @@
 
 ARG base_image=quay.io/centos-bootc/centos-bootc:stream10
 ARG cfsctl_features=pre-6.15
+# "build": install a skopeo built from source that has OpenVarlinkSocket.
+# "distro": keep the distribution's skopeo, to test the fallback.
+ARG skopeo_source=build
 
 # -- source snapshot (keeps layer graph clean) --
 FROM scratch AS src
 COPY . /src
+
+# -- skopeo with the image proxy's OpenVarlinkSocket, which distributions don't
+# ship yet; cfsctl needs it to import from containers-storage --
+FROM ${base_image} AS skopeo-build
+COPY --from=src /src/contrib /src/contrib
+RUN mkdir -p /out && /src/contrib/packaging/build-skopeo.sh /out
+
+# -- empty: leave the distribution's skopeo alone --
+FROM ${base_image} AS skopeo-distro
+RUN mkdir -p /out
 
 # -- build stage --
 FROM ${base_image} AS build
@@ -67,6 +80,9 @@ FROM ${base_image}
 COPY --from=src /src/contrib /src/contrib
 RUN /src/contrib/packaging/install-test-deps.sh && rm -rf /src
 
+# With skopeo_source=build, replaces the distribution's skopeo installed above
+ARG skopeo_source
+COPY --from=skopeo-${skopeo_source} /out/ /usr/bin/
 COPY --from=build /usr/bin/cfsctl /usr/bin/cfsctl
 COPY --from=build /usr/bin/cfsctl-integration-tests /usr/bin/cfsctl-integration-tests
 COPY --from=build /usr/lib/composefs-rs-test /usr/lib/composefs-rs-test
