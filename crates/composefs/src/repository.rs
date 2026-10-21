@@ -953,9 +953,23 @@ pub struct ImportContext {
     /// Device-ID pairs where FICLONE has already failed.  Stored as
     /// `(source_dev, dest_dev)` from `fstat().st_dev`.
     reflink_unsupported_devs: Vec<(u64, u64)>,
+    /// Never hardlink a source file into the repository.
+    no_hardlinks: bool,
 }
 
 impl ImportContext {
+    /// Never hardlink source files into the repository; reflink or copy only.
+    ///
+    /// Use this when the source files belong to someone else.  Hardlinking
+    /// adds a name to the source's inode, so its link count changes, and
+    /// enabling fs-verity on it makes it read-only for good.  For files from
+    /// containers-storage that is visible inside the containers using the
+    /// image, so it is not safe to do.
+    pub fn forbid_hardlinks(mut self) -> Self {
+        self.no_hardlinks = true;
+        self
+    }
+
     /// Check whether reflinks are known to be unsupported for this
     /// source→destination device pair.
     pub(crate) fn is_reflink_unsupported(&self, src_dev: u64, dst_dev: u64) -> bool {
@@ -1983,17 +1997,24 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         // Try hardlink: enable verity on the source in-place, then link it
         // directly into objects/. This avoids all data copying.
-        match self.try_hardlink_object(src, size) {
-            Ok(result) => return Ok(result),
-            Err(_) if allow_copy => {
-                // Hardlink failed, fall through to copy.
-                // Common causes: cross-mount (overlay bind mount), EPERM,
-                // or verity enablement failure.
-            }
-            Err(e) => {
-                return Err(e).context(
-                    "reflink and hardlink both failed; copy fallback is disabled (zerocopy mode)",
-                );
+        if ctx.no_hardlinks {
+            anyhow::ensure!(
+                allow_copy,
+                "reflink failed, hardlinks are not allowed and the copy fallback is disabled (zerocopy mode)"
+            );
+        } else {
+            match self.try_hardlink_object(src, size) {
+                Ok(result) => return Ok(result),
+                Err(_) if allow_copy => {
+                    // Hardlink failed, fall through to copy.
+                    // Common causes: cross-mount (overlay bind mount), EPERM,
+                    // or verity enablement failure.
+                }
+                Err(e) => {
+                    return Err(e).context(
+                        "reflink and hardlink both failed; copy fallback is disabled (zerocopy mode)",
+                    );
+                }
             }
         }
 
@@ -5043,6 +5064,47 @@ mod tests {
             repo.ensure_object_from_file(&temp_file, test_data.len() as u64, &mut ctx)?;
         assert_eq!(object_id, object_id_2);
         assert_eq!(method_2, ObjectStoreMethod::AlreadyPresent);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ensure_object_from_file_forbid_hardlinks() -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let mut ctx = ImportContext::default().forbid_hardlinks();
+
+        let test_data = generate_test_data(64 * 1024, 0xAB);
+        let mut temp_file = crate::test::tempfile();
+        temp_file.write_all(&test_data)?;
+        temp_file.seek(SeekFrom::Start(0))?;
+
+        // The source must be left alone: reflink or copy, whatever the
+        // filesystem and the privileges of the test.
+        let nlink = rustix::fs::fstat(&temp_file)?.st_nlink;
+        let (object_id, method) =
+            repo.ensure_object_from_file(&temp_file, test_data.len() as u64, &mut ctx)?;
+        assert!(matches!(
+            method,
+            ObjectStoreMethod::Copied | ObjectStoreMethod::Reflinked
+        ));
+        assert_eq!(repo.read_object(&object_id)?, test_data);
+        assert_eq!(rustix::fs::fstat(&temp_file)?.st_nlink, nlink);
+
+        // Without the copy fallback, a failed reflink is an error.
+        let other = generate_test_data(64 * 1024, 0xCD);
+        let mut other_file = crate::test::tempfile();
+        other_file.write_all(&other)?;
+        other_file.seek(SeekFrom::Start(0))?;
+        let nlink = rustix::fs::fstat(&other_file)?.st_nlink;
+        if let Ok((_, method)) =
+            repo.ensure_object_from_file_zerocopy(&other_file, other.len() as u64, &mut ctx)
+        {
+            assert_eq!(method, ObjectStoreMethod::Reflinked);
+        }
+        assert_eq!(rustix::fs::fstat(&other_file)?.st_nlink, nlink);
 
         Ok(())
     }
