@@ -16,7 +16,7 @@ use composefs_integration_tests::{
 };
 
 use crate::integration_test;
-use crate::tests::privileged::{require_privileged, require_userns};
+use crate::tests::privileged::{require_cstor_skopeo, require_privileged};
 
 /// Helper: copy an image into a separate containers-storage root.
 ///
@@ -156,7 +156,7 @@ integration_test!(privileged_test_cstor_vs_skopeo_equivalence);
 ///
 /// Requires user namespace support (podman unshare), so runs only in privileged/VM tests.
 fn privileged_test_cstor_idempotent_import() -> Result<()> {
-    if require_userns("privileged_test_cstor_idempotent_import")?.is_some() {
+    if require_cstor_skopeo("privileged_test_cstor_idempotent_import")?.is_some() {
         return Ok(());
     }
     let rt = tokio::runtime::Runtime::new()?;
@@ -259,7 +259,7 @@ integration_test!(privileged_test_cstor_idempotent_import);
 ///
 /// Requires user namespace support (podman unshare), so runs only in privileged/VM tests.
 fn privileged_test_cstor_import_with_reference() -> Result<()> {
-    if require_userns("privileged_test_cstor_import_with_reference")?.is_some() {
+    if require_cstor_skopeo("privileged_test_cstor_import_with_reference")?.is_some() {
         return Ok(());
     }
     let rt = tokio::runtime::Runtime::new()?;
@@ -340,7 +340,7 @@ integration_test!(privileged_test_cstor_import_with_reference);
 /// 4. Runs `cfsctl oci pull` with `STORAGE_OPTS` in the command environment
 ///    (avoiding process-global env mutation)
 fn privileged_test_cstor_additional_image_store() -> Result<()> {
-    if require_userns("privileged_test_cstor_additional_image_store")?.is_some() {
+    if require_cstor_skopeo("privileged_test_cstor_additional_image_store")?.is_some() {
         return Ok(());
     }
     let sh = Shell::new()?;
@@ -407,7 +407,7 @@ integration_test!(privileged_test_cstor_additional_image_store);
 /// gracefully handles images without boot entries by applying SELinux
 /// relabeling and emptying /boot and /sysroot.
 fn privileged_test_cstor_bootable() -> Result<()> {
-    if require_userns("privileged_test_cstor_bootable")?.is_some() {
+    if require_cstor_skopeo("privileged_test_cstor_bootable")?.is_some() {
         return Ok(());
     }
     let sh = Shell::new()?;

@@ -148,6 +148,61 @@ pub fn require_userns(test_name: &str) -> Result<Option<()>> {
     Ok(Some(()))
 }
 
+/// Whether the `skopeo` on `PATH` can serve `containers-storage:` imports,
+/// i.e. its image proxy has `OpenVarlinkSocket`.
+fn skopeo_has_varlink_socket() -> bool {
+    use containers_image_proxy::{ImageProxy, ImageProxyConfig};
+
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    rt.block_on(async {
+        let mut config = ImageProxyConfig::default();
+        config.insecure_policy = Some(true);
+        match ImageProxy::new_with_config(config).await {
+            Ok(proxy) => proxy.supports_open_varlink_socket(),
+            Err(_) => false,
+        }
+    })
+}
+
+/// Like [`require_userns`], and in addition require a skopeo that can serve
+/// `containers-storage:` imports.
+///
+/// Distribution skopeo packages (including the one on CI runners) predate
+/// `OpenVarlinkSocket`; the test image carries a skopeo that has it.  When the
+/// skopeo here lacks it, re-exec the test inside the VM instead.  The VM may
+/// itself have the distribution's skopeo, to test the fallback.
+///
+/// Returns `Ok(None)` if the test should proceed, `Ok(Some(()))` if it was
+/// dispatched to a VM and the caller should return immediately.
+pub fn require_cstor_skopeo(test_name: &str) -> Result<Option<()>> {
+    if require_userns(test_name)?.is_some() {
+        return Ok(Some(()));
+    }
+    // Root means we are already in the VM (or were asked to run privileged):
+    // there is nowhere else to go, and without the method the import falls
+    // back to reading containers-storage directly.
+    if rustix::process::getuid().is_root()
+        || std::env::var_os("COMPOSEFS_IN_VM").is_some()
+        || skopeo_has_varlink_socket()
+    {
+        return Ok(None);
+    }
+
+    let image = std::env::var("COMPOSEFS_TEST_IMAGE").map_err(|_| {
+        anyhow::anyhow!(
+            "skopeo lacks OpenVarlinkSocket and COMPOSEFS_TEST_IMAGE is not set; \
+             run `just test-integration-vm` to use the test image's skopeo"
+        )
+    })?;
+    run_in_vm(test_name, &image, None)?;
+    Ok(Some(()))
+}
+
 /// A temporary directory backed by a loopback ext4 filesystem with verity support.
 ///
 /// tmpfs doesn't support fs-verity, so privileged tests that need verity
