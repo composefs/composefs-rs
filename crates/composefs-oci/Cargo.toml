@@ -14,7 +14,7 @@ version.workspace = true
 default = ["containers-storage"]
 test = ["tar", "rand", "composefs/test"]
 boot = ["composefs-boot"]
-containers-storage = ["dep:cstorage", "dep:base64", "varlink", "cstorage/layer-transfer"]
+containers-storage = ["dep:cstorage", "varlink", "cstorage/layer-transfer"]
 varlink = ['dep:zlink', 'dep:zlink-core', 'composefs/varlink']
 
 [dependencies]
@@ -22,7 +22,6 @@ oci-delta = "0.1.0"
 anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
 async-compression = { version = "0.4.43", default-features = false, features = ["tokio", "zstd", "gzip"] }
-base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.9.4", features = ["tokio"] }
 bytes = { version = "1", default-features = false }
 composefs = { workspace = true }
