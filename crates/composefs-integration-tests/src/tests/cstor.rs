@@ -11,10 +11,12 @@ use anyhow::Result;
 use tempfile::TempDir;
 use xshell::{Shell, cmd};
 
-use composefs_integration_tests::{build_test_image, cleanup_test_image, create_test_repository};
+use composefs_integration_tests::{
+    build_test_image, cleanup_test_image, containers_storage_ref, create_test_repository,
+};
 
 use crate::integration_test;
-use crate::tests::privileged::{require_privileged, require_userns};
+use crate::tests::privileged::{require_cstor_skopeo, require_privileged};
 
 /// Helper: copy an image into a separate containers-storage root.
 ///
@@ -68,7 +70,7 @@ fn privileged_test_cstor_vs_skopeo_equivalence() -> Result<()> {
         let skopeo_repo = create_test_repository(&skopeo_repo_dir)?;
 
         // Import via containers-storage (reflink path)
-        let cstor_image_ref = format!("containers-storage:{}", test_image);
+        let cstor_image_ref = containers_storage_ref(&test_image);
         println!("Importing via containers-storage: {}", cstor_image_ref);
         let cstor_opts = composefs_oci::PullOptions {
             local_fetch: composefs_oci::LocalFetchOpt::IfPossible,
@@ -161,7 +163,7 @@ integration_test!(privileged_test_cstor_vs_skopeo_equivalence);
 ///
 /// Requires user namespace support (podman unshare), so runs only in privileged/VM tests.
 fn privileged_test_cstor_idempotent_import() -> Result<()> {
-    if require_userns("privileged_test_cstor_idempotent_import")?.is_some() {
+    if require_cstor_skopeo("privileged_test_cstor_idempotent_import")?.is_some() {
         return Ok(());
     }
     let rt = tokio::runtime::Runtime::new()?;
@@ -173,7 +175,7 @@ fn privileged_test_cstor_idempotent_import() -> Result<()> {
         let repo_dir = TempDir::new()?;
         let repo = create_test_repository(&repo_dir)?;
 
-        let cstor_image_ref = format!("containers-storage:{}", test_image);
+        let cstor_image_ref = containers_storage_ref(&test_image);
 
         // First import
         println!("First import via containers-storage...");
@@ -223,16 +225,24 @@ fn privileged_test_cstor_idempotent_import() -> Result<()> {
         println!("First import stats: {:?}", first_stats);
         println!("Second import stats: {:?}", second_stats);
 
-        // The first import should have copied some objects
+        // The first import should have brought the objects in.  Which
+        // mechanism it used depends on the filesystem - a reflink-capable
+        // one copies nothing - so count them all.
         assert!(
-            first_stats.objects_copied > 0,
-            "first import should copy objects"
+            first_stats.objects_copied
+                + first_stats.objects_reflinked
+                + first_stats.objects_hardlinked
+                > 0,
+            "first import should bring objects in"
         );
 
         // The second import should find everything already present
         assert_eq!(
-            second_stats.objects_copied, 0,
-            "second import should not copy any new objects"
+            second_stats.objects_copied
+                + second_stats.objects_reflinked
+                + second_stats.objects_hardlinked,
+            0,
+            "second import should not bring in any new objects"
         );
 
         println!("SUCCESS: Idempotent import produced identical results");
@@ -256,7 +266,7 @@ integration_test!(privileged_test_cstor_idempotent_import);
 ///
 /// Requires user namespace support (podman unshare), so runs only in privileged/VM tests.
 fn privileged_test_cstor_import_with_reference() -> Result<()> {
-    if require_userns("privileged_test_cstor_import_with_reference")?.is_some() {
+    if require_cstor_skopeo("privileged_test_cstor_import_with_reference")?.is_some() {
         return Ok(());
     }
     let rt = tokio::runtime::Runtime::new()?;
@@ -268,7 +278,7 @@ fn privileged_test_cstor_import_with_reference() -> Result<()> {
         let repo_dir = TempDir::new()?;
         let repo = create_test_repository(&repo_dir)?;
 
-        let cstor_image_ref = format!("containers-storage:{}", test_image);
+        let cstor_image_ref = containers_storage_ref(&test_image);
         let reference_name = "test-ref";
 
         // Import with a reference name
@@ -337,7 +347,7 @@ integration_test!(privileged_test_cstor_import_with_reference);
 /// 4. Runs `cfsctl oci pull` with `STORAGE_OPTS` in the command environment
 ///    (avoiding process-global env mutation)
 fn privileged_test_cstor_additional_image_store() -> Result<()> {
-    if require_userns("privileged_test_cstor_additional_image_store")?.is_some() {
+    if require_cstor_skopeo("privileged_test_cstor_additional_image_store")?.is_some() {
         return Ok(());
     }
     let sh = Shell::new()?;
@@ -366,7 +376,7 @@ fn privileged_test_cstor_additional_image_store() -> Result<()> {
 
     let repo_dir = TempDir::new()?;
     let repo = repo_dir.path();
-    let cstor_image_ref = format!("containers-storage:{}", test_image);
+    let cstor_image_ref = containers_storage_ref(&test_image);
 
     // Initialize the repository first
     cmd!(sh, "{cfsctl} --insecure --repo {repo} init").run()?;
@@ -404,7 +414,7 @@ integration_test!(privileged_test_cstor_additional_image_store);
 /// gracefully handles images without boot entries by applying SELinux
 /// relabeling and emptying /boot and /sysroot.
 fn privileged_test_cstor_bootable() -> Result<()> {
-    if require_userns("privileged_test_cstor_bootable")?.is_some() {
+    if require_cstor_skopeo("privileged_test_cstor_bootable")?.is_some() {
         return Ok(());
     }
     let sh = Shell::new()?;
@@ -416,7 +426,7 @@ fn privileged_test_cstor_bootable() -> Result<()> {
 
     let repo_dir = TempDir::new()?;
     let repo = repo_dir.path();
-    let cstor_image_ref = format!("containers-storage:{}", test_image);
+    let cstor_image_ref = containers_storage_ref(&test_image);
 
     // Initialize the repository first
     cmd!(sh, "{cfsctl} --insecure --repo {repo} init").run()?;

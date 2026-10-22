@@ -75,11 +75,6 @@ fn main() -> Result<()> {
             }
         }
         _ => {
-            // If we were spawned as a userns helper process, handle that and exit.
-            // This MUST be called before the tokio runtime is created.
-            #[cfg(feature = "containers-storage")]
-            cstorage::init_if_helper();
-
             clap_complete::CompleteEnv::with_factory(|| {
                 use clap::CommandFactory;
                 composefs_ctl::App::command()

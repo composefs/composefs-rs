@@ -14,7 +14,7 @@ version.workspace = true
 default = ["containers-storage"]
 test = ["tar", "rand", "composefs/test"]
 boot = ["composefs-boot"]
-containers-storage = ["dep:cstorage", "dep:base64", "varlink", "cstorage/layer-transfer"]
+containers-storage = ["dep:cstorage", "varlink", "cstorage/layer-transfer"]
 varlink = ['dep:zlink', 'dep:zlink-core', 'composefs/varlink']
 
 [dependencies]
@@ -22,7 +22,6 @@ oci-delta = "0.1.0"
 anyhow = { version = "1.0.87", default-features = false }
 fn-error-context = "0.2"
 async-compression = { version = "0.4.43", default-features = false, features = ["tokio", "zstd", "gzip"] }
-base64 = { version = "0.23", default-features = false, features = ["std"], optional = true }
 composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.9.4", features = ["tokio"] }
 bytes = { version = "1", default-features = false }
 composefs = { workspace = true }
@@ -30,9 +29,10 @@ zlink = { workspace = true, optional = true }
 zlink-core = { workspace = true, optional = true }
 composefs-boot = { workspace = true, optional = true }
 flate2 = { version = "1.0", default-features = false, features = ["zlib"] }
-containers-image-proxy = { version = "0.11", default-features = false }
+containers-image-proxy = { version = "0.11.2", default-features = false }
 cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.9.4", optional = true }
 hex = { version = "0.4.0", default-features = false }
+tempfile = "3.8.0"
 indicatif = { version = "0.18.0", default-features = false }
 rustix = { version = "1.0.0", features = ["fs"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -61,7 +61,6 @@ composefs = { workspace = true, features = ["test"] }
 composefs-boot = { workspace = true }
 once_cell = "1.21.3"
 proptest = "1"
-tempfile = "3.8.0"
 
 [lints]
 workspace = true

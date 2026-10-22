@@ -20,6 +20,12 @@ ARG cfsctl_features=pre-6.15
 FROM scratch AS src
 COPY . /src
 
+# -- skopeo with the image proxy's OpenVarlinkSocket, which distributions don't
+# ship yet; cfsctl needs it to import from containers-storage --
+FROM ${base_image} AS skopeo-build
+COPY --from=src /src/contrib /src/contrib
+RUN mkdir -p /out && /src/contrib/packaging/build-skopeo.sh /out
+
 # -- build stage --
 FROM ${base_image} AS build
 ARG cfsctl_features
@@ -67,6 +73,8 @@ FROM ${base_image}
 COPY --from=src /src/contrib /src/contrib
 RUN /src/contrib/packaging/install-test-deps.sh && rm -rf /src
 
+# Replaces the distribution's skopeo installed above
+COPY --from=skopeo-build /out/skopeo /usr/bin/skopeo
 COPY --from=build /usr/bin/cfsctl /usr/bin/cfsctl
 COPY --from=build /usr/bin/cfsctl-integration-tests /usr/bin/cfsctl-integration-tests
 COPY --from=build /usr/lib/composefs-rs-test /usr/lib/composefs-rs-test

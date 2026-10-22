@@ -205,6 +205,13 @@ RUN mkdir -p /boot /sysroot
     Ok(image_id)
 }
 
+/// Build a `containers-storage:` reference for an image ID as [`build_test_image`]
+/// returns it, i.e. in the form podman writes to an `--iidfile`.
+pub fn containers_storage_ref(image_id: &str) -> String {
+    let id = image_id.strip_prefix("sha256:").unwrap_or(image_id);
+    format!("containers-storage:@{id}")
+}
+
 /// Remove a test image
 pub fn cleanup_test_image(image_id: &str) {
     let _ = podman_command().args(["rmi", "-f", image_id]).output();

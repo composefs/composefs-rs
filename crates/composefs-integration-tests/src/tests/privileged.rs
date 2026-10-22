@@ -148,6 +148,56 @@ pub fn require_userns(test_name: &str) -> Result<Option<()>> {
     Ok(Some(()))
 }
 
+/// Whether the `skopeo` on `PATH` can serve `containers-storage:` imports,
+/// i.e. its image proxy has `OpenVarlinkSocket`.
+fn skopeo_has_varlink_socket() -> bool {
+    use containers_image_proxy::{ImageProxy, ImageProxyConfig};
+
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    rt.block_on(async {
+        let mut config = ImageProxyConfig::default();
+        config.insecure_policy = Some(true);
+        match ImageProxy::new_with_config(config).await {
+            Ok(proxy) => proxy.supports_open_varlink_socket(),
+            Err(_) => false,
+        }
+    })
+}
+
+/// Like [`require_userns`], and in addition require a skopeo that can serve
+/// `containers-storage:` imports.
+///
+/// Distribution skopeo packages (including the one on CI runners) predate
+/// `OpenVarlinkSocket`; the test image carries a skopeo that has it.  When the
+/// skopeo here lacks it, re-exec the test inside the VM instead.
+///
+/// Returns `Ok(None)` if the test should proceed, `Ok(Some(()))` if it was
+/// dispatched to a VM and the caller should return immediately.
+pub fn require_cstor_skopeo(test_name: &str) -> Result<Option<()>> {
+    if require_userns(test_name)?.is_some() {
+        return Ok(Some(()));
+    }
+    // Inside the VM there is nowhere else to go; let the test report the
+    // missing support.
+    if skopeo_has_varlink_socket() || std::env::var_os("COMPOSEFS_IN_VM").is_some() {
+        return Ok(None);
+    }
+
+    let image = std::env::var("COMPOSEFS_TEST_IMAGE").map_err(|_| {
+        anyhow::anyhow!(
+            "skopeo lacks OpenVarlinkSocket and COMPOSEFS_TEST_IMAGE is not set; \
+             run `just test-integration-vm` to use the test image's skopeo"
+        )
+    })?;
+    run_in_vm(test_name, &image, None)?;
+    Ok(Some(()))
+}
+
 /// A temporary directory backed by a loopback ext4 filesystem with verity support.
 ///
 /// tmpfs doesn't support fs-verity, so privileged tests that need verity
@@ -773,7 +823,7 @@ fn privileged_pull_readonly_repo() -> Result<()> {
 integration_test!(privileged_pull_readonly_repo);
 
 // ============================================================================
-// Filesystem-specific reflink / hardlink tests
+// Filesystem-specific reflink tests
 // ============================================================================
 
 /// A temporary directory backed by a loop-mounted filesystem.
@@ -787,11 +837,6 @@ pub(crate) struct LoopTempDir {
 }
 
 impl LoopTempDir {
-    /// Create a loop-mounted ext4 filesystem with verity support.
-    pub(crate) fn ext4_verity() -> Result<Self> {
-        Self::create("mkfs.ext4", &["-q", "-O", "verity", "-b", "4096"])
-    }
-
     /// Create a loop-mounted XFS filesystem with reflink support.
     pub(crate) fn xfs_reflink() -> Result<Self> {
         Self::create("mkfs.xfs", &["-q", "-m", "reflink=1"])
@@ -891,11 +936,11 @@ pub(super) fn create_oci_layout_with_large_files(parent: &Path) -> Result<PathBu
     // bootc-dev/bootc#2324: without `consumer_has_cap_dac_override` wired up,
     // cstor import would inline this file's content into the varlink stream,
     // materialize it into a memfd on the consumer side, and then crash with
-    // EXDEV when zerocopy mode tried to reflink/hardlink the memfd (memfds
+    // EXDEV when zerocopy mode tried to reflink the memfd (memfds
     // can never be zero-copied to a real filesystem).  With the fix, the
     // privileged (direct, in-process) import path recognizes that it can
     // bypass DAC checks and emits a real dirfd+filename reference instead,
-    // so this file is hardlinked/reflinked just like the world-readable ones.
+    // so this file is reflinked just like the world-readable ones.
     {
         let data = vec![0xffu8; 4096];
         let mut header = tar::Header::new_gnu();
@@ -942,7 +987,7 @@ pub(super) fn copy_oci_to_cstor(sh: &Shell, oci_dir: &Path, mount: &Path) -> Res
     // Run in a private mount namespace so that any bind mounts the overlay
     // driver creates (e.g. on storage/overlay) don't leak into our namespace.
     // This ensures the diff files we later open are on the raw filesystem,
-    // not behind a bind mount that would cause EXDEV on hardlinks.
+    // not behind a bind mount that would cause EXDEV on reflinks.
     cmd!(sh, "unshare -m skopeo copy {oci_ref} {cstor_ref}").run()?;
 
     Ok(storage_root)
@@ -1012,67 +1057,6 @@ fn cstor_pull_with_algorithm(
     }
 }
 
-/// On ext4 (no reflink support), the import should skip FICLONE after the
-/// first probe fails and use hardlinks instead (zero-copy).  The `skopeo
-/// copy` step runs in `unshare -m` to prevent the overlay driver's bind
-/// mount from interfering with hardlinks.
-///
-/// Covers all combinations of `{sha256, sha512} × {auto, zerocopy}`.
-fn privileged_cstor_import_ext4_hardlink() -> Result<()> {
-    use composefs_oci::LocalFetchOpt;
-    use composefs_oci::composefs::fsverity::Algorithm;
-
-    if require_privileged("privileged_cstor_import_ext4_hardlink")?.is_some() {
-        return Ok(());
-    }
-
-    let algorithms = [(Algorithm::SHA256, "sha256"), (Algorithm::SHA512, "sha512")];
-    let modes = [
-        (LocalFetchOpt::IfPossible, "auto"),
-        (LocalFetchOpt::ZeroCopy, "zerocopy"),
-    ];
-
-    let sh = Shell::new()?;
-
-    for (algorithm, alg_name) in &algorithms {
-        // One LoopTempDir per algorithm: enabling verity is irreversible and
-        // algorithm-specific, so we cannot reuse across algorithms.
-        let fs = LoopTempDir::ext4_verity()?;
-
-        let oci_dir = create_oci_layout_with_large_files(fs.path())?;
-        let storage_root = copy_oci_to_cstor(&sh, &oci_dir, fs.path())?;
-
-        for (mode, mode_name) in &modes {
-            let repo_dir = fs.path().join(format!("repo-{alg_name}-{mode_name}"));
-            let stats = cstor_pull_with_algorithm(&storage_root, &repo_dir, *algorithm, *mode)?;
-
-            println!("ext4 [{alg_name}/{mode_name}] import stats: {stats:?}");
-            ensure!(
-                stats.objects_reflinked == 0,
-                "ext4 [{alg_name}/{mode_name}] should not reflink any objects, got {} reflinked",
-                stats.objects_reflinked,
-            );
-            ensure!(
-                stats.objects_hardlinked > 0,
-                "ext4 [{alg_name}/{mode_name}] should hardlink objects, got 0 hardlinked (copied={})",
-                stats.objects_copied,
-            );
-            ensure!(
-                stats.objects_copied == 0,
-                "ext4 [{alg_name}/{mode_name}] should not need copies, got {} copied",
-                stats.objects_copied,
-            );
-            println!(
-                "ext4 [{alg_name}/{mode_name}]: {} hardlinked, {} already present",
-                stats.objects_hardlinked, stats.objects_already_present,
-            );
-        }
-    }
-
-    Ok(())
-}
-integration_test!(privileged_cstor_import_ext4_hardlink);
-
 /// On XFS with reflink support, importing from containers-storage on the same
 /// filesystem should use reflinks (zero-copy), and the import stats should
 /// show `objects_reflinked > 0`.
@@ -1113,8 +1097,7 @@ fn privileged_cstor_import_xfs_reflink() -> Result<()> {
             println!("XFS [{alg_name}/{mode_name}] import stats: {stats:?}");
             ensure!(
                 stats.objects_reflinked > 0,
-                "XFS [{alg_name}/{mode_name}] should reflink objects, got 0 reflinked (hardlinked={}, copied={})",
-                stats.objects_hardlinked,
+                "XFS [{alg_name}/{mode_name}] should reflink objects, got 0 reflinked (copied={})",
                 stats.objects_copied,
             );
             ensure!(

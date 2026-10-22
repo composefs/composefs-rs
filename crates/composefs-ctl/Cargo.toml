@@ -20,7 +20,7 @@ path = "src/main.rs"
 default = ['pre-6.15', 'pre-6.16', 'oci', 'containers-storage', 'ostree', 'fuse']
 http = ['composefs-http']
 oci = ['composefs-oci', 'composefs-oci/varlink', 'composefs-splitdirfdstream']
-containers-storage = ['composefs-oci/containers-storage', 'cstorage']
+containers-storage = ['composefs-oci/containers-storage']
 ostree = ['composefs-ostree']
 fuse = ['dep:composefs-fuse']
 rhel9 = ['composefs/rhel9']
@@ -38,7 +38,6 @@ composefs-boot = { workspace = true }
 composefs-oci = { workspace = true, optional = true, features = ["boot"] }
 composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.9.4", optional = true }
 composefs-http = { workspace = true, optional = true }
-cstorage = { package = "composefs-storage", path = "../composefs-storage", version = "0.9.4", features = ["layer-transfer"], optional = true }
 cap-std-ext = { workspace = true }
 composefs-fuse = { workspace = true, optional = true }
 composefs-ostree = { workspace = true, optional = true }
