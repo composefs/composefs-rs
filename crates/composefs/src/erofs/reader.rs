@@ -3234,10 +3234,10 @@ mod tests {
                     // (it only strips the root-level 00–ff overlay whiteout stubs).
                     // Strip all chardev(0,0) entries from both sides of the comparison
                     // so the test reflects what C actually outputs.
-                    if let Item::Device { rdev: 0, .. } = entry.item {
-                        if (entry.mode & 0o170000) == 0o20000 {
-                            return None;
-                        }
+                    if let Item::Device { rdev: 0, .. } = entry.item
+                        && (entry.mode & 0o170000) == 0o20000
+                    {
+                        return None;
                     }
 
                     if strip_empty_xattrs {

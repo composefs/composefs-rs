@@ -840,12 +840,11 @@ pub(crate) mod proptest_strategies {
                     }
                     Some(raw_idx) => {
                         let idx = raw_idx % subdir_names.len();
-                        if subdir_used_names[idx].insert(hl.link_name.clone()) {
-                            if let Ok(subdir) =
+                        if subdir_used_names[idx].insert(hl.link_name.clone())
+                            && let Ok(subdir) =
                                 fs.root.get_directory_mut(subdir_names[idx].as_os_str())
-                            {
-                                subdir.insert(&hl.link_name, tree::Inode::leaf(leaf_id));
-                            }
+                        {
+                            subdir.insert(&hl.link_name, tree::Inode::leaf(leaf_id));
                         }
                     }
                 }
