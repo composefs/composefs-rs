@@ -378,6 +378,45 @@ impl<'a, W: Write, ObjectID: FsVerityHashValue> DumpfileWriter<'a, W, ObjectID> 
 ///
 /// Serializes the entire filesystem structure including all directories, files,
 /// metadata, and handles hardlink tracking automatically.
+///
+/// # Example
+///
+/// Build an in-memory filesystem, serialize it, and parse it back. External
+/// files remain object references; the dumpfile does not contain their data.
+///
+/// ```
+/// use std::{collections::BTreeMap, ffi::OsStr};
+/// use composefs::dumpfile::{write_dumpfile, dumpfile_to_filesystem};
+/// use composefs::fsverity::Sha256HashValue;
+/// use composefs::tree::{FileSystem, Inode, LeafContent, RegularFile, Stat};
+///
+/// let stat = Stat {
+///     st_mode: 0o755,
+///     st_uid: 1000,
+///     st_gid: 1000,
+///     st_mtim_sec: 123,
+///     st_mtim_nsec: 0,
+///     xattrs: BTreeMap::new(),
+/// };
+/// let mut fs = FileSystem::<Sha256HashValue>::new(stat.clone());
+/// let file = fs.push_leaf(
+///     Stat { st_mode: 0o644, ..stat },
+///     LeafContent::Regular(RegularFile::Inline(b"hello world\n".to_vec().into())),
+/// );
+/// fs.root.insert(OsStr::new("greeting"), Inode::leaf(file));
+/// fs.root.insert(OsStr::new("link"), Inode::leaf(file));
+///
+/// let mut dump = Vec::new();
+/// write_dumpfile(&mut dump, &fs)?;
+/// let restored = dumpfile_to_filesystem::<Sha256HashValue>(std::str::from_utf8(&dump)?)?;
+/// restored.fsck()?;
+/// assert_eq!(restored.root.stat.st_mode, 0o755);
+/// assert_eq!(restored.root.stat.st_uid, 1000);
+/// let mut round_trip = Vec::new();
+/// write_dumpfile(&mut round_trip, &restored)?;
+/// assert_eq!(round_trip, dump);
+/// # anyhow::Ok(())
+/// ```
 pub fn write_dumpfile(
     writer: &mut impl Write,
     fs: &FileSystem<impl FsVerityHashValue>,
@@ -594,6 +633,7 @@ fn entry_to_stat(entry: &Entry<'_>) -> Result<Stat> {
 ///
 /// The dumpfile must start with a root directory entry (`/`) which provides
 /// the root metadata. Returns an error if no root entry is found.
+/// See [`write_dumpfile`] for a runnable filesystem/dumpfile round trip.
 pub fn dumpfile_to_filesystem<ObjectID: FsVerityHashValue>(
     dumpfile: &str,
 ) -> Result<FileSystem<ObjectID>> {
@@ -640,7 +680,8 @@ pub fn dumpfile_to_filesystem<ObjectID: FsVerityHashValue>(
 /// Parse a composefs dumpfile string and validate the resulting filesystem
 /// for EROFS serialization.
 ///
-/// Combines [`dumpfile_to_filesystem`] with [`ValidatedFileSystem::new`].
+/// Combines [`dumpfile_to_filesystem`] with
+/// [`ValidatedFileSystem::new`](crate::erofs::writer::ValidatedFileSystem::new).
 /// Returns an error if the dumpfile is malformed or if the resulting
 /// filesystem violates EROFS invariants (e.g. hardlinked whiteouts).
 pub fn dumpfile_to_validated_filesystem<ObjectID: FsVerityHashValue>(

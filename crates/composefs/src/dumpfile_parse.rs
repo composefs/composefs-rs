@@ -1,7 +1,7 @@
 //! # Parsing and generating composefs dump file entry
 //!
 //! The composefs project defines a "dump file" which is a textual
-//! serializion of the metadata file.  This module supports parsing
+//! serialization of the metadata file.  This module supports parsing
 //! and generating dump file entries.
 use std::borrow::Cow;
 use std::ffi::OsStr;
@@ -55,6 +55,24 @@ pub struct Mtime {
 }
 
 /// A composefs dumpfile entry
+///
+/// # Example
+///
+/// Parse one line and serialize it back. For complete trees, see
+/// [`write_dumpfile`](crate::dumpfile::write_dumpfile) and its round-trip example.
+///
+/// ```
+/// use composefs::dumpfile_parse::{Entry, Item};
+/// use std::path::Path;
+///
+/// let entry = Entry::parse(r"/greeting 12 100644 1 1000 1000 0 123.0 - hello\x20world\n -")?;
+/// assert_eq!(entry.path.as_ref(), Path::new("/greeting"));
+/// assert!(matches!(&entry.item, Item::RegularInline { content, size: 12, .. }
+///     if content.as_ref() == b"hello world\n"));
+/// let text = entry.to_string();
+/// assert_eq!(Entry::parse(&text)?, entry);
+/// # anyhow::Ok(())
+/// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct Entry<'p> {
     /// The filename

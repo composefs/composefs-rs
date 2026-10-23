@@ -295,17 +295,37 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamEntry<ObjectID>
 ///
 /// This builder collects entries (inline data and pending external object handles),
 /// then serializes them all at once when `finish()` is called. This approach:
-/// - Allows all external handles to be awaited in parallel
+/// - Allows external storage tasks to run in parallel
 /// - Enables proper deduplication of ObjectIDs
 /// - Writes the stream in one clean pass after all IDs are known
 ///
 /// # Example
-/// ```ignore
-/// let mut builder = SplitStreamBuilder::new(repo.clone(), content_type)?;
-/// builder.push_inline(header_bytes);
-/// builder.push_external(storage_handle, file_size);
-/// builder.push_inline(padding);
-/// let object_id = builder.finish().await?;
+/// ```
+/// use std::sync::Arc;
+/// use composefs::fsverity::Sha256HashValue;
+/// use composefs::repository::{Repository, RepositoryConfig};
+/// use composefs::splitstream::SplitStreamBuilder;
+///
+/// # tokio_test::block_on(async {
+/// let tmp = tempfile::tempdir()?;
+/// let (repo, _) = Repository::<Sha256HashValue>::init_path(
+///     rustix::fs::CWD, tmp.path().join("repo"),
+///     RepositoryConfig::default().set_insecure(),
+/// )?;
+/// let repo = Arc::new(repo);
+/// let mut builder = SplitStreamBuilder::new(repo.clone(), 0)?;
+/// builder.push_inline(b"hello");
+/// let (object_id, stats) = builder.finish().await?;
+/// assert_eq!(stats.inline_bytes, 5);
+/// let mut reader = composefs::splitstream::SplitStreamReader::<Sha256HashValue>::new(
+///     repo.open_object(&object_id)?.into(), Some(0),
+/// )?;
+/// let mut output = Vec::new();
+/// reader.cat(&repo, &mut output)?;
+/// assert_eq!(output, b"hello");
+/// # anyhow::Ok(())
+/// # })?;
+/// # anyhow::Ok(())
 /// ```
 pub struct SplitStreamBuilder<ObjectID: FsVerityHashValue> {
     repo: Arc<Repository<ObjectID>>,
@@ -391,7 +411,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamBuilder<ObjectID> {
     ///
     /// This method:
     /// 1. Awaits all external handles to get ObjectIDs
-    /// 2. Builds a UniqueVec<ObjectID> for deduplication
+    /// 2. Builds a `UniqueVec<ObjectID>` for deduplication
     /// 3. Creates a SplitStreamWriter and replays all entries
     /// 4. Stores the final splitstream in the repository
     ///
@@ -464,6 +484,52 @@ enum ResolvedEntry<ObjectID: FsVerityHashValue> {
 }
 
 /// Writer for creating split stream format files with inline content and external object references.
+///
+/// Obtain a writer with [`Repository::create_stream`]. Store inline and external
+/// chunks, then publish the stream under a name with [`Repository::write_stream`].
+/// The content type is an application-defined identifier checked when opening it.
+///
+/// # Example
+///
+/// ```
+/// use std::sync::Arc;
+/// use composefs::fsverity::{Sha256HashValue, compute_verity};
+/// use composefs::repository::{Repository, RepositoryConfig};
+/// use composefs::splitstream::SplitStreamData;
+///
+/// let tmp = tempfile::tempdir()?;
+/// // Insecure mode is only for this example: no kernel fs-verity is required.
+/// let (repo, _) = Repository::<Sha256HashValue>::init_path(
+///     rustix::fs::CWD, tmp.path().join("repo"),
+///     RepositoryConfig::default().set_insecure(),
+/// )?;
+/// let repo = Arc::new(repo);
+/// let mut writer = repo.create_stream(42)?;
+/// writer.write_inline(b"hello ");
+/// writer.write_external(b"world")?;
+/// writer.write_inline(b"!");
+/// let id = repo.write_stream(writer, "greeting", None)?;
+///
+/// let mut reader = repo.open_stream("greeting", Some(&id), Some(42))?;
+/// assert_eq!(reader.total_size, 12);
+/// let mut output = Vec::new();
+/// reader.cat(&repo, &mut output)?;
+/// assert_eq!(output, b"hello world!");
+///
+/// // Reopen the stream to walk chunks without loading the external content.
+/// let mut reader = repo.open_stream("greeting", Some(&id), Some(42))?;
+/// let mut chunks = Vec::new();
+/// reader.for_each_chunk(|chunk| {
+///     chunks.push(chunk);
+///     Ok(())
+/// })?;
+/// assert_eq!(chunks.len(), 3);
+/// assert!(matches!(&chunks[0], SplitStreamData::Inline(data) if &**data == b"hello "));
+/// assert!(matches!(&chunks[1], SplitStreamData::External(id)
+///     if *id == compute_verity::<Sha256HashValue>(b"world")));
+/// assert!(matches!(&chunks[2], SplitStreamData::Inline(data) if &**data == b"!"));
+/// # anyhow::Ok(())
+/// ```
 pub struct SplitStreamWriter<ObjectId: FsVerityHashValue> {
     repo: Arc<Repository<ObjectId>>,
     /// Proof that the writable check was performed when this writer was
@@ -506,7 +572,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     /// Create a new split stream writer.
     ///
     /// The `writable` token is carried so that subsequent object writes
-    /// (via [`write_external`] / [`done`]) skip redundant writable checks.
+    /// (via [`Self::write_external`] / [`Self::done`]) skip redundant writable checks.
     pub(crate) fn new(
         repo: &Arc<Repository<ObjectID>>,
         content_type: u64,
@@ -539,7 +605,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     /// This is the primary mechanism by which splitstreams reference split external content.
     ///
     /// You usually won't need to call this yourself: if you want to add split external content to
-    /// the stream, call `.write_external()` or `._write_external_async()`.
+    /// the stream, call [`Self::write_external`] or [`Self::write_external_async`].
     pub fn add_object_ref(&mut self, verity: &ObjectID) -> usize {
         self.object_refs.ensure(verity)
     }
@@ -614,7 +680,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     /// Write externally-split data to the stream.
     ///
     /// The data is stored in the repository and a reference is written to the stream.
-    /// Uses the carried [`WritableRepo`] token to skip redundant writable checks.
+    /// Uses the carried writable token to skip redundant writable checks.
     pub fn write_external(&mut self, data: &[u8]) -> Result<()> {
         self.total_size += data.len() as u64;
         let id = self.repo.ensure_object_impl(data, &self.writable)?;
@@ -625,7 +691,7 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
     ///
     /// The data is stored in the repository asynchronously and a reference is written to the stream.
     /// This method awaits the storage operation before returning.
-    /// Uses the carried [`WritableRepo`] token to skip redundant writable checks.
+    /// Uses the carried writable token to skip redundant writable checks.
     pub async fn write_external_async(&mut self, data: Vec<u8>) -> Result<()> {
         self.total_size += data.len() as u64;
         let self_ = Arc::clone(&self.repo);
@@ -647,8 +713,8 @@ impl<ObjectID: FsVerityHashValue> SplitStreamWriter<ObjectID> {
 
     /// Finalizes the split stream and returns its object ID.
     ///
-    /// Flushes any remaining inline content, validates the SHA256 hash if provided,
-    /// and stores the compressed stream in the repository.
+    /// Flushes any remaining inline content and stores the compressed stream
+    /// in the repository.
     pub fn done(mut self) -> Result<ObjectID> {
         self.flush_inline()?;
         let stream = self.writer.finish()?;
@@ -760,6 +826,12 @@ pub enum SplitStreamData<ObjectID: FsVerityHashValue> {
 }
 
 /// Reader for parsing split stream format files with inline content and external object references.
+///
+/// Open a named stream with [`Repository::open_stream`], or construct a reader
+/// from an object file with [`Self::new`]. [`Self::cat`] resolves external data;
+/// [`Self::for_each_chunk`] preserves references. Both consume the remaining
+/// chunks, so reopen the stream to read it again. See [`SplitStreamWriter`]
+/// for a runnable write/read example using both methods.
 pub struct SplitStreamReader<ObjectID: FsVerityHashValue> {
     decoder: Decoder<'static, BufReader<Take<File>>>,
     inline_bytes: usize,
@@ -798,9 +870,10 @@ enum ChunkType<ObjectID: FsVerityHashValue> {
 }
 
 impl<ObjectID: FsVerityHashValue> SplitStreamReader<ObjectID> {
-    /// Creates a new split stream reader from the provided reader.
+    /// Creates a new split stream reader from the provided file.
     ///
-    /// Reads the digest map header from the stream during initialization.
+    /// Reads the header and reference tables during initialization, and checks
+    /// the content type if `expected_content_type` is provided.
     #[context("Creating new splitstream reader")]
     pub fn new(mut file: File, expected_content_type: Option<u64>) -> Result<Self> {
         let header = SplitstreamHeader::read_from_io(&mut file)
@@ -1019,10 +1092,37 @@ impl<ObjectID: FsVerityHashValue> SplitStreamReader<ObjectID> {
         }
     }
 
-    /// Concatenates the entire split stream content to the output writer.
+    /// Concatenates the remaining split stream content to the output writer.
     ///
     /// Inline content is written directly, while external references are resolved
-    /// using the provided load_data callback function.
+    /// using the provided repository. See the [`SplitStreamWriter`] example
+    /// for a round trip with inline and external chunks.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use composefs::fsverity::Sha256HashValue;
+    /// use composefs::repository::{Repository, RepositoryConfig};
+    /// use composefs::splitstream::SplitStreamReader;
+    ///
+    /// let tmp = tempfile::tempdir()?;
+    /// let (repo, _) = Repository::<Sha256HashValue>::init_path(
+    ///     rustix::fs::CWD, tmp.path().join("repo"),
+    ///     RepositoryConfig::default().set_insecure(),
+    /// )?;
+    /// let repo = Arc::new(repo);
+    /// let mut writer = repo.create_stream(0)?;
+    /// writer.write_inline(b"prefix:");
+    /// writer.write_external(b"data")?;
+    /// let id = writer.done()?;
+    /// // Read directly from the stored object, without publishing a name.
+    /// let mut reader = SplitStreamReader::<Sha256HashValue>::new(
+    ///     repo.open_object(&id)?.into(), Some(0),
+    /// )?;
+    /// let mut bytes = Vec::new();
+    /// reader.cat(&repo, &mut bytes)?;
+    /// assert_eq!(bytes, b"prefix:data");
+    /// # anyhow::Ok(())
+    /// ```
     #[context("Concatenating splitstream to output")]
     pub fn cat(&mut self, repo: &Repository<ObjectID>, output: &mut impl Write) -> Result<()> {
         let mut buffer = vec![];
@@ -1062,6 +1162,41 @@ impl<ObjectID: FsVerityHashValue> SplitStreamReader<ObjectID> {
     /// Inline chunks carry their raw bytes; external chunks carry the object
     /// identifier so the caller can look up the object by whatever means it
     /// prefers (e.g. emitting a filename reference into a `splitdirfdstream`).
+    /// See the [`SplitStreamWriter`] example for assertions on chunk order
+    /// and the external object identifier.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use composefs::fsverity::Sha256HashValue;
+    /// # use composefs::repository::{Repository, RepositoryConfig};
+    /// use composefs::splitstream::{SplitStreamData, SplitStreamReader};
+    /// # let tmp = tempfile::tempdir()?;
+    /// # let (repo, _) = Repository::<Sha256HashValue>::init_path(
+    /// #     rustix::fs::CWD, tmp.path().join("repo"),
+    /// #     RepositoryConfig::default().set_insecure(),
+    /// # )?;
+    /// # let repo = Arc::new(repo);
+    /// # let mut writer = repo.create_stream(0)?;
+    /// # writer.write_inline(b"header");
+    /// # writer.write_external(b"body")?;
+    /// # let id = writer.done()?;
+    /// # let mut reader = SplitStreamReader::<Sha256HashValue>::new(
+    /// #     repo.open_object(&id)?.into(), Some(0),
+    /// # )?;
+    /// let mut inline = Vec::new();
+    /// let mut objects = Vec::new();
+    /// reader.for_each_chunk(|chunk| {
+    ///     match chunk {
+    ///         SplitStreamData::Inline(data) => inline.extend_from_slice(&data),
+    ///         SplitStreamData::External(id) => objects.push(id),
+    ///     }
+    ///     Ok(())
+    /// })?;
+    /// assert_eq!(inline, b"header");
+    /// assert_eq!(objects.len(), 1);
+    /// assert_eq!(objects[0], composefs::fsverity::compute_verity::<Sha256HashValue>(b"body"));
+    /// # anyhow::Ok(())
+    /// ```
     #[context("Walking splitstream chunks")]
     pub fn for_each_chunk(
         &mut self,
