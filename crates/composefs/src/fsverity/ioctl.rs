@@ -80,7 +80,10 @@ mod tests {
         let fd = OwnedFd::from(file);
         let err = fs_ioc_enable_verity::<Sha256HashValue>(&fd).unwrap_err();
         assert!(matches!(err, EnableVerityError::FilesystemNotSupported));
-        assert_eq!(err.to_string(), "Filesystem does not support fs-verity",);
+        assert_eq!(
+            err.to_string(),
+            "FS_IOC_ENABLE_VERITY: filesystem does not support fs-verity",
+        );
     }
 
     // Note: This test uses unsafe code via ManuallyDrop + from_raw_fd.

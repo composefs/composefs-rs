@@ -17,19 +17,19 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum EnableVerityError {
     /// I/O operation failed.
-    #[error("{0}")]
+    #[error("FS_IOC_ENABLE_VERITY: {0}")]
     Io(#[from] Error),
     /// The filesystem does not support fs-verity.
-    #[error("Filesystem does not support fs-verity")]
+    #[error("FS_IOC_ENABLE_VERITY: filesystem does not support fs-verity")]
     FilesystemNotSupported,
     /// fs-verity is already enabled on the file.
-    #[error("fs-verity is already enabled on file")]
+    #[error("FS_IOC_ENABLE_VERITY: fs-verity is already enabled on file")]
     AlreadyEnabled,
     /// The file has an open writable file descriptor.
-    #[error("File is opened for writing")]
+    #[error("FS_IOC_ENABLE_VERITY: file is opened for writing")]
     FileOpenedForWrite,
     /// Signature verification failed (when using kernel signatures).
-    #[error("Signature verification failed")]
+    #[error("FS_IOC_ENABLE_VERITY: signature verification failed")]
     SignatureVerificationFailed,
 }
 
@@ -37,16 +37,16 @@ pub enum EnableVerityError {
 #[derive(Error, Debug)]
 pub enum MeasureVerityError {
     /// I/O operation failed.
-    #[error("{0}")]
+    #[error("FS_IOC_MEASURE_VERITY: {0}")]
     Io(#[from] Error),
     /// fs-verity is not enabled on the file.
-    #[error("fs-verity is not enabled on file")]
+    #[error("FS_IOC_MEASURE_VERITY: fs-verity is not enabled on file")]
     VerityMissing,
     /// The filesystem does not support fs-verity.
-    #[error("fs-verity is not supported by filesystem")]
+    #[error("FS_IOC_MEASURE_VERITY: fs-verity is not supported by filesystem")]
     FilesystemNotSupported,
     /// The hash algorithm does not match the expected algorithm.
-    #[error("Expected algorithm {expected}, found {found}")]
+    #[error("FS_IOC_MEASURE_VERITY: expected algorithm {expected}, found {found}")]
     InvalidDigestAlgorithm {
         /// The expected algorithm identifier.
         expected: u16,
@@ -54,7 +54,7 @@ pub enum MeasureVerityError {
         found: u16,
     },
     /// The digest size does not match the expected size.
-    #[error("Expected digest size {expected}")]
+    #[error("FS_IOC_MEASURE_VERITY: expected digest size {expected}")]
     InvalidDigestSize {
         /// The expected digest size in bytes.
         expected: u16,
@@ -214,7 +214,7 @@ pub fn fs_ioc_measure_verity<const N: usize>(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{io::Write, os::fd::AsRawFd};
 
     use tempfile::tempfile_in;
 
@@ -235,21 +235,84 @@ mod tests {
         tempfile_in(get_test_tmpdir()).unwrap()
     }
 
+    fn reopen_readonly(file: &std::fs::File) -> rustix::fd::OwnedFd {
+        let path = format!("/proc/self/fd/{}", file.as_raw_fd());
+        rustix::fs::open(&path, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty()).unwrap()
+    }
+
     #[test]
     fn test_measure_verity_missing() {
         let mut tf = test_tempfile();
         tf.write_all(b"test").unwrap();
         tf.sync_all().unwrap();
 
-        // Re-open read-only
-        let path = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&tf));
-        let ro_fd =
-            rustix::fs::open(&path, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty()).unwrap();
+        let ro_fd = reopen_readonly(&tf);
+        let err = fs_ioc_measure_verity::<32>(&ro_fd, 1).unwrap_err();
+        // The configured test filesystem may not implement fs-verity at all.
+        assert!(
+            matches!(
+                err,
+                MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported
+            ),
+            "{err:?}"
+        );
+    }
 
-        assert!(matches!(
-            fs_ioc_measure_verity::<32>(&ro_fd, 1),
-            Err(MeasureVerityError::VerityMissing)
-        ));
+    #[test]
+    fn test_enable_verity_readonly_and_open_writer() {
+        let mut writer = test_tempfile();
+        writer.write_all(b"test").unwrap();
+        writer.sync_all().unwrap();
+        let reader = reopen_readonly(&writer);
+
+        match fs_ioc_enable_verity(&reader, 1, 4096).unwrap_err() {
+            EnableVerityError::FilesystemNotSupported => {
+                assert!(matches!(
+                    fs_ioc_measure_verity::<32>(&reader, 1),
+                    Err(MeasureVerityError::FilesystemNotSupported)
+                ));
+                drop(writer);
+                assert!(matches!(
+                    fs_ioc_enable_verity(&reader, 1, 4096),
+                    Err(EnableVerityError::FilesystemNotSupported)
+                ));
+            }
+            EnableVerityError::FileOpenedForWrite => {
+                drop(writer);
+                fs_ioc_enable_verity(&reader, 1, 4096).unwrap();
+                let digest = fs_ioc_measure_verity::<32>(&reader, 1).unwrap();
+                assert!(matches!(
+                    fs_ioc_enable_verity(&reader, 1, 4096),
+                    Err(EnableVerityError::AlreadyEnabled)
+                ));
+                assert_eq!(fs_ioc_measure_verity::<32>(&reader, 1).unwrap(), digest);
+            }
+            err => panic!("unexpected error with an open writer: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_verity_io_error_context() {
+        // O_PATH descriptors cannot be used for these ioctls, regardless of
+        // whether the underlying filesystem supports fs-verity.
+        let fd =
+            rustix::fs::open("/", rustix::fs::OFlags::PATH, rustix::fs::Mode::empty()).unwrap();
+        let enable = fs_ioc_enable_verity(&fd, 1, 4096).unwrap_err();
+        let measure = fs_ioc_measure_verity::<32>(&fd, 1).unwrap_err();
+        assert!(enable.to_string().starts_with("FS_IOC_ENABLE_VERITY:"));
+        assert!(measure.to_string().starts_with("FS_IOC_MEASURE_VERITY:"));
+        match enable {
+            EnableVerityError::Io(err) => {
+                assert_eq!(err.raw_os_error(), Some(Errno::BADF.raw_os_error()))
+            }
+            err => panic!("unexpected enable error: {err:?}"),
+        }
+        match measure {
+            MeasureVerityError::Io(err) => {
+                assert_eq!(err.raw_os_error(), Some(Errno::BADF.raw_os_error()))
+            }
+            err => panic!("unexpected measure error: {err:?}"),
+        }
     }
 
     #[test_with::path(/dev/shm)]
@@ -266,7 +329,12 @@ mod tests {
     #[test]
     fn test_enable_verity_wrong_fs() {
         let file = tempfile_in("/dev/shm").unwrap();
-        let err = fs_ioc_enable_verity(&file, 1, 4096).unwrap_err();
-        assert!(matches!(err, EnableVerityError::FilesystemNotSupported));
+        let reader = reopen_readonly(&file);
+        drop(file);
+        let err = fs_ioc_enable_verity(&reader, 1, 4096).unwrap_err();
+        assert!(
+            matches!(err, EnableVerityError::FilesystemNotSupported),
+            "{err:?}"
+        );
     }
 }
