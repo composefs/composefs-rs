@@ -428,23 +428,15 @@ impl ComposefsFuse {
         };
         find_raw_xattr(&self.image, inode, &lookup_name)
     }
-}
 
-impl Filesystem for ComposefsFuse {
-    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
-    }
-
-    fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
-
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup_attr(&self, parent: INodeNo, name: &OsStr) -> Result<FileAttr, fuser::Errno> {
         let Some(parent_nid) = Nid::from_fuse_ino(parent, self.root_nid()) else {
-            return reply.error(fuser::Errno::EINVAL);
+            return Err(fuser::Errno::EINVAL);
         };
         log::trace!("lookup {parent_nid} {name:?}");
 
         let Ok(parent_inode) = self.get_inode(parent_nid) else {
-            return reply.error(fuser::Errno::EBADF);
+            return Err(fuser::Errno::EBADF);
         };
 
         let name_bytes = name.as_bytes();
@@ -461,67 +453,51 @@ impl Filesystem for ComposefsFuse {
         match found {
             Some(child_nid) if !self.is_hidden(child_nid) => {
                 let child_fuse_ino = child_nid.to_fuse_ino(self.root_nid());
-                match self.get_fileattr(child_fuse_ino) {
-                    Ok(attrs) => reply.entry(&TTL, &attrs, Generation(0)),
-                    Err(e) => reply.error(e),
-                }
+                self.get_fileattr(child_fuse_ino)
             }
-            _ => reply.error(fuser::Errno::ENOENT),
+            _ => Err(fuser::Errno::ENOENT),
         }
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.get_fileattr(ino) {
-            Ok(attrs) => reply.attr(&TTL, &attrs),
-            Err(e) => reply.error(e),
-        }
-    }
-
-    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+    fn readlink_data(&self, ino: INodeNo, reply: impl FnOnce(Result<&[u8], fuser::Errno>)) {
         let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
-            return reply.error(fuser::Errno::EINVAL);
+            return reply(Err(fuser::Errno::EINVAL));
         };
         let Ok(inode) = self.get_inode(nid) else {
-            return reply.error(fuser::Errno::EINVAL);
+            return reply(Err(fuser::Errno::EINVAL));
         };
         match inode.inline() {
-            Some(data) => reply.data(data),
-            None => reply.error(fuser::Errno::EINVAL),
+            Some(data) => reply(Ok(data)),
+            None => reply(Err(fuser::Errno::EINVAL)),
         }
     }
 
-    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        reply.opened(FileHandle(0), FopenFlags::empty());
-    }
-
-    fn readdir(
+    fn read_dir(
         &self,
-        _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
         offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
+        mut add: impl FnMut(INodeNo, u64, FileType, &OsStr) -> bool,
+    ) -> Result<(), fuser::Errno> {
         let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
-            return reply.error(fuser::Errno::EINVAL);
+            return Err(fuser::Errno::EINVAL);
         };
         let Ok(inode) = self.get_inode(nid) else {
-            return reply.error(fuser::Errno::EBADF);
+            return Err(fuser::Errno::EBADF);
         };
 
         let mut cur_offset = offset;
 
         if cur_offset == 0 {
             cur_offset += 1;
-            if reply.add(ino, cur_offset, FileType::Directory, ".") {
-                return reply.ok();
+            if add(ino, cur_offset, FileType::Directory, OsStr::new(".")) {
+                return Ok(());
             }
         }
 
         if cur_offset == 1 {
             cur_offset += 1;
-            if reply.add(ino, cur_offset, FileType::Directory, "..") {
-                return reply.ok();
+            if add(ino, cur_offset, FileType::Directory, OsStr::new("..")) {
+                return Ok(());
             }
         }
 
@@ -547,7 +523,7 @@ impl Filesystem for ComposefsFuse {
                 ErofsFileType::Unknown => FileType::RegularFile,
             };
             entry_idx += 1;
-            if reply.add(
+            if add(
                 child_fuse_ino,
                 entry_idx,
                 kind,
@@ -558,41 +534,39 @@ impl Filesystem for ComposefsFuse {
             std::ops::ControlFlow::Continue(())
         });
 
-        reply.ok();
+        Ok(())
     }
 
-    fn readdirplus(
+    fn read_dir_plus(
         &self,
-        _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
         offset: u64,
-        mut reply: ReplyDirectoryPlus,
-    ) {
+        mut add: impl FnMut(INodeNo, u64, &OsStr, &FileAttr) -> bool,
+    ) -> Result<(), fuser::Errno> {
         let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
-            return reply.error(fuser::Errno::EINVAL);
+            return Err(fuser::Errno::EINVAL);
         };
         let Ok(inode) = self.get_inode(nid) else {
-            return reply.error(fuser::Errno::EBADF);
+            return Err(fuser::Errno::EBADF);
         };
 
         let Ok(dir_attrs) = self.get_fileattr(ino) else {
-            return reply.error(fuser::Errno::EIO);
+            return Err(fuser::Errno::EIO);
         };
 
         let mut cur_offset = offset;
 
         if cur_offset == 0 {
             cur_offset += 1;
-            if reply.add(ino, cur_offset, ".", &TTL, &dir_attrs, Generation(0)) {
-                return reply.ok();
+            if add(ino, cur_offset, OsStr::new("."), &dir_attrs) {
+                return Ok(());
             }
         }
 
         if cur_offset == 1 {
             cur_offset += 1;
-            if reply.add(ino, cur_offset, "..", &TTL, &dir_attrs, Generation(0)) {
-                return reply.ok();
+            if add(ino, cur_offset, OsStr::new(".."), &dir_attrs) {
+                return Ok(());
             }
         }
 
@@ -615,20 +589,218 @@ impl Filesystem for ComposefsFuse {
                 }
             };
             entry_idx += 1;
-            if reply.add(
+            if add(
                 child_ino,
                 entry_idx,
                 OsStr::from_bytes(entry.name),
-                &TTL,
                 &child_attrs,
-                Generation(0),
             ) {
                 return std::ops::ControlFlow::Break(());
             }
             std::ops::ControlFlow::Continue(())
         });
 
-        reply.ok();
+        Ok(())
+    }
+
+    fn get_xattr(&self, ino: INodeNo, name: &OsStr, size: u32) -> Result<XattrReply, fuser::Errno> {
+        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
+            return Err(fuser::Errno::EINVAL);
+        };
+        let Ok(inode) = self.get_inode(nid) else {
+            return Err(fuser::Errno::EBADF);
+        };
+
+        match self.find_xattr_value(&inode, name.as_bytes()) {
+            Some(value) => xattr_reply(value, size),
+            None => Err(fuser::Errno::ENODATA),
+        }
+    }
+
+    fn list_xattrs(&self, ino: INodeNo, size: u32) -> Result<XattrReply, fuser::Errno> {
+        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
+            return Err(fuser::Errno::EINVAL);
+        };
+        let Ok(inode) = self.get_inode(nid) else {
+            return Err(fuser::Errno::EBADF);
+        };
+
+        let names = self.collect_xattr_names(&inode);
+        let mut list = Vec::new();
+        for name in &names {
+            list.extend_from_slice(name);
+            list.push(b'\0');
+        }
+
+        xattr_reply(list, size)
+    }
+
+    fn open_handle(&self, ino: INodeNo) -> Result<FileHandle, fuser::Errno> {
+        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
+            return Err(fuser::Errno::EINVAL);
+        };
+        log::trace!("open({nid})");
+
+        let Ok(inode) = self.get_inode(nid) else {
+            return Err(fuser::Errno::EBADF);
+        };
+
+        let Ok(layout) = inode.data_layout() else {
+            return Err(fuser::Errno::EIO);
+        };
+
+        let handle = match layout {
+            DataLayout::FlatInline => match inode.inline() {
+                Some(data) => OpenHandle::Data(data.into()),
+                None => OpenHandle::Data(Box::new([])),
+            },
+            DataLayout::FlatPlain => {
+                if self.overlay_xattr.is_some() {
+                    return Err(errno_to_fuser(rustix::io::Errno::OPNOTSUPP));
+                }
+                OpenHandle::Fd(self.open_object_by_redirect(&inode)?)
+            }
+            DataLayout::ChunkBased => {
+                if self.overlay_xattr.is_some() {
+                    return Err(errno_to_fuser(rustix::io::Errno::OPNOTSUPP));
+                }
+                OpenHandle::Fd(self.open_object_by_redirect(&inode)?)
+            }
+        };
+
+        let mut state = self.handles.lock().expect("fuse handles mutex poisoned");
+        let fh = state.next_fh;
+        state.next_fh += 1;
+        state.handles.insert(fh, handle);
+        Ok(FileHandle(fh))
+    }
+
+    fn read_handle(
+        &self,
+        fh: FileHandle,
+        offset: u64,
+        size: u32,
+        reply: impl FnOnce(Result<&[u8], fuser::Errno>),
+    ) {
+        let state = self.handles.lock().expect("fuse handles mutex poisoned");
+        match state.handles.get(&fh.0) {
+            Some(OpenHandle::Fd(fd)) => {
+                let mut data = Vec::with_capacity(size as usize);
+                match pread(fd, spare_capacity(&mut data), offset) {
+                    Ok(_) => reply(Ok(&data)),
+                    Err(errno) => reply(Err(errno_to_fuser(errno))),
+                }
+            }
+            Some(OpenHandle::Data(data)) => {
+                let start = (offset as usize).min(data.len());
+                let end = (start + size as usize).min(data.len());
+                reply(Ok(&data[start..end]));
+            }
+            None => {
+                log::error!("read(fh={fh}): handle does not exist");
+                reply(Err(fuser::Errno::EBADF));
+            }
+        }
+    }
+
+    fn release_handle(&self, fh: FileHandle) -> Result<(), fuser::Errno> {
+        let mut state = self.handles.lock().expect("fuse handles mutex poisoned");
+        match state.handles.remove(&fh.0) {
+            Some(_) => Ok(()),
+            None => {
+                log::error!("release(fh={fh}): handle does not exist");
+                Err(fuser::Errno::EBADF)
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum XattrReply {
+    Size(u32),
+    Data(Vec<u8>),
+}
+
+fn xattr_reply(data: Vec<u8>, size: u32) -> Result<XattrReply, fuser::Errno> {
+    if size == 0 {
+        Ok(XattrReply::Size(data.len() as u32))
+    } else if data.len() > size as usize {
+        Err(fuser::Errno::ERANGE)
+    } else {
+        Ok(XattrReply::Data(data))
+    }
+}
+
+fn send_xattr(reply: fuser::ReplyXattr, result: Result<XattrReply, fuser::Errno>) {
+    match result {
+        Ok(XattrReply::Size(size)) => reply.size(size),
+        Ok(XattrReply::Data(data)) => reply.data(&data),
+        Err(e) => reply.error(e),
+    }
+}
+
+impl Filesystem for ComposefsFuse {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
+        reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
+    }
+
+    fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
+
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        match self.lookup_attr(parent, name) {
+            Ok(attrs) => reply.entry(&TTL, &attrs, Generation(0)),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        match self.get_fileattr(ino) {
+            Ok(attrs) => reply.attr(&TTL, &attrs),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        self.readlink_data(ino, |result| match result {
+            Ok(data) => reply.data(data),
+            Err(e) => reply.error(e),
+        });
+    }
+
+    fn opendir(&self, _req: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::empty());
+    }
+
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
+        match self.read_dir(ino, offset, |ino, offset, kind, name| {
+            reply.add(ino, offset, kind, name)
+        }) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn readdirplus(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        match self.read_dir_plus(ino, offset, |ino, offset, name, attrs| {
+            reply.add(ino, offset, name, &TTL, attrs, Generation(0))
+        }) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
     }
 
     fn releasedir(
@@ -650,95 +822,18 @@ impl Filesystem for ComposefsFuse {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
-            return reply.error(fuser::Errno::EINVAL);
-        };
-        let Ok(inode) = self.get_inode(nid) else {
-            return reply.error(fuser::Errno::EBADF);
-        };
-
-        match self.find_xattr_value(&inode, name.as_bytes()) {
-            Some(value) => {
-                if size == 0 {
-                    reply.size(value.len() as u32);
-                } else if value.len() > size as usize {
-                    reply.error(fuser::Errno::ERANGE);
-                } else {
-                    reply.data(&value);
-                }
-            }
-            None => reply.error(fuser::Errno::ENODATA),
-        }
+        send_xattr(reply, self.get_xattr(ino, name, size));
     }
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: fuser::ReplyXattr) {
-        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
-            return reply.error(fuser::Errno::EINVAL);
-        };
-        let Ok(inode) = self.get_inode(nid) else {
-            return reply.error(fuser::Errno::EBADF);
-        };
-
-        let names = self.collect_xattr_names(&inode);
-        let mut list = Vec::new();
-        for name in &names {
-            list.extend_from_slice(name);
-            list.push(b'\0');
-        }
-
-        if size == 0 {
-            reply.size(list.len() as u32);
-        } else if list.len() > size as usize {
-            reply.error(fuser::Errno::ERANGE);
-        } else {
-            reply.data(&list);
-        }
+        send_xattr(reply, self.list_xattrs(ino, size));
     }
 
     fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let Some(nid) = Nid::from_fuse_ino(ino, self.root_nid()) else {
-            return reply.error(fuser::Errno::EINVAL);
-        };
-        log::trace!("open({nid})");
-
-        let Ok(inode) = self.get_inode(nid) else {
-            return reply.error(fuser::Errno::EBADF);
-        };
-
-        let Ok(layout) = inode.data_layout() else {
-            return reply.error(fuser::Errno::EIO);
-        };
-
-        let handle = match layout {
-            DataLayout::FlatInline => match inode.inline() {
-                Some(data) => OpenHandle::Data(data.into()),
-                None => OpenHandle::Data(Box::new([])),
-            },
-            DataLayout::FlatPlain => {
-                if self.overlay_xattr.is_some() {
-                    return reply.error(errno_to_fuser(rustix::io::Errno::OPNOTSUPP));
-                }
-                match self.open_object_by_redirect(&inode) {
-                    Ok(fd) => OpenHandle::Fd(fd),
-                    Err(e) => return reply.error(e),
-                }
-            }
-            DataLayout::ChunkBased => {
-                if self.overlay_xattr.is_some() {
-                    return reply.error(errno_to_fuser(rustix::io::Errno::OPNOTSUPP));
-                }
-                match self.open_object_by_redirect(&inode) {
-                    Ok(fd) => OpenHandle::Fd(fd),
-                    Err(e) => return reply.error(e),
-                }
-            }
-        };
-
-        let mut state = self.handles.lock().expect("fuse handles mutex poisoned");
-        let fh = state.next_fh;
-        state.next_fh += 1;
-        state.handles.insert(fh, handle);
-        reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
+        match self.open_handle(ino) {
+            Ok(fh) => reply.opened(fh, FopenFlags::FOPEN_KEEP_CACHE),
+            Err(e) => reply.error(e),
+        }
     }
 
     fn read(
@@ -752,25 +847,10 @@ impl Filesystem for ComposefsFuse {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let state = self.handles.lock().expect("fuse handles mutex poisoned");
-        match state.handles.get(&fh.0) {
-            Some(OpenHandle::Fd(fd)) => {
-                let mut data = Vec::with_capacity(size as usize);
-                match pread(fd, spare_capacity(&mut data), offset) {
-                    Ok(_) => reply.data(&data),
-                    Err(errno) => reply.error(errno_to_fuser(errno)),
-                }
-            }
-            Some(OpenHandle::Data(data)) => {
-                let start = (offset as usize).min(data.len());
-                let end = (start + size as usize).min(data.len());
-                reply.data(&data[start..end]);
-            }
-            None => {
-                log::error!("read(fh={fh}): handle does not exist");
-                reply.error(fuser::Errno::EBADF);
-            }
-        }
+        self.read_handle(fh, offset, size, |result| match result {
+            Ok(data) => reply.data(data),
+            Err(e) => reply.error(e),
+        });
     }
 
     fn release(
@@ -783,13 +863,9 @@ impl Filesystem for ComposefsFuse {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        let mut state = self.handles.lock().expect("fuse handles mutex poisoned");
-        match state.handles.remove(&fh.0) {
-            Some(_) => reply.ok(),
-            None => {
-                log::error!("release(fh={fh}): handle does not exist");
-                reply.error(fuser::Errno::EBADF);
-            }
+        match self.release_handle(fh) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
         }
     }
 }
@@ -1086,3 +1162,6 @@ pub fn serve_fuse_fd(
         .spawn()?
         .join()
 }
+
+#[cfg(test)]
+mod tests;
