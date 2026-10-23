@@ -187,9 +187,16 @@ impl From<Range<u64>> for FileRange {
 
 #[context("Reading range from splitstream file")]
 fn read_range(file: &mut File, range: FileRange) -> Result<Vec<u8>> {
+    ensure!(
+        range.end.get() <= file.metadata()?.len(),
+        "Splitstream section extends beyond end of file"
+    );
     let size: usize = (range.len()?.try_into())
         .context("Unable to allocate buffer for implausibly large splitstream section")?;
-    let mut buffer = Vec::with_capacity(size);
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(size)
+        .context("Allocating splitstream section")?;
     if size > 0 {
         pread(file, spare_capacity(&mut buffer), range.start.get())
             .context("Unable to read section from splitstream file")?;
@@ -786,8 +793,11 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for SplitStreamReader<ObjectID
 /// in [`vec`] will be discarded; however its capacity will be reused,
 /// making this function suitable for use in loops.
 fn read_into_vec(reader: &mut impl Read, vec: &mut Vec<u8>, size: usize) -> Result<()> {
-    vec.resize(size, 0u8);
-    reader.read_exact(vec.as_mut_slice())?;
+    // Do not allocate the declared size before receiving any data: a corrupt
+    // chunk can claim up to 2^63 bytes even in a tiny compressed stream.
+    vec.clear();
+    reader.take(size as u64).read_to_end(vec)?;
+    ensure!(vec.len() == size, "Incomplete inline chunk in splitstream");
     Ok(())
 }
 
@@ -1201,6 +1211,54 @@ mod tests {
         assert_eq!(vec.len(), 2);
         assert_eq!(vec, vec![1, 2]);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_malicious_lengths() -> Result<()> {
+        let mut file = tempfile::tempfile()?;
+        file.write_all(b"short")?;
+        for (start, end) in [(0, u64::MAX), (0, 1 << 63), (4, 3)] {
+            assert!(read_range(&mut file, (start..end).into()).is_err());
+        }
+        for size in [usize::MAX, isize::MAX as usize] {
+            let mut buffer = Vec::new();
+            assert!(read_into_vec(&mut Cursor::new(b"short"), &mut buffer, size).is_err());
+            assert_eq!(buffer, b"short");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_truncated_huge_inline_chunk() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let writer = repo.create_stream(0)?;
+        let id = writer.done()?;
+        let mut bytes = Vec::new();
+        File::from(repo.open_object(&id)?).read_to_end(&mut bytes)?;
+        let header_size = size_of::<SplitstreamHeader>();
+        let info_size = size_of::<SplitstreamInfo>();
+        let mut info =
+            SplitstreamInfo::read_from_bytes(&bytes[header_size..header_size + info_size]).unwrap();
+        let start = info.stream.start.get() as usize;
+        bytes.truncate(start);
+        let compressed = zstd::stream::encode_all(i64::MIN.to_le_bytes().as_slice(), 0)?;
+        bytes.extend_from_slice(&compressed);
+        info.stream = (start as u64..bytes.len() as u64).into();
+        bytes[header_size..header_size + info_size].copy_from_slice(info.as_bytes());
+        for cat in [true, false] {
+            let mut file = tempfile::tempfile()?;
+            file.write_all(&bytes)?;
+            file.rewind()?;
+            let mut reader = SplitStreamReader::<Sha256HashValue>::new(file, None)?;
+            let result = if cat {
+                reader.cat(&repo, &mut std::io::sink())
+            } else {
+                reader.for_each_chunk(|_| Ok(()))
+            };
+            assert!(format!("{:#}", result.unwrap_err()).contains("Incomplete inline chunk"));
+        }
         Ok(())
     }
 
