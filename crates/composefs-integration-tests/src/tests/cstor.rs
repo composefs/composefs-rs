@@ -133,17 +133,10 @@ fn privileged_test_cstor_vs_skopeo_equivalence() -> Result<()> {
         println!("CSTOR config verity: {:?}", cstor_result.config_verity);
         println!("SKOPEO config verity: {:?}", skopeo_config_verity);
 
-        // NOTE: Config verity IDs may differ due to layer ref ordering.
-        // The skopeo path sorts layers by size for parallel fetching, then adds
-        // named refs in that order. The cstor path adds refs in config order.
-        // Both produce valid splitstreams with correct content, but different verity.
-        // TODO: Fix the ordering discrepancy in one of the implementations.
-        if cstor_result.config_verity != skopeo_config_verity {
-            println!(
-                "WARNING: Config verity IDs differ due to layer ref ordering. \
-                 Content is equivalent but splitstream structure differs."
-            );
-        }
+        assert_eq!(
+            cstor_result.config_verity, skopeo_config_verity,
+            "config verity IDs must match"
+        );
 
         println!("SUCCESS: Both import paths produced equivalent content");
         println!("  Config digest: {}", cstor_result.config_digest);
