@@ -59,8 +59,14 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
             Inode::leaf(id)
         }
         TarItem::Hardlink(target) => {
-            let (dir, filename) = filesystem.root.split(&target)?;
-            Inode::leaf(dir.leaf_id(filename)?)
+            let context = || {
+                format!(
+                    "Resolving hardlink target {target:?} for container layer entry {:?}",
+                    entry.path
+                )
+            };
+            let (dir, filename) = filesystem.root.split(&target).with_context(context)?;
+            Inode::leaf(dir.leaf_id(filename).with_context(context)?)
         }
     };
 
@@ -69,8 +75,8 @@ pub fn process_entry<ObjectID: FsVerityHashValue>(
         .split_mut(entry.path.as_os_str())
         .with_context(|| {
             format!(
-                "Error unpacking container layer file {:?} {:?}",
-                entry.path, inode
+                "Resolving destination parent for container layer entry {:?}",
+                entry.path
             )
         })?;
 
@@ -532,6 +538,47 @@ mod test {
             "total entry count (dirs + files + symlinks + hardlinks)"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_process_entry_errors_report_full_path() -> Result<()> {
+        use composefs::generic_tree::ImageError;
+
+        for (destination, target, expected_error) in [
+            ("/usr/missing/file", None, "not found"),
+            ("/usr/file/child", None, "not a directory"),
+            ("/usr/link", Some("/usr/missing/target"), "not found"),
+            ("/usr/link", Some("/usr/absent"), "not found"),
+            ("/usr/link", Some("/usr/file/target"), "not a directory"),
+            ("/usr/link", Some("/usr/directory"), "is a directory"),
+        ] {
+            let mut fs = FileSystem::<Sha256HashValue>::new(Stat::uninitialized());
+            process_entry(&mut fs, dir_entry("/usr"))?;
+            process_entry(&mut fs, dir_entry("/usr/directory"))?;
+            process_entry(&mut fs, file_entry("/usr/file"))?;
+            let mut entry = file_entry(destination);
+            if let Some(target) = target {
+                entry.item = TarItem::Hardlink(OsStr::new(target).into());
+            }
+
+            let err = process_entry(&mut fs, entry).unwrap_err();
+            let chain = format!("{err:#}");
+            assert!(chain.contains("Processing tar entry"), "{chain}");
+            assert!(chain.contains(destination), "{chain}");
+            if let Some(target) = target {
+                assert!(chain.contains("Resolving hardlink target"), "{chain}");
+                assert!(chain.contains(target), "{chain}");
+            } else {
+                assert!(chain.contains("Resolving destination parent"), "{chain}");
+            }
+            match (err.downcast_ref::<ImageError>(), expected_error) {
+                (Some(ImageError::NotFound(_)), "not found")
+                | (Some(ImageError::NotADirectory(_)), "not a directory")
+                | (Some(ImageError::IsADirectory(_)), "is a directory") => {}
+                _ => panic!("Unexpected error category: {chain}"),
+            }
+        }
         Ok(())
     }
 

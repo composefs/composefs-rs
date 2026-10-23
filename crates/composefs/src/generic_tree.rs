@@ -286,6 +286,16 @@ pub enum ImageError {
     OrphanedLeaves(Vec<usize>),
 }
 
+impl ImageError {
+    fn with_lookup_path(self, pathname: &OsStr) -> Self {
+        match self {
+            Self::NotFound(_) => Self::NotFound(pathname.into()),
+            Self::NotADirectory(_) => Self::NotADirectory(pathname.into()),
+            other => other,
+        }
+    }
+}
+
 impl<T> Inode<T> {
     /// Returns a reference to the metadata for this inode.
     ///
@@ -387,7 +397,7 @@ impl<T> Directory<T> {
                 }
                 Component::Normal(filename) => match dir.entries.get(filename) {
                     Some(Inode::Directory(subdir)) => subdir,
-                    Some(_) => return Err(ImageError::NotADirectory(filename.into())),
+                    Some(_) => return Err(ImageError::NotADirectory(pathname.into())),
                     None => return Ok(None),
                 },
             }
@@ -411,8 +421,8 @@ impl<T> Directory<T> {
                 }
                 Component::Normal(filename) => match dir.entries.get_mut(filename) {
                     Some(Inode::Directory(subdir)) => subdir,
-                    Some(_) => return Err(ImageError::NotADirectory(filename.into())),
-                    None => return Err(ImageError::NotFound(filename.into())),
+                    Some(_) => return Err(ImageError::NotADirectory(pathname.into())),
+                    None => return Err(ImageError::NotFound(pathname.into())),
                 },
             };
         }
@@ -451,7 +461,9 @@ impl<T> Directory<T> {
         };
 
         let dir = match path.parent() {
-            Some(parent) => self.get_directory(parent.as_os_str())?,
+            Some(parent) => self
+                .get_directory(parent.as_os_str())
+                .map_err(|err| err.with_lookup_path(pathname))?,
             None => self,
         };
 
@@ -473,7 +485,9 @@ impl<T> Directory<T> {
         };
 
         let dir = match path.parent() {
-            Some(parent) => self.get_directory_mut(parent.as_os_str())?,
+            Some(parent) => self
+                .get_directory_mut(parent.as_os_str())
+                .map_err(|err| err.with_lookup_path(pathname))?,
             None => self,
         };
 
@@ -1350,6 +1364,32 @@ mod tests {
         match root.get_directory(OsStr::new("file1")) {
             Err(ImageError::NotADirectory(name)) => assert_eq!(name.to_str().unwrap(), "file1"),
             _ => panic!("Expected NotADirectory"),
+        }
+    }
+
+    #[test]
+    fn test_nested_lookup_errors_report_full_path() {
+        let mut root = Directory::<()>::new(default_stat());
+        let mut outer = Directory::new(default_stat());
+        outer.insert(OsStr::new("file"), Inode::leaf(LeafId(0)));
+        root.insert(OsStr::new("outer"), Inode::Directory(Box::new(outer)));
+
+        for (pathname, not_found) in [("/outer/missing/deep", true), ("outer/file/deep", false)] {
+            let pathname = OsStr::new(pathname);
+            let errors = [
+                root.get_directory(pathname).unwrap_err(),
+                root.get_directory_mut(pathname).unwrap_err(),
+                root.split(pathname).unwrap_err(),
+                root.split_mut(pathname).unwrap_err(),
+            ];
+            for err in errors {
+                let reported = match (&err, not_found) {
+                    (ImageError::NotFound(path), true)
+                    | (ImageError::NotADirectory(path), false) => path,
+                    _ => panic!("Unexpected error for {pathname:?}: {err:?}"),
+                };
+                assert_eq!(reported.as_ref(), pathname);
+            }
         }
     }
 
