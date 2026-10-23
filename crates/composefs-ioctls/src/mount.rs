@@ -3,7 +3,7 @@
 
 use std::os::fd::{AsFd, AsRawFd};
 
-const MOUNT_ATTR_IDMAP: u64 = 0x00100000;
+const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
 const AT_EMPTY_PATH: u32 = 0x1000;
 
 #[cfg(not(any(
@@ -31,12 +31,16 @@ unsafe extern "C" {
 }
 
 /// Applies an ID mapping from a user namespace to a mount.
+///
+/// # Errors
+/// Returns the kernel error if the mount cannot be ID-mapped.
 pub fn mount_setattr_idmap(mount_fd: impl AsFd, userns_fd: impl AsFd) -> std::io::Result<()> {
     let attr = MountAttr {
         attr_set: MOUNT_ATTR_IDMAP,
         attr_clr: 0,
         propagation: 0,
-        userns_fd: userns_fd.as_fd().as_raw_fd() as u64,
+        userns_fd: u64::try_from(userns_fd.as_fd().as_raw_fd())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?,
     };
     let ret = unsafe {
         syscall(
@@ -44,7 +48,7 @@ pub fn mount_setattr_idmap(mount_fd: impl AsFd, userns_fd: impl AsFd) -> std::io
             mount_fd.as_fd().as_raw_fd(),
             c"".as_ptr(),
             AT_EMPTY_PATH,
-            &attr as *const MountAttr,
+            &raw const attr,
             std::mem::size_of::<MountAttr>(),
         )
     };

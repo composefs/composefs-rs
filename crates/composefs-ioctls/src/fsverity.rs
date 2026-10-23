@@ -86,9 +86,13 @@ const FS_IOC_ENABLE_VERITY: Opcode = opcode::write::<FsVerityEnableArg>(b'f', 13
 /// other writable file descriptors or mappings for the file.
 ///
 /// # Arguments
-/// * `fd` - File descriptor opened O_RDONLY
+/// * `fd` - File descriptor opened `O_RDONLY`
 /// * `hash_algorithm` - Algorithm ID (1 = SHA-256, 2 = SHA-512)
 /// * `block_size` - Block size (typically 4096)
+///
+/// # Errors
+/// Returns an error if the filesystem does not support verity, verity is already
+/// enabled, the file is open for writing, or the ioctl otherwise fails.
 pub fn fs_ioc_enable_verity(
     fd: impl AsFd,
     hash_algorithm: u8,
@@ -103,10 +107,15 @@ pub fn fs_ioc_enable_verity(
 /// in the `.fs-verity` keyring before enabling verity.
 ///
 /// # Arguments
-/// * `fd` - File descriptor opened O_RDONLY
+/// * `fd` - File descriptor opened `O_RDONLY`
 /// * `hash_algorithm` - Algorithm ID (1 = SHA-256, 2 = SHA-512)
 /// * `block_size` - Block size (typically 4096)
 /// * `signature` - Optional PKCS#7 DER-encoded signature
+///
+/// # Errors
+/// Returns an error if the signature is too large or rejected, the filesystem
+/// does not support verity, verity is already enabled, the file is open for
+/// writing, or the ioctl otherwise fails.
 pub fn fs_ioc_enable_verity_with_sig(
     fd: impl AsFd,
     hash_algorithm: u8,
@@ -114,7 +123,15 @@ pub fn fs_ioc_enable_verity_with_sig(
     signature: Option<&[u8]>,
 ) -> Result<(), EnableVerityError> {
     let (sig_size, sig_ptr) = match signature {
-        Some(sig) => (sig.len() as u32, sig.as_ptr() as u64),
+        Some(sig) => (
+            u32::try_from(sig.len()).map_err(|_| {
+                Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "verity signature is too large",
+                )
+            })?,
+            sig.as_ptr() as u64,
+        ),
         None => (0, 0),
     };
 
@@ -123,7 +140,7 @@ pub fn fs_ioc_enable_verity_with_sig(
             fd,
             Setter::<{ FS_IOC_ENABLE_VERITY }, FsVerityEnableArg>::new(FsVerityEnableArg {
                 version: 1,
-                hash_algorithm: hash_algorithm as u32,
+                hash_algorithm: u32::from(hash_algorithm),
                 block_size,
                 salt_size: 0,
                 salt_ptr: 0,
@@ -133,14 +150,12 @@ pub fn fs_ioc_enable_verity_with_sig(
                 __reserved2: [0; 11],
             }),
         ) {
-            Err(Errno::NOTTY) | Err(Errno::OPNOTSUPP) => {
-                Err(EnableVerityError::FilesystemNotSupported)
-            }
+            Err(Errno::NOTTY | Errno::OPNOTSUPP) => Err(EnableVerityError::FilesystemNotSupported),
             Err(Errno::EXIST) => Err(EnableVerityError::AlreadyEnabled),
             Err(Errno::TXTBSY) => Err(EnableVerityError::FileOpenedForWrite),
             Err(Errno::KEYREJECTED) => Err(EnableVerityError::SignatureVerificationFailed),
             Err(e) => Err(Error::from(e).into()),
-            Ok(_) => Ok(()),
+            Ok(()) => Ok(()),
         }
     }
 }
@@ -168,12 +183,22 @@ const FS_IOC_MEASURE_VERITY: Opcode = opcode::read_write::<FsVerityDigest<0>>(b'
 ///
 /// # Returns
 /// The digest bytes on success.
+///
+/// # Errors
+/// Returns an error if `N` exceeds the ioctl's size limit, the filesystem does
+/// not support verity, verity is missing, the digest algorithm or size differs
+/// from the expected value, or the ioctl otherwise fails.
 pub fn fs_ioc_measure_verity<const N: usize>(
     fd: impl AsFd,
     expected_algorithm: u8,
 ) -> Result<[u8; N], MeasureVerityError> {
-    let digest_size = N as u16;
-    let digest_algorithm = expected_algorithm as u16;
+    let digest_size = u16::try_from(N).map_err(|_| {
+        Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "verity digest size is too large",
+        )
+    })?;
+    let digest_algorithm = u16::from(expected_algorithm);
 
     let mut digest = FsVerityDigest::<N> {
         digest_algorithm,
@@ -233,6 +258,16 @@ mod tests {
 
     fn test_tempfile() -> std::fs::File {
         tempfile_in(get_test_tmpdir()).unwrap()
+    }
+
+    #[test]
+    fn test_measure_verity_oversized_digest() {
+        let tf = test_tempfile();
+        let err = fs_ioc_measure_verity::<65536>(&tf, 1).unwrap_err();
+        assert!(matches!(
+            err,
+            MeasureVerityError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 
     #[test]
