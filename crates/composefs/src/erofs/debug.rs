@@ -239,8 +239,7 @@ impl fmt::Debug for DirectoryBlock {
                 utf8_or_hex(entry.name)
             )?;
         }
-        // TODO: trailing junk inside of st_size
-        // TODO: padding up to block or inode boundary
+        // Trailing junk and padding depend on st_size, so ImageVisitor checks them.
         Ok(())
     }
 }
@@ -253,6 +252,7 @@ impl fmt::Debug for DataBlock {
 
 // This is basically just a fancy fat pointer type
 #[allow(missing_debug_implementations)]
+#[derive(Clone, Copy)]
 enum SegmentType<'img> {
     Header(&'img ComposefsHeader),
     Superblock(&'img Superblock),
@@ -302,13 +302,66 @@ impl SegmentType<'_> {
     }
 }
 
+/// Counts the non-zero bytes in `data`.
+fn count_nonzero(data: &[u8]) -> usize {
+    data.iter().filter(|c| **c != 0).count()
+}
+
+/// Returns the bytes of `block` that follow the nul terminating the last entry
+/// name, up to `len` (the part of the block inside st_size).
+fn directory_trailing(block: &DirectoryBlock, len: usize) -> Result<&[u8]> {
+    let n_entries = block.n_entries()?;
+    let last = block.get_entry_header(n_entries - 1)?;
+    let tail = block
+        .0
+        .get(last.name_offset.get() as usize..len)
+        .unwrap_or_default();
+    let name_len = tail.iter().position(|c| *c == 0).unwrap_or(tail.len());
+    Ok(&tail[name_len..])
+}
+
 #[allow(missing_debug_implementations)]
 struct ImageVisitor<'img> {
     image: &'img Image<'img>,
     visited: BTreeMap<usize, (SegmentType<'img>, Vec<Box<Path>>)>,
+    /// Problems found in a segment, keyed by its offset like `visited`
+    findings: BTreeMap<usize, Vec<String>>,
 }
 
 impl<'img> ImageVisitor<'img> {
+    fn report(&mut self, segment: &SegmentType<'img>, finding: String) {
+        let offset = segment.addr() - self.image.image.as_ptr() as usize;
+        self.findings.entry(offset).or_default().push(finding);
+    }
+
+    /// Reports non-zero bytes in a block of an inode with `size` bytes of
+    /// data: in a directory, after the last entry name and inside st_size;
+    /// in any inode, after st_size up to the block boundary.
+    fn check_block(&mut self, segment: &SegmentType<'img>, block: &[u8], size: u64, index: u64) {
+        let block_size = self.image.block_size as u64;
+        let len = size
+            .saturating_sub(index.saturating_mul(block_size))
+            .min(block_size) as usize;
+        if let SegmentType::DirectoryBlock(dir) = segment
+            && let Ok(trailing) = directory_trailing(dir, len)
+        {
+            let junk = count_nonzero(trailing);
+            if junk > 0 {
+                self.report(
+                    segment,
+                    format!("{junk} non-zero bytes after the last directory entry"),
+                );
+            }
+        }
+        let padding = count_nonzero(block.get(len..).unwrap_or_default());
+        if padding > 0 {
+            self.report(
+                segment,
+                format!("{padding} non-zero bytes of padding after st_size at +{len:x}"),
+            );
+        }
+    }
+
     fn note(&mut self, segment: SegmentType<'img>, path: Option<&Path>) -> Result<bool> {
         let offset = segment.addr() - self.image.image.as_ptr() as usize;
         match self.visited.entry(offset) {
@@ -341,13 +394,11 @@ impl<'img> ImageVisitor<'img> {
         }
     }
 
-    #[allow(clippy::type_complexity)]
-    fn visit_image(
-        image: &'img Image<'img>,
-    ) -> Result<BTreeMap<usize, (SegmentType<'img>, Vec<Box<Path>>)>> {
+    fn visit_image(image: &'img Image<'img>) -> Result<Self> {
         let mut this = Self {
             image,
             visited: BTreeMap::new(),
+            findings: BTreeMap::new(),
         };
         this.note(SegmentType::Header(image.header), None)?;
         this.note(SegmentType::Superblock(image.sb), None)?;
@@ -370,6 +421,7 @@ impl<'img> ImageVisitor<'img> {
                 // Already visited this byte offset — additional path recorded, skip children.
                 continue;
             }
+            let size = inode.size();
 
             if let Some(xattrs) = inode.xattrs()? {
                 for xid in xattrs.shared()? {
@@ -393,8 +445,17 @@ impl<'img> ImageVisitor<'img> {
                             ));
                         }
                     }
+                    // The inline tail is exactly the part of st_size after the blocks.
+                    let junk = count_nonzero(directory_trailing(inline_block, inline.len())?);
+                    if junk > 0 {
+                        this.report(
+                            &segment,
+                            format!("{junk} non-zero bytes after the last inline directory entry"),
+                        );
+                    }
                 }
-                for blkid in this.image.inode_blocks(&inode)? {
+                let blocks = this.image.inode_blocks(&inode)?;
+                for (index, blkid) in (0..).zip(blocks) {
                     let block = this.image.directory_block(blkid)?;
                     for entry in block.entries()? {
                         let entry = entry?;
@@ -405,17 +466,24 @@ impl<'img> ImageVisitor<'img> {
                             ));
                         }
                     }
-                    this.note(SegmentType::DirectoryBlock(block), Some(&path))?;
+                    let segment = SegmentType::DirectoryBlock(block);
+                    if !this.note(segment, Some(&path))? {
+                        this.check_block(&segment, &block.0, size, index);
+                    }
                 }
             } else {
-                for blkid in this.image.inode_blocks(&inode)? {
+                let blocks = this.image.inode_blocks(&inode)?;
+                for (index, blkid) in (0..).zip(blocks) {
                     let block = this.image.data_block(blkid)?;
-                    this.note(SegmentType::DataBlock(block), Some(&path))?;
+                    let segment = SegmentType::DataBlock(block);
+                    if !this.note(segment, Some(&path))? {
+                        this.check_block(&segment, &block.0, size, index);
+                    }
                 }
             }
         }
 
-        Ok(this.visited)
+        Ok(this)
     }
 }
 
@@ -459,7 +527,9 @@ pub fn dump_unassigned(
 /// all inodes, blocks, xattrs, and padding. Also produces space usage statistics.
 pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
     let image = Image::open(data)?;
-    let visited = ImageVisitor::visit_image(&image)?;
+    let ImageVisitor {
+        visited, findings, ..
+    } = ImageVisitor::visit_image(&image)?;
 
     let inode_start = (image.sb.meta_blkaddr.get() as usize)
         .checked_mul(image.block_size)
@@ -540,6 +610,13 @@ pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
             }
         }
 
+        if let Some(findings) = findings.get(&start) {
+            for finding in findings {
+                writeln!(output, "*** {finding}")?;
+            }
+            writeln!(output)?;
+        }
+
         offset += segment.size();
     }
 
@@ -577,4 +654,126 @@ pub fn debug_img(output: &mut impl std::io::Write, data: &[u8]) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, ffi::OsStr};
+
+    use super::*;
+    use crate::{
+        erofs::{
+            reader::InodeHeader,
+            writer::{ValidatedFileSystem, mkfs_erofs},
+        },
+        fsverity::Sha256HashValue,
+        tree::{FileSystem, Inode, LeafContent, RegularFile, Stat},
+    };
+
+    fn stat() -> Stat {
+        Stat {
+            st_mode: 0o755,
+            st_uid: 0,
+            st_gid: 0,
+            st_mtim_sec: 0,
+            st_mtim_nsec: 0,
+            xattrs: BTreeMap::new(),
+        }
+    }
+
+    /// Builds an image whose root holds a two-block file "big", a small
+    /// inline file "small" and enough other entries to need directory blocks.
+    fn build_image() -> Box<[u8]> {
+        let mut fs = FileSystem::<Sha256HashValue>::new(stat());
+        let mut add = |name: &str, data: &[u8]| {
+            let id = fs.push_leaf(
+                stat(),
+                LeafContent::Regular(RegularFile::Inline(data.into())),
+            );
+            fs.root.insert(OsStr::new(name), Inode::leaf(id));
+        };
+        add("big", &[b'x'; 8192]);
+        add("small", b"hi\n");
+        for i in 0..300 {
+            add(&format!("file-{i:04}"), b"");
+        }
+        mkfs_erofs(&ValidatedFileSystem::new(fs).unwrap())
+    }
+
+    fn dump(image: &[u8]) -> String {
+        let mut output = vec![];
+        debug_img(&mut output, image).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    /// Returns the image offset of the inode of a file in the root directory.
+    fn inode_offset(image: &[u8], name: &str) -> usize {
+        let image = Image::open(image).unwrap();
+        let nid = image
+            .find_child_nid(image.sb.root_nid.get().into(), name.as_bytes())
+            .unwrap()
+            .unwrap();
+        image.sb.meta_blkaddr.get() as usize * image.block_size + nid as usize * 32
+    }
+
+    #[test]
+    fn test_clean_image_has_no_findings() {
+        let output = dump(&build_image());
+        assert!(!output.contains("***"), "{output}");
+        assert!(!output.contains("Unknown content"), "{output}");
+    }
+
+    #[test]
+    fn test_nonzero_padding_after_st_size() {
+        let mut image = build_image();
+        // "big" fills two blocks; shrinking st_size turns the end of its last
+        // block (still all 'x') into padding.
+        let offset = inode_offset(&image, "big");
+        assert_eq!(image[offset] & 1, 0, "expected a compact inode");
+        assert_eq!(&image[offset + 8..offset + 12], &8192u32.to_le_bytes());
+        image[offset + 8..offset + 12].copy_from_slice(&8000u32.to_le_bytes());
+
+        let output = dump(&image);
+        assert!(
+            output.contains("*** 192 non-zero bytes of padding after st_size at +f40\n"),
+            "{output}"
+        );
+        assert_eq!(output.matches("***").count(), 1, "{output}");
+    }
+
+    #[test]
+    fn test_trailing_junk_in_directory_block() {
+        let mut image = build_image();
+        let root = {
+            let img = Image::open(&image).unwrap();
+            let root = img.root().unwrap();
+            let blocks = img.inode_blocks(&root).unwrap();
+            assert!(!blocks.is_empty(), "expected directory blocks");
+            root.u() as usize * img.block_size + img.block_size
+        };
+        // The last byte of the first directory block is nul padding after the
+        // last entry name, inside st_size.
+        assert_eq!(image[root - 1], 0);
+        image[root - 1] = b'!';
+
+        let output = dump(&image);
+        assert!(
+            output.contains("*** 1 non-zero bytes after the last directory entry\n"),
+            "{output}"
+        );
+        assert_eq!(output.matches("***").count(), 1, "{output}");
+    }
+
+    #[test]
+    fn test_nonzero_padding_after_inode() {
+        let mut image = build_image();
+        // "small" is a 32 byte compact inode with 3 bytes inline, followed by
+        // padding up to the next 32 byte inode slot.
+        let offset = inode_offset(&image, "small") + 32 + 3;
+        assert_eq!(image[offset], 0);
+        image[offset] = 0xff;
+
+        let output = dump(&image);
+        assert!(output.contains(" Unknown content\n"), "{output}");
+    }
 }
