@@ -392,3 +392,144 @@ fn test_clone_deep_rewrites_hardlinks() {
         node::lcfs_node_unref(root);
     }
 }
+
+unsafe extern "C" {
+    fn write_ostree_image(fd: libc::c_int) -> libc::c_int;
+}
+
+/// The fsverity digest of the image `tests/ostree-image.c` writes, as written
+/// by the C libcomposefs.  To regenerate it with the C library installed:
+///
+/// ```text
+/// cc -DOSTREE_IMAGE_MAIN -o ostree-image tests/ostree-image.c \
+///     $(pkg-config --cflags --libs composefs)
+/// ./ostree-image > image && fsverity digest image
+/// ```
+const OSTREE_IMAGE_C_DIGEST: &str =
+    "ed8a80347e9a3b0566dfefcd65509c47551746d9ae6c2dcfd0660ba4810c1013";
+
+/// ostree gives each regular file a payload of `xx/<checksum>.file` and sets
+/// the fsverity digest separately; the image must be byte-identical to what
+/// the C libcomposefs writes, or overlayfs can't find the file contents.
+#[test]
+fn test_ostree_image_matches_c() {
+    use composefs::fsverity::{FsVerityHashValue, Sha256HashValue, compute_verity};
+    use composefs::tree::RegularFile;
+    use std::ffi::OsStr;
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use zerocopy::IntoBytes;
+
+    let name = CString::new("ostree-image").unwrap();
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), 0) };
+    assert!(fd >= 0, "memfd_create failed");
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let ret = unsafe { write_ostree_image(file.as_raw_fd()) };
+    assert_eq!(ret, 0, "write_ostree_image failed");
+    file.rewind().unwrap();
+    let mut image = Vec::new();
+    file.read_to_end(&mut image).unwrap();
+
+    let fs = composefs::erofs::reader::erofs_to_filesystem::<Sha256HashValue>(&image).unwrap();
+    let file_at = |path: &str| {
+        let (dir, name) = fs.root.split(OsStr::new(path)).unwrap();
+        dir.get_file(name, &fs.leaves).unwrap()
+    };
+    let expected_verity: Vec<u8> = (0..32u8)
+        .map(|i| i.wrapping_mul(7).wrapping_add(3))
+        .collect();
+    match file_at("/usr/bin/bash") {
+        RegularFile::ExternalPath {
+            redirect: Some(redirect),
+            verity: Some(verity),
+            size: 1432144,
+        } => {
+            assert_eq!(
+                redirect.as_bytes(),
+                b"8a/5d74a2f8e3c1a0b9d7e6f5c4b3a2918070605040302010f0e0d0c0b0a09087.file"
+            );
+            assert_eq!(verity.as_bytes(), expected_verity);
+        }
+        other => panic!("unexpected /usr/bin/bash: {other:?}"),
+    }
+    match file_at("/usr/lib/libfoo.so.1") {
+        RegularFile::ExternalPath {
+            redirect: Some(redirect),
+            verity: None,
+            size: 8193,
+        } => assert_eq!(
+            redirect.as_bytes(),
+            b"e3/b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.file"
+        ),
+        other => panic!("unexpected /usr/lib/libfoo.so.1: {other:?}"),
+    }
+    match file_at("/usr/lib/verity-only") {
+        RegularFile::ExternalPath {
+            redirect: None,
+            verity: Some(verity),
+            size: 4097,
+        } => assert_eq!(verity.as_bytes(), expected_verity),
+        other => panic!("unexpected /usr/lib/verity-only: {other:?}"),
+    }
+    match file_at("/usr/lib/object") {
+        RegularFile::External(verity, 5000) => assert_eq!(verity.as_bytes(), expected_verity),
+        other => panic!("unexpected /usr/lib/object: {other:?}"),
+    }
+
+    let digest: Sha256HashValue = compute_verity(&image);
+    assert_eq!(digest.to_hex(), OSTREE_IMAGE_C_DIGEST);
+}
+
+/// A redirect with an interior NUL can't become a C payload, and must fail
+/// the conversion instead of silently dropping the redirect.  The entries
+/// sorting before it (a subdirectory and a hardlinked pair, with xattrs) are
+/// already converted by then, so this also exercises freeing a partial tree
+/// (meant to be run under ASan or Miri too).
+#[test]
+fn test_redirect_with_nul_fails() {
+    use composefs::fsverity::Sha256HashValue;
+    use composefs::generic_tree::{Directory, Inode, LeafContent, Stat};
+    use composefs::tree::{FileSystem, RegularFile};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let stat = |mode| Stat {
+        st_mode: mode,
+        st_uid: 0,
+        st_gid: 0,
+        st_mtim_sec: 0,
+        st_mtim_nsec: 0,
+        xattrs: [(
+            Box::from(OsStr::new("user.test")),
+            Box::from(b"value".as_slice()),
+        )]
+        .into(),
+    };
+    let inline = |data: &[u8]| LeafContent::Regular(RegularFile::Inline(Box::from(data)));
+    let mut fs = FileSystem::<Sha256HashValue>::new(stat(0o755));
+
+    let mut subdir = Directory::new(stat(0o755));
+    let id = fs.push_leaf(stat(0o644), inline(b"in subdir"));
+    subdir.insert(OsStr::new("file"), Inode::leaf(id));
+    fs.root
+        .insert(OsStr::new("a-dir"), Inode::Directory(Box::new(subdir)));
+
+    let id = fs.push_leaf(stat(0o644), inline(b"hardlinked"));
+    fs.root.insert(OsStr::new("b-link1"), Inode::leaf(id));
+    fs.root.insert(OsStr::new("b-link2"), Inode::leaf(id));
+
+    let id = fs.push_leaf(
+        stat(0o644),
+        LeafContent::Regular(RegularFile::external(
+            Some(Box::from(OsStr::from_bytes(b"8a/5d\0.file"))),
+            None,
+            4096,
+        )),
+    );
+    fs.root.insert(OsStr::new("z-bad"), Inode::leaf(id));
+
+    let err = crate::convert::filesystem_to_ffi_tree(&fs).unwrap_err();
+    let err = format!("{err:#}");
+    assert!(err.contains("Invalid redirect"), "{err}");
+    assert!(err.contains("z-bad"), "{err}");
+}

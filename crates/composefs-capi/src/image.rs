@@ -74,7 +74,14 @@ pub unsafe extern "C" fn lcfs_load_node_from_image_ext(
         }
     };
 
-    let root = filesystem_to_ffi_tree(&fs);
+    let root = match filesystem_to_ffi_tree(&fs) {
+        Ok(root) => root,
+        Err(e) => {
+            log::debug!("Converting the loaded image for the C API: {e:#}");
+            set_errno(libc::EINVAL);
+            return ptr::null_mut();
+        }
+    };
 
     // Apply toplevel_entries filter if specified
     if !options.is_null() {
