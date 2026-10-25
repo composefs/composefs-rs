@@ -308,9 +308,10 @@ fn write_leaf<ObjectID: FsVerityHashValue>(
             set_file_contents(dirfd, name, &leaf.stat, data)?
         }
         LeafContent::Regular(
-            RegularFile::External(id, size) | RegularFile::ExternalNoVerity(id, size),
+            file @ (RegularFile::External(_, size) | RegularFile::ExternalPath { size, .. }),
         ) => {
-            let object = repo.open_object(id)?;
+            let id = file.repo_object_id()?;
+            let object = repo.open_object(id.as_ref())?;
             // TODO: make this better.  At least needs to be EINTR-safe.  Could even do reflink in some cases.
             // Regardless we shouldn't read the whole file into memory.
             let size = (*size).try_into().context("size overflow")?;
@@ -694,10 +695,11 @@ pub fn read_file<ObjectID: FsVerityHashValue>(
 ) -> Result<Box<[u8]>> {
     match file {
         RegularFile::Inline(data) => Ok(data.clone()),
-        RegularFile::External(id, size) | RegularFile::ExternalNoVerity(id, size) => {
+        RegularFile::External(_, size) | RegularFile::ExternalPath { size, .. } => {
+            let id = file.repo_object_id()?;
             let capacity: usize = (*size).try_into().context("file too large for memory")?;
             let mut data = Vec::with_capacity(capacity);
-            std::fs::File::from(repo.open_object(id)?).read_to_end(&mut data)?;
+            std::fs::File::from(repo.open_object(id.as_ref())?).read_to_end(&mut data)?;
             ensure!(
                 *size == data.len() as u64,
                 "File content doesn't have the expected length"
