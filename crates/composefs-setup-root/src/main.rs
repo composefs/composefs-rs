@@ -27,9 +27,9 @@ use serde::Deserialize;
 
 use composefs::{
     fsverity::{Algorithm, FsVerityHashValue, Sha256HashValue, Sha512HashValue},
-    mount::{FsHandle, mount_at},
+    mount::{FsHandle, MountOptions, mount_at},
     mountcompat::{overlayfs_set_fd, overlayfs_set_lower_and_data_fds, prepare_mount},
-    repository::{ImageNotFound, Repository},
+    repository::{ImageNotFound, IntegrityPolicy, Repository, VerityState},
 };
 use composefs_boot::cmdline::{KARG_COMPOSEFS_DIGEST, KARG_V2, parse_digest_value, split_cmdline};
 
@@ -183,6 +183,33 @@ fn open_root_fs(path: &Path) -> Result<OwnedFd> {
     Ok(rootfs)
 }
 
+/// Mount the image named by one kernel command line digest.
+///
+/// The digest is authoritative: the image is mounted with
+/// `Repository::mount_digest`, which only looks at `images/<digest>` and
+/// verifies its fs-verity digest against the command line.  The repository's
+/// mode comes from the command line too, not from meta.json, which lives on
+/// the same unverified filesystem as the images.  Without the `?` marker
+/// fs-verity is required on the image and on every object it serves, so an
+/// installation whose metadata was written without fs-verity still boots as
+/// long as the image itself carries it.  With the marker, missing fs-verity
+/// is tolerated and the image is mounted unverified.
+fn mount_composefs_digest<H: FsVerityHashValue>(
+    sysroot: &OwnedFd,
+    name: &str,
+    insecure: bool,
+) -> Result<OwnedFd> {
+    let digest = H::from_hex(name).context("Parsing composefs digest")?;
+    let mut repo = Repository::<H>::open_path(sysroot, "composefs")?;
+    let verity = if insecure {
+        VerityState::Disabled
+    } else {
+        VerityState::Enabled
+    };
+    repo.set_integrity_policy(IntegrityPolicy::Explicit(verity))?;
+    repo.mount_digest(&digest, &MountOptions::default())
+}
+
 /// Try to mount a composefs image, returning `Ok(None)` if the image does not
 /// exist in the repository.  All other errors (permission, verity mismatch,
 /// corrupt image, …) are propagated.
@@ -192,24 +219,8 @@ fn mount_composefs_image_if_exists(
     insecure: bool,
 ) -> Result<Option<OwnedFd>> {
     let result = match name.len() {
-        128 => {
-            let mut repo = Repository::<Sha512HashValue>::open_path(sysroot, "composefs")?;
-            if insecure {
-                repo.set_insecure();
-            } else {
-                repo.require_verity()?;
-            }
-            repo.mount(name)
-        }
-        64 => {
-            let mut repo = Repository::<Sha256HashValue>::open_path(sysroot, "composefs")?;
-            if insecure {
-                repo.set_insecure();
-            } else {
-                repo.require_verity()?;
-            }
-            repo.mount(name)
-        }
+        128 => mount_composefs_digest::<Sha512HashValue>(sysroot, name, insecure),
+        64 => mount_composefs_digest::<Sha256HashValue>(sysroot, name, insecure),
         _ => anyhow::bail!("Invalid composefs digest length: {}", name.len()),
     };
     match result {

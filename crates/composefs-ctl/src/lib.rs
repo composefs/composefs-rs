@@ -1382,7 +1382,7 @@ where
     // now is to inherit the repo config, but if it's specified we
     // disable requiring verity even if the repo says to use it.
     if insecure {
-        repo.set_insecure();
+        repo.set_insecure()?;
     }
     if require_verity {
         repo.require_verity()?;

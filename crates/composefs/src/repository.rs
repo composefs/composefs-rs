@@ -68,6 +68,16 @@
 //! In "insecure" mode, fs-verity is not required, allowing operation on filesystems
 //! like tmpfs or overlayfs.
 //!
+//! Whether a repository requires fs-verity is its [`IntegrityPolicy`].  Opening
+//! a repository detects it from `meta.json`, which lives on the same unverified
+//! filesystem as the objects.  Callers that already know the exact fs-verity
+//! digest they expect, for example from a signed kernel command line, should set
+//! an explicit policy with [`Repository::set_integrity_policy`] and then use
+//! [`Repository::open_digest`] or [`Repository::mount_digest`]: those never
+//! resolve `images/refs/` names, verify the digest whenever the image can be
+//! measured, and in secure mode refuse an image without fs-verity.  An explicit
+//! policy is final for the lifetime of the handle.
+//!
 //! # Concurrency
 //!
 //! The repository uses advisory file locking (flock) to coordinate concurrent access.
@@ -535,6 +545,53 @@ impl Default for RepositoryConfig {
             algorithm: Algorithm::SHA256,
             erofs_formats: FormatConfig::single(FormatVersion::default()),
             insecure: false,
+        }
+    }
+}
+
+/// Whether fs-verity is required on the objects and images of a repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerityState {
+    /// Every object and image must carry fs-verity and is verified against its
+    /// digest (secure mode).
+    Enabled,
+    /// fs-verity is not required; digests are still verified whenever they can
+    /// be measured (insecure mode).
+    Disabled,
+}
+
+impl VerityState {
+    fn from_enabled(enabled: bool) -> Self {
+        if enabled {
+            VerityState::Enabled
+        } else {
+            VerityState::Disabled
+        }
+    }
+}
+
+/// Where a repository's fs-verity requirement comes from.
+///
+/// The distinction matters because `meta.json` is stored on the same filesystem
+/// as the objects it describes, so the detected state is only as trustworthy as
+/// that filesystem.  Callers with an external source of truth, such as a signed
+/// kernel command line, set an explicit policy instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityPolicy {
+    /// Read from `meta.json` when the repository was opened.  Can be replaced
+    /// with [`Repository::set_integrity_policy`].
+    Detected(VerityState),
+    /// Chosen by the caller.  Final for the lifetime of the handle: it cannot
+    /// be replaced, so a repository that was made secure cannot later be
+    /// flipped back to insecure by accident.
+    Explicit(VerityState),
+}
+
+impl IntegrityPolicy {
+    /// The fs-verity requirement, regardless of where it came from.
+    pub fn verity(self) -> VerityState {
+        match self {
+            IntegrityPolicy::Detected(state) | IntegrityPolicy::Explicit(state) => state,
         }
     }
 }
@@ -1048,7 +1105,10 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     /// Set via [`set_write_concurrency`](Self::set_write_concurrency) before the semaphore
     /// is first used; if `None`, defaults to [`available_parallelism`].
     write_concurrency: Option<usize>,
-    insecure: bool,
+    /// Whether fs-verity is required, and whether that was detected from
+    /// `meta.json` or chosen by the caller.  Read through
+    /// [`is_insecure`](Self::is_insecure).
+    integrity: IntegrityPolicy,
     metadata: RepoMetadata,
     /// Per-invocation EROFS version override set by [`set_erofs_version`](Self::set_erofs_version).
     /// Does not rewrite `meta.json`; only affects this `Repository` instance.
@@ -1072,7 +1132,7 @@ impl<ObjectID: FsVerityHashValue> std::fmt::Debug for Repository<ObjectID> {
         f.debug_struct("Repository")
             .field("repository", &self.repository)
             .field("objects", &self.objects)
-            .field("insecure", &self.insecure)
+            .field("integrity", &self.integrity)
             .finish_non_exhaustive()
     }
 }
@@ -1523,7 +1583,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// The repository's security mode is auto-detected: if `meta.json`
     /// has fs-verity enabled the repo requires verity on all objects
     /// (secure mode).  Otherwise the repository operates in insecure
-    /// mode.  Use [`set_insecure`] to override after opening.
+    /// mode.  The result is recorded as [`IntegrityPolicy::Detected`];
+    /// use [`set_integrity_policy`](Self::set_integrity_policy) or
+    /// [`set_insecure`](Self::set_insecure) to override it after opening.
     pub fn open_path(
         dirfd: impl AsFd,
         path: impl AsRef<Path>,
@@ -1547,7 +1609,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             images: OnceCell::new(),
             write_semaphore: OnceCell::new(),
             write_concurrency: None,
-            insecure: !has_verity,
+            integrity: IntegrityPolicy::Detected(VerityState::from_enabled(has_verity)),
             metadata,
             erofs_version_override: None,
             #[cfg(any(test, feature = "test"))]
@@ -1773,7 +1835,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         // `link_tmpfile_as_object` / `finalize_object_tmpfile_impl`.
         let guard = tmpfile.guard(objects_dir);
 
-        if self.insecure {
+        if self.is_insecure() {
             let mut hasher = FsVerityHasher::<ObjectID>::new();
             let mut src = std::io::BufReader::with_capacity(IO_BUF_CAPACITY, &mut source);
             let mut dst = File::from(tmpfile.try_clone()?);
@@ -2071,7 +2133,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         let verity_enabled = match enable_verity_with_retry::<ObjectID>(src) {
             Ok(()) => true,
             Err(EnableVerityError::AlreadyEnabled) => true,
-            Err(EnableVerityError::FilesystemNotSupported) if self.insecure => false,
+            Err(EnableVerityError::FilesystemNotSupported) if self.is_insecure() => false,
             Err(e) => {
                 return Err(e).context("enabling verity on source file for hardlink")?;
             }
@@ -2181,7 +2243,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             match enable_verity_maybe_copy::<ObjectID>(objects_dir, ro_fd.as_fd()) {
                 Ok(None) => (ro_fd, true),
                 Ok(Some(new_fd)) => (new_fd, true),
-                Err(EnableVerityError::FilesystemNotSupported) if self.insecure => (ro_fd, false),
+                Err(EnableVerityError::FilesystemNotSupported) if self.is_insecure() => {
+                    (ro_fd, false)
+                }
                 Err(EnableVerityError::AlreadyEnabled) => (ro_fd, true),
                 Err(other) => return Err(other).context("Enabling verity on tmpfile")?,
             };
@@ -2325,7 +2389,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 match ensure_verity_equal(&fd, id) {
                     Ok(()) => {}
                     Err(CompareVerityError::Measure(MeasureVerityError::VerityMissing))
-                        if self.insecure =>
+                        if self.is_insecure() =>
                     {
                         match enable_verity_maybe_copy::<ObjectID>(dirfd, fd.as_fd()) {
                             Ok(Some(fd)) => ensure_verity_equal(&fd, id)
@@ -2339,7 +2403,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     }
                     Err(CompareVerityError::Measure(
                         MeasureVerityError::FilesystemNotSupported,
-                    )) if self.insecure => {}
+                    )) if self.is_insecure() => {}
                     Err(other) => Err(other).context("Verifying existing object integrity")?,
                 }
                 return Ok(());
@@ -2369,11 +2433,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     Err(CompareVerityError::Measure(
                         MeasureVerityError::VerityMissing
                         | MeasureVerityError::FilesystemNotSupported,
-                    )) if self.insecure => ro_fd,
+                    )) if self.is_insecure() => ro_fd,
                     Err(other) => Err(other).context("Double-checking verity digest")?,
                 }
             }
-            Err(EnableVerityError::FilesystemNotSupported) if self.insecure => ro_fd,
+            Err(EnableVerityError::FilesystemNotSupported) if self.is_insecure() => ro_fd,
             Err(other) => Err(other).context("Enabling verity digest")?,
         };
 
@@ -2431,7 +2495,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             Ok(()) => {}
             Err(CompareVerityError::Measure(
                 MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported,
-            )) if self.insecure => {}
+            )) if self.is_insecure() => {}
             Err(other) => Err(other).context("Verifying file verity digest")?,
         }
         Ok(fd)
@@ -2440,9 +2504,18 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// Returns whether the repository is in insecure mode.
     ///
     /// This is auto-detected from whether `meta.json` has fs-verity
-    /// enabled, but can be overridden with [`set_insecure`].
+    /// enabled, but can be overridden with
+    /// [`set_integrity_policy`](Self::set_integrity_policy) or
+    /// [`set_insecure`](Self::set_insecure).
     pub fn is_insecure(&self) -> bool {
-        self.insecure
+        self.integrity.verity() == VerityState::Disabled
+    }
+
+    /// Returns the repository's [`IntegrityPolicy`]: whether fs-verity is
+    /// required and whether that was detected from `meta.json` or set by the
+    /// caller.
+    pub fn integrity_policy(&self) -> IntegrityPolicy {
+        self.integrity
     }
 
     /// Override the EROFS format version for this repository session.
@@ -2458,12 +2531,50 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         self
     }
 
-    /// Mark this repository as insecure, disabling verification of
-    /// fs-verity digests.  This allows operation on filesystems
-    /// without verity support.
-    pub fn set_insecure(&mut self) -> &mut Self {
-        self.insecure = true;
-        self
+    /// Set the repository's [`IntegrityPolicy`].
+    ///
+    /// Only an [`IntegrityPolicy::Explicit`] policy can be set; a
+    /// [`IntegrityPolicy::Detected`] one is what [`open_path`](Self::open_path)
+    /// records from `meta.json`, and claiming it from outside is an error.
+    ///
+    /// The transition is one-way: a detected policy is replaced, but an
+    /// explicit one is final for the lifetime of the handle and any attempt
+    /// to change it is an error.  Setting the policy that is already in
+    /// place is a no-op.  Once a caller has decided the mode from a trusted
+    /// source, "open the repository, then set its mode" is therefore the
+    /// only sequence that can have happened, and a handle that was made
+    /// secure cannot later be flipped back to insecure.
+    ///
+    /// Callers whose trust comes from elsewhere than `meta.json`, such as a
+    /// signed kernel command line naming the image digest, should pass
+    /// [`IntegrityPolicy::Explicit`] with the state that source dictates.
+    pub fn set_integrity_policy(&mut self, policy: IntegrityPolicy) -> Result<&mut Self> {
+        ensure!(
+            matches!(policy, IntegrityPolicy::Explicit(_)),
+            "only an explicit integrity policy can be set, not {policy:?}"
+        );
+        match self.integrity {
+            IntegrityPolicy::Detected(_) => self.integrity = policy,
+            IntegrityPolicy::Explicit(_) => ensure!(
+                self.integrity == policy,
+                "repository integrity policy is already {:?}; refusing to change it to {:?}",
+                self.integrity,
+                policy
+            ),
+        }
+        Ok(self)
+    }
+
+    /// Mark this repository as insecure: fs-verity is no longer required on
+    /// objects and images, though digests are still verified whenever they
+    /// can be measured.  This allows operation on filesystems without verity
+    /// support.
+    ///
+    /// Equivalent to [`set_integrity_policy`](Self::set_integrity_policy)
+    /// with `IntegrityPolicy::Explicit(VerityState::Disabled)`, so it fails
+    /// on a repository that was explicitly made secure.
+    pub fn set_insecure(&mut self) -> Result<&mut Self> {
+        self.set_integrity_policy(IntegrityPolicy::Explicit(VerityState::Disabled))
     }
 
     /// Require that this repository has fs-verity enabled.
@@ -2472,7 +2583,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// verity on `meta.json`, since there is no mechanism to
     /// retroactively enable verity on existing objects.
     pub fn require_verity(&self) -> Result<()> {
-        if self.insecure {
+        if self.is_insecure() {
             bail!(
                 "repository was not initialized with fs-verity \
                  (hint: re-create with `cfsctl init` on a \
@@ -2836,13 +2947,36 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     /// Returns the fd of the image and whether or not verity should be
     /// enabled when mounting it.
+    ///
+    /// `name` is an fs-verity digest (`images/<digest>`), a path containing a
+    /// `/` such as `refs/<name>`, or a bare named ref under `images/refs/`.
+    /// In secure mode a digest is resolved with
+    /// [`open_digest`](Self::open_digest): only `images/<digest>` is consulted
+    /// and it must carry that digest.  In insecure mode `images/refs/<digest>`
+    /// is tried as well, the image is verified against the digest whenever it
+    /// can be measured, and one without fs-verity is returned unverified.
+    /// Named refs are not verified.
+    ///
+    /// When the expected digest comes from a trusted source such as a signed
+    /// kernel command line, set the mode explicitly and use
+    /// [`open_digest`](Self::open_digest) instead.
     #[context("Opening image '{name}'")]
     pub fn open_image(&self, name: &str) -> Result<(OwnedFd, bool)> {
+        if !self.is_insecure()
+            && !name.contains('/')
+            && let Ok(digest) = ObjectID::from_hex(name)
+        {
+            return self.open_digest(&digest);
+        }
         let image = match self.openat(&format!("images/{name}"), OFlags::RDONLY) {
             Ok(fd) => fd,
             Err(Errno::NOENT) if !name.contains('/') => {
                 // Try resolving as a named ref before giving up
                 match self.openat(&format!("images/refs/{name}"), OFlags::RDONLY) {
+                    // A ref named after a digest must still contain that
+                    // digest, so fall through to the verification below
+                    // instead of trusting whatever the ref points at.
+                    Ok(fd) if ObjectID::from_hex(name).is_ok() => fd,
                     Ok(fd) => return Ok((fd, true)),
                     Err(Errno::NOENT) => {
                         return Err(anyhow::Error::new(ImageNotFound {
@@ -2868,27 +3002,59 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             return Ok((image, true));
         }
 
-        // A name with no slashes in it is taken to be a sha256 fs-verity digest
-        match measure_verity::<ObjectID>(&image) {
-            Ok(found)
-                if found
-                    == FsVerityHashValue::from_hex(name)
-                        .context("Parsing expected verity hash from image name")? =>
-            {
-                Ok((image, true))
+        // A name with no slashes in it is taken to be an fs-verity digest
+        let expected =
+            ObjectID::from_hex(name).context("Parsing expected verity hash from image name")?;
+        match ensure_verity_equal(&image, &expected) {
+            Ok(()) => Ok((image, true)),
+            Err(CompareVerityError::Measure(
+                MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported,
+            )) if self.is_insecure() => Ok((image, false)),
+            Err(other) => Err(other).context("Verifying image fs-verity digest")?,
+        }
+    }
+
+    /// Open the image with exactly this fs-verity digest.
+    ///
+    /// This is the API for callers whose expected digest comes from a trusted
+    /// source such as a signed kernel command line.  Unlike
+    /// [`open_image`](Self::open_image) it never consults `images/refs/`: only
+    /// `images/<digest>` is opened, and its measured fs-verity digest must
+    /// equal `digest`.  An image that cannot be measured, because it has no
+    /// fs-verity or the filesystem does not support it, is refused in secure
+    /// mode and returned unverified in insecure mode; the second element of
+    /// the result tells whether verity should be enabled when mounting it.
+    /// Choose the mode with
+    /// [`set_integrity_policy`](Self::set_integrity_policy) rather than
+    /// relying on the detection from `meta.json`, which whoever can tamper
+    /// with the images can also rewrite.
+    ///
+    /// If there is no such image, the error can be downcast to
+    /// [`ImageNotFound`].
+    pub fn open_digest(&self, digest: &ObjectID) -> Result<(OwnedFd, bool)> {
+        let hex = digest.to_hex();
+        let image = match self.openat(&format!("images/{hex}"), OFlags::RDONLY) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Err(anyhow::Error::new(ImageNotFound { name: hex })),
+            Err(e) => return Err(e).with_context(|| format!("Opening image 'images/{hex}'")),
+        };
+        match ensure_verity_equal(&image, digest) {
+            Ok(()) => Ok((image, true)),
+            Err(CompareVerityError::Measure(
+                MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported,
+            )) if self.is_insecure() => Ok((image, false)),
+            Err(other) => {
+                Err(other).with_context(|| format!("Verifying fs-verity digest of image {hex}"))
             }
-            Ok(_) => bail!("fs-verity content mismatch"),
-            Err(MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported)
-                if self.insecure =>
-            {
-                Ok((image, false))
-            }
-            Err(other) => Err(other).context("Measuring image verity digest")?,
         }
     }
 
     /// Create a detached mount of an image. This file descriptor can then
     /// be attached via e.g. `move_mount`.
+    ///
+    /// `name` is resolved as in [`open_image`](Self::open_image).  Boot-time
+    /// callers with a trusted digest should use
+    /// [`mount_digest`](Self::mount_digest) instead.
     #[context("Mounting image '{name}'")]
     pub fn mount_with_options(&self, name: &str, options: &MountOptions) -> Result<OwnedFd> {
         let (image, enable_verity) = self.open_image(name)?;
@@ -2910,6 +3076,31 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     #[context("Mounting image '{name}'")]
     pub fn mount(&self, name: &str) -> Result<OwnedFd> {
         self.mount_with_options(name, &MountOptions::default())
+    }
+
+    /// Create a detached mount of the image with exactly this fs-verity digest.
+    ///
+    /// The image is opened with [`open_digest`](Self::open_digest), so
+    /// `images/refs/` is never consulted and the image must carry the expected
+    /// digest whenever it can be measured.  In secure mode fs-verity is also
+    /// required for the file contents (`verity=require`); in insecure mode an
+    /// image without fs-verity is mounted unverified.  Boot-time callers that
+    /// take the digest from a trusted kernel command line should set the mode
+    /// explicitly and use this rather than
+    /// [`mount_with_options`](Self::mount_with_options).
+    #[context("Mounting image '{}'", digest.to_hex())]
+    pub fn mount_digest(&self, digest: &ObjectID, options: &MountOptions) -> Result<OwnedFd> {
+        let (image, enable_verity) = self.open_digest(digest)?;
+        let objects = self
+            .objects_dir()
+            .context("Getting objects directory for mount")?;
+        let verity = if enable_verity {
+            VerityRequirement::Required
+        } else {
+            VerityRequirement::Disabled
+        };
+        composefs_fsmount(image, &digest.to_hex(), &[objects.as_fd()], verity, options)
+            .context("Creating filesystem mount")
     }
 
     /// Mount the image with the provided digest at the target path.
@@ -3618,7 +3809,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         // Cap at available CPUs; the work is a mix of I/O (reading objects)
         // and CPU (computing verity hashes).
         let max_concurrent = available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let insecure = self.insecure;
+        let insecure = self.is_insecure();
 
         let mut joinset = tokio::task::JoinSet::new();
         let mut partial_results = Vec::new();
@@ -4229,6 +4420,64 @@ mod tests {
             RepositoryConfig::new(Algorithm::SHA512).set_insecure(),
         )?;
         Ok(Arc::new(repo))
+    }
+
+    /// An explicit integrity policy replaces the detected one and is then
+    /// final for the handle.
+    #[test]
+    fn test_integrity_policy_is_set_once() -> Result<()> {
+        let tmp = tempdir();
+        let repo_path = tmp.path().join("repo");
+        drop(create_test_repo(&repo_path)?);
+
+        let mut repo = Repository::<Sha512HashValue>::open_path(CWD, &repo_path)?;
+        assert_eq!(
+            repo.integrity_policy(),
+            IntegrityPolicy::Detected(VerityState::Disabled)
+        );
+        assert!(repo.is_insecure());
+
+        // Detected can be replaced, also by a stricter policy.
+        repo.set_integrity_policy(IntegrityPolicy::Explicit(VerityState::Enabled))?;
+        assert_eq!(
+            repo.integrity_policy(),
+            IntegrityPolicy::Explicit(VerityState::Enabled)
+        );
+        assert!(!repo.is_insecure());
+
+        // Explicit is final: same policy is a no-op, anything else is refused.
+        repo.set_integrity_policy(IntegrityPolicy::Explicit(VerityState::Enabled))?;
+        assert!(repo.set_insecure().is_err());
+        assert_eq!(
+            repo.integrity_policy(),
+            IntegrityPolicy::Explicit(VerityState::Enabled)
+        );
+        assert!(!repo.is_insecure());
+
+        let mut repo = Repository::<Sha512HashValue>::open_path(CWD, &repo_path)?;
+        // A detected policy can only be claimed by open_path.
+        assert!(
+            repo.set_integrity_policy(IntegrityPolicy::Detected(VerityState::Enabled))
+                .is_err()
+        );
+        assert_eq!(
+            repo.integrity_policy(),
+            IntegrityPolicy::Detected(VerityState::Disabled)
+        );
+        repo.set_insecure()?;
+        assert_eq!(
+            repo.integrity_policy(),
+            IntegrityPolicy::Explicit(VerityState::Disabled)
+        );
+        assert!(
+            repo.set_integrity_policy(IntegrityPolicy::Explicit(VerityState::Enabled))
+                .is_err()
+        );
+        assert_eq!(
+            repo.integrity_policy(),
+            IntegrityPolicy::Explicit(VerityState::Disabled)
+        );
+        Ok(())
     }
 
     /// Generate deterministic test data of a given size.
