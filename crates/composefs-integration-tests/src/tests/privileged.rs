@@ -8,14 +8,22 @@
 //! fs-verity support. The `COMPOSEFS_IN_VM` env var prevents infinite
 //! recursion — see [`require_privileged`].
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
+use rustix::fs::{AtFlags, CWD, unlinkat};
 use xshell::{Shell, cmd};
 
-use composefs_oci::composefs::fsverity::{FsVerityHashValue, Sha256HashValue, Sha512HashValue};
-use composefs_oci::composefs::repository::{Repository, RepositoryConfig};
+use composefs_oci::composefs::fsverity::{
+    Algorithm, CompareVerityError, FsVerityHashValue, MeasureVerityError, Sha256HashValue,
+    Sha512HashValue,
+};
+use composefs_oci::composefs::repository::{
+    ImageNotFound, IntegrityPolicy, Repository, RepositoryConfig, VerityState,
+};
+use composefs_oci::composefs::tree::{FileSystem, Inode, LeafContent, RegularFile, Stat};
 
 use crate::{cfsctl, create_test_rootfs, integration_test};
 
@@ -720,6 +728,145 @@ fn privileged_init_insecure_skips_verity() -> Result<()> {
 }
 integration_test!(privileged_init_insecure_skips_verity);
 
+/// Commit a tree holding one external file as an image in `repo`.
+fn commit_single_file_image(
+    repo: &Repository<Sha512HashValue>,
+    object: &Sha512HashValue,
+    size: u64,
+    name: Option<&str>,
+) -> Result<Sha512HashValue> {
+    let stat = |st_mode| Stat {
+        st_mode,
+        st_uid: 0,
+        st_gid: 0,
+        st_mtim_sec: 0,
+        st_mtim_nsec: 0,
+        xattrs: Default::default(),
+    };
+    let mut fs = FileSystem::<Sha512HashValue>::new(stat(0o755));
+    let leaf = fs.push_leaf(
+        stat(0o644),
+        LeafContent::Regular(RegularFile::External(object.clone(), size)),
+    );
+    fs.root.insert(OsStr::new("data"), Inode::leaf(leaf));
+    fs.commit_image(repo, name)
+}
+
+/// Replace a file with a plain copy of itself, which drops fs-verity.
+fn strip_verity(path: &Path) -> Result<()> {
+    let copy = path.with_extension("copy");
+    std::fs::write(&copy, std::fs::read(path)?)?;
+    std::fs::rename(copy, path)?;
+    Ok(())
+}
+
+fn is_verity_missing(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<CompareVerityError>(),
+        Some(CompareVerityError::Measure(
+            MeasureVerityError::VerityMissing
+        ))
+    )
+}
+
+/// `open_digest` only accepts `images/<digest>` carrying that digest, and
+/// `open_image` defers to it in secure mode.  Both return an image without
+/// fs-verity only once the repository has been made insecure explicitly.
+fn privileged_open_digest_requires_exact_verified_image() -> Result<()> {
+    if require_privileged("privileged_open_digest_requires_exact_verified_image")?.is_some() {
+        return Ok(());
+    }
+
+    let verity_dir = VerityTempDir::new()?;
+    let repo_path = verity_dir.path().join("repo");
+    let (mut repo, _) = Repository::<Sha512HashValue>::init_path(
+        CWD,
+        &repo_path,
+        RepositoryConfig::new(Algorithm::SHA512),
+    )?;
+    ensure!(
+        !repo.is_insecure(),
+        "ext4 with verity must give a secure repository"
+    );
+
+    let size = 32 * 1024;
+    let obj_a = repo.ensure_object(&vec![0xAA; size])?;
+    let obj_b = repo.ensure_object(&vec![0xBB; size])?;
+    let image_a = commit_single_file_image(&repo, &obj_a, size as u64, None)?;
+    let image_b = commit_single_file_image(&repo, &obj_b, size as u64, Some("myref"))?;
+    repo.sync()?;
+    ensure!(image_a != image_b);
+
+    // Both lookups find and verify an intact image.
+    ensure!(repo.open_digest(&image_a)?.1);
+    ensure!(repo.open_image(&image_a.to_hex())?.1);
+
+    // Replace images/<A> with a ref of the same name that points at B.
+    repo.symlink(
+        format!("images/refs/{}", image_a.to_hex()),
+        format!("images/{}", image_b.to_hex()),
+    )?;
+    unlinkat(
+        CWD,
+        repo_path.join("images").join(image_a.to_hex()),
+        AtFlags::empty(),
+    )?;
+
+    // In secure mode neither lookup consults refs for a digest.
+    let err = repo.open_digest(&image_a).unwrap_err();
+    ensure!(err.downcast_ref::<ImageNotFound>().is_some(), "{err:#}");
+    let err = repo.open_image(&image_a.to_hex()).unwrap_err();
+    ensure!(err.downcast_ref::<ImageNotFound>().is_some(), "{err:#}");
+    // A real named ref is still resolved.
+    ensure!(repo.open_image("myref")?.1);
+
+    // In insecure mode open_image does follow the ref, but still has to
+    // verify it against the digest it was asked for; open_digest never does.
+    // The policy detected from meta.json may be replaced.
+    ensure!(repo.integrity_policy() == IntegrityPolicy::Detected(VerityState::Enabled));
+    repo.set_insecure()?;
+    ensure!(repo.integrity_policy() == IntegrityPolicy::Explicit(VerityState::Disabled));
+    let err = repo.open_image(&image_a.to_hex()).unwrap_err();
+    ensure!(
+        matches!(
+            err.downcast_ref::<CompareVerityError>(),
+            Some(CompareVerityError::DigestMismatch { .. })
+        ),
+        "{err:#}"
+    );
+    let err = repo.open_digest(&image_a).unwrap_err();
+    ensure!(err.downcast_ref::<ImageNotFound>().is_some(), "{err:#}");
+
+    // Drop fs-verity from B.  Secure mode refuses it, whatever meta.json
+    // says; insecure mode returns it unverified.  An explicit policy is
+    // final, so a fresh handle is needed for each mode.
+    let image_b_path = std::fs::canonicalize(repo_path.join("images").join(image_b.to_hex()))?;
+    strip_verity(&image_b_path)?;
+    ensure!(
+        repo.set_integrity_policy(IntegrityPolicy::Explicit(VerityState::Enabled))
+            .is_err()
+    );
+    ensure!(repo.integrity_policy() == IntegrityPolicy::Explicit(VerityState::Disabled));
+    let mut repo = Repository::<Sha512HashValue>::open_path(CWD, &repo_path)?;
+    repo.set_integrity_policy(IntegrityPolicy::Explicit(VerityState::Enabled))?;
+    let err = repo.open_digest(&image_b).unwrap_err();
+    ensure!(is_verity_missing(&err), "{err:#}");
+    let err = repo.open_image(&image_b.to_hex()).unwrap_err();
+    ensure!(is_verity_missing(&err), "{err:#}");
+    // The explicit secure policy cannot be lowered on this handle.
+    ensure!(repo.set_insecure().is_err());
+    ensure!(repo.integrity_policy() == IntegrityPolicy::Explicit(VerityState::Enabled));
+    let err = repo.open_digest(&image_b).unwrap_err();
+    ensure!(is_verity_missing(&err), "{err:#}");
+    let mut repo = Repository::<Sha512HashValue>::open_path(CWD, &repo_path)?;
+    repo.set_insecure()?;
+    ensure!(!repo.open_digest(&image_b)?.1);
+    ensure!(!repo.open_image(&image_b.to_hex())?.1);
+
+    Ok(())
+}
+integration_test!(privileged_open_digest_requires_exact_verified_image);
+
 /// Verify that `oci pull` into a read-only bind-mounted repository fails
 /// immediately with a clear "not writable" error instead of a confusing
 /// tar header error.
@@ -1334,7 +1481,7 @@ fn privileged_fuse_dumpfile_roundtrip() -> Result<()> {
         ".",
         RepositoryConfig::default().set_insecure(),
     )?;
-    repo.set_insecure();
+    repo.set_insecure()?;
 
     let synthetic = build_test_filesystem(&repo)?;
     let erofs_bytes = mkfs_erofs(&ValidatedFileSystem::new(synthetic)?);
