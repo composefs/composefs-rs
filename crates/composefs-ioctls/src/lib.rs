@@ -4,6 +4,7 @@
 //!
 //! - **fs-verity ioctls**: Enable and measure fs-verity on files
 //! - **Loop device ioctls**: Create loop devices (behind `loop-device` feature)
+//! - **Record locks**: Open-file-description locks interoperable with POSIX locks
 //!
 //! # Safety
 //!
@@ -25,6 +26,7 @@
 #![deny(unsafe_code)]
 
 pub mod fsverity;
+pub mod lock;
 pub mod mount;
 
 #[cfg(feature = "loop-device")]
