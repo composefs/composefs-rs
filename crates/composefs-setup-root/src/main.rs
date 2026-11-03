@@ -142,7 +142,8 @@ fn mount_tmpfs() -> Result<OwnedFd> {
     )?)
 }
 
-fn overlay_state(base: impl AsFd, state: impl AsFd, source: &str) -> Result<()> {
+/// Create an overlay mount of `state` over `base`, without attaching it.
+fn overlay_mount(base: impl AsFd, state: impl AsFd, source: &str) -> Result<OwnedFd> {
     // upper must be 0755: the overlayfs merged view inherits permissions from
     // upperdir, so 0700 would make / (or the mounted subdir) inaccessible to
     // non-root processes (dbus, anything that drops privileges).
@@ -157,17 +158,16 @@ fn overlay_state(base: impl AsFd, state: impl AsFd, source: &str) -> Result<()> 
     overlayfs_set_fd(overlayfs.as_fd(), "upperdir", upper.as_fd())?;
     overlayfs_set_lower_and_data_fds(&overlayfs, base.as_fd(), &[])?;
     fsconfig_create(overlayfs.as_fd())?;
-    let fs = fsmount(
+    Ok(fsmount(
         overlayfs.as_fd(),
         FsMountFlags::FSMOUNT_CLOEXEC,
         MountAttrFlags::empty(),
-    )?;
-
-    Ok(mount_at(fs, base, ".")?)
+    )?)
 }
 
-fn overlay_transient(base: impl AsFd) -> Result<()> {
-    overlay_state(base, prepare_mount(mount_tmpfs()?)?, "transient")
+/// Create an overlay mount of a new tmpfs over `base`, without attaching it.
+fn overlay_transient(base: impl AsFd) -> Result<OwnedFd> {
+    overlay_mount(base, prepare_mount(mount_tmpfs()?)?, "transient")
 }
 
 fn open_root_fs(path: &Path) -> Result<OwnedFd> {
@@ -220,7 +220,8 @@ fn mount_composefs_image_if_exists(
 }
 
 fn mount_subdir(
-    new_root: impl AsFd,
+    lower_root: impl AsFd,
+    target_root: impl AsFd,
     state: impl AsFd,
     subdir: &str,
     config: MountConfig,
@@ -236,13 +237,22 @@ fn mount_subdir(
 
     match mount_type {
         MountType::None => Ok(()),
-        MountType::Bind => Ok(mount_at(bind_mount(&state, subdir)?, &new_root, subdir)?),
-        MountType::Overlay => overlay_state(
-            open_dir(&new_root, subdir)?,
-            open_dir(&state, subdir)?,
-            "overlay",
-        ),
-        MountType::Transient => overlay_transient(open_dir(&new_root, subdir)?),
+        MountType::Bind => Ok(mount_at(bind_mount(&state, subdir)?, &target_root, subdir)?),
+        // With root.transient, target_root is an overlay of the image. Stacking on it would
+        // exceed the maximum fs stacking depth. Instead, use the image as the lower layer. The
+        // transient overlay is still empty, so the image has the same contents as target_root.
+        MountType::Overlay => {
+            let fs = overlay_mount(
+                open_dir(&lower_root, subdir)?,
+                open_dir(&state, subdir)?,
+                "overlay",
+            )?;
+            Ok(mount_at(fs, open_dir(&target_root, subdir)?, ".")?)
+        }
+        MountType::Transient => {
+            let fs = overlay_transient(open_dir(&lower_root, subdir)?)?;
+            Ok(mount_at(fs, open_dir(&target_root, subdir)?, ".")?)
+        }
     }
 }
 
@@ -352,7 +362,7 @@ fn setup_root(args: Args) -> Result<()> {
         anyhow::bail!("no composefs karg found in kernel cmdline");
     }
 
-    let (new_root, image_addr) = match args.root_fs {
+    let (image, image_addr) = match args.root_fs {
         Some(path) => {
             let root = open_root_fs(&path).context("Failed to clone specified root fs")?;
             let addr = kargs[0].0.clone();
@@ -382,27 +392,44 @@ fn setup_root(args: Args) -> Result<()> {
     // 6.15 and later.  Before 6.15 we can't mount into a floating tree, so mount it first.  This
     // will leave an abandoned clone of the sysroot mounted under it, but that's OK for now.
     if cfg!(feature = "pre-6.15") {
-        mount_at(&new_root, CWD, &args.sysroot)?;
+        mount_at(&image, CWD, &args.sysroot)?;
     }
 
-    if config.root.transient {
-        overlay_transient(&new_root)?;
-    }
+    // Further mounts go into the transient overlay.
+    let transient = if config.root.transient {
+        let overlay = overlay_transient(&image).context("Failed to create transient root")?;
+        if cfg!(feature = "pre-6.15") {
+            mount_at(&overlay, &image, ".").context("Failed to attach transient root")?;
+        }
+        Some(overlay)
+    } else {
+        None
+    };
+    let new_root = transient.as_ref().unwrap_or(&image);
 
-    match mount_at(&sysroot_clone, &new_root, "sysroot") {
+    match mount_at(&sysroot_clone, new_root, "sysroot") {
         Ok(()) | Err(Errno::NOENT) => {}
         Err(err) => Err(err)?,
     }
 
     // etc + var
     let state = open_dir(open_dir(&sysroot, "state/deploy")?, &image_addr)?;
-    mount_subdir(&new_root, &state, "etc", config.etc, MountType::Overlay)?;
-    mount_subdir(&new_root, &state, "var", config.var, MountType::Bind)?;
+    mount_subdir(
+        &image,
+        new_root,
+        &state,
+        "etc",
+        config.etc,
+        MountType::Overlay,
+    )
+    .context("Failed to mount /etc")?;
+    mount_subdir(&image, new_root, &state, "var", config.var, MountType::Bind)
+        .context("Failed to mount /var")?;
 
     if cfg!(not(feature = "pre-6.15")) {
         // Replace the /sysroot with the new composed root filesystem
         unmount(&args.sysroot, UnmountFlags::DETACH)?;
-        mount_at(&new_root, CWD, &args.sysroot)?;
+        mount_at(new_root, CWD, &args.sysroot)?;
     }
 
     Ok(())
