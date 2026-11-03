@@ -187,7 +187,7 @@ jobs:
           if-no-files-found: ignore
 
   examples:
-    name: Example tests (${{ matrix.example.dir }}/${{ matrix.example.os }})
+    name: Example tests (${{ matrix.example.dir }}/${{ matrix.example.os }}${{ matrix.example.transient && ' root.transient' || '' }})
     runs-on: ubuntu-24.04
 
     strategy:
@@ -198,6 +198,7 @@ jobs:
           # - { dir: 'bls', os: 'arch' }
           # - { dir: 'uki', os: 'arch' }
           - { dir: 'bls', os: 'fedora' }
+          - { dir: 'bls', os: 'fedora', transient: true }
           - { dir: 'bls', os: 'fedora-compat' }
           # This one is currently failing, needs debugging
           # - { dir: 'bls', os: 'rawhide' }
@@ -272,6 +273,7 @@ jobs:
         export PATH="${HOME}/bin:${PATH}"
         export FS_FORMAT=${{ matrix.example.fsfmt }}
         export FS_VERITY_MODE=${{ matrix.example.verity }}
+        export ROOT_TRANSIENT=${{ matrix.example.transient }}
         examples/test/run ${{ matrix.example.dir }} ${{ matrix.example.os }}
 
   # Sentinel job for required checks — configure this job name in
