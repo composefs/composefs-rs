@@ -14,7 +14,8 @@ version.workspace = true
 default = ["containers-storage"]
 test = ["tar", "rand", "composefs/test"]
 boot = ["composefs-boot"]
-containers-storage = ["dep:cstorage", "dep:base64", "varlink", "cstorage/layer-transfer"]
+containers-storage = ["storage-export", "dep:base64", "varlink", "cstorage/layer-transfer"]
+storage-export = ["dep:cstorage"]
 varlink = ['dep:zlink', 'dep:zlink-core', 'composefs/varlink']
 
 [dependencies]

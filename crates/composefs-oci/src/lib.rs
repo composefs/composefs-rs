@@ -29,6 +29,10 @@ pub mod oci_layout;
 /// Re-exported from [`composefs::progress`]; use that path directly in new code.
 pub mod progress;
 pub mod skopeo;
+#[cfg(feature = "storage-export")]
+pub mod storage_export;
+#[cfg(feature = "storage-export")]
+pub use storage_export::export_to_containers_storage;
 /// Import container images via skopeo's JSON proxy + varlink socket.
 ///
 /// Available when the `containers-storage` feature is enabled (which
