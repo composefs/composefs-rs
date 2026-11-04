@@ -30,7 +30,7 @@ rustix = { version = "1.0.0", default-features = false, features = ["fs", "mount
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 openssl = { version = "0.10", default-features = false }
 thiserror = { version = "2.0.0", default-features = false }
-tokio = { version = "1.24.2", default-features = false, features = ["macros", "process", "io-util", "rt-multi-thread", "sync"] }
+tokio = { version = "1.24.2", default-features = false, features = ["macros", "process", "io-util", "rt-multi-thread", "sync", "time"] }
 tempfile = { version = "3.8.0", optional = true, default-features = false }
 xxhash-rust = { version = "0.8.2", default-features = false, features = ["xxh32"] }
 zerocopy = { version = "0.8.0", default-features = false, features = ["derive", "std"] }
