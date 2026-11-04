@@ -293,30 +293,25 @@ fn unescape_to_path_canonical(s: &str) -> Result<Cow<'_, Path>> {
 enum EscapeMode {
     Standard,
     XattrKey,
+    XattrValue,
 }
 
 /// Escape a byte array according to the composefs dump file text format.
 ///
-/// Note: this function unconditionally maps empty → `-` and escapes a
-/// bare `-`.  That matches C `ESCAPE_LONE_DASH` and is correct for
-/// space-delimited fields (path, payload, content), but the C code does
-/// NOT set `ESCAPE_LONE_DASH` for xattr values — there, `-` and empty
-/// are valid literals.  The `Entry` Display impl currently uses this for
-/// xattr values via `EscapeMode::Standard`, which diverges from C.
-/// The `write_dumpfile` writer in `dumpfile.rs` avoids this by using
-/// a separate `write_escaped_raw` for xattr values.
+/// Only standard fields use the empty sentinel and quote a lone dash.
+/// Xattr keys and values are literal, with `=` escaped as in the dumpfile writer.
 fn escape<W: std::fmt::Write>(out: &mut W, s: &[u8], mode: EscapeMode) -> std::fmt::Result {
     // Empty content must be represented by `-`
-    if s.is_empty() {
+    if mode == EscapeMode::Standard && s.is_empty() {
         return out.write_char('-');
     }
     // But a single `-` must be "quoted".
-    if s == b"-" {
+    if mode == EscapeMode::Standard && s == b"-" {
         return out.write_str(r"\x2d");
     }
     for c in s.iter().copied() {
-        // Escape `=` as hex in xattr keys.
-        let is_special = c == b'\\' || (matches!((mode, c), (EscapeMode::XattrKey, b'=')));
+        // Escape `=` as hex in xattr keys and values.
+        let is_special = c == b'\\' || (mode != EscapeMode::Standard && c == b'=');
         let is_printable = c.is_ascii_alphanumeric() || c.is_ascii_punctuation();
         if is_printable && !is_special {
             out.write_char(c as char)?;
@@ -643,13 +638,7 @@ impl Display for Entry<'_> {
             f.write_char(' ')?;
             escape(f, xattr.key.as_bytes(), EscapeMode::XattrKey)?;
             f.write_char('=')?;
-            // NOTE: the C code uses ESCAPE_EQUAL (not ESCAPE_LONE_DASH)
-            // for xattr values, meaning it does not escape bare `-` or
-            // map empty to `-`.  Using `Standard` mode here is slightly
-            // inconsistent with C but harmless since `\x2d` parses back
-            // to `-`.  The `write_dumpfile` writer uses `write_escaped_raw`
-            // which matches C more closely.
-            escape(f, &xattr.value, EscapeMode::Standard)?;
+            escape(f, &xattr.value, EscapeMode::XattrValue)?;
         }
         std::fmt::Result::Ok(())
     }
@@ -783,7 +772,7 @@ mod tests {
             assert_eq!(buf, "=");
         }
         // Verify other special cases
-        let cases = &[("=", r"\x3d"), ("-", r"\x2d")];
+        let cases = &[("=", r"\x3d"), ("-", "-")];
         for (src, expected) in cases {
             let mut buf = String::new();
             escape(&mut buf, src.as_bytes(), EscapeMode::XattrKey).unwrap();
@@ -884,6 +873,16 @@ mod tests {
         let v = Xattr::parse("security.selinux=bar\x00").unwrap();
         similar_asserts::assert_eq!(v.key.as_bytes(), b"security.selinux");
         similar_asserts::assert_eq!(&*v.value, b"bar\0");
+    }
+
+    #[test]
+    fn test_display_xattr_roundtrip() {
+        for value in ["", "-", r"a\x3db", r"\x00\xff", r"\n\t\\"] {
+            let line = format!("/ 0 40755 2 0 0 0 0.0 - - - user.test={value}");
+            let entry = Entry::parse(&line).unwrap();
+            let written = entry.to_string();
+            assert_eq!(entry, Entry::parse(&written).unwrap());
+        }
     }
 
     #[test]
