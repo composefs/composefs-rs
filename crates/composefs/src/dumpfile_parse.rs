@@ -173,6 +173,12 @@ fn unescape_limited(s: &str, max: usize) -> Result<Cow<'_, [u8]>> {
             anyhow::bail!("Input exceeded maximum length {max}");
         }
         if c != '\\' {
+            if r.len()
+                .checked_add(c.len_utf8())
+                .is_none_or(|len| len > max)
+            {
+                anyhow::bail!("Input exceeded maximum length {max}");
+            }
             write!(r, "{c}").unwrap();
             continue;
         }
@@ -798,6 +804,12 @@ mod tests {
         // But non-ASCII is currently owned out of conservatism
         assert!(matches!(unescape_limited("→", 6).unwrap(), Cow::Owned(_)));
         assert!(unescape_limited("foo→bar", 3).is_err());
+        // A final multibyte character must not exceed the byte limit.
+        assert!(unescape_limited("→", 2).is_err());
+        assert_eq!(unescape_limited("→", 3).unwrap().as_ref(), "→".as_bytes());
+        let content = format!("{}→", "a".repeat(MAX_INLINE_CONTENT - 1));
+        let line = format!("/file 0 100644 1 0 0 0 0.0 - {content} -");
+        assert!(Entry::parse(&line).is_err());
     }
 
     #[test]
