@@ -1,5 +1,6 @@
 FROM quay.io/fedora/fedora:latest
-RUN dnf -y install meson gcc gcc-c++ pkg-config openssl-devel erofs-utils \
+# The Rust library built on Ubuntu needs the OpenSSL 3 runtime.
+RUN dnf -y install meson gcc gcc-c++ pkg-config openssl-devel openssl3-libs erofs-utils \
     fsverity-utils gzip diffutils coreutils findutils && dnf clean all
 COPY composefs-c /src/composefs-c
 COPY libcomposefs_capi.so /usr/lib64/
