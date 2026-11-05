@@ -214,6 +214,16 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
         manifest_digest: &OciDigest,
         verity: Option<&ObjectID>,
     ) -> Result<Self> {
+        let (image, _, _) = Self::open_with_raw_metadata(repo, manifest_digest, verity)?;
+        Ok(image)
+    }
+
+    /// Read raw documents once and retain them for identity-preserving export.
+    pub(crate) fn open_with_raw_metadata(
+        repo: &Repository<ObjectID>,
+        manifest_digest: &OciDigest,
+        verity: Option<&ObjectID>,
+    ) -> Result<(Self, Vec<u8>, Vec<u8>)> {
         let manifest_id = manifest_identifier(manifest_digest);
         let (data, named_refs) =
             read_external_splitstream(repo, &manifest_id, verity, Some(OCI_MANIFEST_CONTENT_TYPE))?;
@@ -286,7 +296,7 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             }
         };
 
-        Ok(Self {
+        let image = Self {
             manifest_digest: manifest_digest.clone(),
             manifest,
             config_digest,
@@ -297,7 +307,8 @@ impl<ObjectID: FsVerityHashValue> OciImage<ObjectID> {
             image_ref_v1,
             boot_image_refs,
             manifest_verity,
-        })
+        };
+        Ok((image, data, config_data))
     }
 
     /// Opens an OCI image by its tag/reference name.

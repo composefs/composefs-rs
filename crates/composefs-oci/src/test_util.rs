@@ -27,7 +27,7 @@ use composefs::dumpfile_parse::{Entry, Item};
 use composefs::fsverity::Sha256HashValue;
 use composefs::repository::{Repository, RepositoryConfig};
 use containers_image_proxy::oci_spec::image::{
-    ConfigBuilder, DescriptorBuilder, Digest as OciDigest, ImageConfigurationBuilder,
+    ConfigBuilder, Descriptor, DescriptorBuilder, Digest as OciDigest, ImageConfigurationBuilder,
     ImageManifestBuilder, MediaType, RootFsBuilder,
 };
 use rustix::fs::FileType;
@@ -303,14 +303,6 @@ pub fn make_manifest_json(
     config_digest_str: &str,
     diff_ids: &[String],
 ) -> Vec<u8> {
-    let config_digest: OciDigest = config_digest_str.parse().unwrap();
-    let config_desc = DescriptorBuilder::default()
-        .media_type(MediaType::ImageConfig)
-        .digest(config_digest)
-        .size(config_json.len() as u64)
-        .build()
-        .unwrap();
-
     let layer_descs: Vec<_> = diff_ids
         .iter()
         .map(|d| {
@@ -323,6 +315,22 @@ pub fn make_manifest_json(
         })
         .collect();
 
+    make_manifest_json_with_layers(config_json, config_digest_str, layer_descs)
+}
+
+/// Build an OCI manifest with caller-supplied layer media types, digests and sizes.
+pub(crate) fn make_manifest_json_with_layers(
+    config_json: &[u8],
+    config_digest_str: &str,
+    layer_descs: Vec<Descriptor>,
+) -> Vec<u8> {
+    let config_digest: OciDigest = config_digest_str.parse().unwrap();
+    let config_desc = DescriptorBuilder::default()
+        .media_type(MediaType::ImageConfig)
+        .digest(config_digest)
+        .size(config_json.len() as u64)
+        .build()
+        .unwrap();
     let manifest = ImageManifestBuilder::default()
         .schema_version(2u32)
         .media_type(MediaType::ImageManifest)

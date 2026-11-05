@@ -171,6 +171,31 @@ impl ProgressReporter for IndicatifReporter {
     }
 }
 
+/// Plain progress output for verbose storage copies, including redirected stderr.
+#[cfg(all(feature = "oci", feature = "containers-storage"))]
+#[derive(Debug)]
+struct TextReporter;
+
+#[cfg(all(feature = "oci", feature = "containers-storage"))]
+impl ProgressReporter for TextReporter {
+    fn report(&self, event: ProgressEvent) {
+        match event {
+            ProgressEvent::Started { id, total, .. } => match total {
+                Some(total) => eprintln!("{id}: starting (total {total})"),
+                None => eprintln!("{id}: starting"),
+            },
+            ProgressEvent::Progress { id, fetched, total } => match total {
+                Some(total) => eprintln!("{id}: {fetched}/{total}"),
+                None => eprintln!("{id}: {fetched}"),
+            },
+            ProgressEvent::Done { id, transferred } => eprintln!("{id}: completed {transferred}"),
+            ProgressEvent::Skipped { id } => eprintln!("{id}: skipped"),
+            ProgressEvent::Message(message) => eprintln!("{message}"),
+            _ => {}
+        }
+    }
+}
+
 /// cfsctl
 #[derive(Debug, Parser)]
 #[clap(name = "cfsctl", version)]
@@ -431,6 +456,36 @@ enum OciCommand {
         /// Use reflink/hardlink zero-copy transfer (requires same filesystem, same hash algorithm, and root).
         #[clap(long)]
         zerocopy: bool,
+    },
+    /// Copy a stored OCI image into a rootful native-overlay containers/storage store.
+    ///
+    /// Creates missing store directories and prints the destination image ID.
+    /// The destination must use the default native overlay configuration.
+    #[cfg(feature = "containers-storage")]
+    CopyToStorage {
+        /// Image to copy (ref name or `@digest`).
+        #[arg(add = ArgValueCompleter::new(complete_oci_tags_and_digests))]
+        image: OciReference,
+        /// Destination containers/storage graphroot.
+        #[arg(long)]
+        graphroot: PathBuf,
+        /// Destination containers/storage runroot; omitted means no mount records.
+        #[arg(long)]
+        runroot: Option<PathBuf>,
+        /// Name to assign in the destination (may be repeated).
+        /// Defaults to :latest when neither a tag nor a digest is supplied.
+        #[arg(long)]
+        name: Vec<String>,
+        /// Permit hardlinks when file metadata is compatible.
+        /// Source labels must allow access by destination consumers.
+        #[arg(long)]
+        allow_hardlinks: bool,
+        /// Move requested names from other images to this image.
+        #[arg(long)]
+        reassign: bool,
+        /// Print each progress update as a plain stderr line.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// List all tagged OCI images in the repository
     #[clap(name = "images")]
@@ -1997,6 +2052,69 @@ where
                 println!("Manifest verity: {}", finalize_reply.manifest_verity);
                 println!("Config digest:   {}", finalize_reply.config_digest);
                 println!("Config verity:   {}", finalize_reply.config_verity);
+            }
+            #[cfg(feature = "containers-storage")]
+            OciCommand::CopyToStorage {
+                ref image,
+                graphroot,
+                runroot,
+                ref name,
+                allow_hardlinks,
+                reassign,
+                verbose,
+            } => {
+                use cap_std_ext::cap_std::{ambient_authority, fs::Dir};
+                use cstorage::writer::{
+                    ImportOptions, NamePolicy, SharingOptions, StorageWriter, StoreLocation,
+                };
+
+                let manifest = match image {
+                    OciReference::Digest(digest) => digest.clone(),
+                    OciReference::Named(name) => {
+                        composefs_oci::oci_image::resolve_ref(&repo, name)?.0
+                    }
+                };
+                // Keep paths relative to a dirfd so ensure() can create nested roots.
+                let graphroot = std::path::absolute(graphroot)?;
+                let runroot = runroot.map(std::path::absolute).transpose()?;
+                let root = Dir::open_ambient_dir("/", ambient_authority())?;
+                let destination = StorageWriter::ensure(StoreLocation {
+                    graphroot: root.try_clone()?,
+                    graphroot_path: Some(graphroot.strip_prefix("/")?.into()),
+                    runroot: runroot.as_ref().map(|_| root),
+                    runroot_path: runroot
+                        .as_ref()
+                        .map(|path| path.strip_prefix("/").map(Path::to_path_buf))
+                        .transpose()?,
+                })
+                .await
+                .context("preparing containers/storage destination")?;
+                let options = ImportOptions {
+                    sharing: SharingOptions {
+                        allow_compatible_hardlinks: allow_hardlinks,
+                    },
+                    names: if reassign {
+                        NamePolicy::Reassign
+                    } else {
+                        NamePolicy::FailOnConflict
+                    },
+                };
+                let progress = if verbose {
+                    Arc::new(TextReporter) as SharedReporter
+                } else {
+                    IndicatifReporter::new().into_shared()
+                };
+                let published = composefs_oci::export_to_containers_storage(
+                    &repo,
+                    &manifest,
+                    destination,
+                    name,
+                    options,
+                    Some(progress),
+                )
+                .await
+                .context("copying image to containers/storage")?;
+                println!("{}", published.image_id);
             }
             OciCommand::ListImages { json } => {
                 let images = composefs_oci::oci_image::list_images(&repo)?;

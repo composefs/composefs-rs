@@ -15,6 +15,7 @@ default = []
 loop-device = []
 
 [dependencies]
+libc = "0.2"
 rustix = { version = "1.0.0", features = ["fs"] }
 thiserror = "2"
 
