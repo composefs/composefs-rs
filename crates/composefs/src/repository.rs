@@ -2838,12 +2838,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// enabled when mounting it.
     #[context("Opening image '{name}'")]
     pub fn open_image(&self, name: &str) -> Result<(OwnedFd, bool)> {
-        let image = match self.openat(&format!("images/{name}"), OFlags::RDONLY) {
-            Ok(fd) => fd,
+        let (image, is_imgref, img_path) = match self
+            .openat(&format!("images/{name}"), OFlags::RDONLY)
+        {
+            Ok(fd) => (fd, name.contains('/'), format!("images/{name}")),
             Err(Errno::NOENT) if !name.contains('/') => {
                 // Try resolving as a named ref before giving up
                 match self.openat(&format!("images/refs/{name}"), OFlags::RDONLY) {
-                    Ok(fd) => return Ok((fd, true)),
+                    Ok(fd) => (fd, true, format!("images/refs/{name}")),
                     Err(Errno::NOENT) => {
                         return Err(anyhow::Error::new(ImageNotFound {
                             name: name.to_string(),
@@ -2859,25 +2861,47 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     name: name.to_string(),
                 }));
             }
+
             Err(e) => {
                 return Err(e).with_context(|| format!("Opening ref 'images/{name}'"));
             }
         };
 
-        if name.contains("/") {
-            return Ok((image, true));
-        }
+        use rustix::path::Arg;
 
-        // A name with no slashes in it is taken to be a sha256 fs-verity digest
+        // Validate the fsverity of the opened image or an image ref
         match measure_verity::<ObjectID>(&image) {
-            Ok(found)
+            Ok(found) => {
+                // Resolve the link to get the actual image name
+                let img_name = if is_imgref {
+                    let target_cstr = rustix::fs::readlinkat(self.repo_fd(), &img_path, [])
+                        .with_context(|| format!("Reading symlink {img_path}"))?;
+
+                    let target = target_cstr
+                        .as_str()
+                        .context("Converting symlink target path to str")?;
+
+                    // We have refs in images/refs and the symlink is relative so it should be
+                    // of the form ../123abc
+                    let Some((_, img_name)) = target.rsplit_once("/") else {
+                        bail!("Failed to get image name from symlink target");
+                    };
+
+                    &img_name.to_string()
+                } else {
+                    name
+                };
+
                 if found
-                    == FsVerityHashValue::from_hex(name)
-                        .context("Parsing expected verity hash from image name")? =>
-            {
-                Ok((image, true))
+                    == FsVerityHashValue::from_hex(img_name).with_context(|| {
+                        format!("Parsing expected verity hash from image name: {img_name}")
+                    })?
+                {
+                    Ok((image, true))
+                } else {
+                    bail!("fs-verity content mismatch")
+                }
             }
-            Ok(_) => bail!("fs-verity content mismatch"),
             Err(MeasureVerityError::VerityMissing | MeasureVerityError::FilesystemNotSupported)
                 if self.insecure =>
             {
