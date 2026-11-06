@@ -631,22 +631,33 @@ pub(crate) fn read_repo_metadata(repo_fd: &impl AsFd) -> Result<Option<RepoMetad
 
 /// Enable fs-verity on an fd, dispatching to the correct hash type
 /// based on the [`Algorithm`].
+///
+/// Returns `Some(copy)` if `fd` was still open for writing somewhere
+/// (e.g. inherited by a child forked from another thread) and verity
+/// was enabled on a copy instead.  In that case `fd` does *not* have
+/// verity enabled, and the caller must use the returned descriptor in
+/// its place.  The copy is an unlinked `O_TMPFILE` in `dirfd` whose
+/// contents have been synced.
 fn enable_verity_for_algorithm(
     dirfd: &impl AsFd,
     fd: BorrowedFd,
     algorithm: &Algorithm,
-) -> Result<()> {
-    match algorithm {
+) -> Result<Option<OwnedFd>> {
+    let copy = match algorithm {
         Algorithm::Sha256 { .. } => {
             enable_verity_maybe_copy::<crate::fsverity::Sha256HashValue>(dirfd, fd)
-                .context("enabling verity (sha256)")?;
+                .context("enabling verity (sha256)")?
         }
         Algorithm::Sha512 { .. } => {
             enable_verity_maybe_copy::<crate::fsverity::Sha512HashValue>(dirfd, fd)
-                .context("enabling verity (sha512)")?;
+                .context("enabling verity (sha512)")?
         }
+    };
+    if let Some(copy) = &copy {
+        // enable_verity_maybe_copy() leaves syncing the copy to the caller.
+        rustix::fs::fsync(copy).context("syncing verity-enabled copy")?;
     }
-    Ok(())
+    Ok(copy)
 }
 
 /// Remove algorithm-specific data from a repository directory.
@@ -710,6 +721,7 @@ pub(crate) fn write_repo_metadata(
     enable_verity: bool,
 ) -> Result<()> {
     let data = meta.to_json()?;
+    let verity = enable_verity.then_some(&meta.algorithm);
 
     // Try O_TMPFILE for atomic creation
     match openat(
@@ -718,61 +730,87 @@ pub(crate) fn write_repo_metadata(
         OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o644),
     ) {
-        Ok(fd) => {
-            let mut file = File::from(fd);
-            file.write_all(&data)
-                .context("writing metadata to tmpfile")?;
-            file.sync_all().context("syncing metadata tmpfile")?;
-
-            let ro_fd = reopen_tmpfile_ro(file).context("re-opening tmpfile read-only")?;
-
-            if enable_verity {
-                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
-                    .context("enabling verity on meta.json")?;
-            }
-
-            linkat(
-                CWD,
-                proc_self_fd(&ro_fd),
-                repo_fd,
-                REPO_METADATA_FILENAME,
-                AtFlags::SYMLINK_FOLLOW,
-            )
-            .context("linking meta.json into repository")?;
-        }
-        Err(Errno::OPNOTSUPP | Errno::NOSYS) => {
-            // Fallback: direct create (no tmpfs O_TMPFILE support).
-            // Use O_EXCL to avoid overwriting, and fsync to ensure the
-            // file is complete on disk before we consider init done.
-            let fd = openat(
-                repo_fd,
-                REPO_METADATA_FILENAME,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-                Mode::from_raw_mode(0o644),
-            )
-            .context("creating meta.json")?;
-            let mut file = File::from(fd);
-            file.write_all(&data).context("writing meta.json")?;
-            file.sync_all().context("syncing meta.json to disk")?;
-
-            if enable_verity {
-                let ro_fd = openat(
-                    repo_fd,
-                    REPO_METADATA_FILENAME,
-                    OFlags::RDONLY | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .context("re-opening meta.json for verity")?;
-                drop(file);
-                enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), &meta.algorithm)
-                    .context("enabling verity on meta.json")?;
-            }
-        }
-        Err(e) => {
-            return Err(e).context("creating tmpfile for meta.json")?;
-        }
+        Ok(fd) => publish_repo_metadata(repo_fd, File::from(fd), None, &data, verity),
+        // Fallback: no O_TMPFILE support on this filesystem.
+        Err(Errno::OPNOTSUPP | Errno::NOSYS) => write_repo_metadata_named(repo_fd, &data, verity),
+        Err(e) => Err(e).context("creating tmpfile for meta.json"),
     }
-    Ok(())
+}
+
+/// Fallback for [`write_repo_metadata`] on filesystems that don't
+/// support O_TMPFILE.
+///
+/// The metadata is staged under a temporary name and only given its
+/// final name once it is complete, so a failure along the way (notably
+/// a failure to enable fs-verity) never leaves behind a `meta.json`
+/// that later opens would mistake for a finished one.
+fn write_repo_metadata_named(
+    repo_fd: &impl AsFd,
+    data: &[u8],
+    verity: Option<&Algorithm>,
+) -> Result<()> {
+    let name = generate_tmpname(".tmp-meta-");
+    let fd = openat(
+        repo_fd,
+        &name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    )
+    .context("creating temporary file for meta.json")?;
+    let result = publish_repo_metadata(repo_fd, File::from(fd), Some(&name), data, verity);
+    // On success meta.json is a second link to the same file; on failure
+    // the staging file is of no further use.
+    if let Err(e) = unlinkat(repo_fd, &name, AtFlags::empty()) {
+        debug!("failed to remove temporary file {name}: {e}");
+    }
+    result
+}
+
+/// Write `data` to the staging file `file`, optionally enable fs-verity
+/// on it, and link the result into the repository as `meta.json`.
+///
+/// `tmpname` is the name of `file` in `repo_fd`, or `None` if it is an
+/// anonymous O_TMPFILE.  The link fails if `meta.json` already exists.
+fn publish_repo_metadata(
+    repo_fd: &impl AsFd,
+    mut file: File,
+    tmpname: Option<&str>,
+    data: &[u8],
+    verity: Option<&Algorithm>,
+) -> Result<()> {
+    file.write_all(data)
+        .context("writing metadata to tmpfile")?;
+    file.sync_all().context("syncing metadata tmpfile")?;
+
+    let ro_fd = reopen_tmpfile_ro(file).context("re-opening tmpfile read-only")?;
+
+    let copy = match verity {
+        Some(algorithm) => enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), algorithm)
+            .context("enabling verity on meta.json")?,
+        None => None,
+    };
+
+    match (copy, tmpname) {
+        // The staging file itself is what we publish, and it has a name.
+        (None, Some(name)) => linkat(
+            repo_fd,
+            name,
+            repo_fd,
+            REPO_METADATA_FILENAME,
+            AtFlags::empty(),
+        ),
+        // Otherwise publish by descriptor: either the anonymous staging
+        // file, or the copy that verity was enabled on.  In the latter
+        // case the staging file has no verity and must not be linked.
+        (copy, _) => linkat(
+            CWD,
+            proc_self_fd(copy.as_ref().unwrap_or(&ro_fd)),
+            repo_fd,
+            REPO_METADATA_FILENAME,
+            AtFlags::SYMLINK_FOLLOW,
+        ),
+    }
+    .context("linking meta.json into repository")
 }
 
 /// Infer repository metadata by examining existing objects.
@@ -6195,6 +6233,136 @@ mod tests {
             meta.check_compatible::<Sha512HashValue>().unwrap(),
             FeatureCheck::ReadWrite
         );
+    }
+
+    // ---- meta.json fs-verity tests ----
+    //
+    // Like the tests in `fsverity`, these need a test directory on a
+    // filesystem with fs-verity support.
+
+    fn names_in(tmp: &TempDir) -> Result<Vec<OsString>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(tmp.path())? {
+            names.push(entry?.file_name());
+        }
+        Ok(names)
+    }
+
+    /// If the staging file for `meta.json` is still open for writing
+    /// elsewhere when verity is enabled (as happens when another thread
+    /// forks and the child has not yet exec'd), verity ends up on a copy.
+    /// That copy, not the staging file, must become `meta.json`: otherwise
+    /// a strict init silently produces a repository without verity.
+    #[test]
+    fn test_meta_json_verity_with_busy_staging_file() -> Result<()> {
+        let meta = RepoMetadata::new(Algorithm::SHA512);
+        let data = meta.to_json()?;
+
+        for tmpname in [None, Some(".tmp-meta-test")] {
+            let tmp = tempdir();
+            let repo_fd = openat(
+                CWD,
+                tmp.path(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            let staging = match tmpname {
+                None => openat(
+                    &repo_fd,
+                    ".",
+                    OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+                    Mode::from_raw_mode(0o644),
+                )?,
+                Some(name) => openat(
+                    &repo_fd,
+                    name,
+                    OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+                    Mode::from_raw_mode(0o644),
+                )?,
+            };
+            let staging = File::from(staging);
+            // Stand in for the forked child holding an inherited descriptor.
+            let writer = staging.try_clone()?;
+
+            publish_repo_metadata(&repo_fd, staging, tmpname, &data, Some(&meta.algorithm))?;
+            drop(writer);
+
+            assert_eq!(
+                Repository::<Sha512HashValue>::read_and_probe_metadata(&repo_fd)?,
+                (meta.clone(), true),
+                "staging name {tmpname:?}"
+            );
+            let repo = Repository::<Sha512HashValue>::open_path(&repo_fd, ".")?;
+            assert!(!repo.is_insecure(), "staging name {tmpname:?}");
+        }
+        Ok(())
+    }
+
+    /// The fallback for filesystems without O_TMPFILE stages `meta.json`
+    /// under a temporary name, which must not outlive the call.
+    #[test]
+    fn test_meta_json_named_fallback() -> Result<()> {
+        let tmp = tempdir();
+        let repo_fd = openat(
+            CWD,
+            tmp.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let meta = RepoMetadata::new(Algorithm::SHA512);
+        let data = meta.to_json()?;
+
+        write_repo_metadata_named(&repo_fd, &data, Some(&meta.algorithm))?;
+        assert_eq!(
+            Repository::<Sha512HashValue>::read_and_probe_metadata(&repo_fd)?,
+            (meta.clone(), true)
+        );
+        assert_eq!(names_in(&tmp)?, [REPO_METADATA_FILENAME]);
+
+        // An existing meta.json is never replaced, and the failed attempt
+        // cleans up after itself.
+        let other = RepoMetadata::new(Algorithm::SHA256).to_json()?;
+        let err = write_repo_metadata_named(&repo_fd, &other, None).unwrap_err();
+        assert_eq!(
+            err.root_cause().downcast_ref::<Errno>(),
+            Some(&Errno::EXIST)
+        );
+        assert_eq!(
+            Repository::<Sha512HashValue>::read_and_probe_metadata(&repo_fd)?,
+            (meta.clone(), true)
+        );
+        assert_eq!(names_in(&tmp)?, [REPO_METADATA_FILENAME]);
+        Ok(())
+    }
+
+    /// Where fs-verity is unavailable, asking for it must fail without
+    /// leaving a `meta.json` (or anything else) behind: `init_path` treats
+    /// an existing `meta.json` as an already initialized repository.
+    #[test_with::path(/dev/shm)]
+    #[test]
+    fn test_meta_json_verity_unsupported_leaves_nothing() -> Result<()> {
+        let meta = RepoMetadata::new(Algorithm::SHA512);
+        let data = meta.to_json()?;
+
+        // /dev/shm is a tmpfs: O_TMPFILE works there, fs-verity does not.
+        let tmp = TempDir::with_prefix_in("composefs-test-", "/dev/shm")?;
+        let repo_fd = openat(
+            CWD,
+            tmp.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+
+        assert!(write_repo_metadata(&repo_fd, &meta, true).is_err());
+        assert!(names_in(&tmp)?.is_empty());
+
+        assert!(write_repo_metadata_named(&repo_fd, &data, Some(&meta.algorithm)).is_err());
+        assert!(names_in(&tmp)?.is_empty());
+
+        // Without the verity requirement both succeed.
+        write_repo_metadata_named(&repo_fd, &data, None)?;
+        assert_eq!(names_in(&tmp)?, [REPO_METADATA_FILENAME]);
+        Ok(())
     }
 
     // ---- erofs_version / v1_erofs feature tests ----
