@@ -2430,7 +2430,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                         if self.is_insecure() =>
                     {
                         match enable_verity_maybe_copy::<ObjectID>(dirfd, fd.as_fd()) {
-                            Ok(Some(fd)) => ensure_verity_equal(&fd, id)
+                            // The object is open for writing somewhere, so
+                            // verity went onto a copy.  The copy only
+                            // serves to check the content here and is then
+                            // dropped on purpose: swapping it in would
+                            // replace the inode whose flock tells gc() that
+                            // an image is mounted.  The object stays without
+                            // verity, which an insecure repository allows.
+                            Ok(Some(copy)) => ensure_verity_equal(&copy, id)
                                 .context("Verifying verity after enabling (copied)")?,
                             Ok(None) => ensure_verity_equal(&fd, id)
                                 .context("Verifying verity after enabling (original)")?,
