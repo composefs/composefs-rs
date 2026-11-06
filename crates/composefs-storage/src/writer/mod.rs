@@ -1,9 +1,9 @@
 //! Importing OCI images into a containers/storage overlay store.
 //!
-//! Use [`StorageWriter`] to begin an [`ImageImport`], supply its layers through
-//! [`LayerSource`], and publish the image with its names. Imports preserve OCI
-//! metadata and layer content for use by containers/storage consumers. Compatible
-//! destination layers can be reused.
+//! Use [`StorageWriter`] to begin an [`ImageImport`], supply layers through
+//! [`ImageImport::put_layer_stream`] or [`LayerSource`], and publish the image
+//! with its names. Imports preserve OCI metadata and layer content for
+//! containers/storage consumers. Compatible destination layers can be reused.
 //!
 //! Reflinks avoid copying file-backed payloads where supported. Callers can also
 //! enable hardlinking through [`SharingOptions`] when source metadata is
@@ -21,6 +21,7 @@ mod locking;
 mod names;
 mod overlay;
 mod records;
+mod splitdirfd;
 mod transaction;
 
 use std::fs::File;
@@ -36,6 +37,9 @@ pub type Result<T> = std::result::Result<T, ImportError>;
 /// Failure to validate, materialize or publish an image.
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
+    /// Invalid splitdirfdstream framing or file reference.
+    #[error("splitdirfdstream: {0}")]
+    SplitDirFd(#[from] composefs_splitdirfdstream::Error),
     /// Unsupported destination layout or driver setting.
     #[error("unsupported store configuration: {0}")]
     UnsupportedStore(String),

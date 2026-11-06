@@ -3,7 +3,6 @@
 //! This is the basis for exporting an OCI either to an out-of-process Varlink consumer
 //! or and internal rust consumer like composefs-storage.
 
-
 use std::future::Future;
 use std::os::fd::AsFd;
 use std::pin::Pin;

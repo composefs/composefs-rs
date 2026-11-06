@@ -16,6 +16,7 @@ mod initialize_tests;
 
 mod mapping_tests;
 mod reuse_tests;
+mod splitdirfd_tests;
 
 async fn store() -> (TempDir, TestStore) {
     let temp = TempDir::new().unwrap();

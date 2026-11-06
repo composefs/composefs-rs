@@ -88,6 +88,21 @@ pub struct ImagePublication {
 }
 
 impl ImageImport {
+    /// Import a splitdirfdstream on a filesystem worker, retaining all received
+    /// lifetime descriptors through layer registration or error cleanup.
+    ///
+    /// File-backed chunks remain whole-file references for sharing. The stream
+    /// must reconstruct the uncompressed tar identified by this config index.
+    /// Cancellation has the same semantics as [`Self::put_layer`].
+    pub async fn put_layer_stream(
+        &mut self,
+        index: u32,
+        stream: composefs_splitdirfdstream::SplitDirFdStream,
+    ) -> Result<LayerResult> {
+        self.put_layer(index, super::splitdirfd::SplitDirFdSource::new(stream))
+            .await
+    }
+
     /// Check a layer's availability and select it for reuse when possible.
     pub fn layer_status(&mut self, index: u32) -> Result<LayerStatus> {
         self.state
