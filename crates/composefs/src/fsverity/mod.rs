@@ -446,8 +446,11 @@ mod tests {
                 let mut rng = rand::rng();
 
                 loop {
-                    if rx.try_recv().is_ok() {
-                        break;
+                    match rx.try_recv() {
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        // Stop on an explicit signal, or if the sender was dropped
+                        // (e.g. the test panicked); otherwise we'd fork forever.
+                        Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     }
 
                     let delay = rng.random_range(DELAY_MIN..=DELAY_MAX);
