@@ -88,6 +88,16 @@ pub struct ImagePublication {
 }
 
 impl ImageImport {
+    pub(super) fn layer_count(&self) -> Result<usize> {
+        Ok(self
+            .state
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .image
+            .diff_ids
+            .len())
+    }
+
     /// Import a splitdirfdstream on a filesystem worker, retaining all received
     /// lifetime descriptors through layer registration or error cleanup.
     ///

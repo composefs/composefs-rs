@@ -1,9 +1,11 @@
 //! Importing OCI images into a containers/storage overlay store.
 //!
-//! Use [`StorageWriter`] to begin an [`ImageImport`], supply layers through
+//! Use [`import_image`] to publish an image source, or use [`StorageWriter`] to
+//! begin an [`ImageImport`], supply its layers through
 //! [`ImageImport::put_layer_stream`] or [`LayerSource`], and publish the image
-//! with its names. Imports preserve OCI metadata and layer content for
-//! containers/storage consumers. Compatible destination layers can be reused.
+//! with its names. Imports preserve OCI
+//! metadata and layer content for use by containers/storage consumers. Compatible
+//! destination layers can be reused.
 //!
 //! Reflinks avoid copying file-backed payloads where supported. Callers can also
 //! enable hardlinking through [`SharingOptions`] when source metadata is
@@ -16,6 +18,7 @@
 //! installation, recovery cleanup and durability syncs, run on blocking workers.
 
 mod extract;
+mod import;
 mod initialize;
 mod locking;
 mod names;
@@ -28,6 +31,8 @@ use std::fs::File;
 use std::path::PathBuf;
 
 use cap_std::fs::Dir;
+pub use composefs_splitdirfdstream::ImageSource;
+pub use import::import_image;
 pub use oci_spec::image::Digest as OciDigest;
 pub use transaction::{ImageImport, ImagePublication, StorageWriter};
 
@@ -37,6 +42,14 @@ pub type Result<T> = std::result::Result<T, ImportError>;
 /// Failure to validate, materialize or publish an image.
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
+    /// Failure to request a source layer.
+    #[error("layer {index} source: {source}")]
+    Source {
+        /// Layer index in the original image.
+        index: u32,
+        /// Underlying source failure.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// Invalid splitdirfdstream framing or file reference.
     #[error("splitdirfdstream: {0}")]
     SplitDirFd(#[from] composefs_splitdirfdstream::Error),

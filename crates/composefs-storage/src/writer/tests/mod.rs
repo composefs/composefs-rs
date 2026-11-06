@@ -12,6 +12,7 @@ use super::*;
 
 mod async_tests;
 
+mod import_tests;
 mod initialize_tests;
 
 mod mapping_tests;
