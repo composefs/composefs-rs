@@ -183,8 +183,12 @@ fn enable_verity_on_copy<H: FsVerityHashValue>(
         )
         .map_err(|e| EnableVerityError::Io(e.into()))?;
         drop(new_rw_fd);
-        if enable_verity_with_retry::<H>(&new_ro_fd).is_ok() {
-            return Ok(new_ro_fd);
+        match enable_verity_with_retry::<H>(&new_ro_fd) {
+            Ok(()) => return Ok(new_ro_fd),
+            // The copy was itself inherited by a forked child while we
+            // were writing it; try again with a fresh one.
+            Err(EnableVerityError::FileOpenedForWrite) => continue,
+            Err(other) => return Err(other),
         }
     }
 }
