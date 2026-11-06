@@ -33,10 +33,11 @@ path = "src/cleanup.rs"
 anyhow = "1"
 cap-std-ext = { workspace = true }
 composefs = { workspace = true }
-# Only the test_util module is used — for creating test OCI images.
-# All verification must go through the cfsctl CLI.
+# Builds OCI fixtures and supports the containers/storage user-namespace helper.
 composefs-oci = { workspace = true, features = ["test", "boot", "containers-storage"] }
 composefs-ostree = { workspace = true }
+composefs-storage = { path = "../composefs-storage", version = "0.10.0" }
+composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.10.0" }
 # Used by the varlink tests to drive the service through zlink's native typed
 # proxy bindings (alongside the external `varlinkctl` CLI), and to assert on the
 # typed wire reply/error types.
