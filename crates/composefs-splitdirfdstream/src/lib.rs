@@ -190,6 +190,10 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 use rustix::fs::{Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 
+mod source;
+pub use source::ImageSource;
+mod stream;
+pub use stream::SplitDirFdStream;
 pub mod transport;
 #[cfg(feature = "tokio")]
 pub use transport::spawn_self_reaping_producer;
@@ -667,6 +671,9 @@ pub fn validate_filename(filename: &[u8]) -> Result<()> {
 ///
 /// Returns any error from [`validate_filename`], or an [`Error::Io`] wrapping
 /// the kernel error (`EXDEV` for escape attempts, etc.).
+/// Opens use `O_NONBLOCK` so a malformed reference to a FIFO cannot block
+/// before the consumer checks the file type. Consumers must validate that the
+/// opened descriptor is a regular file before materializing its contents.
 #[allow(clippy::missing_panics_doc)] // validate_filename rejects NUL before CString construction.
 pub fn open_beneath(dirfd: BorrowedFd<'_>, filename: &[u8]) -> Result<OwnedFd> {
     validate_filename(filename)?;
@@ -679,7 +686,7 @@ pub fn open_beneath(dirfd: BorrowedFd<'_>, filename: &[u8]) -> Result<OwnedFd> {
     // RESOLVE_NO_MAGICLINKS — block /proc/self/fd-style magic links.
     // RESOLVE_NO_XDEV  — prevent crossing filesystem mount boundaries.
     // Symlinks that stay within the base directory are permitted.
-    let oflags = OFlags::RDONLY | OFlags::CLOEXEC;
+    let oflags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK;
     let result = rustix::fs::openat2(
         dirfd,
         &cname,
@@ -693,13 +700,7 @@ pub fn open_beneath(dirfd: BorrowedFd<'_>, filename: &[u8]) -> Result<OwnedFd> {
         Err(e) if e == Errno::NOSYS => {
             // Kernel too old for openat2; fall back to plain openat.
             // validate_filename already rejected `..` and absolute paths.
-            rustix::fs::openat(
-                dirfd,
-                &cname,
-                OFlags::RDONLY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(Error::from)
+            rustix::fs::openat(dirfd, &cname, oflags, Mode::empty()).map_err(Error::from)
         }
         Err(e) => Err(e.into()),
     }
