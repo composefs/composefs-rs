@@ -107,6 +107,14 @@ pub fn enable_verity_raw<H: FsVerityHashValue>(fd: impl AsFd) -> Result<(), Enab
 /// quickly under these circumstances, so this function will try to
 /// enable verity three times, pausing for one millisecond between
 /// attempts.
+///
+/// Deprecated: retrying can't guarantee success.  Create files with
+/// [`FsVerityHelper`] instead, which never exposes writable descriptors
+/// to forked children.
+#[deprecated(
+    since = "0.11.0",
+    note = "retrying can't guarantee success; create files with FsVerityHelper instead"
+)]
 pub fn enable_verity_with_retry<H: FsVerityHashValue>(
     fd: impl AsFd,
 ) -> Result<(), EnableVerityError> {
@@ -143,6 +151,15 @@ pub fn enable_verity_with_retry<H: FsVerityHashValue>(
 /// # Return Value:
 /// * `Ok(None)` is returned if verity was enabled on the original file
 /// * `Ok(Some(OwnedFd))` is returned if a copy was made
+///
+/// Deprecated: it is easy to keep using the original file by mistake
+/// when a copy is returned.  Create files with [`FsVerityHelper`]
+/// instead, which never exposes writable descriptors to forked children.
+#[deprecated(
+    since = "0.11.0",
+    note = "easy to misuse; create files with FsVerityHelper instead"
+)]
+#[allow(deprecated)]
 pub fn enable_verity_maybe_copy<H: FsVerityHashValue>(
     dirfd: impl AsFd,
     fd: BorrowedFd,
@@ -160,6 +177,7 @@ pub fn enable_verity_maybe_copy<H: FsVerityHashValue>(
 /// Enable fs-verity on a new copy of `fd`, consuming `fd` and
 /// returning the new copy.  The copy is created via O_TMPFILE
 /// relative to `dirfd`.
+#[allow(deprecated)]
 fn enable_verity_on_copy<H: FsVerityHashValue>(
     dirfd: impl AsFd,
     fd: BorrowedFd,
@@ -309,6 +327,8 @@ pub fn ensure_verity_equal(
 }
 
 #[cfg(test)]
+// Keeps testing the deprecated functions until they're removed.
+#[allow(deprecated)]
 mod tests {
     use std::{collections::BTreeSet, io::Write, time::Duration};
 
