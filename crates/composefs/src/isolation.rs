@@ -56,10 +56,6 @@ use rustix::thread::UnshareFlags;
 /// Standard input, output and error stay open as copies of the
 /// process's own, so writing to them (as the default panic hook does)
 /// is fine, but they aren't private to the thread.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by FsVerityHelper in the next commit")
-)]
 pub(crate) unsafe fn spawn_isolated<A: Copy + Send + 'static>(
     name: String,
     fds: Vec<OwnedFd>,

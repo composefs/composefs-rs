@@ -6,9 +6,14 @@
 
 mod digest;
 mod hashvalue;
+mod helper;
 mod ioctl;
 
 pub use digest::FsVerityHasher;
+pub use helper::{
+    FinishError, FsVerityHelper, FsVerityHelperBuilder, Published, UnverifiedFile, VerityFile,
+    VerityWriter,
+};
 
 use std::{
     fs::File,

@@ -25,7 +25,6 @@ pub(super) fn fs_ioc_enable_verity<H: FsVerityHashValue>(
 ///
 /// Unlike [`fs_ioc_enable_verity`], this honours the block size carried by
 /// `algorithm`.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by FsVerityHelper"))]
 pub(crate) fn fs_ioc_enable_verity_with_algorithm(
     fd: impl AsFd,
     algorithm: Algorithm,
@@ -40,7 +39,6 @@ pub(crate) fn fs_ioc_enable_verity_with_algorithm(
 /// Measure the fsverity digest of a file, with the algorithm chosen at runtime.
 ///
 /// Returns the raw digest bytes (32 for SHA-256, 64 for SHA-512).
-#[cfg_attr(not(test), expect(dead_code, reason = "used by FsVerityHelper"))]
 pub(crate) fn fs_ioc_measure_verity_with_algorithm(
     fd: impl AsFd,
     algorithm: Algorithm,
@@ -151,7 +149,18 @@ mod tests {
             fs_ioc_measure_verity_with_algorithm(&fd, H::ALGORITHM),
             Err(MeasureVerityError::VerityMissing)
         ));
-        fs_ioc_enable_verity_with_algorithm(&fd, H::ALGORITHM).unwrap();
+        // Other tests fork concurrently, which can briefly leave the
+        // writable descriptor from rdonly_file_with() open in a child.
+        let mut attempts = 0;
+        loop {
+            match fs_ioc_enable_verity_with_algorithm(&fd, H::ALGORITHM) {
+                Err(EnableVerityError::FileOpenedForWrite) if attempts < 100 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                other => break other.unwrap(),
+            }
+        }
         let digest = fs_ioc_measure_verity_with_algorithm(&fd, H::ALGORITHM).unwrap();
         assert_eq!(
             digest,
