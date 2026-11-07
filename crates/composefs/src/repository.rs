@@ -120,8 +120,8 @@ use crate::{
     erofs::format::{FormatConfig, FormatVersion},
     fsverity::{
         Algorithm, CompareVerityError, CopyMethod, DEFAULT_LG_BLOCKSIZE, EnableVerityError,
-        FinishError, FsVerityHashValue, FsVerityHasher, FsVerityHelper, MeasureVerityError,
-        Published, UnverifiedFile, VerityFile, VerityWriter, compute_verity, enable_verity_raw,
+        FinishError, FinishedFile, FsVerityHashValue, FsVerityHasher, FsVerityHelper,
+        MeasureVerityError, Published, VerityFile, VerityWriter, compute_verity, enable_verity_raw,
         ensure_verity_equal, has_verity, measure_verity, measure_verity_opt,
     },
     mount::{MountOptions, VerityRequirement, composefs_fsmount, mount_at},
@@ -982,39 +982,6 @@ impl<ObjectID: FsVerityHashValue> tokio::io::AsyncWrite for ObjectWriter<'_, Obj
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
-    }
-}
-
-/// A new object file from the fs-verity helper.
-enum NewObject {
-    Verity(VerityFile),
-    Unverified(UnverifiedFile),
-}
-
-impl NewObject {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        match self {
-            Self::Verity(file) => file.as_fd(),
-            Self::Unverified(file) => file.as_fd(),
-        }
-    }
-
-    fn method(&self) -> ObjectStoreMethod {
-        let method = match self {
-            Self::Verity(file) => file.copy_method(),
-            Self::Unverified(file) => file.copy_method(),
-        };
-        match method {
-            CopyMethod::Reflinked => ObjectStoreMethod::Reflinked,
-            CopyMethod::Written | CopyMethod::Copied => ObjectStoreMethod::Copied,
-        }
-    }
-
-    fn publish(self, dir: impl AsFd, path: &str) -> std::io::Result<Published> {
-        match self {
-            Self::Verity(file) => file.publish(dir, path),
-            Self::Unverified(file) => file.publish(dir, path),
-        }
     }
 }
 
@@ -2140,7 +2107,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                 let id = file
                     .digest::<ObjectID>()
                     .context("fs-verity digest has the wrong algorithm")?;
-                (NewObject::Verity(file), id)
+                (FinishedFile::Verity(file), id)
             }
             Err(FinishError::NotSupported(file)) if self.is_insecure() => {
                 let id = match file.userspace_digest::<ObjectID>() {
@@ -2155,7 +2122,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                         Self::compute_verity_digest(&mut reader)?
                     }
                 };
-                (NewObject::Unverified(file), id)
+                (FinishedFile::Unverified(file), id)
             }
             Err(e) => return Err(e).context("Enabling fs-verity on new object"),
         };
@@ -2181,7 +2148,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
         ensure_dir_at(objects_dir, &id.to_object_dir(), Mode::from_raw_mode(0o755))
             .context("creating object parent directory")?;
-        let method = file.method();
+        let method = match file.copy_method() {
+            CopyMethod::Reflinked => ObjectStoreMethod::Reflinked,
+            CopyMethod::Written | CopyMethod::Copied => ObjectStoreMethod::Copied,
+        };
         match file
             .publish(objects_dir, &path)
             .context("Linking new object into objects directory")?

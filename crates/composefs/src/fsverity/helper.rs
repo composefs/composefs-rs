@@ -718,6 +718,36 @@ impl AsFd for UnverifiedFile {
     }
 }
 
+/// Either kind of finished file, for callers that accept both.
+#[derive(Debug)]
+pub(crate) enum FinishedFile {
+    Verity(VerityFile),
+    Unverified(UnverifiedFile),
+}
+
+impl FinishedFile {
+    pub(crate) fn as_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            Self::Verity(file) => file.as_fd(),
+            Self::Unverified(file) => file.as_fd(),
+        }
+    }
+
+    pub(crate) fn copy_method(&self) -> CopyMethod {
+        match self {
+            Self::Verity(file) => file.copy_method(),
+            Self::Unverified(file) => file.copy_method(),
+        }
+    }
+
+    pub(crate) fn publish(self, dir: impl AsFd, path: impl AsRef<Path>) -> io::Result<Published> {
+        match self {
+            Self::Verity(file) => file.publish(dir, path),
+            Self::Unverified(file) => file.publish(dir, path),
+        }
+    }
+}
+
 /// The `/proc` path of a descriptor in the calling thread's table.
 ///
 /// `/proc/self/fd` would be the table of the thread group leader, which

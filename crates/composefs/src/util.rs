@@ -54,40 +54,6 @@ pub(crate) fn proc_self_fd(fd: impl AsFd) -> String {
     format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd())
 }
 
-/// Re-open a writable file as read-only, consuming the original.
-///
-/// This is the standard preparation step before enabling fs-verity:
-/// the kernel requires that no writable file descriptors exist for
-/// the inode.  The re-open goes through `/proc/self/fd` so it works
-/// on anonymous O_TMPFILE inodes that have no directory entry yet.
-pub(crate) fn reopen_tmpfile_ro(file: std::fs::File) -> std::io::Result<rustix::fd::OwnedFd> {
-    let path = proc_self_fd(&file);
-    let ro = rustix::fs::open(
-        &*path,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )?;
-    drop(file);
-    Ok(ro)
-}
-
-/// Create an anonymous O_TMPFILE in the given directory.
-///
-/// The returned fd is open read-write and has no directory entry — it is
-/// invisible in the filesystem until explicitly linked via `linkat`. To make
-/// it permanent, reopen it read-only via [`reopen_tmpfile_ro`] and then use
-/// `linkat` through `/proc/self/fd`.
-pub(crate) fn create_tmpfile_in(
-    dirfd: impl rustix::fd::AsFd,
-) -> rustix::io::Result<rustix::fd::OwnedFd> {
-    rustix::fs::openat(
-        dirfd,
-        ".",
-        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::TMPFILE | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::from_raw_mode(0o644),
-    )
-}
-
 /// This function reads the exact amount of bytes required to fill the buffer, possibly performing
 /// multiple reads to do so (and also retrying if required to deal with EINTR).
 ///

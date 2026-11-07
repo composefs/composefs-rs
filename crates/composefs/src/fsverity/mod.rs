@@ -10,6 +10,7 @@ mod helper;
 mod ioctl;
 
 pub use digest::FsVerityHasher;
+pub(crate) use helper::FinishedFile;
 pub use helper::{
     CopyMethod, FinishError, FsVerityHelper, FsVerityHelperBuilder, Published, UnverifiedFile,
     VerityFile, VerityWriter,

@@ -34,13 +34,13 @@ use zerocopy::IntoBytes;
 
 use crate::{
     INLINE_CONTENT_MAX_V0,
-    fsverity::{FsVerityHashValue, FsVerityHasher},
+    fsverity::{FsVerityHashValue, FsVerityHasher, FsVerityHelper},
     generic_tree,
     generic_tree::OciTransformOptions,
     repository::Repository,
     shared_internals::IO_BUF_CAPACITY,
     tree::{Directory, FileSystem, Inode, Leaf, LeafContent, RegularFile, Stat},
-    util::{create_tmpfile_in, proc_self_fd, reopen_tmpfile_ro},
+    util::proc_self_fd,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,6 +86,8 @@ pub struct FlatDigestStore {
     /// Open directory fd for the store root.
     root: Arc<OwnedFd>,
     semaphore: Arc<Semaphore>,
+    /// Creates object files with fs-verity enabled.
+    helper: FsVerityHelper,
     /// If true, fall back to userspace hashing when kernel fs-verity is
     /// unavailable (e.g. tmpfs, overlayfs). Matches `Repository::insecure`.
     insecure: bool,
@@ -117,9 +119,16 @@ impl FlatDigestStore {
         )
         .with_context(|| format!("Failed to open flat digest store: {path:?}"))?;
 
+        let helper = FsVerityHelper::builder()
+            .max_workers(concurrency)
+            .userspace_digest(insecure)
+            .start()
+            .context("Starting fs-verity helper")?;
+
         Ok(Self {
             root: Arc::new(root),
             semaphore: Arc::new(Semaphore::new(concurrency)),
+            helper,
             insecure,
         })
     }
@@ -127,72 +136,47 @@ impl FlatDigestStore {
 
 impl<ObjectID: FsVerityHashValue> ObjectStore<ObjectID> for FlatDigestStore {
     fn ensure_object_from_fd(&self, fd: OwnedFd, size: u64) -> Result<ObjectID> {
-        use crate::fsverity::{EnableVerityError, enable_verity_maybe_copy, measure_verity};
-        use std::io::BufRead as _;
+        use crate::fsverity::{FinishError, FinishedFile};
 
-        // 1. Create an anonymous O_TMPFILE in the store root.
-        //    No name collision possible; invisible until linked.
-        let tmpfile_fd = create_tmpfile_in(self.root.as_fd())
-            .context("Creating O_TMPFILE in flat digest store")?;
+        // 1. Copy the data into a new file with fs-verity enabled (by
+        //    reflink if possible), via the helper so no writable
+        //    descriptor to it can leak into a forked child.
+        let result = self
+            .helper
+            .create_from_fd::<ObjectID>(self.root.as_fd(), &fd, size);
+        drop(fd);
 
-        // 2. Stream from source fd into tmpfile (no in-memory buffering).
-        let mut src = std::io::BufReader::with_capacity(IO_BUF_CAPACITY, File::from(fd));
-        let mut dst = File::from(tmpfile_fd.try_clone().context("Cloning tmpfile fd")?);
-        let copied = std::io::copy(&mut src, &mut dst).context("Copying object data to tmpfile")?;
-        ensure!(
-            copied == size,
-            "object size mismatch: expected {size}, copied {copied}"
-        );
-        drop(dst);
-
-        // 3. Reopen as read-only (kernel requires no writable fds to enable verity).
-        let ro_fd =
-            reopen_tmpfile_ro(File::from(tmpfile_fd)).context("Reopening tmpfile as read-only")?;
-
-        // 4. Enable kernel fs-verity (kernel reads and hashes the file for us).
-        let (ro_fd, verity_enabled) =
-            match enable_verity_maybe_copy::<ObjectID>(self.root.as_fd(), ro_fd.as_fd()) {
-                Ok(None) => (ro_fd, true),
-                Ok(Some(new_fd)) => (new_fd, true),
-                Err(EnableVerityError::AlreadyEnabled) => (ro_fd, true),
-                Err(EnableVerityError::FilesystemNotSupported) if self.insecure => (ro_fd, false),
-                Err(e) => {
-                    return Err(anyhow::anyhow!(e)).context("Enabling verity on object tmpfile");
-                }
-            };
-
-        // 5. Get the digest — from the kernel (fast) or userspace fallback.
-        let id: ObjectID = if verity_enabled {
-            measure_verity(&ro_fd).context("Measuring verity digest after enable")?
-        } else {
-            // Insecure fallback: re-read the tmpfile to compute the digest.
-            let mut reader = std::io::BufReader::with_capacity(
-                IO_BUF_CAPACITY,
-                File::from(ro_fd.try_clone().context("Cloning ro_fd for digest")?),
-            );
-            let mut hasher = FsVerityHasher::<ObjectID>::new();
-            loop {
-                let buf = reader.fill_buf().context("Reading tmpfile for digest")?;
-                if buf.is_empty() {
-                    break;
-                }
-                let chunk = &buf[..buf.len().min(FsVerityHasher::<ObjectID>::BLOCK_SIZE)];
-                hasher.add_block(chunk);
-                let n = chunk.len();
-                reader.consume(n);
+        // 2. Get the digest: from the kernel, or (insecure mode, without
+        //    fs-verity support) computed in userspace.
+        let (file, id) = match result {
+            Ok(file) => {
+                let id = file
+                    .digest::<ObjectID>()
+                    .context("fs-verity digest has the wrong algorithm")?;
+                (FinishedFile::Verity(file), id)
             }
-            hasher.digest()
+            Err(FinishError::NotSupported(file)) if self.insecure => {
+                let id = match file.userspace_digest::<ObjectID>() {
+                    Some(id) => id,
+                    None => compute_verity_from_fd(
+                        file.as_fd()
+                            .try_clone_to_owned()
+                            .context("Cloning fd for digest")?,
+                    )?,
+                };
+                (FinishedFile::Unverified(file), id)
+            }
+            Err(e) => return Err(e).context("Creating object in flat digest store"),
         };
 
-        // 6. Derive flat path: XX/rest-of-hex (C-compatible layout).
+        // 3. Derive flat path: XX/rest-of-hex (C-compatible layout).
         let obj_path = id.to_object_pathname();
         let slash = obj_path
             .find('/')
             .expect("to_object_pathname always has '/'");
         let dir_name = &obj_path[..slash];
-        let file_name = &obj_path[slash + 1..];
 
-        // 7. Create XX/ subdirectory if needed.
+        // 4. Create XX/ subdirectory if needed.
         match mkdirat(self.root.as_fd(), dir_name, Mode::from_raw_mode(0o755)) {
             Ok(()) | Err(rustix::io::Errno::EXIST) => {}
             Err(e) => {
@@ -201,31 +185,10 @@ impl<ObjectID: FsVerityHashValue> ObjectStore<ObjectID> for FlatDigestStore {
             }
         }
 
-        // 8. Open the XX/ subdirectory for use as linkat target.
-        let subdir = openat(
-            self.root.as_fd(),
-            dir_name,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .with_context(|| format!("Opening digest store subdirectory {dir_name:?}"))?;
-
-        // 9. Atomically link the tmpfile into its final content-addressed path.
-        //    EEXIST means another writer already stored the same object — fine.
-        match linkat(
-            CWD,
-            proc_self_fd(&ro_fd),
-            &subdir,
-            file_name,
-            AtFlags::SYMLINK_FOLLOW,
-        ) {
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("Linking object into flat digest store: {obj_path:?}")
-                });
-            }
-        }
+        // 5. Atomically put the file at its final content-addressed path.
+        //    If it already exists, another writer stored the same object.
+        file.publish(self.root.as_fd(), &obj_path)
+            .with_context(|| format!("Linking object into flat digest store: {obj_path:?}"))?;
 
         Ok(id)
     }
@@ -1054,6 +1017,36 @@ mod tests {
         check_copy_file(&sparse, None)?;
         check_copy_file(&sparse, Some(4 * 1024 * 1024 + 3))?;
 
+        Ok(())
+    }
+
+    /// A secure `FlatDigestStore` gives its objects fs-verity.
+    #[test]
+    fn test_flat_digest_store_verity() -> Result<()> {
+        use crate::fsverity::{Sha256HashValue, compute_verity, measure_verity};
+
+        let td = crate::test::tempdir();
+        let store_path = td.path().join("store");
+        let store = FlatDigestStore::open(&store_path, 2, false)?;
+
+        let content = b"protected by fs-verity".repeat(100);
+        let src_path = td.path().join("file");
+        std::fs::write(&src_path, &content)?;
+        let src_fd = openat(
+            CWD,
+            &src_path,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let id = <FlatDigestStore as ObjectStore<Sha256HashValue>>::ensure_object_from_fd(
+            &store,
+            src_fd,
+            content.len() as u64,
+        )?;
+        assert_eq!(id, compute_verity::<Sha256HashValue>(&content));
+
+        let stored = File::open(store_path.join(id.to_object_pathname()))?;
+        assert_eq!(measure_verity::<Sha256HashValue>(&stored)?, id);
         Ok(())
     }
 
