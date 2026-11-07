@@ -1,8 +1,10 @@
-//! Generate seed corpus files for the EROFS fuzz targets.
+//! Generate seed corpus files for the EROFS, dumpfile, and splitstream fuzz targets.
 //!
-//! Each seed is a valid EROFS image that exercises a distinct reader code path:
+//! EROFS seeds are valid images that exercise distinct reader code paths:
 //! inline/external files, special file types, xattrs, directory
 //! layouts, hardlinks, and edge cases around inode sizing.
+//! Dumpfile seeds are individual writer-generated entries; splitstream seeds
+//! cover empty, inline, and mixed content in both header layouts.
 //!
 //! Run via: `cargo run --manifest-path crates/composefs/fuzz/Cargo.toml --bin generate-corpus`
 //! or:      `just generate-corpus`
@@ -10,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use composefs::erofs::format::FormatVersion;
@@ -67,19 +70,19 @@ fn push_all_versions(
     build_fs: impl Fn() -> FileSystem<Sha256HashValue>,
 ) {
     // V2 (Rust-native extended inodes, DFS ordering, no stubs)
-    let image = mkfs_erofs(&mut ValidatedFileSystem::new(build_fs()).unwrap());
+    let image = mkfs_erofs(&ValidatedFileSystem::new(build_fs()).unwrap());
     seeds.push((name.to_string(), image.into()));
 
     // V1 (compact inodes, always composefs_version=1, stubs injected)
     let image = mkfs_erofs_versioned(
-        &mut ValidatedFileSystem::new(build_fs()).unwrap(),
+        &ValidatedFileSystem::new(build_fs()).unwrap(),
         FormatVersion::V1,
     );
     seeds.push((format!("{name}_v1"), image.into()));
 
     // V0 (compact inodes, composefs_version auto-bumps to 1 only if whiteouts present)
     let image = mkfs_erofs_versioned(
-        &mut ValidatedFileSystem::new(build_fs()).unwrap(),
+        &ValidatedFileSystem::new(build_fs()).unwrap(),
         FormatVersion::V0,
     );
     seeds.push((format!("{name}_v0"), image.into()));
@@ -87,6 +90,8 @@ fn push_all_versions(
 
 fn main() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    generate_dumpfile_corpus(manifest_dir);
+    generate_splitstream_corpus(manifest_dir);
 
     let mut seeds: Vec<(String, Vec<u8>)> = Vec::new();
 
@@ -356,6 +361,89 @@ fn main() {
         "\nGenerated {count} seed files for {} fuzz targets",
         targets.len()
     );
+}
+
+fn write_seed(manifest_dir: &Path, target: &str, name: &str, data: &[u8]) {
+    let dir = manifest_dir.join("corpus").join(target);
+    fs::create_dir_all(&dir).expect("creating corpus directory");
+    fs::write(dir.join(name), data).expect("writing corpus seed");
+}
+
+fn generate_dumpfile_corpus(manifest_dir: &Path) {
+    use composefs::dumpfile::{write_directory, write_hardlink, write_leaf};
+
+    let mut stat = file_stat();
+    for (key, value) in [
+        ("user.empty", b"".as_slice()),
+        ("user.dash", b"-".as_slice()),
+        ("user.equals=", b"=\0\xff\n".as_slice()),
+    ] {
+        stat.xattrs.insert(OsStr::new(key).into(), value.into());
+    }
+    let mut line = String::new();
+    write_directory(&mut line, Path::new("/"), &stat, 2).unwrap();
+    write_seed(
+        manifest_dir,
+        "dumpfile",
+        "directory_xattrs",
+        line.as_bytes(),
+    );
+
+    let leaves: [tree::LeafContent<Sha256HashValue>; 9] = [
+        LeafContent::Regular(RegularFile::Inline(b"-\0\xff\n".as_slice().into())),
+        LeafContent::Regular(RegularFile::Inline(b"".as_slice().into())),
+        LeafContent::Regular(RegularFile::Sparse(4096)),
+        LeafContent::Regular(RegularFile::External(Sha256HashValue::EMPTY, 65536)),
+        LeafContent::Symlink(OsStr::new("-").into()),
+        LeafContent::Fifo,
+        LeafContent::Socket,
+        LeafContent::CharacterDevice(makedev(1, 3)),
+        LeafContent::BlockDevice(makedev(8, 0)),
+    ];
+    for (i, content) in leaves.iter().enumerate() {
+        line.clear();
+        write_leaf(&mut line, Path::new("/file name"), &stat, content, 1).unwrap();
+        write_seed(
+            manifest_dir,
+            "dumpfile",
+            &format!("leaf_{i}"),
+            line.as_bytes(),
+        );
+    }
+    line.clear();
+    write_hardlink(&mut line, Path::new("/link"), OsStr::new("/file name")).unwrap();
+    write_seed(manifest_dir, "dumpfile", "hardlink", line.as_bytes());
+}
+
+fn generate_splitstream_corpus(manifest_dir: &Path) {
+    use composefs::splitstream::new_to_old_format;
+    use composefs::test::TestRepo;
+
+    let test_repo = TestRepo::<Sha256HashValue>::new();
+    let repo = &test_repo.repo;
+    for name in ["empty", "inline", "mixed"] {
+        let mut writer = repo.create_stream(42).unwrap();
+        if name != "empty" {
+            writer.write_inline(b"inline fuzz seed");
+        }
+        if name == "mixed" {
+            writer.write_external(b"external fuzz seed").unwrap();
+            writer.write_inline(b"trailer");
+            writer.add_named_stream_ref("named", &Sha256HashValue::EMPTY);
+        }
+        let id = writer.done().unwrap();
+        let mut bytes = Vec::new();
+        fs::File::from(repo.open_object(&id).unwrap())
+            .read_to_end(&mut bytes)
+            .unwrap();
+        write_seed(manifest_dir, "splitstream", name, &bytes);
+        write_seed(
+            manifest_dir,
+            "splitstream",
+            &format!("{name}_old"),
+            &new_to_old_format(&bytes),
+        );
+    }
 }
 
 /// Encode major/minor device numbers into a single u64 (Linux encoding).
