@@ -26,6 +26,7 @@
 //! table.  In particular it does no logging.
 
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self, IoSlice, IoSliceMut, PipeWriter, Write},
     mem::MaybeUninit,
@@ -56,8 +57,11 @@ use rustix::{
 use thiserror::Error;
 use tokio::{io::AsyncWrite, net::unix::pipe::Sender};
 
+use zerocopy::IntoBytes as _;
+
 use super::{
-    Algorithm, EnableVerityError, FsVerityHashValue,
+    Algorithm, DEFAULT_LG_BLOCKSIZE, EnableVerityError, FsVerityHashValue, FsVerityHasher,
+    Sha256HashValue, Sha512HashValue,
     ioctl::{fs_ioc_enable_verity_with_algorithm, fs_ioc_measure_verity_with_algorithm},
 };
 
@@ -70,7 +74,9 @@ const TMPNAME_PREFIX: &str = ".tmp-verity-";
 
 const KIND_PIPE: u8 = 1;
 const KIND_FROM_FD: u8 = 2;
+const KIND_REFLINK: u8 = 3;
 const FLAG_FORCE_NAMED: u8 = 1;
+const FLAG_USERSPACE_DIGEST: u8 = 2;
 const REQUEST_LEN: usize = 16;
 
 const COMMIT: u8 = 1;
@@ -79,6 +85,7 @@ const STATUS_OK: u8 = 0;
 const STATUS_NOT_SUPPORTED: u8 = 1;
 const STATUS_SIZE_MISMATCH: u8 = 2;
 const STATUS_ERROR: u8 = 3;
+const STATUS_REFLINK_UNSUPPORTED: u8 = 4;
 const REPLY_HEADER_LEN: usize = 10;
 const REPLY_MAX_LEN: usize = 4096;
 
@@ -107,6 +114,10 @@ pub enum FinishError {
         #[source]
         source: io::Error,
     },
+    /// [`FsVerityHelper::reflink_from_fd`] was asked to reflink between
+    /// filesystems (or on a filesystem) that can't.
+    #[error("reflinks are not supported here")]
+    ReflinkUnsupported,
     /// Communicating with the helper failed.  The file was discarded.
     #[error("fs-verity helper: {0}")]
     Io(#[from] io::Error),
@@ -116,6 +127,7 @@ pub enum FinishError {
 #[derive(Debug, Clone)]
 pub struct FsVerityHelperBuilder {
     max_workers: usize,
+    userspace_digest: bool,
     force_named_tmpfile: bool,
 }
 
@@ -125,6 +137,7 @@ impl Default for FsVerityHelperBuilder {
             max_workers: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
+            userspace_digest: false,
             force_named_tmpfile: false,
         }
     }
@@ -145,6 +158,18 @@ impl FsVerityHelperBuilder {
     /// [`finish`]: VerityWriter::finish
     pub fn max_workers(mut self, n: usize) -> Self {
         self.max_workers = n.max(1);
+        self
+    }
+
+    /// On filesystems without fs-verity support, compute the digest in
+    /// userspace instead, while the data is copied, and return it with
+    /// the [`UnverifiedFile`] (see [`UnverifiedFile::userspace_digest`]).
+    ///
+    /// Off by default.  When on, the helper finds out once per filesystem
+    /// whether fs-verity works there (by trying it on an empty file), so
+    /// files where the kernel computes the digest aren't hashed twice.
+    pub fn userspace_digest(mut self, enable: bool) -> Self {
+        self.userspace_digest = enable;
         self
     }
 
@@ -184,6 +209,7 @@ impl FsVerityHelperBuilder {
             control: Mutex::new(Some(control)),
             outstanding: Mutex::new(0),
             idle: Condvar::new(),
+            userspace_digest: self.userspace_digest,
             force_named_tmpfile: self.force_named_tmpfile,
         })))
     }
@@ -207,6 +233,7 @@ struct Inner {
     /// Number of requests in progress.
     outstanding: Mutex<usize>,
     idle: Condvar,
+    userspace_digest: bool,
     force_named_tmpfile: bool,
 }
 
@@ -276,6 +303,20 @@ impl FsVerityHelper {
         receive_reply(&reply, dir, size)
     }
 
+    /// Like [`create_from_fd`](Self::create_from_fd), but only by reflink:
+    /// fails with [`FinishError::ReflinkUnsupported`] rather than copying.
+    pub fn reflink_from_fd<H: FsVerityHashValue>(
+        &self,
+        dirfd: impl AsFd,
+        src: impl AsFd,
+        size: u64,
+    ) -> Result<VerityFile, FinishError> {
+        let dir = dirfd.as_fd().try_clone_to_owned()?;
+        let (reply, _outstanding) =
+            self.request(KIND_REFLINK, H::ALGORITHM, size, dir.as_fd(), src.as_fd())?;
+        receive_reply(&reply, dir, size)
+    }
+
     /// Block until all files being written have been finished or dropped.
     ///
     /// Calling this while holding a [`VerityWriter`] deadlocks.
@@ -331,11 +372,12 @@ impl FsVerityHelper {
 
         let mut msg = [0u8; REQUEST_LEN];
         msg[0] = kind;
-        msg[1] = if self.0.force_named_tmpfile {
-            FLAG_FORCE_NAMED
-        } else {
-            0
-        };
+        if self.0.force_named_tmpfile {
+            msg[1] |= FLAG_FORCE_NAMED;
+        }
+        if self.0.userspace_digest {
+            msg[1] |= FLAG_USERSPACE_DIGEST;
+        }
         msg[2] = algorithm.kernel_id();
         msg[3] = algorithm.lg_blocksize();
         msg[4..12].copy_from_slice(&size.to_le_bytes());
@@ -519,6 +561,29 @@ pub enum Published {
     AlreadyExists,
 }
 
+/// How the data of a file got there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CopyMethod {
+    /// Written through a [`VerityWriter`].
+    Written = 0,
+    /// Reflinked from the source file.
+    Reflinked = 1,
+    /// Copied from the source file.
+    Copied = 2,
+}
+
+impl CopyMethod {
+    fn decode(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Written),
+            1 => Some(Self::Reflinked),
+            2 => Some(Self::Copied),
+            _ => None,
+        }
+    }
+}
+
 /// A finished, read-only file not yet linked at its final path.
 #[derive(Debug)]
 struct Staged {
@@ -568,6 +633,7 @@ pub struct VerityFile {
     staged: Staged,
     algorithm: Algorithm,
     digest: Vec<u8>,
+    method: CopyMethod,
 }
 
 impl VerityFile {
@@ -590,6 +656,11 @@ impl VerityFile {
         &self.digest
     }
 
+    /// How the data got into the file.
+    pub fn copy_method(&self) -> CopyMethod {
+        self.method
+    }
+
     /// Atomically put the file at `path` relative to `dir`, unless
     /// something already exists there.
     pub fn publish(self, dir: impl AsFd, path: impl AsRef<Path>) -> io::Result<Published> {
@@ -609,9 +680,31 @@ impl AsFd for VerityFile {
 #[derive(Debug)]
 pub struct UnverifiedFile {
     staged: Staged,
+    algorithm: Algorithm,
+    digest: Option<Vec<u8>>,
+    method: CopyMethod,
 }
 
 impl UnverifiedFile {
+    /// The fs-verity digest computed in userspace while the data was
+    /// copied, if the helper was configured with
+    /// [`userspace_digest`](FsVerityHelperBuilder::userspace_digest) and
+    /// `H` matches the requested algorithm.
+    ///
+    /// This is *not* enforced by the kernel: nothing stops the file from
+    /// being changed later.
+    pub fn userspace_digest<H: FsVerityHashValue>(&self) -> Option<H> {
+        if self.algorithm != H::ALGORITHM {
+            return None;
+        }
+        H::read_from_bytes(self.digest.as_deref()?).ok()
+    }
+
+    /// How the data got into the file.
+    pub fn copy_method(&self) -> CopyMethod {
+        self.method
+    }
+
     /// Atomically put the file at `path` relative to `dir`, unless
     /// something already exists there.
     pub fn publish(self, dir: impl AsFd, path: impl AsRef<Path>) -> io::Result<Published> {
@@ -706,18 +799,26 @@ fn receive_reply(reply: &OwnedFd, dir: OwnedFd, expected: u64) -> Result<VerityF
         let fd = fds.pop().ok_or_else(malformed)?;
         let name = (!text.is_empty()).then_some((dir, text));
         let staged = Staged { fd, name };
-        if status == STATUS_NOT_SUPPORTED {
-            return Err(FinishError::NotSupported(UnverifiedFile { staged }));
-        }
         let algorithm = decode_algorithm(aux as u8, (aux >> 8) as u8).ok_or_else(malformed)?;
+        let method = CopyMethod::decode((aux >> 16) as u8).ok_or_else(malformed)?;
+        if status == STATUS_NOT_SUPPORTED {
+            return Err(FinishError::NotSupported(UnverifiedFile {
+                staged,
+                algorithm,
+                digest: (!digest.is_empty()).then(|| digest.to_vec()),
+                method,
+            }));
+        }
         return Ok(VerityFile {
             staged,
             algorithm,
             digest: digest.to_vec(),
+            method,
         });
     }
 
     match status {
+        STATUS_REFLINK_UNSUPPORTED => Err(FinishError::ReflinkUnsupported),
         STATUS_SIZE_MISMATCH => Err(FinishError::SizeMismatch {
             expected,
             actual: aux,
@@ -755,6 +856,7 @@ fn decode_algorithm(kernel_id: u8, lg_blocksize: u8) -> Option<Algorithm> {
 struct Job {
     kind: u8,
     force_named: bool,
+    userspace_digest: bool,
     algorithm: Algorithm,
     size: u64,
     mode: Mode,
@@ -770,6 +872,7 @@ fn control_main(fds: Vec<OwnedFd>, max_workers: usize) {
     // Jobs handed out and not yet finished.  Counted here rather than by
     // the workers so that a job still sitting in the queue counts too.
     let busy = Arc::new(AtomicUsize::new(0));
+    let probes = Arc::new(Probes::default());
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
 
     loop {
@@ -791,9 +894,10 @@ fn control_main(fds: Vec<OwnedFd>, max_workers: usize) {
         if busy.load(Ordering::SeqCst) >= workers.len() && workers.len() < max_workers {
             let rx = Arc::clone(&rx);
             let busy = Arc::clone(&busy);
+            let probes = Arc::clone(&probes);
             match std::thread::Builder::new()
                 .name("fsverity-worker".into())
-                .spawn(move || worker_main(&rx, &busy))
+                .spawn(move || worker_main(&rx, &busy, &probes))
             {
                 Ok(handle) => workers.push(handle),
                 Err(e) if workers.is_empty() => {
@@ -825,15 +929,24 @@ fn decode_job(msg: &[u8], fds: Vec<OwnedFd>) -> Result<Job, Option<OwnedFd>> {
         Some((
             msg[0],
             msg[1] & FLAG_FORCE_NAMED != 0,
+            msg[1] & FLAG_USERSPACE_DIGEST != 0,
             decode_algorithm(msg[2], msg[3])?,
             u64::from_le_bytes(msg[4..12].try_into().ok()?),
             Mode::from_raw_mode(u32::from_le_bytes(msg[12..16].try_into().ok()?)),
         ))
     };
     match decode() {
-        Some((kind @ (KIND_PIPE | KIND_FROM_FD), force_named, algorithm, size, mode)) => Ok(Job {
+        Some((
+            kind @ (KIND_PIPE | KIND_FROM_FD | KIND_REFLINK),
+            force_named,
+            userspace_digest,
+            algorithm,
+            size,
+            mode,
+        )) => Ok(Job {
             kind,
             force_named,
+            userspace_digest,
             algorithm,
             size,
             mode,
@@ -845,14 +958,14 @@ fn decode_job(msg: &[u8], fds: Vec<OwnedFd>) -> Result<Job, Option<OwnedFd>> {
     }
 }
 
-fn worker_main(rx: &Mutex<mpsc::Receiver<Job>>, busy: &AtomicUsize) {
+fn worker_main(rx: &Mutex<mpsc::Receiver<Job>>, busy: &AtomicUsize, probes: &Probes) {
     loop {
         let job = rx.lock().unwrap().recv();
         match job {
             Ok(job) => {
                 // A panic drops the job, and with it the reply socket, so
                 // the caller gets an error; the worker carries on.
-                let _ = std::panic::catch_unwind(AssertUnwindSafe(|| run_job(job)));
+                let _ = std::panic::catch_unwind(AssertUnwindSafe(|| run_job(job, probes)));
                 busy.fetch_sub(1, Ordering::SeqCst);
             }
             Err(mpsc::RecvError) => break,
@@ -937,10 +1050,82 @@ fn tmpname() -> io::Result<String> {
     Ok(format!("{TMPNAME_PREFIX}{}", hex::encode(bytes)))
 }
 
-fn run_job(job: Job) {
+/// Whether fs-verity works on each filesystem seen so far, by `st_dev`.
+#[derive(Default)]
+struct Probes(Mutex<HashMap<u64, bool>>);
+
+impl Probes {
+    /// Find out whether fs-verity is supported for files in `dir`, by
+    /// trying it on an empty file the first time we see the filesystem.
+    /// When unsure, says it is.
+    fn verity_supported(&self, dir: &OwnedFd, algorithm: Algorithm, force_named: bool) -> bool {
+        let Ok(stat) = rustix::fs::fstat(dir) else {
+            return true;
+        };
+        let mut known = self.0.lock().unwrap();
+        *known
+            .entry(stat.st_dev)
+            .or_insert_with(|| probe_verity(dir, algorithm, force_named))
+    }
+}
+
+fn probe_verity(dir: &OwnedFd, algorithm: Algorithm, force_named: bool) -> bool {
+    let Ok(mut tmp) = Tmpfile::create(dir, Mode::from_raw_mode(0o600), force_named) else {
+        return true;
+    };
+    let Ok(ro) = rustix::fs::open(
+        thread_self_fd(tmp.file()),
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) else {
+        return true;
+    };
+    drop(tmp.file.take());
+    !matches!(
+        fs_ioc_enable_verity_with_algorithm(&ro, algorithm),
+        Err(EnableVerityError::FilesystemNotSupported)
+    )
+}
+
+/// Computes an fs-verity digest in userspace, for a runtime algorithm.
+enum Hasher {
+    Sha256(FsVerityHasher<Sha256HashValue>),
+    Sha512(FsVerityHasher<Sha512HashValue>),
+}
+
+impl Hasher {
+    fn new(algorithm: Algorithm) -> Option<Self> {
+        // FsVerityHasher only does the default block size.
+        if algorithm.lg_blocksize() != DEFAULT_LG_BLOCKSIZE {
+            return None;
+        }
+        Some(match algorithm {
+            Algorithm::Sha256 { .. } => Self::Sha256(FsVerityHasher::new()),
+            Algorithm::Sha512 { .. } => Self::Sha512(FsVerityHasher::new()),
+        })
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        let result = match self {
+            Self::Sha256(h) => h.write_all(data),
+            Self::Sha512(h) => h.write_all(data),
+        };
+        result.expect("hashing doesn't fail");
+    }
+
+    fn finish(self) -> Vec<u8> {
+        match self {
+            Self::Sha256(mut h) => h.digest().as_bytes().to_vec(),
+            Self::Sha512(mut h) => h.digest().as_bytes().to_vec(),
+        }
+    }
+}
+
+fn run_job(job: Job, probes: &Probes) {
     let Job {
         kind,
         force_named,
+        userspace_digest,
         algorithm,
         size,
         mode,
@@ -951,16 +1136,24 @@ fn run_job(job: Job) {
 
     let tmp = Tmpfile::create(&dir, mode, force_named);
     let file = tmp.as_ref().ok().map(Tmpfile::file);
-    let copied = if kind == KIND_PIPE {
+    // Hash while copying only where the kernel can't do it for us.
+    let mut hasher = match file {
+        Some(_) if userspace_digest && !probes.verity_supported(&dir, algorithm, force_named) => {
+            Hasher::new(algorithm)
+        }
+        _ => None,
+    };
+
+    let copied = match (kind, file) {
         // Even if creating the file failed, the data is consumed so the
         // writer doesn't block, and the error is reported on commit.
-        match receive_pipe(&data, &reply, file) {
+        (KIND_PIPE, _) => match receive_pipe(&data, &reply, file, hasher.as_mut()) {
             None => return,
-            Some((n, None)) => Ok(n),
+            Some((n, None)) => Ok(Some((n, CopyMethod::Written))),
             Some((_, Some(e))) => Err(e),
-        }
-    } else {
-        file.map_or(Ok(0), |file| copy_from_fd(&data, file))
+        },
+        (_, Some(file)) => copy_from_fd(&data, file, kind == KIND_REFLINK, hasher.as_mut()),
+        (_, None) => Ok(Some((0, CopyMethod::Copied))),
     };
     drop(data);
 
@@ -968,8 +1161,12 @@ fn run_job(job: Job) {
         Ok(tmp) => tmp,
         Err(e) => return send_error(&reply, "creating file", &e),
     };
-    let copied = match copied {
-        Ok(n) => n,
+    let (copied, method) = match copied {
+        Ok(Some(copied)) => copied,
+        Ok(None) => {
+            let _ = send_reply(&reply, STATUS_REFLINK_UNSUPPORTED, 0, &[], "", None);
+            return;
+        }
         Err(e) => return send_error(&reply, "writing file", &e),
     };
     if copied != size {
@@ -988,19 +1185,26 @@ fn run_job(job: Job) {
     drop(tmp.file.take());
 
     let name = tmp.name.as_deref().unwrap_or("");
+    let aux = u64::from(algorithm.kernel_id())
+        | (u64::from(algorithm.lg_blocksize()) << 8)
+        | (u64::from(method as u8) << 16);
     let sent = match fs_ioc_enable_verity_with_algorithm(&ro, algorithm) {
         Ok(()) => match fs_ioc_measure_verity_with_algorithm(&ro, algorithm) {
-            Ok(digest) => {
-                let aux =
-                    u64::from(algorithm.kernel_id()) | (u64::from(algorithm.lg_blocksize()) << 8);
-                send_reply(&reply, STATUS_OK, aux, &digest, name, Some(ro.as_fd()))
-            }
+            Ok(digest) => send_reply(&reply, STATUS_OK, aux, &digest, name, Some(ro.as_fd())),
             Err(e) => {
                 return send_error(&reply, "measuring fs-verity", &io::Error::other(e));
             }
         },
         Err(EnableVerityError::FilesystemNotSupported) => {
-            send_reply(&reply, STATUS_NOT_SUPPORTED, 0, &[], name, Some(ro.as_fd()))
+            let digest = hasher.map(Hasher::finish).unwrap_or_default();
+            send_reply(
+                &reply,
+                STATUS_NOT_SUPPORTED,
+                aux,
+                &digest,
+                name,
+                Some(ro.as_fd()),
+            )
         }
         Err(EnableVerityError::Io(e)) => return send_error(&reply, "enabling fs-verity", &e),
         Err(EnableVerityError::FileOpenedForWrite) => {
@@ -1027,11 +1231,14 @@ fn receive_pipe(
     pipe: &OwnedFd,
     reply: &OwnedFd,
     file: Option<&File>,
+    hasher: Option<&mut Hasher>,
 ) -> Option<(u64, Option<io::Error>)> {
     let mut state = PipeState {
         total: 0,
         error: None,
-        use_splice: file.is_some(),
+        // splice() keeps the data out of userspace, where we'd hash it.
+        use_splice: file.is_some() && hasher.is_none(),
+        hasher,
         buf: Vec::new(),
     };
     if let Err(e) = rustix::fs::fcntl_setfl(pipe, OFlags::NONBLOCK) {
@@ -1071,14 +1278,15 @@ fn receive_pipe(
     }
 }
 
-struct PipeState {
+struct PipeState<'a> {
     total: u64,
     error: Option<io::Error>,
     use_splice: bool,
+    hasher: Option<&'a mut Hasher>,
     buf: Vec<u8>,
 }
 
-impl PipeState {
+impl PipeState<'_> {
     /// Move whatever is in the (non-blocking) pipe into `file`.
     /// Returns true at end of file.
     fn pump(&mut self, pipe: &OwnedFd, file: Option<&File>) -> bool {
@@ -1103,10 +1311,13 @@ impl PipeState {
                 Ok(0) => return true,
                 Ok(n) => {
                     self.total += n as u64;
-                    if let (Some(mut file), None) = (file, &self.error)
-                        && let Err(e) = file.write_all(&self.buf[..n])
-                    {
-                        self.error = Some(e);
+                    if let (Some(mut file), None) = (file, &self.error) {
+                        if let Some(hasher) = self.hasher.as_deref_mut() {
+                            hasher.update(&self.buf[..n]);
+                        }
+                        if let Err(e) = file.write_all(&self.buf[..n]) {
+                            self.error = Some(e);
+                        }
                     }
                 }
                 Err(Errno::AGAIN) => return false,
@@ -1121,16 +1332,34 @@ impl PipeState {
 }
 
 /// Copy all of `src` into the (empty) `file`: reflink if possible, then
-/// `copy_file_range()`, then plain reads and writes.
-fn copy_from_fd(src: &OwnedFd, file: &File) -> io::Result<u64> {
-    if rustix::fs::ioctl_ficlone(file, src).is_ok() {
-        return Ok(file.metadata()?.len());
+/// (unless `reflink_only`) `copy_file_range()`, then plain reads and
+/// writes.  Feeds the data to `hasher`, if any.
+///
+/// Returns the size and how it was copied, or `None` if `reflink_only`
+/// and the filesystems can't reflink.
+fn copy_from_fd(
+    src: &OwnedFd,
+    file: &File,
+    reflink_only: bool,
+    mut hasher: Option<&mut Hasher>,
+) -> io::Result<Option<(u64, CopyMethod)>> {
+    match rustix::fs::ioctl_ficlone(file, src) {
+        Ok(()) => {
+            if let Some(hasher) = hasher {
+                hash_file(file, hasher)?;
+            }
+            return Ok(Some((file.metadata()?.len(), CopyMethod::Reflinked)));
+        }
+        Err(Errno::OPNOTSUPP | Errno::XDEV) if reflink_only => return Ok(None),
+        Err(e) if reflink_only => return Err(e.into()),
+        Err(_) => {}
     }
 
     let mut offset = 0u64;
-    loop {
+    // copy_file_range() keeps the data out of userspace, where we'd hash it.
+    while hasher.is_none() {
         match rustix::fs::copy_file_range(src, Some(&mut offset), file, None, 1 << 30) {
-            Ok(0) => return Ok(offset),
+            Ok(0) => return Ok(Some((offset, CopyMethod::Copied))),
             Ok(_) => {}
             Err(Errno::INTR) => {}
             Err(Errno::XDEV | Errno::INVAL | Errno::OPNOTSUPP | Errno::NOSYS) if offset == 0 => {
@@ -1144,9 +1373,28 @@ fn copy_from_fd(src: &OwnedFd, file: &File) -> io::Result<u64> {
     let mut writer = file;
     loop {
         match rustix::io::pread(src, &mut buf, offset) {
-            Ok(0) => return Ok(offset),
+            Ok(0) => return Ok(Some((offset, CopyMethod::Copied))),
             Ok(n) => {
+                if let Some(hasher) = hasher.as_deref_mut() {
+                    hasher.update(&buf[..n]);
+                }
                 writer.write_all(&buf[..n])?;
+                offset += n as u64;
+            }
+            Err(Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+fn hash_file(file: &File, hasher: &mut Hasher) -> io::Result<()> {
+    let mut buf = vec![0u8; 128 * 1024];
+    let mut offset = 0u64;
+    loop {
+        match rustix::io::pread(file, &mut buf, offset) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                hasher.update(&buf[..n]);
                 offset += n as u64;
             }
             Err(Errno::INTR) => {}
@@ -1394,6 +1642,100 @@ mod tests {
         };
         assert_eq!(file.publish(&dir, "obj").unwrap(), Published::Created);
         assert_eq!(std::fs::read(tmp.path().join("obj")).unwrap(), b"hello");
+    }
+
+    #[test_with::path(/dev/shm)]
+    #[test]
+    fn test_userspace_digest() {
+        let tmp = tempfile::TempDir::new_in("/dev/shm").unwrap();
+        let dir = open_dir(tmp.path());
+        let data = b"hash me in userspace".repeat(5000);
+        let src_path = tmp.path().join("src");
+        std::fs::write(&src_path, &data).unwrap();
+        let src = std::fs::File::open(&src_path).unwrap();
+
+        for enabled in [false, true] {
+            let helper = FsVerityHelper::builder()
+                .userspace_digest(enabled)
+                .start()
+                .unwrap();
+
+            let mut w = helper
+                .create::<Sha512HashValue>(&dir, data.len() as u64)
+                .unwrap();
+            w.write_all(&data).unwrap();
+            let Err(FinishError::NotSupported(file)) = w.finish() else {
+                panic!("expected NotSupported");
+            };
+            assert_eq!(file.copy_method(), CopyMethod::Written);
+            assert!(file.userspace_digest::<Sha256HashValue>().is_none());
+            assert_eq!(
+                file.userspace_digest::<Sha512HashValue>(),
+                enabled.then(|| compute_verity::<Sha512HashValue>(&data))
+            );
+
+            let Err(FinishError::NotSupported(file)) =
+                helper.create_from_fd::<Sha256HashValue>(&dir, &src, data.len() as u64)
+            else {
+                panic!("expected NotSupported");
+            };
+            assert_eq!(
+                file.userspace_digest::<Sha256HashValue>(),
+                enabled.then(|| compute_verity::<Sha256HashValue>(&data))
+            );
+        }
+    }
+
+    /// With verity available, asking for userspace digests changes nothing.
+    #[test]
+    fn test_userspace_digest_with_verity() {
+        let tmp = tempdir();
+        let dir = open_dir(tmp.path());
+        let helper = FsVerityHelper::builder()
+            .userspace_digest(true)
+            .start()
+            .unwrap();
+        for _ in 0..2 {
+            let mut w = helper.create::<Sha256HashValue>(&dir, 5).unwrap();
+            w.write_all(b"hello").unwrap();
+            let file = w.finish().unwrap();
+            assert_eq!(file.copy_method(), CopyMethod::Written);
+            assert_eq!(
+                file.digest::<Sha256HashValue>().unwrap(),
+                compute_verity::<Sha256HashValue>(b"hello")
+            );
+        }
+        // The probe leaves nothing behind.
+        assert!(dir_entries(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn test_reflink_from_fd() {
+        let tmp = tempdir();
+        let dir = open_dir(tmp.path());
+        let helper = FsVerityHelper::start().unwrap();
+        let data = b"reflink me".repeat(1000);
+        let src_path = tmp.path().join("src");
+        std::fs::write(&src_path, &data).unwrap();
+        let src = std::fs::File::open(&src_path).unwrap();
+
+        match helper.reflink_from_fd::<Sha256HashValue>(&dir, &src, data.len() as u64) {
+            Ok(file) => {
+                assert_eq!(file.copy_method(), CopyMethod::Reflinked);
+                assert_eq!(
+                    file.digest::<Sha256HashValue>().unwrap(),
+                    compute_verity::<Sha256HashValue>(&data)
+                );
+            }
+            Err(FinishError::ReflinkUnsupported) => {
+                let file = helper
+                    .create_from_fd::<Sha256HashValue>(&dir, &src, data.len() as u64)
+                    .unwrap();
+                assert_eq!(file.copy_method(), CopyMethod::Copied);
+            }
+            Err(e) => panic!("{e}"),
+        }
+        assert_eq!(dir_entries(tmp.path()), ["src"]);
     }
 
     #[test]

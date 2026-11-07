@@ -11,8 +11,8 @@ mod ioctl;
 
 pub use digest::FsVerityHasher;
 pub use helper::{
-    FinishError, FsVerityHelper, FsVerityHelperBuilder, Published, UnverifiedFile, VerityFile,
-    VerityWriter,
+    CopyMethod, FinishError, FsVerityHelper, FsVerityHelperBuilder, Published, UnverifiedFile,
+    VerityFile, VerityWriter,
 };
 
 use std::{
