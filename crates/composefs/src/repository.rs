@@ -5130,6 +5130,7 @@ mod tests {
         assert_eq!(result.images_pruned, 0);
 
         // Once the lock is gone, the next GC collects everything.
+        flock(&lock, FlockOperation::Unlock)?;
         drop(lock);
         let result = repo.gc(&[])?;
         assert!(!test_object_exists(&tmp, &obj2_id)?);
