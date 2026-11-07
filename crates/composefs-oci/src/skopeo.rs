@@ -231,8 +231,10 @@ impl<ObjectID: FsVerityHashValue> ImageOp<ObjectID> {
             } else {
                 // Non-tar layers (OCI artifacts): stream raw bytes to object store.
                 // Run the progress driver concurrently with the blob store.
-                let (store_result, ()) =
-                    tokio::join!(store_blob_async(&self.repo, blob_reader), progress_driver);
+                let (store_result, ()) = tokio::join!(
+                    store_blob_async(&self.repo, blob_reader, descriptor.size()),
+                    progress_driver
+                );
                 let (object_id, size, method) = store_result?;
                 driver.await?;
 
@@ -556,7 +558,7 @@ impl<ObjectID: FsVerityHashValue> oci_delta::DeltaBlobReader for ProxyBlobReader
             let tmpfile = self
                 .image_op
                 .repo
-                .create_object_tmpfile()
+                .create_scratch_tmpfile()
                 .context("Creating temp file for delta blob")?;
             let copy_fut = async {
                 let mut async_dst = tokio::fs::File::from(std::fs::File::from(tmpfile));

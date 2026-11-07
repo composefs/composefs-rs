@@ -48,7 +48,10 @@
 //!   filesystem with a hardlink to a text dumpfile and parsing it back.
 //! - [`dumpfile_parse::Entry`] demonstrates parsing and serializing one entry.
 
-#![forbid(unsafe_code)]
+// Unsafe code is only allowed where it is opted in with
+// `#[allow(unsafe_code)]` (module-wide or on a single item) and every
+// use is justified.
+#![deny(unsafe_code)]
 // This is a library: emit diagnostics via the `log` crate (or return them),
 // never by writing to the process's stdout/stderr. Genuinely-intentional
 // exceptions carry a local `#[allow]` with justification. Test code is exempt.
@@ -61,6 +64,7 @@ pub mod erofs;
 pub mod filesystem_ops;
 pub mod fs;
 pub mod fsverity;
+pub(crate) mod isolation;
 pub mod mount;
 pub mod mountcompat;
 pub mod progress;

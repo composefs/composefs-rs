@@ -490,7 +490,10 @@ async fn import_layer_from_blob<ObjectID: FsVerityHashValue>(
     } else {
         // Non-tar blob: store as object and create splitstream wrapper.
         // Run the progress driver concurrently with the blob store.
-        let (store_result, ()) = tokio::join!(store_blob_async(repo, async_file), progress_driver);
+        let (store_result, ()) = tokio::join!(
+            store_blob_async(repo, async_file, layer_size),
+            progress_driver
+        );
         let (object_id, size, method) = store_result?;
 
         let mut stats = ImportStats::default();

@@ -92,7 +92,7 @@ use std::{
     ffi::{CStr, CString, OsStr, OsString},
     fmt,
     fs::{File, canonicalize},
-    io::{BufRead, Read, Write},
+    io::{Read, Write},
     os::{
         fd::{AsFd, BorrowedFd, OwnedFd},
         unix::ffi::OsStrExt,
@@ -110,9 +110,8 @@ use fn_error_context::context;
 use once_cell::sync::OnceCell;
 use rustix::{
     fs::{
-        Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, RenameFlags,
-        StatVfsMountFlags, accessat, flock, fstatvfs, linkat, mkdirat, openat, readlinkat,
-        renameat_with, statat, syncfs, unlinkat,
+        Access, AtFlags, CWD, Dir, FileType, FlockOperation, Mode, OFlags, StatVfsMountFlags,
+        accessat, flock, fstatvfs, linkat, mkdirat, openat, readlinkat, statat, syncfs, unlinkat,
     },
     io::{Errno, Result as ErrnoResult},
 };
@@ -120,14 +119,15 @@ use rustix::{
 use crate::{
     erofs::format::{FormatConfig, FormatVersion},
     fsverity::{
-        Algorithm, CompareVerityError, DEFAULT_LG_BLOCKSIZE, EnableVerityError, FsVerityHashValue,
-        FsVerityHasher, MeasureVerityError, compute_verity, enable_verity_maybe_copy,
+        Algorithm, CompareVerityError, CopyMethod, DEFAULT_LG_BLOCKSIZE, EnableVerityError,
+        FinishError, FinishedFile, FsVerityHashValue, FsVerityHasher, FsVerityHelper,
+        MeasureVerityError, Published, VerityFile, VerityWriter, compute_verity, enable_verity_raw,
         ensure_verity_equal, has_verity, measure_verity, measure_verity_opt,
     },
     mount::{MountOptions, VerityRequirement, composefs_fsmount, mount_at},
     shared_internals::IO_BUF_CAPACITY,
     splitstream::{SplitStreamReader, SplitStreamWriter},
-    util::{ErrnoFilter, generate_tmpname, proc_self_fd, reopen_tmpfile_ro, replace_symlinkat},
+    util::{ErrnoFilter, generate_tmpname, proc_self_fd, replace_symlinkat},
 };
 
 /// The filename used for repository metadata.
@@ -629,37 +629,6 @@ pub(crate) fn read_repo_metadata(repo_fd: &impl AsFd) -> Result<Option<RepoMetad
     }
 }
 
-/// Enable fs-verity on an fd, dispatching to the correct hash type
-/// based on the [`Algorithm`].
-///
-/// Returns `Some(copy)` if `fd` was still open for writing somewhere
-/// (e.g. inherited by a child forked from another thread) and verity
-/// was enabled on a copy instead.  In that case `fd` does *not* have
-/// verity enabled, and the caller must use the returned descriptor in
-/// its place.  The copy is an unlinked `O_TMPFILE` in `dirfd` whose
-/// contents have been synced.
-fn enable_verity_for_algorithm(
-    dirfd: &impl AsFd,
-    fd: BorrowedFd,
-    algorithm: &Algorithm,
-) -> Result<Option<OwnedFd>> {
-    let copy = match algorithm {
-        Algorithm::Sha256 { .. } => {
-            enable_verity_maybe_copy::<crate::fsverity::Sha256HashValue>(dirfd, fd)
-                .context("enabling verity (sha256)")?
-        }
-        Algorithm::Sha512 { .. } => {
-            enable_verity_maybe_copy::<crate::fsverity::Sha512HashValue>(dirfd, fd)
-                .context("enabling verity (sha512)")?
-        }
-    };
-    if let Some(copy) = &copy {
-        // enable_verity_maybe_copy() leaves syncing the copy to the caller.
-        rustix::fs::fsync(copy).context("syncing verity-enabled copy")?;
-    }
-    Ok(copy)
-}
-
 /// Remove algorithm-specific data from a repository directory.
 ///
 /// Deletes `streams/`, `images/`, and `meta.json` but preserves
@@ -707,8 +676,8 @@ fn repo_format_config_from_meta(meta: &RepoMetadata) -> FormatConfig {
 
 /// Write `meta.json` into a repository directory fd.
 ///
-/// This atomically writes (via O_TMPFILE + linkat) the metadata file.
-/// It will fail if the file already exists.
+/// The file is created atomically and only given its name once it is
+/// complete.  It will fail if the file already exists.
 ///
 /// If `enable_verity` is true, fs-verity is enabled on `meta.json`
 /// before linking it into place.  This signals to future
@@ -721,34 +690,76 @@ pub(crate) fn write_repo_metadata(
     enable_verity: bool,
 ) -> Result<()> {
     let data = meta.to_json()?;
-    let verity = enable_verity.then_some(&meta.algorithm);
-
-    // Try O_TMPFILE for atomic creation
-    match openat(
-        repo_fd,
-        ".",
-        OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o644),
-    ) {
-        Ok(fd) => publish_repo_metadata(repo_fd, File::from(fd), None, &data, verity),
-        // Fallback: no O_TMPFILE support on this filesystem.
-        Err(Errno::OPNOTSUPP | Errno::NOSYS) => write_repo_metadata_named(repo_fd, &data, verity),
-        Err(e) => Err(e).context("creating tmpfile for meta.json"),
+    match enable_verity {
+        true => write_repo_metadata_verity(repo_fd, &data, meta.algorithm, false),
+        false => write_repo_metadata_plain(repo_fd, &data, false),
     }
 }
 
-/// Fallback for [`write_repo_metadata`] on filesystems that don't
-/// support O_TMPFILE.
+/// Write `meta.json` with fs-verity enabled, via an [`FsVerityHelper`].
 ///
-/// The metadata is staged under a temporary name and only given its
-/// final name once it is complete, so a failure along the way (notably
-/// a failure to enable fs-verity) never leaves behind a `meta.json`
-/// that later opens would mistake for a finished one.
-fn write_repo_metadata_named(
+/// `force_named` skips `O_TMPFILE`, for testing the fallback.
+fn write_repo_metadata_verity(
     repo_fd: &impl AsFd,
     data: &[u8],
-    verity: Option<&Algorithm>,
+    algorithm: Algorithm,
+    force_named: bool,
 ) -> Result<()> {
+    // There's no repository (and so no long-lived helper) yet, and this
+    // happens once per repository, so a helper just for this is fine.
+    let builder = FsVerityHelper::builder().max_workers(1);
+    #[cfg(any(test, feature = "test"))]
+    let builder = builder.force_named_tmpfile(force_named);
+    #[cfg(not(any(test, feature = "test")))]
+    let _ = force_named;
+    let helper = builder.start().context("starting fs-verity helper")?;
+
+    let mut writer = helper
+        .create_with_algorithm(repo_fd, data.len() as u64, algorithm)
+        .context("creating meta.json")?;
+    writer.write_all(data).context("writing meta.json")?;
+    let file = writer.finish().context("enabling verity on meta.json")?;
+    rustix::fs::fsync(&file).context("syncing meta.json")?;
+    match file
+        .publish(repo_fd, REPO_METADATA_FILENAME)
+        .context("linking meta.json into repository")?
+    {
+        Published::Created => Ok(()),
+        Published::AlreadyExists => Err(Errno::EXIST).context("linking meta.json into repository"),
+    }
+}
+
+/// Write `meta.json` without fs-verity.
+///
+/// Uses an anonymous O_TMPFILE, or (if the filesystem doesn't support
+/// that, or `force_named` is set) a temporary name, so that a failure
+/// along the way never leaves behind a `meta.json` that later opens
+/// would mistake for a finished one.
+fn write_repo_metadata_plain(repo_fd: &impl AsFd, data: &[u8], force_named: bool) -> Result<()> {
+    if !force_named {
+        match openat(
+            repo_fd,
+            ".",
+            OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        ) {
+            Ok(fd) => {
+                let file = File::from(fd);
+                fill_repo_metadata(&file, data)?;
+                return linkat(
+                    CWD,
+                    proc_self_fd(&file),
+                    repo_fd,
+                    REPO_METADATA_FILENAME,
+                    AtFlags::SYMLINK_FOLLOW,
+                )
+                .context("linking meta.json into repository");
+            }
+            Err(Errno::OPNOTSUPP | Errno::NOSYS) => {}
+            Err(e) => return Err(e).context("creating tmpfile for meta.json"),
+        }
+    }
+
     let name = generate_tmpname(".tmp-meta-");
     let fd = openat(
         repo_fd,
@@ -757,7 +768,16 @@ fn write_repo_metadata_named(
         Mode::from_raw_mode(0o644),
     )
     .context("creating temporary file for meta.json")?;
-    let result = publish_repo_metadata(repo_fd, File::from(fd), Some(&name), data, verity);
+    let result = fill_repo_metadata(&File::from(fd), data).and_then(|()| {
+        linkat(
+            repo_fd,
+            &name,
+            repo_fd,
+            REPO_METADATA_FILENAME,
+            AtFlags::empty(),
+        )
+        .context("linking meta.json into repository")
+    });
     // On success meta.json is a second link to the same file; on failure
     // the staging file is of no further use.
     if let Err(e) = unlinkat(repo_fd, &name, AtFlags::empty()) {
@@ -766,51 +786,10 @@ fn write_repo_metadata_named(
     result
 }
 
-/// Write `data` to the staging file `file`, optionally enable fs-verity
-/// on it, and link the result into the repository as `meta.json`.
-///
-/// `tmpname` is the name of `file` in `repo_fd`, or `None` if it is an
-/// anonymous O_TMPFILE.  The link fails if `meta.json` already exists.
-fn publish_repo_metadata(
-    repo_fd: &impl AsFd,
-    mut file: File,
-    tmpname: Option<&str>,
-    data: &[u8],
-    verity: Option<&Algorithm>,
-) -> Result<()> {
+fn fill_repo_metadata(mut file: &File, data: &[u8]) -> Result<()> {
     file.write_all(data)
         .context("writing metadata to tmpfile")?;
-    file.sync_all().context("syncing metadata tmpfile")?;
-
-    let ro_fd = reopen_tmpfile_ro(file).context("re-opening tmpfile read-only")?;
-
-    let copy = match verity {
-        Some(algorithm) => enable_verity_for_algorithm(repo_fd, ro_fd.as_fd(), algorithm)
-            .context("enabling verity on meta.json")?,
-        None => None,
-    };
-
-    match (copy, tmpname) {
-        // The staging file itself is what we publish, and it has a name.
-        (None, Some(name)) => linkat(
-            repo_fd,
-            name,
-            repo_fd,
-            REPO_METADATA_FILENAME,
-            AtFlags::empty(),
-        ),
-        // Otherwise publish by descriptor: either the anonymous staging
-        // file, or the copy that verity was enabled on.  In the latter
-        // case the staging file has no verity and must not be linked.
-        (copy, _) => linkat(
-            CWD,
-            proc_self_fd(copy.as_ref().unwrap_or(&ro_fd)),
-            repo_fd,
-            REPO_METADATA_FILENAME,
-            AtFlags::SYMLINK_FOLLOW,
-        ),
-    }
-    .context("linking meta.json into repository")
+    file.sync_all().context("syncing metadata tmpfile")
 }
 
 /// Infer repository metadata by examining existing objects.
@@ -934,100 +913,75 @@ pub enum ObjectStoreMethod {
     AlreadyPresent,
 }
 
-/// A staging file for object data, created either as an anonymous
-/// O_TMPFILE (preferred: no directory entry, no cleanup needed) or,
-/// as a fallback for filesystems that don't support O_TMPFILE (e.g.
-/// some fuse-overlayfs configurations), a regular file with a
-/// temporary random name in the objects directory that must be
-/// explicitly renamed into place or unlinked.
-pub(crate) enum ObjectTmpfile {
-    /// An anonymous O_TMPFILE fd with no directory entry.
-    Anonymous(OwnedFd),
-    /// A regular file with a temporary name, used when O_TMPFILE isn't
-    /// supported by the underlying filesystem.
-    Named { fd: OwnedFd, name: String },
-}
-
-impl ObjectTmpfile {
-    /// Duplicate the underlying fd, e.g. for writing to it while keeping
-    /// `self` around to track the fallback name (if any).
-    fn try_clone(&self) -> std::io::Result<OwnedFd> {
-        match self {
-            ObjectTmpfile::Anonymous(fd) => fd.try_clone(),
-            ObjectTmpfile::Named { fd, .. } => fd.try_clone(),
-        }
-    }
-
-    /// The fallback temporary name, if this is a [`Named`](Self::Named) tmpfile.
-    fn name(&self) -> Option<&str> {
-        match self {
-            ObjectTmpfile::Anonymous(_) => None,
-            ObjectTmpfile::Named { name, .. } => Some(name),
-        }
-    }
-
-    /// Build a [`NamedTmpfileGuard`] tracking this tmpfile's fallback name
-    /// (a no-op guard for [`Anonymous`](Self::Anonymous) tmpfiles), to
-    /// protect it from leaking until cleanup responsibility is explicitly
-    /// handed off (e.g. to [`Repository::link_tmpfile_as_object`]).
-    fn guard<'a>(&self, objects_dir: &'a OwnedFd) -> NamedTmpfileGuard<'a> {
-        NamedTmpfileGuard::new(objects_dir, self.name().map(str::to_owned))
-    }
-
-    /// Consume `self`, returning the underlying file.  Callers that need
-    /// the fallback name after this point should retrieve it via
-    /// [`name`](Self::name) beforehand.
-    fn into_file(self) -> File {
-        match self {
-            ObjectTmpfile::Anonymous(fd) => File::from(fd),
-            ObjectTmpfile::Named { fd, .. } => File::from(fd),
-        }
-    }
-}
-
-impl AsFd for ObjectTmpfile {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        match self {
-            ObjectTmpfile::Anonymous(fd) => fd.as_fd(),
-            ObjectTmpfile::Named { fd, .. } => fd.as_fd(),
-        }
-    }
-}
-
-/// RAII guard that unlinks a fallback (named) object tmpfile on drop,
-/// unless disarmed first.
+/// Writes the contents of a new object.
 ///
-/// Used to avoid leaking the temporary file if an error occurs between
-/// its creation and the point where responsibility for it is handed off
-/// to [`Repository::link_tmpfile_as_object`], which either renames it
-/// into place or unlinks it itself (on dedup).
-pub(crate) struct NamedTmpfileGuard<'a> {
-    dirfd: &'a OwnedFd,
-    name: Option<String>,
+/// Created by [`Repository::create_object`].  Write exactly the size given
+/// there, via [`Write`], [`tokio::io::AsyncWrite`] or
+/// [`pipe_mut`](Self::pipe_mut), then call [`finish`](Self::finish).
+/// Dropping the writer without finishing discards the object.
+#[derive(Debug)]
+pub struct ObjectWriter<'r, ObjectID: FsVerityHashValue> {
+    repo: &'r Repository<ObjectID>,
+    writer: VerityWriter,
 }
 
-impl<'a> NamedTmpfileGuard<'a> {
-    fn new(dirfd: &'a OwnedFd, name: Option<String>) -> Self {
-        Self { dirfd, name }
+impl<ObjectID: FsVerityHashValue> ObjectWriter<'_, ObjectID> {
+    /// Return the write end of the pipe that feeds the object; see
+    /// [`VerityWriter::pipe_mut`].
+    pub fn pipe_mut(&mut self) -> std::io::Result<&mut std::io::PipeWriter> {
+        self.writer.pipe_mut()
     }
 
-    /// The fallback temp name being guarded, if any.
-    fn name(&self) -> Option<&str> {
-        self.name.as_deref()
+    /// Finish writing: enable fs-verity, compute the object ID and link
+    /// the object into the repository.
+    ///
+    /// This blocks while the kernel reads the file to compute the digest.
+    #[context("Finishing object")]
+    pub fn finish(self) -> Result<(ObjectID, ObjectStoreMethod)> {
+        self.repo.publish_object(self.writer.finish(), None)
     }
 
-    /// Disarm the guard and return the name, transferring cleanup
-    /// responsibility to the caller.
-    fn disarm(mut self) -> Option<String> {
-        self.name.take()
+    /// Like [`finish`](Self::finish), but waits for fs-verity to be
+    /// enabled on tokio's blocking pool.
+    pub async fn finish_async(self) -> Result<(ObjectID, ObjectStoreMethod)> {
+        let result = self.writer.finish_async().await;
+        self.repo
+            .publish_object(result, None)
+            .context("Finishing object")
     }
 }
 
-impl Drop for NamedTmpfileGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(name) = &self.name {
-            let _ = unlinkat(self.dirfd, name, AtFlags::empty());
-        }
+impl<ObjectID: FsVerityHashValue> Write for ObjectWriter<'_, ObjectID> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl<ObjectID: FsVerityHashValue> tokio::io::AsyncWrite for ObjectWriter<'_, ObjectID> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().writer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
     }
 }
 
@@ -1143,6 +1097,8 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     /// Set via [`set_write_concurrency`](Self::set_write_concurrency) before the semaphore
     /// is first used; if `None`, defaults to [`available_parallelism`].
     write_concurrency: Option<usize>,
+    /// Creates object files with fs-verity enabled; started on first use.
+    verity_helper: OnceCell<FsVerityHelper>,
     /// Whether fs-verity is required, and whether that was detected from
     /// `meta.json` or chosen by the caller.  Read through
     /// [`is_insecure`](Self::is_insecure).
@@ -1156,10 +1112,10 @@ pub struct Repository<ObjectID: FsVerityHashValue> {
     /// written before #[repr(C)] was added to SplitstreamHeader.
     #[cfg(any(test, feature = "test"))]
     write_old_splitstream_format: std::sync::atomic::AtomicBool,
-    /// When true, [`Repository::create_object_tmpfile_impl`] skips the
-    /// O_TMPFILE attempt and goes straight to the named-tmpfile fallback.
-    /// Used to test that fallback path without needing a real
-    /// O_TMPFILE-incapable filesystem.
+    /// When true, object files skip the O_TMPFILE attempt and go
+    /// straight to the named-tmpfile fallback.  Used to test that
+    /// fallback path without needing a real O_TMPFILE-incapable
+    /// filesystem.
     #[cfg(any(test, feature = "test"))]
     force_named_tmpfile: std::sync::atomic::AtomicBool,
     _data: std::marker::PhantomData<ObjectID>,
@@ -1457,20 +1413,41 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Force object tmpfile creation to use the named-tmpfile fallback
-    /// (as if O_TMPFILE were unsupported), for testing.
+    /// Force object files to use the named-tmpfile fallback (as if
+    /// O_TMPFILE were unsupported), for testing.  Must be called before
+    /// the first object is written.
     #[cfg(any(test, feature = "test"))]
     pub fn set_force_named_tmpfile(&self, enabled: bool) {
         self.force_named_tmpfile
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Whether object tmpfile creation should skip straight to the
-    /// named-tmpfile fallback.
-    #[cfg(any(test, feature = "test"))]
-    fn force_named_tmpfile(&self) -> bool {
-        self.force_named_tmpfile
-            .load(std::sync::atomic::Ordering::Relaxed)
+    /// The helper that creates object files with fs-verity enabled,
+    /// started on first use with one worker per allowed concurrent write
+    /// (see [`set_write_concurrency`](Self::set_write_concurrency)).
+    fn verity_helper(&self) -> Result<&FsVerityHelper> {
+        self.verity_helper
+            .get_or_try_init(|| {
+                let workers = self
+                    .write_concurrency
+                    .unwrap_or_else(|| available_parallelism().map(|n| n.get()).unwrap_or(4));
+                // Insecure repositories name objects by a digest computed
+                // in userspace where the kernel can't; computing it while
+                // copying saves reading the file again.  The repository
+                // can be made insecure after the helper is started, so
+                // always ask: it only costs anything where verity doesn't
+                // work, and then writing a secure repository fails anyway.
+                let builder = FsVerityHelper::builder()
+                    .max_workers(workers)
+                    .userspace_digest(true);
+                #[cfg(any(test, feature = "test"))]
+                let builder = builder.force_named_tmpfile(
+                    self.force_named_tmpfile
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                builder.start()
+            })
+            .context("Starting fs-verity helper")
     }
 
     /// Return the objects directory.
@@ -1487,8 +1464,12 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
 
     /// Override the maximum number of concurrent object writes.
     ///
-    /// Must be called before the first use of [`write_semaphore`](Self::write_semaphore);
-    /// has no effect if the semaphore has already been initialized.
+    /// This also sets the number of worker threads that create object
+    /// files (see [`create_object`](Self::create_object)).
+    ///
+    /// Must be called before the first use of [`write_semaphore`](Self::write_semaphore)
+    /// and before the first object is written; has no effect on whatever
+    /// has already been initialized.
     pub fn set_write_concurrency(&mut self, n: usize) {
         // Guard: the semaphore is lazily initialized on first use. If it's
         // already been initialized, this call has no effect. Callers must
@@ -1647,6 +1628,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             images: OnceCell::new(),
             write_semaphore: OnceCell::new(),
             write_concurrency: None,
+            verity_helper: OnceCell::new(),
             integrity: IntegrityPolicy::Detected(VerityState::from_enabled(has_verity)),
             metadata,
             erofs_version_override: None,
@@ -1848,84 +1830,62 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         tokio::task::spawn_blocking(move || self_.ensure_object_impl(&data, &writable)).await?
     }
 
-    /// Import an object by streaming from a file descriptor into a
-    /// tmpfile, without buffering the entire file in memory.
+    /// Import an object from a file descriptor, reflinking it if the
+    /// filesystem allows and copying it in the kernel otherwise.
     ///
-    /// In insecure mode the verity digest is computed while copying,
-    /// avoiding a second read pass.
+    /// `source` must be a regular file of `size` bytes; it is read from
+    /// the start regardless of its file offset.
     #[context("Ensuring object from file descriptor")]
     pub(crate) fn ensure_object_from_fd(&self, source: OwnedFd, size: u64) -> Result<ObjectID> {
-        self.ensure_object_from_reader(File::from(source), size)
+        let _writable = self.ensure_writable_token()?;
+        let result =
+            self.verity_helper()?
+                .create_from_fd::<ObjectID>(self.objects_dir()?, &source, size);
+        Ok(self.publish_object(result, None)?.0)
     }
 
     /// Ensures that the given data is stored as an object in the repository,
     /// reading from any source that implements [`Read`].
-    ///
-    /// In insecure mode, the fs-verity digest is computed while copying,
-    /// avoiding a second read pass.
     #[context("Ensuring object from reader")]
     pub fn ensure_object_from_reader(&self, mut source: impl Read, size: u64) -> Result<ObjectID> {
-        let writable = self.ensure_writable_token()?;
-        let objects_dir = self.objects_dir().context("Getting objects directory")?;
-        let tmpfile = self.create_object_tmpfile_impl(&writable)?;
-        // Protects the fallback tmpfile (if any) from leaking if we bail
-        // out (via `?`) before handing its name off to
-        // `link_tmpfile_as_object` / `finalize_object_tmpfile_impl`.
-        let guard = tmpfile.guard(objects_dir);
-
-        if self.is_insecure() {
-            let mut hasher = FsVerityHasher::<ObjectID>::new();
-            let mut src = std::io::BufReader::with_capacity(IO_BUF_CAPACITY, &mut source);
-            let mut dst = File::from(tmpfile.try_clone()?);
-
-            loop {
-                let buf = src.fill_buf()?;
-                if buf.is_empty() {
-                    break;
-                }
-                hasher.write_all(buf)?;
-                dst.write_all(buf)?;
-                let n = buf.len();
-                src.consume(n);
-            }
-            drop(dst);
-
-            let id = hasher.digest();
-            let ro_fd = reopen_tmpfile_ro(tmpfile.into_file())
-                .context("Re-opening tmpfile as read-only")?;
-            let (id, _method) =
-                self.link_tmpfile_as_object(objects_dir, &ro_fd, &id, size, guard)?;
-            Ok(id)
-        } else {
-            // Secure mode: let std::io::copy use copy_file_range for
-            // potential reflinks, then finalize_object_tmpfile_impl
-            // enables kernel verity and measures the digest.
-            let mut dst = File::from(tmpfile.try_clone()?);
-            let copied = std::io::copy(&mut source, &mut dst)?;
-            ensure!(copied == size, "Expected {size} bytes, got {copied}");
-            drop(dst);
-
-            let (id, _method) =
-                self.finalize_object_tmpfile_impl(tmpfile, guard, size, &writable)?;
-            Ok(id)
-        }
+        let mut writer = self.create_object(size)?;
+        // Copying into the pipe itself lets std::io::copy() splice()
+        // from files and sockets.
+        std::io::copy(&mut source, writer.pipe_mut()?).context("Copying object data")?;
+        Ok(writer.finish()?.0)
     }
 
-    /// Create an O_TMPFILE in the objects directory for streaming writes.
+    /// Start writing a new object of `size` bytes.
     ///
-    /// Returns the file descriptor for writing. The caller should write data to this fd,
-    /// then call [`finalize_object_tmpfile`](Self::finalize_object_tmpfile) to compute
-    /// the verity digest, enable fs-verity, and link the file into the objects directory.
+    /// Write the data to the returned [`ObjectWriter`], then call
+    /// [`ObjectWriter::finish`] to enable fs-verity, compute the object
+    /// ID and link the object into the repository.
     ///
-    /// Unlike the crate-internal streaming ingestion path, this public API
-    /// always uses O_TMPFILE with no fallback: callers (e.g. `cfsctl`) are
-    /// expected to hold a real anonymous tmpfile fd.
-    #[context("Creating object tmpfile")]
-    pub fn create_object_tmpfile(&self) -> Result<OwnedFd> {
+    /// Each unfinished writer occupies one of the repository's
+    /// [write slots](Self::set_write_concurrency), and data for a writer
+    /// beyond that limit isn't read until a slot frees up.  So a thread
+    /// must not write to one object while holding that many unfinished
+    /// others, or it deadlocks; [`write_semaphore`](Self::write_semaphore)
+    /// helps avoid that.
+    #[context("Creating object")]
+    pub fn create_object(&self, size: u64) -> Result<ObjectWriter<'_, ObjectID>> {
         let _writable = self.ensure_writable_token()?;
-        let objects_dir = self
-            .objects_dir()
-            .context("Getting objects directory for tmpfile creation")?;
+        let writer = self
+            .verity_helper()?
+            .create::<ObjectID>(self.objects_dir()?, size)?;
+        Ok(ObjectWriter { repo: self, writer })
+    }
+
+    /// Create an anonymous read-write temporary file in the repository's
+    /// filesystem, for scratch data that won't become an object.
+    ///
+    /// Use [`create_object`](Self::create_object) for objects instead:
+    /// fs-verity can't be enabled on a file that had a writable
+    /// descriptor like this one, which forked children may inherit.
+    #[context("Creating scratch tmpfile")]
+    pub fn create_scratch_tmpfile(&self) -> Result<OwnedFd> {
+        let _writable = self.ensure_writable_token()?;
+        let objects_dir = self.objects_dir()?;
         let fd = openat(
             objects_dir,
             ".",
@@ -1934,64 +1894,6 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         )
         .context("Opening temp file in objects directory")?;
         Ok(fd)
-    }
-
-    /// Create a staging file for object data in the objects directory.
-    ///
-    /// Prefers an anonymous O_TMPFILE (no directory entry, no cleanup
-    /// needed if the caller bails out).  Falls back to a regular file
-    /// with a random temporary name when the underlying filesystem
-    /// doesn't support O_TMPFILE (`EOPNOTSUPP`), e.g. some fuse-overlayfs
-    /// configurations used in CI (see bootc-dev/bootc#2340).
-    #[context("Creating object tmpfile")]
-    pub(crate) fn create_object_tmpfile_impl(
-        &self,
-        _writable: &WritableRepo,
-    ) -> Result<ObjectTmpfile> {
-        let objects_dir = self
-            .objects_dir()
-            .context("Getting objects directory for tmpfile creation")?;
-
-        #[cfg(any(test, feature = "test"))]
-        if self.force_named_tmpfile() {
-            return self.create_named_object_tmpfile(objects_dir);
-        }
-
-        match openat(
-            objects_dir,
-            ".",
-            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
-            Mode::from_raw_mode(0o644),
-        ) {
-            Ok(fd) => Ok(ObjectTmpfile::Anonymous(fd)),
-            Err(Errno::OPNOTSUPP) => self.create_named_object_tmpfile(objects_dir),
-            Err(e) => Err(e).context("Opening temp file in objects directory")?,
-        }
-    }
-
-    /// Fallback for [`create_object_tmpfile_impl`](Self::create_object_tmpfile_impl):
-    /// create a regular file with a random temporary name in the objects
-    /// directory, for use on filesystems that don't support O_TMPFILE.
-    fn create_named_object_tmpfile(&self, objects_dir: &OwnedFd) -> Result<ObjectTmpfile> {
-        // A handful of retries is plenty: collisions on a 12-character
-        // random alphanumeric suffix are astronomically unlikely; this
-        // just guards against a freak collision.
-        for _ in 0..16 {
-            let name = generate_tmpname(".tmp-object-");
-            match openat(
-                objects_dir,
-                &name,
-                OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC,
-                Mode::from_raw_mode(0o644),
-            ) {
-                Ok(fd) => return Ok(ObjectTmpfile::Named { fd, name }),
-                Err(Errno::EXIST) => continue,
-                Err(e) => {
-                    return Err(e).context("Creating fallback temp file in objects directory")?;
-                }
-            }
-        }
-        bail!("failed to create a uniquely-named fallback object tmpfile after 16 attempts")
     }
 
     /// Ensure an object exists by reflinking or hardlinking from a source file.
@@ -2047,50 +1949,29 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         allow_copy: bool,
         ctx: &mut ImportContext,
     ) -> Result<(ObjectID, ObjectStoreMethod)> {
-        use rustix::fs::{fstat, ioctl_ficlone};
+        use rustix::fs::fstat;
 
-        let writable = self.ensure_writable_token()?;
+        let _writable = self.ensure_writable_token()?;
+        let helper = self.verity_helper()?;
+        let objects_dir = self.objects_dir()?;
 
         // Determine the source and destination device IDs so we can look up
         // whether this particular filesystem pair supports reflinks.
         let src_dev = fstat(src)?.st_dev;
-        let dst_dev = fstat(self.objects_dir()?)?.st_dev;
+        let dst_dev = fstat(objects_dir)?.st_dev;
 
         // Try reflink first, unless a previous call on this device pair
         // already discovered that FICLONE is unsupported.
         if !ctx.is_reflink_unsupported(src_dev, dst_dev) {
-            let objects_dir = self.objects_dir()?;
-            let tmpfile = self.create_object_tmpfile_impl(&writable)?;
-            let guard = tmpfile.guard(objects_dir);
-
-            match ioctl_ficlone(&tmpfile, src) {
-                Ok(()) => {
-                    // Reflink succeeded — verify size matches
-                    let stat = fstat(&tmpfile)?;
-                    anyhow::ensure!(
-                        stat.st_size as u64 == size,
-                        "Reflink size mismatch: expected {}, got {}",
-                        size,
-                        stat.st_size
-                    );
-
-                    let (object_id, method) =
-                        self.finalize_object_tmpfile_impl(tmpfile, guard, size, &writable)?;
-                    let method = match method {
-                        ObjectStoreMethod::Copied => ObjectStoreMethod::Reflinked,
-                        other => other,
-                    };
-                    return Ok((object_id, method));
-                }
-                Err(Errno::OPNOTSUPP | Errno::XDEV) => {
+            match helper.reflink_from_fd::<ObjectID>(objects_dir, src, size) {
+                Err(FinishError::ReflinkUnsupported) => {
                     // Record for this device pair so subsequent calls skip.
                     ctx.mark_reflink_unsupported(src_dev, dst_dev);
-                    drop(tmpfile);
-                    // `guard` drops here too, cleaning up the fallback
-                    // tmpfile (if any) since it was never used.
                 }
-                Err(e) => {
-                    return Err(e).context("Reflinking source file to objects directory")?;
+                result => {
+                    return self
+                        .publish_object(result, None)
+                        .context("Reflinking source file to objects directory");
                 }
             }
         }
@@ -2118,21 +1999,10 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             }
         }
 
-        // Final fallback: copy data into a new tmpfile.
-        let objects_dir = self.objects_dir()?;
-        let tmpfile = self.create_object_tmpfile_impl(&writable)?;
-        let guard = tmpfile.guard(objects_dir);
-        {
-            use std::io::{Seek, SeekFrom};
-            let mut dst = File::from(tmpfile.try_clone()?);
-            let mut src_clone = src.try_clone()?;
-            src_clone.seek(SeekFrom::Start(0))?;
-            std::io::copy(&mut src_clone, &mut dst)?;
-        }
-
-        let (object_id, method) =
-            self.finalize_object_tmpfile_impl(tmpfile, guard, size, &writable)?;
-        Ok((object_id, method))
+        // Final fallback: copy the data.
+        let result = helper.create_from_fd::<ObjectID>(objects_dir, src, size);
+        self.publish_object(result, None)
+            .context("Copying source file to objects directory")
     }
 
     /// Try to hardlink a source file directly into the objects directory.
@@ -2147,7 +2017,6 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         src: &std::fs::File,
         size: u64,
     ) -> Result<(ObjectID, ObjectStoreMethod)> {
-        use crate::fsverity::enable_verity_with_retry;
         use rustix::thread::{CapabilitySet, capabilities};
 
         // AT_EMPTY_PATH linkat requires CAP_DAC_READ_SEARCH.  Check upfront
@@ -2168,7 +2037,9 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         // This is safe because the caller (bootc/containers-storage) owns the
         // source files and they are immutable image data.
         // AlreadyEnabled is fine — the file was already verity-protected.
-        let verity_enabled = match enable_verity_with_retry::<ObjectID>(src) {
+        // The file isn't ours, so if something holds it open for writing
+        // that's an error (and the caller can fall back to copying).
+        let verity_enabled = match enable_verity_raw::<ObjectID>(src) {
             Ok(()) => true,
             Err(EnableVerityError::AlreadyEnabled) => true,
             Err(EnableVerityError::FilesystemNotSupported) if self.is_insecure() => false,
@@ -2217,163 +2088,76 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         }
     }
 
-    /// Finalize a tmpfile as an object.
+    /// Link a file from the fs-verity helper into the objects directory.
     ///
-    /// This method should be called from a blocking context (e.g., `spawn_blocking`)
-    /// as it performs synchronous I/O operations.
-    ///
-    /// This method:
-    /// 1. Re-opens the file as read-only
-    /// 2. Enables fs-verity on the file (kernel computes digest)
-    /// 3. Reads the digest from the kernel
-    /// 4. Checks if object already exists (deduplication)
-    /// 5. Links the file into the objects directory
-    ///
-    /// By letting the kernel compute the digest during verity enable, we avoid
-    /// reading the file an extra time in userspace.
-    #[context("Finalizing object tempfile")]
-    pub fn finalize_object_tmpfile(
+    /// Without fs-verity support the file is only accepted for insecure
+    /// repositories, named by a digest computed in userspace.  If an
+    /// object with the same digest and size already exists, the new file
+    /// is discarded and `AlreadyPresent` is returned.  If `expected` is
+    /// given, the digest must match it.
+    #[context("Storing new object")]
+    fn publish_object(
         &self,
-        file: File,
-        size: u64,
+        result: Result<VerityFile, FinishError>,
+        expected: Option<&ObjectID>,
     ) -> Result<(ObjectID, ObjectStoreMethod)> {
-        let writable = self.ensure_writable_token()?;
-        let objects_dir = self
-            .objects_dir()
-            .context("Getting objects directory for finalization")?;
-        // The public API only ever hands us an anonymous O_TMPFILE (created
-        // via `create_object_tmpfile`), so there's no fallback name to track.
-        let guard = NamedTmpfileGuard::new(objects_dir, None);
-        self.finalize_object_tmpfile_impl(
-            ObjectTmpfile::Anonymous(file.into()),
-            guard,
-            size,
-            &writable,
-        )
-    }
-
-    /// Like [`finalize_object_tmpfile`](Self::finalize_object_tmpfile), but
-    /// also accepts the [`ObjectTmpfile`] wrapper produced by
-    /// [`create_object_tmpfile_impl`](Self::create_object_tmpfile_impl)
-    /// along with the [`NamedTmpfileGuard`] that's been protecting it since
-    /// creation, so the fallback temp name (for filesystems that don't
-    /// support O_TMPFILE) stays tracked and cleaned up on error.
-    #[context("Finalizing object tempfile")]
-    pub(crate) fn finalize_object_tmpfile_impl(
-        &self,
-        tmpfile: ObjectTmpfile,
-        guard: NamedTmpfileGuard<'_>,
-        size: u64,
-        _writable: &WritableRepo,
-    ) -> Result<(ObjectID, ObjectStoreMethod)> {
-        // Get objects_dir early since we may need it for verity copy.
-        let objects_dir = self
-            .objects_dir()
-            .context("Getting objects directory for finalization")?;
-
-        let ro_fd = reopen_tmpfile_ro(tmpfile.into_file())
-            .context("Re-opening tmpfile as read-only for verity")?;
-
-        // Enable verity - the kernel reads the file and computes the digest.
-        // Use enable_verity_maybe_copy to handle the case where forked processes
-        // have inherited writable fds to this file.
-        let (ro_fd, verity_enabled) =
-            match enable_verity_maybe_copy::<ObjectID>(objects_dir, ro_fd.as_fd()) {
-                Ok(None) => (ro_fd, true),
-                Ok(Some(new_fd)) => (new_fd, true),
-                Err(EnableVerityError::FilesystemNotSupported) if self.is_insecure() => {
-                    (ro_fd, false)
-                }
-                Err(EnableVerityError::AlreadyEnabled) => (ro_fd, true),
-                Err(other) => return Err(other).context("Enabling verity on tmpfile")?,
-            };
-
-        // Get the digest - either from kernel (fast) or compute in userspace (fallback)
-        let id: ObjectID = if verity_enabled {
-            measure_verity(&ro_fd).context("Measuring verity digest")?
-        } else {
-            // Insecure mode: compute digest in userspace from ro_fd
-            let mut reader = std::io::BufReader::new(File::from(
-                ro_fd
-                    .try_clone()
-                    .context("Cloning fd for digest computation")?,
-            ));
-            Self::compute_verity_digest(&mut reader)
-                .context("Computing verity digest in insecure mode")?
-        };
-
-        self.link_tmpfile_as_object(objects_dir, &ro_fd, &id, size, guard)
-    }
-
-    /// Link a read-only tmpfile into the objects directory with dedup check.
-    ///
-    /// If an object with the same digest and size already exists, the
-    /// tmpfile is discarded and `AlreadyPresent` is returned.
-    ///
-    /// `guard` protects the fallback (named) tmpfile, if any, from leaking:
-    /// it stays armed for the whole function and is only disarmed once the
-    /// tmpfile has actually been put in place, so any early return (e.g.
-    /// from `ensure_dir_at` failing) or the dedup/race paths below all
-    /// still clean it up via `Drop`.
-    ///
-    /// When there's a fallback name, the new object is put in place with
-    /// an atomic `renameat` (`RENAME_NOREPLACE`) instead of the
-    /// `linkat`-via-`/proc/self/fd` trick used for anonymous tmpfiles. If a
-    /// racing writer completes first for the same digest, the rename fails
-    /// with `EEXIST`; that's fine, we just discard our tmpfile and report
-    /// `AlreadyPresent`.
-    fn link_tmpfile_as_object(
-        &self,
-        objects_dir: &OwnedFd,
-        ro_fd: &impl AsFd,
-        id: &ObjectID,
-        size: u64,
-        guard: NamedTmpfileGuard,
-    ) -> Result<(ObjectID, ObjectStoreMethod)> {
-        let path = id.to_object_pathname();
-
-        match statat(objects_dir, &path, AtFlags::empty()) {
-            Ok(stat) if stat.st_size as u64 == size => {
-                // `guard` drops here, discarding our now-redundant tmpfile.
-                return Ok((id.clone(), ObjectStoreMethod::AlreadyPresent));
+        let objects_dir = self.objects_dir()?;
+        let (file, id) = match result {
+            Ok(file) => {
+                let id = file
+                    .digest::<ObjectID>()
+                    .context("fs-verity digest has the wrong algorithm")?;
+                (FinishedFile::Verity(file), id)
             }
-            _ => {}
+            Err(FinishError::NotSupported(file)) if self.is_insecure() => {
+                let id = match file.userspace_digest::<ObjectID>() {
+                    Some(id) => id,
+                    None => {
+                        let fd = file
+                            .as_fd()
+                            .try_clone_to_owned()
+                            .context("Cloning fd for digest computation")?;
+                        let mut reader =
+                            std::io::BufReader::with_capacity(IO_BUF_CAPACITY, File::from(fd));
+                        Self::compute_verity_digest(&mut reader)?
+                    }
+                };
+                (FinishedFile::Unverified(file), id)
+            }
+            Err(e) => return Err(e).context("Enabling fs-verity on new object"),
+        };
+        if let Some(expected) = expected {
+            ensure!(
+                &id == expected,
+                "Object digest mismatch: expected {}, got {}",
+                expected.to_hex(),
+                id.to_hex()
+            );
         }
 
-        let parent_dir = id.to_object_dir();
-        ensure_dir_at(objects_dir, &parent_dir, Mode::from_raw_mode(0o755))
+        let path = id.to_object_pathname();
+        let size = rustix::fs::fstat(file.as_fd())
+            .context("Checking new object size")?
+            .st_size;
+        if let Ok(stat) = statat(objects_dir, &path, AtFlags::empty())
+            && stat.st_size == size
+        {
+            // Dropping `file` discards it.
+            return Ok((id, ObjectStoreMethod::AlreadyPresent));
+        }
+
+        ensure_dir_at(objects_dir, &id.to_object_dir(), Mode::from_raw_mode(0o755))
             .context("creating object parent directory")?;
-
-        if let Some(name) = guard.name() {
-            return match renameat_with(
-                objects_dir,
-                name,
-                objects_dir,
-                &path,
-                RenameFlags::NOREPLACE,
-            ) {
-                Ok(()) => {
-                    // Successfully in place; nothing left to clean up.
-                    guard.disarm();
-                    Ok((id.clone(), ObjectStoreMethod::Copied))
-                }
-                // Lost a race to a concurrent writer for the same digest;
-                // `guard` drops here, discarding our tmpfile.
-                Err(Errno::EXIST) => Ok((id.clone(), ObjectStoreMethod::AlreadyPresent)),
-                Err(e) => Err(e).context("Renaming tmpfile into objects directory")?,
-            };
-        }
-
-        match linkat(
-            CWD,
-            proc_self_fd(ro_fd),
-            objects_dir,
-            &path,
-            AtFlags::SYMLINK_FOLLOW,
-        ) {
-            Ok(()) => Ok((id.clone(), ObjectStoreMethod::Copied)),
-            Err(Errno::EXIST) => Ok((id.clone(), ObjectStoreMethod::AlreadyPresent)),
-            Err(e) => Err(e).context("Linking tmpfile into objects directory")?,
+        let method = match file.copy_method() {
+            CopyMethod::Reflinked => ObjectStoreMethod::Reflinked,
+            CopyMethod::Written | CopyMethod::Copied => ObjectStoreMethod::Copied,
+        };
+        match file
+            .publish(objects_dir, &path)
+            .context("Linking new object into objects directory")?
+        {
+            Published::Created => Ok((id, method)),
+            Published::AlreadyExists => Ok((id, ObjectStoreMethod::AlreadyPresent)),
         }
     }
 
@@ -2429,18 +2213,30 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     Err(CompareVerityError::Measure(MeasureVerityError::VerityMissing))
                         if self.is_insecure() =>
                     {
-                        match enable_verity_maybe_copy::<ObjectID>(dirfd, fd.as_fd()) {
-                            // The object is open for writing somewhere, so
-                            // verity went onto a copy.  The copy only
-                            // serves to check the content here and is then
-                            // dropped on purpose: swapping it in would
-                            // replace the inode whose flock tells gc() that
-                            // an image is mounted.  The object stays without
-                            // verity, which an insecure repository allows.
-                            Ok(Some(copy)) => ensure_verity_equal(&copy, id)
-                                .context("Verifying verity after enabling (copied)")?,
-                            Ok(None) => ensure_verity_equal(&fd, id)
-                                .context("Verifying verity after enabling (original)")?,
+                        match enable_verity_raw::<ObjectID>(&fd) {
+                            Ok(()) | Err(EnableVerityError::AlreadyEnabled) => {
+                                ensure_verity_equal(&fd, id)
+                                    .context("Verifying verity after enabling")?
+                            }
+                            // The object is open for writing somewhere (e.g.
+                            // in a forked child that hasn't exec'd yet).  It
+                            // stays without verity, which an insecure
+                            // repository allows; check its content instead.
+                            // Replacing it with a fresh copy isn't an option:
+                            // that would replace the inode whose flock tells
+                            // gc() that an image is mounted.
+                            Err(EnableVerityError::FileOpenedForWrite) => {
+                                let mut reader = std::io::BufReader::with_capacity(
+                                    IO_BUF_CAPACITY,
+                                    File::from(fd.try_clone()?),
+                                );
+                                let found = Self::compute_verity_digest(&mut reader)?;
+                                ensure!(
+                                    &found == id,
+                                    "Existing object has digest {}",
+                                    found.to_hex()
+                                );
+                            }
                             Err(other) => {
                                 Err(other).context("Enabling verity on existing object")?
                             }
@@ -2461,46 +2257,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             }
         }
 
-        let fd = ensure_dir_and_openat(dirfd, &id.to_object_dir(), OFlags::RDWR | OFlags::TMPFILE)
-            .with_context(|| "Creating tempfile in object subdirectory")?;
-        let mut file = File::from(fd);
-        file.write_all(data).context("Writing data to tmpfile")?;
         // NB: We should do fdatasync() or fsync() here, but doing this for each file forces the
         // creation of a massive number of journal commits and is a performance disaster.  We need
         // to coordinate this at a higher level.  See .write_stream().
-        let ro_fd = reopen_tmpfile_ro(file).context("Re-opening file as read-only for verity")?;
-
-        let ro_fd = match enable_verity_maybe_copy::<ObjectID>(dirfd, ro_fd.as_fd()) {
-            Ok(maybe_fd) => {
-                let ro_fd = maybe_fd.unwrap_or(ro_fd);
-                match ensure_verity_equal(&ro_fd, id) {
-                    Ok(()) => ro_fd,
-                    Err(CompareVerityError::Measure(
-                        MeasureVerityError::VerityMissing
-                        | MeasureVerityError::FilesystemNotSupported,
-                    )) if self.is_insecure() => ro_fd,
-                    Err(other) => Err(other).context("Double-checking verity digest")?,
-                }
-            }
-            Err(EnableVerityError::FilesystemNotSupported) if self.is_insecure() => ro_fd,
-            Err(other) => Err(other).context("Enabling verity digest")?,
-        };
-
-        match linkat(
-            CWD,
-            proc_self_fd(&ro_fd),
-            dirfd,
-            path,
-            AtFlags::SYMLINK_FOLLOW,
-        ) {
-            Ok(()) => {}
-            Err(Errno::EXIST) => {
-                // TODO: strictly, we should measure the newly-appeared file
-            }
-            Err(other) => {
-                return Err(other).context("Linking created object file");
-            }
-        }
+        let mut writer = self
+            .verity_helper()?
+            .create::<ObjectID>(dirfd, data.len() as u64)?;
+        writer.write_all(data).context("Writing object data")?;
+        self.publish_object(writer.finish(), Some(id))?;
 
         Ok(())
     }
@@ -5427,8 +5191,8 @@ mod tests {
     }
 
     /// On filesystems without O_TMPFILE support (e.g. some fuse-overlayfs
-    /// configurations, see bootc-dev/bootc#2340), `create_object_tmpfile_impl`
-    /// must fall back to a named temp file that gets renamed into place (or
+    /// configurations, see bootc-dev/bootc#2340), object files must fall
+    /// back to a named temp file that gets renamed into place (or
     /// unlinked on dedup) instead of erroring out.
     #[test]
     fn test_ensure_object_from_reader_named_tmpfile_fallback() -> Result<()> {
@@ -5452,6 +5216,150 @@ mod tests {
         assert_eq!(object_id, object_id_2);
         assert!(stray_tmpfiles_in_objects(&tmp)?.is_empty());
 
+        Ok(())
+    }
+
+    /// Regression test: with the named-tmpfile fallback, a writable
+    /// descriptor inherited by a forked child used to make verity go onto
+    /// a copy while the original, verity-less file was renamed into
+    /// place.  Objects in a secure repository must always have verity.
+    #[test]
+    fn test_named_tmpfile_objects_have_verity_while_forking() -> Result<()> {
+        use composefs_ioctls::test_utils_pub::CommandExt as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempdir();
+        let (repo, _) = Repository::<Sha512HashValue>::init_path(
+            CWD,
+            tmp.path().join("repo"),
+            RepositoryConfig::new(Algorithm::SHA512),
+        )?;
+        assert!(!repo.is_insecure());
+        repo.set_force_named_tmpfile(true);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let forkers: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true")
+                            .pre_exec_sleep(std::time::Duration::from_millis(5))
+                            .status();
+                    }
+                })
+            })
+            .collect();
+
+        let result = (0..100u32).try_for_each(|i| -> Result<()> {
+            let data = generate_test_data(16 * 1024, i as u8);
+            let id = repo.ensure_object_from_reader(data.as_slice(), data.len() as u64)?;
+            let fd = repo.open_object(&id)?;
+            assert_eq!(measure_verity::<Sha512HashValue>(&fd)?, id);
+            Ok(())
+        });
+
+        stop.store(true, Ordering::Relaxed);
+        for forker in forkers {
+            forker.join().unwrap();
+        }
+        result?;
+        assert!(stray_tmpfiles_in_objects(&tmp)?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_object_async() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let data = generate_test_data(256 * 1024, 0x5A);
+
+        let mut writer = repo.create_object(data.len() as u64)?;
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &data).await?;
+        let (id, method) = writer.finish_async().await?;
+        assert_eq!(id, compute_verity::<Sha512HashValue>(&data));
+        assert_eq!(method, ObjectStoreMethod::Copied);
+        assert_eq!(repo.read_object(&id)?, data);
+
+        let mut writer = repo.create_object(data.len() as u64)?;
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &data).await?;
+        let (_, method) = writer.finish_async().await?;
+        assert_eq!(method, ObjectStoreMethod::AlreadyPresent);
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_object_size_mismatch() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let data = generate_test_data(4096, 0x11);
+
+        let err = repo
+            .ensure_object_from_reader(data.as_slice(), 4000)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.root_cause().downcast_ref::<FinishError>(),
+                Some(FinishError::SizeMismatch {
+                    expected: 4000,
+                    actual: 4096
+                })
+            ),
+            "{err:#}"
+        );
+
+        // A dropped writer leaves nothing behind either.
+        let mut writer = repo.create_object(100)?;
+        writer.write_all(b"partial")?;
+        drop(writer);
+        assert!(stray_tmpfiles_in_objects(&tmp)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_create_scratch_tmpfile() -> Result<()> {
+        use std::io::{Read as _, Seek as _};
+
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let mut file = File::from(repo.create_scratch_tmpfile()?);
+        file.write_all(b"scratch")?;
+        file.rewind()?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        assert_eq!(contents, "scratch");
+        assert!(
+            std::fs::read_dir(tmp.path().join("repo/objects"))?
+                .next()
+                .is_none()
+        );
+        Ok(())
+    }
+
+    /// In an insecure repository, an existing object without verity gets
+    /// it enabled when stored again; but if it is open for writing
+    /// somewhere, it is left as it is and only its content is checked.
+    #[test]
+    fn test_existing_object_open_for_writing() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let data = generate_test_data(8192, 0x77);
+        let id = compute_verity::<Sha512HashValue>(&data);
+
+        let objects = tmp.path().join("repo/objects");
+        let path = objects.join(id.to_object_pathname());
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, &data)?;
+        let writer = std::fs::OpenOptions::new().write(true).open(&path)?;
+
+        assert_eq!(repo.ensure_object(&data)?, id);
+        assert!(measure_verity_opt::<Sha512HashValue>(&File::open(&path)?)?.is_none());
+
+        // Wrong content is caught.
+        std::fs::write(&path, generate_test_data(8192, 0x78))?;
+        assert!(repo.ensure_object(&data).is_err());
+
+        drop(writer);
         Ok(())
     }
 
@@ -6255,90 +6163,67 @@ mod tests {
         Ok(names)
     }
 
-    /// If the staging file for `meta.json` is still open for writing
-    /// elsewhere when verity is enabled (as happens when another thread
-    /// forks and the child has not yet exec'd), verity ends up on a copy.
-    /// That copy, not the staging file, must become `meta.json`: otherwise
-    /// a strict init silently produces a repository without verity.
+    fn open_dir(path: &Path) -> Result<OwnedFd> {
+        Ok(openat(
+            CWD,
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?)
+    }
+
+    /// A strict `meta.json` must end up with fs-verity, with or without
+    /// O_TMPFILE, and leave nothing else behind.
     #[test]
-    fn test_meta_json_verity_with_busy_staging_file() -> Result<()> {
+    fn test_meta_json_verity() -> Result<()> {
         let meta = RepoMetadata::new(Algorithm::SHA512);
         let data = meta.to_json()?;
 
-        for tmpname in [None, Some(".tmp-meta-test")] {
+        for force_named in [false, true] {
             let tmp = tempdir();
-            let repo_fd = openat(
-                CWD,
-                tmp.path(),
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?;
-            let staging = match tmpname {
-                None => openat(
-                    &repo_fd,
-                    ".",
-                    OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
-                    Mode::from_raw_mode(0o644),
-                )?,
-                Some(name) => openat(
-                    &repo_fd,
-                    name,
-                    OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-                    Mode::from_raw_mode(0o644),
-                )?,
-            };
-            let staging = File::from(staging);
-            // Stand in for the forked child holding an inherited descriptor.
-            let writer = staging.try_clone()?;
-
-            publish_repo_metadata(&repo_fd, staging, tmpname, &data, Some(&meta.algorithm))?;
-            drop(writer);
+            let repo_fd = open_dir(tmp.path())?;
+            write_repo_metadata_verity(&repo_fd, &data, meta.algorithm, force_named)?;
 
             assert_eq!(
                 Repository::<Sha512HashValue>::read_and_probe_metadata(&repo_fd)?,
                 (meta.clone(), true),
-                "staging name {tmpname:?}"
+                "force_named {force_named}"
             );
+            assert_eq!(names_in(&tmp)?, [REPO_METADATA_FILENAME]);
             let repo = Repository::<Sha512HashValue>::open_path(&repo_fd, ".")?;
-            assert!(!repo.is_insecure(), "staging name {tmpname:?}");
+            assert!(!repo.is_insecure(), "force_named {force_named}");
         }
         Ok(())
     }
 
-    /// The fallback for filesystems without O_TMPFILE stages `meta.json`
-    /// under a temporary name, which must not outlive the call.
+    /// An existing meta.json is never replaced, and a failed attempt
+    /// cleans up after itself.
     #[test]
-    fn test_meta_json_named_fallback() -> Result<()> {
+    fn test_meta_json_exists() -> Result<()> {
         let tmp = tempdir();
-        let repo_fd = openat(
-            CWD,
-            tmp.path(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
+        let repo_fd = open_dir(tmp.path())?;
         let meta = RepoMetadata::new(Algorithm::SHA512);
-        let data = meta.to_json()?;
+        write_repo_metadata(&repo_fd, &meta, true)?;
 
-        write_repo_metadata_named(&repo_fd, &data, Some(&meta.algorithm))?;
-        assert_eq!(
-            Repository::<Sha512HashValue>::read_and_probe_metadata(&repo_fd)?,
-            (meta.clone(), true)
-        );
-        assert_eq!(names_in(&tmp)?, [REPO_METADATA_FILENAME]);
-
-        // An existing meta.json is never replaced, and the failed attempt
-        // cleans up after itself.
         let other = RepoMetadata::new(Algorithm::SHA256).to_json()?;
-        let err = write_repo_metadata_named(&repo_fd, &other, None).unwrap_err();
-        assert_eq!(
-            err.root_cause().downcast_ref::<Errno>(),
-            Some(&Errno::EXIST)
-        );
-        assert_eq!(
-            Repository::<Sha512HashValue>::read_and_probe_metadata(&repo_fd)?,
-            (meta.clone(), true)
-        );
-        assert_eq!(names_in(&tmp)?, [REPO_METADATA_FILENAME]);
+        for force_named in [false, true] {
+            let errors = [
+                write_repo_metadata_plain(&repo_fd, &other, force_named).unwrap_err(),
+                write_repo_metadata_verity(&repo_fd, &other, Algorithm::SHA256, force_named)
+                    .unwrap_err(),
+            ];
+            for err in errors {
+                assert_eq!(
+                    err.root_cause().downcast_ref::<Errno>(),
+                    Some(&Errno::EXIST)
+                );
+            }
+            assert_eq!(
+                Repository::<Sha512HashValue>::read_and_probe_metadata(&repo_fd)?,
+                (meta.clone(), true)
+            );
+            assert_eq!(names_in(&tmp)?, [REPO_METADATA_FILENAME]);
+        }
         Ok(())
     }
 
@@ -6353,21 +6238,16 @@ mod tests {
 
         // /dev/shm is a tmpfs: O_TMPFILE works there, fs-verity does not.
         let tmp = TempDir::with_prefix_in("composefs-test-", "/dev/shm")?;
-        let repo_fd = openat(
-            CWD,
-            tmp.path(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?;
+        let repo_fd = open_dir(tmp.path())?;
 
         assert!(write_repo_metadata(&repo_fd, &meta, true).is_err());
         assert!(names_in(&tmp)?.is_empty());
 
-        assert!(write_repo_metadata_named(&repo_fd, &data, Some(&meta.algorithm)).is_err());
+        assert!(write_repo_metadata_verity(&repo_fd, &data, meta.algorithm, true).is_err());
         assert!(names_in(&tmp)?.is_empty());
 
-        // Without the verity requirement both succeed.
-        write_repo_metadata_named(&repo_fd, &data, None)?;
+        // Without the verity requirement it succeeds.
+        write_repo_metadata_plain(&repo_fd, &data, true)?;
         assert_eq!(names_in(&tmp)?, [REPO_METADATA_FILENAME]);
         Ok(())
     }

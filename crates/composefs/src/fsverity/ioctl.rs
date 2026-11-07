@@ -8,7 +8,7 @@ use std::os::fd::AsFd;
 // Re-export error types from composefs-ioctls
 pub use composefs_ioctls::fsverity::{EnableVerityError, MeasureVerityError};
 
-use super::FsVerityHashValue;
+use super::{Algorithm, FsVerityHashValue};
 
 /// Enable fsverity on the target file.
 ///
@@ -19,6 +19,43 @@ pub(super) fn fs_ioc_enable_verity<H: FsVerityHashValue>(
     fd: impl AsFd,
 ) -> Result<(), EnableVerityError> {
     composefs_ioctls::fsverity::fs_ioc_enable_verity(fd.as_fd(), H::ALGORITHM.kernel_id(), 4096)
+}
+
+/// Enable fsverity on the target file, with the algorithm chosen at runtime.
+///
+/// Unlike [`fs_ioc_enable_verity`], this honours the block size carried by
+/// `algorithm`.
+pub(crate) fn fs_ioc_enable_verity_with_algorithm(
+    fd: impl AsFd,
+    algorithm: Algorithm,
+) -> Result<(), EnableVerityError> {
+    composefs_ioctls::fsverity::fs_ioc_enable_verity(
+        fd.as_fd(),
+        algorithm.kernel_id(),
+        1u32 << algorithm.lg_blocksize(),
+    )
+}
+
+/// Measure the fsverity digest of a file, with the algorithm chosen at runtime.
+///
+/// Returns the raw digest bytes (32 for SHA-256, 64 for SHA-512).
+pub(crate) fn fs_ioc_measure_verity_with_algorithm(
+    fd: impl AsFd,
+    algorithm: Algorithm,
+) -> Result<Vec<u8>, MeasureVerityError> {
+    let kid = algorithm.kernel_id();
+    match algorithm {
+        Algorithm::Sha256 { .. } => {
+            let digest: [u8; 32] =
+                composefs_ioctls::fsverity::fs_ioc_measure_verity(fd.as_fd(), kid)?;
+            Ok(digest.to_vec())
+        }
+        Algorithm::Sha512 { .. } => {
+            let digest: [u8; 64] =
+                composefs_ioctls::fsverity::fs_ioc_measure_verity(fd.as_fd(), kid)?;
+            Ok(digest.to_vec())
+        }
+    }
 }
 
 /// Measure the fsverity digest of the provided file descriptor.
@@ -89,4 +126,56 @@ mod tests {
     // Note: This test uses unsafe code via ManuallyDrop + from_raw_fd.
     // Since we forbid unsafe in this crate, we test bad fd behavior differently.
     // The composefs-ioctls crate has its own tests for error handling.
+
+    fn rdonly_file_with(data: &[u8]) -> OwnedFd {
+        use std::io::Write;
+
+        let mut file = tempfile();
+        file.write_all(data).unwrap();
+        let fd = rustix::fs::open(
+            crate::util::proc_self_fd(&file),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        drop(file);
+        fd
+    }
+
+    fn check_runtime_algorithm<H: FsVerityHashValue>() {
+        let data = b"hello world";
+        let fd = rdonly_file_with(data);
+        assert!(matches!(
+            fs_ioc_measure_verity_with_algorithm(&fd, H::ALGORITHM),
+            Err(MeasureVerityError::VerityMissing)
+        ));
+        // Other tests fork concurrently, which can briefly leave the
+        // writable descriptor from rdonly_file_with() open in a child.
+        let mut attempts = 0;
+        loop {
+            match fs_ioc_enable_verity_with_algorithm(&fd, H::ALGORITHM) {
+                Err(EnableVerityError::FileOpenedForWrite) if attempts < 100 => {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                other => break other.unwrap(),
+            }
+        }
+        let digest = fs_ioc_measure_verity_with_algorithm(&fd, H::ALGORITHM).unwrap();
+        assert_eq!(
+            digest,
+            crate::fsverity::compute_verity::<H>(data).as_bytes()
+        );
+        assert_eq!(fs_ioc_measure_verity::<H>(&fd).unwrap().as_bytes(), digest);
+    }
+
+    #[test]
+    fn test_runtime_algorithm_sha256() {
+        check_runtime_algorithm::<Sha256HashValue>();
+    }
+
+    #[test]
+    fn test_runtime_algorithm_sha512() {
+        check_runtime_algorithm::<crate::fsverity::Sha512HashValue>();
+    }
 }
