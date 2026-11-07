@@ -64,6 +64,7 @@ pub mod erofs;
 pub mod filesystem_ops;
 pub mod fs;
 pub mod fsverity;
+pub(crate) mod isolation;
 pub mod mount;
 pub mod mountcompat;
 pub mod progress;
