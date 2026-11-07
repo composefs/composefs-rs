@@ -335,7 +335,7 @@ impl Drop for FuseOverlayTempDir {
 /// support `O_TMPFILE`, ingesting object data used to fail outright with
 /// `EOPNOTSUPP` ("Opening temp file in objects directory"). This is
 /// exactly the path bootc's composefs digest computation exercises
-/// (`ensure_object_from_reader`, via `ensure_object_from_fd`) when reading
+/// (`ensure_object_from_fd`) when reading
 /// a container rootfs through a storage backend without O_TMPFILE support.
 ///
 /// Verifies the repository's named-tmpfile fallback lets object ingestion

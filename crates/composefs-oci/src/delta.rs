@@ -164,7 +164,7 @@ fn reconstruct_layer<ObjectID: FsVerityHashValue>(
     expected_diff_id: &OciDigest,
 ) -> Result<File> {
     let tmpfile_fd = repo
-        .create_object_tmpfile()
+        .create_scratch_tmpfile()
         .context("Creating temp file for layer reconstruction")?;
     let mut tmpfile = File::from(tmpfile_fd);
     let mut data_source = ComposeFsDataSource {

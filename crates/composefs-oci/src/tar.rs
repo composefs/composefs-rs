@@ -13,7 +13,6 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt,
-    fs::File,
     os::unix::prelude::{OsStrExt, OsStringExt},
     path::PathBuf,
     sync::Arc,
@@ -85,21 +84,16 @@ fn receive_and_finalize_object<ObjectID: FsVerityHashValue>(
 ) -> Result<(ObjectID, ObjectStoreMethod)> {
     use std::io::Write;
 
-    // Create tmpfile in the blocking context
-    let tmpfile_fd = repo.create_object_tmpfile()?;
-    let mut tmpfile = std::io::BufWriter::with_capacity(IO_BUF_CAPACITY, File::from(tmpfile_fd));
+    let mut writer = repo.create_object(size)?;
 
-    // Receive chunks and write to tmpfile
+    // Receive chunks and write them to the object
     let mut rx = rx;
     while let Some(chunk) = rx.blocking_recv() {
-        tmpfile.write_all(&chunk)?;
+        writer.write_all(&chunk)?;
     }
 
-    // Flush and get the File back
-    let tmpfile = tmpfile.into_inner()?;
-
     // Finalize: enable verity, get digest, link into objects/
-    repo.finalize_object_tmpfile(tmpfile, size)
+    writer.finish()
 }
 
 /// Stream a large file's content through a channel to a background storage task.

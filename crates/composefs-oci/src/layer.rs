@@ -93,21 +93,22 @@ where
 /// Use this for non-tar blobs (OCI artifacts) where the caller will create
 /// the splitstream wrapper.
 ///
+/// The blob must be exactly `size` bytes long.
+///
 /// Returns (object_id, size, store_method) of the stored object.
 pub async fn store_blob_async<ObjectID, R>(
     repo: &Repository<ObjectID>,
     mut reader: R,
+    size: u64,
 ) -> Result<(ObjectID, u64, ObjectStoreMethod)>
 where
     ObjectID: FsVerityHashValue,
     R: AsyncRead + Unpin,
 {
-    let tmpfile = repo.create_object_tmpfile()?;
-    let mut writer = tokio::fs::File::from(std::fs::File::from(tmpfile));
-    let size = tokio::io::copy(&mut reader, &mut writer).await?;
+    let mut writer = repo.create_object(size)?;
+    tokio::io::copy(&mut reader, &mut writer).await?;
     writer.flush().await?;
-    let tmpfile = writer.into_std().await;
-    let (object_id, method) = repo.finalize_object_tmpfile(tmpfile, size)?;
+    let (object_id, method) = writer.finish_async().await?;
     Ok((object_id, size, method))
 }
 
