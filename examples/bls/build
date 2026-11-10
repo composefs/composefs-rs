@@ -41,6 +41,11 @@ esac
 
 cp ../../target/release/cfsctl .
 cp ../../target/release/composefs-setup-root extra/usr/lib/dracut/modules.d/37composefs/
+setup_root_conf='extra/usr/lib/dracut/modules.d/37composefs/setup-root-conf.toml'
+rm -f "${setup_root_conf}"
+if [ -n "${ROOT_TRANSIENT:-}" ]; then
+    printf '[root]\ntransient = true\n' > "${setup_root_conf}"
+fi
 CFSCTL='./cfsctl --repo tmp/sysroot/composefs'
 
 rm -rf tmp
