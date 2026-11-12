@@ -5412,15 +5412,18 @@ mod tests {
     fn stray_tmpfiles_in_objects(tmp: &TempDir) -> Result<Vec<PathBuf>> {
         let objects_path = tmp.path().join("repo").join("objects");
         let mut stray = Vec::new();
-        for subdir in std::fs::read_dir(&objects_path)? {
-            let subdir = subdir?;
-            if !subdir.file_type()?.is_dir() {
-                continue;
-            }
-            for entry in std::fs::read_dir(subdir.path())? {
-                let entry = entry?;
-                if entry.file_name().to_string_lossy().starts_with(".tmp-") {
-                    stray.push(entry.path());
+        // Fallback tmpfiles are created in objects/ itself; also look in
+        // the per-prefix subdirectories in case one ends up there.
+        for entry in std::fs::read_dir(&objects_path)? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with(".tmp-") {
+                stray.push(entry.path());
+            } else if entry.file_type()?.is_dir() {
+                for entry in std::fs::read_dir(entry.path())? {
+                    let entry = entry?;
+                    if entry.file_name().to_string_lossy().starts_with(".tmp-") {
+                        stray.push(entry.path());
+                    }
                 }
             }
         }
