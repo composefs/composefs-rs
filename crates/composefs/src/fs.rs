@@ -151,14 +151,16 @@ impl<ObjectID: FsVerityHashValue> ObjectStore<ObjectID> for FlatDigestStore {
 
         // 4. Enable kernel fs-verity (kernel reads and hashes the file for us).
         let (ro_fd, verity_enabled) =
-            match enable_verity_maybe_copy::<ObjectID>(self.root.as_fd(), ro_fd.as_fd()) {
-                Ok(None) => (ro_fd, true),
-                Ok(Some(new_fd)) => (new_fd, true),
-                Err(EnableVerityError::AlreadyEnabled) => (ro_fd, true),
-                Err(EnableVerityError::FilesystemNotSupported) if self.insecure => (ro_fd, false),
-                Err(e) => {
-                    return Err(anyhow::anyhow!(e)).context("Enabling verity on object tmpfile");
-                }
+            match enable_verity_maybe_copy::<ObjectID>(self.root.as_fd(), ro_fd) {
+                Ok(enabled) => (enabled.into_fd(), true),
+                Err(e) => match e.error {
+                    EnableVerityError::AlreadyEnabled => (e.fd, true),
+                    EnableVerityError::FilesystemNotSupported if self.insecure => (e.fd, false),
+                    other => {
+                        return Err(anyhow::anyhow!(other))
+                            .context("Enabling verity on object tmpfile");
+                    }
+                },
             };
 
         // 5. Get the digest — from the kernel (fast) or userspace fallback.
