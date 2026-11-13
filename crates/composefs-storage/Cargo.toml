@@ -1,6 +1,6 @@
 [package]
 name = "composefs-storage"
-description = "Read-only access to containers-storage (overlay driver)"
+description = "Read and publish images in containers-storage (overlay driver)"
 keywords = ["containers", "storage", "overlay", "podman", "buildah"]
 
 edition.workspace = true
@@ -15,18 +15,23 @@ anyhow = { version = "1.0", default-features = false, features = ["std"] }
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 cap-std = { version = "4.0", default-features = false }
 cap-std-ext = { version = "5.0", default-features = false }
-composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.10.0", optional = true, features = ["tokio"] }
+composefs = { workspace = true }
+composefs-ioctls = { workspace = true }
+composefs-splitdirfdstream = { path = "../composefs-splitdirfdstream", version = "0.10.0", features = ["tokio"] }
 crc = { version = "3.0", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hex = "0.4"
+openssl = "0.10"
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
-oci-spec = { version = "0.10", default-features = false, features = ["image"] }
+oci-spec = { version = "0.10", default-features = false, features = ["image", "distribution"] }
 rustix = { version = "1.0", default-features = false, features = ["fs", "std", "process", "thread", "pipe"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tar-core = "0.1.0"
 thiserror = { version = "2.0", default-features = false }
-tokio = { version = "1.40", default-features = false, features = ["rt", "net", "sync"], optional = true }
+tokio = { version = "1.40", default-features = false, features = ["rt", "sync", "time"] }
 toml = { version = "1.0", default-features = false, features = ["parse", "serde"] }
-tracing = { version = "0.1", default-features = false, optional = true }
+tracing = { version = "0.1", default-features = false }
 zlink = { workspace = true, optional = true }
 zstd = { version = "0.14", default-features = false }
 
@@ -35,10 +40,11 @@ default = []
 # Layer transfer over zlink + splitdirfdstream. Enables both the in-process
 # transport and the rootless `podman unshare` helper (init_if_helper /
 # StorageProxy).
-layer-transfer = ["dep:zlink", "dep:composefs-splitdirfdstream", "dep:tokio", "dep:tracing"]
+layer-transfer = ["dep:zlink", "tokio/net"]
 
 [dev-dependencies]
 tempfile = { version = "3.8", default-features = false }
+tar = { version = "0.4", default-features = false }
 tokio = { version = "1.40", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "sync"] }
 
 [lints]

@@ -1128,6 +1128,16 @@ fn ensure_dir_at(dirfd: impl AsFd, path: &str, mode: Mode) -> ErrnoResult<()> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WritableRepo;
 
+/// A shared lifetime lease independent of the repository handle's own lock.
+///
+/// In particular, GC called through another `Arc` of the same repository must
+/// wait for this lease instead of upgrading that handle's shared lock beneath
+/// an exporter. The lease is released by closing its private descriptor.
+#[derive(Debug)]
+pub struct RepositoryLease {
+    _fd: OwnedFd,
+}
+
 /// A content-addressable repository for composefs objects.
 ///
 /// Stores content-addressed objects, splitstreams, and images with fsverity
@@ -1439,6 +1449,37 @@ impl fmt::Display for FsckResult {
 }
 
 impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
+    /// Acquire a lifetime lease without blocking the async executor on GC.
+    pub async fn lease_async(self: &Arc<Self>) -> Result<RepositoryLease> {
+        let repo = Arc::clone(self);
+        let fd = tokio::task::spawn_blocking(move || {
+            openat(
+                &repo.repository,
+                ".",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+        })
+        .await??;
+        // Respond quickly to short GC lock handoffs, then back off during long collections.
+        const INITIAL: std::time::Duration = std::time::Duration::from_millis(10);
+        const MAX: std::time::Duration = std::time::Duration::from_millis(250);
+        let mut retry = INITIAL;
+        loop {
+            match flock(&fd, FlockOperation::NonBlockingLockShared) {
+                Ok(()) => return Ok(RepositoryLease { _fd: fd }),
+                Err(rustix::io::Errno::WOULDBLOCK) => {
+                    if retry == INITIAL {
+                        debug!("waiting for composefs repository lease");
+                    }
+                    tokio::time::sleep(retry).await;
+                    retry = (retry * 2).min(MAX);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     /// Enable or disable writing old-format splitstream headers.
     ///
     /// When enabled, all splitstreams created via [`create_stream`] will be
@@ -4465,6 +4506,32 @@ mod tests {
             RepositoryConfig::new(Algorithm::SHA512).set_insecure(),
         )?;
         Ok(Arc::new(repo))
+    }
+
+    #[tokio::test]
+    async fn lifetime_lease_survives_same_handle_lock_conversion() -> Result<()> {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let lease = repo.lease_async().await?;
+        assert_eq!(
+            flock(&repo.repository, FlockOperation::NonBlockingLockExclusive),
+            Err(rustix::io::Errno::WOULDBLOCK)
+        );
+        drop(lease);
+        flock(&repo.repository, FlockOperation::NonBlockingLockExclusive)?;
+        let mut pending = Box::pin(repo.lease_async());
+        assert!(
+            timeout(Duration::from_millis(50), &mut pending)
+                .await
+                .is_err()
+        );
+        drop(pending);
+        flock(&repo.repository, FlockOperation::LockShared)?;
+        timeout(Duration::from_secs(5), repo.lease_async()).await??;
+        Ok(())
     }
 
     /// An explicit integrity policy replaces the detected one and is then
