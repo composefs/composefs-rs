@@ -62,6 +62,9 @@ pub enum ProgressUnit {
 #[non_exhaustive]
 pub enum ProgressEvent {
     /// A new component (layer/object) has started being fetched.
+    ///
+    /// This is sent again for the same component when a retry restarts its
+    /// transfer from the beginning; progress for it then starts over.
     Started {
         /// Identifier for this component.
         id: ComponentId,

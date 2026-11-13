@@ -87,7 +87,8 @@ use composefs::{
 ///
 /// Renders per-component progress bars via [`MultiProgress`].  When a component
 /// completes or is skipped the bar is removed; human-readable messages are
-/// printed above the bar group via [`MultiProgress::println`].
+/// printed above the bar group via [`MultiProgress::println`], or directly to
+/// stderr when it is not a terminal.
 #[cfg(any(feature = "oci", feature = "http", feature = "ostree"))]
 struct IndicatifReporter {
     multi: MultiProgress,
@@ -144,7 +145,10 @@ impl ProgressReporter for IndicatifReporter {
                         .progress_chars("##-"),
                 );
                 bar.set_message(id.to_string());
-                self.bars.lock().unwrap().insert(id, bar);
+                // A retried component is started again; replace its bar.
+                if let Some(old) = self.bars.lock().unwrap().insert(id, bar) {
+                    old.finish_and_clear();
+                }
             }
             ProgressEvent::Progress { id, fetched, .. } => {
                 if let Some(bar) = self.bars.lock().unwrap().get(&id) {
@@ -162,7 +166,14 @@ impl ProgressReporter for IndicatifReporter {
                 }
             }
             ProgressEvent::Message(msg) => {
-                let _ = self.multi.println(msg);
+                // Progress bars are hidden when stderr is not a terminal (e.g. in
+                // CI logs), and `println` then discards the message; print it
+                // directly instead so that e.g. retry warnings stay visible.
+                if self.multi.is_hidden() {
+                    eprintln!("{msg}");
+                } else {
+                    let _ = self.multi.println(msg);
+                }
             }
             // `ProgressEvent` is #[non_exhaustive]: new variants added to the library
             // will be silently ignored here until cfsctl is updated to handle them.
@@ -406,6 +417,11 @@ enum OciCommand {
         /// import path with zero-copy reflink/hardlink support.
         #[arg(long, value_enum, default_value_t = LocalFetchCli::Disabled)]
         local_fetch: LocalFetchCli,
+        /// Number of times to retry transient registry failures (as
+        /// classified by skopeo, e.g. network errors and HTTP 502-504), with
+        /// exponential backoff as in podman; 0 disables retrying.
+        #[arg(long, value_name = "N", default_value_t = composefs_oci::RetryPolicy::default().max_retries)]
+        retry: u32,
     },
     /// Copy an OCI image (and its layers) from another composefs repository
     /// into this repository.
@@ -1826,6 +1842,7 @@ where
                 bootable,
                 expected_digest,
                 local_fetch,
+                retry,
             } => {
                 // Parse before pulling so a malformed digest fails fast,
                 // rather than after a potentially long-running fetch.
@@ -1851,6 +1868,7 @@ where
                     local_fetch: local_fetch.into(),
                     progress: Some(reporter),
                     bootable: use_bootable_opt,
+                    retry: composefs_oci::RetryPolicy::with_max_retries(retry),
                     ..Default::default()
                 };
 
