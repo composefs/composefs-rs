@@ -1864,10 +1864,19 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
     /// In insecure mode, the fs-verity digest is computed while copying,
     /// avoiding a second read pass.
     #[context("Ensuring object from reader")]
-    pub fn ensure_object_from_reader(&self, mut source: impl Read, size: u64) -> Result<ObjectID> {
+    pub fn ensure_object_from_reader(&self, source: impl Read, size: u64) -> Result<ObjectID> {
         let writable = self.ensure_writable_token()?;
+        self.ensure_object_from_reader_impl(source, size, &writable)
+    }
+
+    fn ensure_object_from_reader_impl(
+        &self,
+        mut source: impl Read,
+        size: u64,
+        writable: &WritableRepo,
+    ) -> Result<ObjectID> {
         let objects_dir = self.objects_dir().context("Getting objects directory")?;
-        let tmpfile = self.create_object_tmpfile_impl(&writable)?;
+        let tmpfile = self.create_object_tmpfile_impl(writable)?;
         // Protects the fallback tmpfile (if any) from leaking if we bail
         // out (via `?`) before handing its name off to
         // `link_tmpfile_as_object` / `finalize_object_tmpfile_impl`.
@@ -1906,7 +1915,7 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
             drop(dst);
 
             let (id, _method) =
-                self.finalize_object_tmpfile_impl(tmpfile, guard, size, &writable)?;
+                self.finalize_object_tmpfile_impl(tmpfile, guard, size, writable)?;
             Ok(id)
         }
     }
@@ -2398,23 +2407,14 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         Ok(hasher.digest())
     }
 
-    /// Store an object with a pre-computed fs-verity ID.
-    ///
-    /// This is an internal helper that stores data assuming the caller has already
-    /// computed the correct fs-verity digest. The digest is verified after storage.
-    #[context("Storing object with ID {id:?}")]
-    fn store_object_with_id(
-        &self,
-        data: &[u8],
-        id: &ObjectID,
-        _writable: &WritableRepo,
-    ) -> Result<()> {
+    /// Check whether an object already exists, verifying it before reuse.
+    #[context("Checking for existing object with ID {id:?}")]
+    fn verified_object_exists(&self, id: &ObjectID) -> Result<bool> {
         let dirfd = self
             .objects_dir()
             .context("Getting objects directory for storage")?;
         let path = id.to_object_pathname();
 
-        // the usual case is that the file will already exist
         match openat(
             dirfd,
             &path,
@@ -2451,58 +2451,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
                     )) if self.is_insecure() => {}
                     Err(other) => Err(other).context("Verifying existing object integrity")?,
                 }
-                return Ok(());
+                Ok(true)
             }
-            Err(Errno::NOENT) => {
-                // in this case we'll create the file
-            }
-            Err(other) => {
-                return Err(other).context("Checking for existing object in repository")?;
-            }
+            Err(Errno::NOENT) => Ok(false),
+            Err(other) => Err(other).context("Checking for existing object in repository"),
         }
-
-        let fd = ensure_dir_and_openat(dirfd, &id.to_object_dir(), OFlags::RDWR | OFlags::TMPFILE)
-            .with_context(|| "Creating tempfile in object subdirectory")?;
-        let mut file = File::from(fd);
-        file.write_all(data).context("Writing data to tmpfile")?;
-        // NB: We should do fdatasync() or fsync() here, but doing this for each file forces the
-        // creation of a massive number of journal commits and is a performance disaster.  We need
-        // to coordinate this at a higher level.  See .write_stream().
-        let ro_fd = reopen_tmpfile_ro(file).context("Re-opening file as read-only for verity")?;
-
-        let ro_fd = match enable_verity_maybe_copy::<ObjectID>(dirfd, ro_fd.as_fd()) {
-            Ok(maybe_fd) => {
-                let ro_fd = maybe_fd.unwrap_or(ro_fd);
-                match ensure_verity_equal(&ro_fd, id) {
-                    Ok(()) => ro_fd,
-                    Err(CompareVerityError::Measure(
-                        MeasureVerityError::VerityMissing
-                        | MeasureVerityError::FilesystemNotSupported,
-                    )) if self.is_insecure() => ro_fd,
-                    Err(other) => Err(other).context("Double-checking verity digest")?,
-                }
-            }
-            Err(EnableVerityError::FilesystemNotSupported) if self.is_insecure() => ro_fd,
-            Err(other) => Err(other).context("Enabling verity digest")?,
-        };
-
-        match linkat(
-            CWD,
-            proc_self_fd(&ro_fd),
-            dirfd,
-            path,
-            AtFlags::SYMLINK_FOLLOW,
-        ) {
-            Ok(()) => {}
-            Err(Errno::EXIST) => {
-                // TODO: strictly, we should measure the newly-appeared file
-            }
-            Err(other) => {
-                return Err(other).context("Linking created object file");
-            }
-        }
-
-        Ok(())
     }
 
     /// Given a blob of data, store it in the repository.
@@ -2527,8 +2480,11 @@ impl<ObjectID: FsVerityHashValue> Repository<ObjectID> {
         writable: &WritableRepo,
     ) -> Result<ObjectID> {
         let id: ObjectID = compute_verity(data);
-        self.store_object_with_id(data, &id, writable)?;
-        Ok(id)
+        if self.verified_object_exists(&id)? {
+            Ok(id)
+        } else {
+            self.ensure_object_from_reader_impl(data, data.len() as u64, writable)
+        }
     }
 
     #[context("Opening file '{filename}' with verity verification")]
@@ -4455,6 +4411,7 @@ mod tests {
     use crate::fsverity::{Sha256HashValue, Sha512HashValue};
     use crate::test::tempdir;
     use rustix::fs::{CWD, statat};
+    use std::os::unix::fs::MetadataExt;
     use tempfile::TempDir;
 
     /// Create a test repository in insecure mode (no fs-verity required).
@@ -5456,6 +5413,59 @@ mod tests {
         assert_eq!(object_id, object_id_2);
         assert!(stray_tmpfiles_in_objects(&tmp)?.is_empty());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_ensure_object_bytes_reuses_existing_object() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        repo.set_force_named_tmpfile(true);
+
+        let data = generate_test_data(64 * 1024, 0xC5);
+        let id = repo.ensure_object(&data)?;
+        let path = tmp
+            .path()
+            .join("repo/objects")
+            .join(id.to_object_pathname());
+        let original_inode = std::fs::metadata(&path)?;
+        assert_eq!(repo.read_object(&id)?, data);
+        assert_eq!(repo.ensure_object(&data)?, id);
+        assert_eq!(std::fs::metadata(&path)?.ino(), original_inode.ino());
+        assert!(stray_tmpfiles_in_objects(&tmp)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_ensure_object_bytes_rejects_wrong_existing_digest() -> Result<()> {
+        let tmp = tempdir();
+        let (repo, _) = match Repository::<Sha512HashValue>::init_path(
+            CWD,
+            tmp.path().join("repo"),
+            RepositoryConfig::new(Algorithm::SHA512),
+        ) {
+            Ok(repo) => repo,
+            Err(e)
+                if matches!(
+                    e.root_cause().downcast_ref::<EnableVerityError>(),
+                    Some(EnableVerityError::FilesystemNotSupported)
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let data = generate_test_data(4096, 0x41);
+        let other = generate_test_data(4096, 0x42);
+        let id = repo.ensure_object(&data)?;
+        let other_id = repo.ensure_object(&other)?;
+        let objects = tmp.path().join("repo/objects");
+        std::fs::rename(
+            objects.join(other_id.to_object_pathname()),
+            objects.join(id.to_object_pathname()),
+        )?;
+
+        assert!(repo.ensure_object(&data).is_err());
         Ok(())
     }
 
