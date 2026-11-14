@@ -14,7 +14,7 @@ cargo build --release -p composefs-capi --manifest-path="$REPO_DIR/Cargo.toml"
 BUILD_CTX=$(mktemp -d)
 trap 'rm -rf "$BUILD_CTX"' EXIT
 
-cp "$REPO_DIR/target/release/libcomposefs_capi.so" "$BUILD_CTX/"
+cp "$REPO_DIR/target/release/libcomposefs_capi.so" "$SCRIPT_DIR/ostree-image.c" "$BUILD_CTX/"
 
 if [ -n "$C_REPO" ]; then
     cp -a "$(cd "$C_REPO" && pwd)" "$BUILD_CTX/composefs-c"

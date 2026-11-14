@@ -706,7 +706,7 @@ impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
             }
             tree::LeafContent::Regular(
                 tree::RegularFile::External(.., size)
-                | tree::RegularFile::ExternalNoVerity(.., size)
+                | tree::RegularFile::ExternalPath { size, .. }
                 | tree::RegularFile::Sparse(size),
             ) => {
                 let chunk_format = match version.epoch() {
@@ -757,7 +757,7 @@ impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
             }
             tree::LeafContent::Regular(
                 tree::RegularFile::External(..)
-                | tree::RegularFile::ExternalNoVerity(..)
+                | tree::RegularFile::ExternalPath { .. }
                 | tree::RegularFile::Sparse(..),
             ) => {
                 let n_chunks = self.inline_tail_size / 4;
@@ -794,7 +794,7 @@ impl<ObjectID: FsVerityHashValue> Leaf<'_, ObjectID> {
                 }
                 tree::LeafContent::Regular(
                     tree::RegularFile::External(..)
-                    | tree::RegularFile::ExternalNoVerity(..)
+                    | tree::RegularFile::ExternalPath { .. }
                     | tree::RegularFile::Sparse(..),
                 ) => {
                     const LCFS_MAX_NONINLINE_CHUNKS: usize = 1024;
@@ -1178,17 +1178,29 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
                 self.version,
             );
         } else if let InodeContent::Leaf(Leaf {
-            content: tree::LeafContent::Regular(tree::RegularFile::ExternalNoVerity(id, ..)),
+            content:
+                tree::LeafContent::Regular(tree::RegularFile::ExternalPath {
+                    redirect, verity, ..
+                }),
             ..
         }) = content
         {
-            xattrs.add(format::XATTR_OVERLAY_METACOPY, b"", self.version);
-            let redirect = format!("/{}", id.to_object_pathname());
-            xattrs.add(
-                format::XATTR_OVERLAY_REDIRECT,
-                redirect.as_bytes(),
-                self.version,
-            );
+            // This matches libcomposefs, which writes the redirect as "/" + payload.
+            match verity {
+                Some(id) => {
+                    let metacopy = OverlayMetacopy::new(id);
+                    xattrs.add(
+                        format::XATTR_OVERLAY_METACOPY,
+                        metacopy.as_bytes(),
+                        self.version,
+                    );
+                }
+                None => xattrs.add(format::XATTR_OVERLAY_METACOPY, b"", self.version),
+            }
+            if let Some(redirect) = redirect {
+                let redirect = [b"/", redirect.as_bytes()].concat();
+                xattrs.add(format::XATTR_OVERLAY_REDIRECT, &redirect, self.version);
+            }
         } else if let InodeContent::Leaf(Leaf {
             content: tree::LeafContent::Regular(tree::RegularFile::Sparse(..)),
             ..
@@ -1263,7 +1275,7 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
                 }
                 tree::LeafContent::Regular(
                     tree::RegularFile::External(.., size)
-                    | tree::RegularFile::ExternalNoVerity(.., size)
+                    | tree::RegularFile::ExternalPath { size, .. }
                     | tree::RegularFile::Sparse(size),
                 ) if *size > 0 => {
                     let chunk_count = compute_chunk_count(*size);
@@ -1274,7 +1286,9 @@ impl<'a, ObjectID: FsVerityHashValue> InodeCollector<'a, ObjectID> {
         } else {
             match &leaf.content {
                 tree::LeafContent::Regular(tree::RegularFile::Inline(data)) => (0, data.len()),
-                tree::LeafContent::Regular(tree::RegularFile::External(..)) => {
+                tree::LeafContent::Regular(
+                    tree::RegularFile::External(..) | tree::RegularFile::ExternalPath { .. },
+                ) => {
                     (0, 4) // single null chunk index
                 }
                 _ => (0, 0),
@@ -2056,7 +2070,7 @@ fn fixup_epoch1_data_blocks<ObjectID: FsVerityHashValue>(
                     leaf.content,
                     tree::LeafContent::Regular(
                         tree::RegularFile::External(..)
-                            | tree::RegularFile::ExternalNoVerity(..)
+                            | tree::RegularFile::ExternalPath { .. }
                             | tree::RegularFile::Sparse(..)
                     )
                 ),

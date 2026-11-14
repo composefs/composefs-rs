@@ -1590,36 +1590,32 @@ fn extract_metacopy_digest<ObjectID: FsVerityHashValue>(
     Ok(None)
 }
 
-/// Try to extract the object ID from a redirect xattr (`trusted.overlay.redirect`).
+/// Extract the path from a redirect xattr (`trusted.overlay.redirect`).
 ///
-/// The redirect value is a path like `/55/90e94b...` from which we parse
-/// the object ID.  Returns `None` if no redirect xattr is present.
-fn extract_redirect_object_id<ObjectID: FsVerityHashValue>(
-    img: &Image,
-    inode: &InodeType,
-) -> anyhow::Result<Option<ObjectID>> {
+/// The redirect value is a path like `/55/90e94b...`; this returns it without
+/// the leading `/`, as the inverse of what the writer does.  Returns `None` if
+/// no redirect xattr is present.
+fn extract_redirect(img: &Image, inode: &InodeType) -> anyhow::Result<Option<Box<OsStr>>> {
     let Some(xattrs_section) = inode.xattrs()? else {
         return Ok(None);
     };
 
     for id in xattrs_section.shared()? {
         let xattr = img.shared_xattr(id.get())?;
-        if let Some(obj) = check_redirect_xattr(xattr)? {
-            return Ok(Some(obj));
+        if let Some(path) = check_redirect_xattr(xattr)? {
+            return Ok(Some(path));
         }
     }
     for xattr in xattrs_section.local()? {
         let xattr = xattr?;
-        if let Some(obj) = check_redirect_xattr(xattr)? {
-            return Ok(Some(obj));
+        if let Some(path) = check_redirect_xattr(xattr)? {
+            return Ok(Some(path));
         }
     }
     Ok(None)
 }
 
-fn check_redirect_xattr<ObjectID: FsVerityHashValue>(
-    xattr: &XAttr,
-) -> anyhow::Result<Option<ObjectID>> {
+fn check_redirect_xattr(xattr: &XAttr) -> anyhow::Result<Option<Box<OsStr>>> {
     if xattr.header.name_index != 4 {
         return Ok(None);
     }
@@ -1628,10 +1624,7 @@ fn check_redirect_xattr<ObjectID: FsVerityHashValue>(
     }
     let value = xattr.value()?;
     let path = value.strip_prefix(b"/").unwrap_or(value);
-    match ObjectID::from_object_pathname(path) {
-        Ok(id) => Ok(Some(id)),
-        Err(_) => Ok(None),
-    }
+    Ok(Some(Box::from(OsStr::from_bytes(path))))
 }
 
 /// Check if a single xattr is a valid overlay.metacopy and return the digest.
@@ -1882,19 +1875,12 @@ fn populate_directory<ObjectID: FsVerityHashValue>(
             } else {
                 match file_type {
                     S_IFREG => {
-                        if let Some(digest) =
-                            extract_metacopy_digest::<ObjectID>(img, &child_inode)?
-                        {
-                            tree::LeafContent::Regular(tree::RegularFile::External(
-                                digest,
-                                child_inode.size(),
-                            ))
-                        } else if let Some(id) =
-                            extract_redirect_object_id::<ObjectID>(img, &child_inode)?
-                        {
-                            tree::LeafContent::Regular(tree::RegularFile::ExternalNoVerity(
-                                id,
-                                child_inode.size(),
+                        let verity = extract_metacopy_digest::<ObjectID>(img, &child_inode)?;
+                        let redirect = extract_redirect(img, &child_inode)?;
+                        let size = child_inode.size();
+                        if verity.is_some() || redirect.is_some() {
+                            tree::LeafContent::Regular(tree::RegularFile::external(
+                                redirect, verity, size,
                             ))
                         } else if child_inode.data_layout()? == DataLayout::ChunkBased {
                             tree::LeafContent::Regular(tree::RegularFile::Sparse(
