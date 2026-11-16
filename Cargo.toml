@@ -42,7 +42,7 @@ composefs-fuse = { version = "0.10.0", path = "crates/composefs-fuse", default-f
 composefs-http = { version = "0.10.0", path = "crates/composefs-http", default-features = false }
 composefs-ostree = { version = "0.10.0", path = "crates/composefs-ostree", default-features = false }
 cap-std-ext = "5.1.2"
-ocidir = "0.8.0"
+ocidir = "0.9.0"
 
 zlink = { version = "0.8", default-features = false, features = ["tokio", "introspection", "proxy", "server", "service", "tracing"] }
 zlink-core = { version = "0.8", default-features = false, features = ["introspection", "std", "tracing"] }

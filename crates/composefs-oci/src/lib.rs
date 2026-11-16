@@ -351,6 +351,12 @@ pub struct PullOptions<'a> {
     /// Supported uniformly across transports, including `containers-storage:`
     /// imports (see [`LocalFetchOpt`]).
     pub bootable: bool,
+
+    /// The platform whose manifest to select from a multi-platform source.
+    /// `None` selects the running host's platform. Only `oci:` directories
+    /// and uncompressed `oci-archive:` files support `Some`; other references
+    /// (including compressed archives) pull through the skopeo proxy and fail.
+    pub platform: Option<containers_image_proxy::oci_spec::image::Platform>,
 }
 
 impl<'a> std::fmt::Debug for PullOptions<'a> {
@@ -369,6 +375,7 @@ impl<'a> std::fmt::Debug for PullOptions<'a> {
                 },
             )
             .field("bootable", &self.bootable)
+            .field("platform", &self.platform)
             .finish()
     }
 }
@@ -541,13 +548,14 @@ pub async fn pull<ObjectID: FsVerityHashValue>(
         });
     }
 
-    let (result, stats) = skopeo::pull_image(
+    let (result, stats) = skopeo::pull_image_for_platform(
         repo,
         imgref,
         reference,
         opts.img_proxy_config,
         reporter,
         boot_options.as_ref(),
+        opts.platform.as_ref(),
     )
     .await?;
     Ok(crate::PullResult {
@@ -2587,20 +2595,13 @@ mod test {
 
     /// A gzip-compressed `oci-archive:` is not readable by the direct
     /// `OciArchive` fast path, but containers/image decompresses it
-    /// transparently, so the pull must fall back to the skopeo proxy.
+    /// transparently, so the pull must fall back to the skopeo proxy. The
+    /// proxy can't select a platform, so requesting one must fail.
     #[tokio::test]
     async fn test_compressed_oci_archive_falls_back_to_proxy() {
         use composefs::fsverity::Sha256HashValue;
         use composefs::test::TestRepo;
-
-        if std::process::Command::new("skopeo")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("skipping: skopeo not found in PATH");
-            return;
-        }
+        use containers_image_proxy::oci_spec::image::{Arch, Os, PlatformBuilder};
 
         let layout = crate::test_util::build_oci_layout(&["\
             /usr 0 40755 2 0 0 0 0.0 - - -\n\
@@ -2620,18 +2621,49 @@ mod test {
 
         assert!(!crate::oci_layout::is_uncompressed_tar(&archive_path));
 
+        let imgref = format!("oci-archive:{}", archive_path.display());
         let test_repo = TestRepo::<Sha256HashValue>::new();
         let reporter: crate::progress::SharedReporter = std::sync::Arc::new(crate::NullReporter);
-        skopeo::pull_image(
+
+        let foreign_arch = if Arch::default() == Arch::Amd64 {
+            "s390x"
+        } else {
+            "amd64"
+        };
+        let platform = PlatformBuilder::default()
+            .architecture(foreign_arch)
+            .os(Os::default())
+            .build()
+            .unwrap();
+        let err = skopeo::pull_image_for_platform(
             &test_repo.repo,
-            &format!("oci-archive:{}", archive_path.display()),
+            &imgref,
             None,
             None,
-            reporter,
+            reporter.clone(),
             None,
+            Some(&platform),
         )
         .await
-        .expect("pulling a gzipped oci-archive");
+        .expect_err("the proxy can't select a platform");
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("only supported for oci: directories"),
+            "unexpected error: {err_msg}"
+        );
+
+        if std::process::Command::new("skopeo")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: skopeo not found in PATH");
+            return;
+        }
+
+        skopeo::pull_image(&test_repo.repo, &imgref, None, None, reporter, None)
+            .await
+            .expect("pulling a gzipped oci-archive");
     }
 
     /// Pulling a fresh OCI layout image (no prior cache) must emit at least one

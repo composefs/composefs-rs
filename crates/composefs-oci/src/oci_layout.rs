@@ -25,7 +25,7 @@ use std::thread::available_parallelism;
 use anyhow::{Context, Result};
 use cap_std_ext::cap_std;
 use containers_image_proxy::oci_spec::image::{
-    Descriptor, Digest as OciDigest, ImageManifest, MediaType,
+    Descriptor, Digest as OciDigest, ImageManifest, MediaType, Platform,
 };
 use fn_error_context::context;
 use ocidir::prelude::*;
@@ -159,13 +159,18 @@ pub(crate) fn is_uncompressed_tar(path: &Path) -> bool {
         && &buf == TAR_MAGIC
 }
 
-/// Resolve a manifest from an OCI layout directory for the current platform.
+/// Resolve a manifest from an OCI layout directory for `platform`, or for the
+/// current platform when it is `None`.
 fn resolve_manifest<T: OciRead + Send + Sync>(
     oci: &T,
     tag: Option<&str>,
+    platform: Option<&Platform>,
 ) -> Result<ResolvedManifest> {
-    oci.open_image_this_platform(tag)
-        .context("Resolving manifest for platform")
+    match platform {
+        Some(platform) => oci.open_image_for_platform(tag, platform),
+        None => oci.open_image_this_platform(tag),
+    }
+    .context("Resolving manifest for platform")
 }
 
 /// Whether a layout path is an `oci:` directory or an `oci-archive:` tarball.
@@ -193,6 +198,20 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
     layout_tag: Option<&str>,
     reporter: SharedReporter,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
+    import_oci_layout_for_platform(repo, kind, layout_path, layout_tag, reporter, None).await
+}
+
+/// [`import_oci_layout`], selecting `platform`'s manifest instead of the
+/// host's. `None` behaves exactly as [`import_oci_layout`].
+#[context("Importing OCI layout from {}", layout_path.display())]
+pub async fn import_oci_layout_for_platform<ObjectID: FsVerityHashValue>(
+    repo: &Arc<Repository<ObjectID>>,
+    kind: OciLayoutKind,
+    layout_path: &Path,
+    layout_tag: Option<&str>,
+    reporter: SharedReporter,
+    platform: Option<&Platform>,
+) -> Result<(PullResult<ObjectID>, ImportStats)> {
     // Check writability before touching the source, so a read-only repo gives
     // a clear "not writable" error rather than a misleading source-open error.
     repo.ensure_writable()?;
@@ -201,7 +220,7 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
         OciLayoutKind::Archive => {
             let oci = OciArchive::open(layout_path)
                 .with_context(|| format!("Opening OCI archive {}", layout_path.display()))?;
-            import_opened_layout(repo, oci, layout_tag, reporter).await
+            import_opened_layout(repo, oci, layout_tag, reporter, platform).await
         }
         OciLayoutKind::Directory => {
             let dir = cap_std::fs::Dir::open_ambient_dir(layout_path, cap_std::ambient_authority())
@@ -209,7 +228,7 @@ pub async fn import_oci_layout<ObjectID: FsVerityHashValue>(
                     format!("Opening OCI layout directory {}", layout_path.display())
                 })?;
             let oci = OciDir::open(dir).context("Opening OCI directory")?;
-            import_opened_layout(repo, oci, layout_tag, reporter).await
+            import_opened_layout(repo, oci, layout_tag, reporter, platform).await
         }
     }
 }
@@ -221,6 +240,7 @@ async fn import_opened_layout<ObjectID: FsVerityHashValue, T: OciRead + Send + S
     oci: T,
     tag: Option<&str>,
     reporter: SharedReporter,
+    platform: Option<&Platform>,
 ) -> Result<(PullResult<ObjectID>, ImportStats)> {
     if let Some(manifest) = detect_delta_manifest(&oci)? {
         let blob_reader = Arc::new(OciBlobReader(oci));
@@ -228,7 +248,7 @@ async fn import_opened_layout<ObjectID: FsVerityHashValue, T: OciRead + Send + S
     }
 
     // Resolve the manifest, with fallback for images lacking platform annotations
-    let resolved = resolve_manifest(&oci, tag)?;
+    let resolved = resolve_manifest(&oci, tag, platform)?;
 
     let manifest = resolved.manifest;
     let manifest_descriptor = &resolved.manifest_descriptor;
@@ -682,16 +702,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_wrong_platform_rejected() {
-        use cap_std_ext::cap_std;
-        use composefs::fsverity::Sha256HashValue;
+    /// Write an OCI layout at `layout_path` holding one minimal image for an
+    /// architecture other than the host's. Returns that image's platform and
+    /// its manifest descriptor.
+    fn foreign_platform_layout(
+        layout_path: &Path,
+    ) -> (
+        containers_image_proxy::oci_spec::image::Platform,
+        containers_image_proxy::oci_spec::image::Descriptor,
+    ) {
         use containers_image_proxy::oci_spec::image::{
             Arch, ConfigBuilder, ImageConfigurationBuilder, Os, PlatformBuilder, RootFsBuilder,
         };
-
-        let tempdir = tempfile::tempdir().unwrap();
-        let layout_path = tempdir.path();
 
         let dir =
             cap_std::fs::Dir::open_ambient_dir(layout_path, cap_std::ambient_authority()).unwrap();
@@ -704,7 +726,6 @@ mod tests {
             "amd64"
         };
 
-        // Build a minimal image for the foreign platform
         let manifest = ocidir.new_empty_manifest().unwrap().build().unwrap();
         let config = ImageConfigurationBuilder::default()
             .architecture(foreign_arch)
@@ -724,28 +745,69 @@ mod tests {
             .os(Os::default())
             .build()
             .unwrap();
-        ocidir
-            .insert_manifest_and_config(manifest, config, None, platform)
+        let manifest_desc = ocidir
+            .insert_manifest_and_config(manifest, config, None, platform.clone())
             .unwrap();
+        (platform, manifest_desc)
+    }
 
-        let repo_dir = tempfile::tempdir().unwrap();
-        let repo_path = repo_dir.path().join("repo");
-        let (repo, _) = composefs::repository::Repository::<Sha256HashValue>::init_path(
+    /// An empty insecure composefs repository under `dir`.
+    fn test_repo(
+        dir: &Path,
+    ) -> Arc<composefs::repository::Repository<composefs::fsverity::Sha256HashValue>> {
+        let (repo, _) = composefs::repository::Repository::init_path(
             rustix::fs::CWD,
-            &repo_path,
+            dir.join("repo"),
             composefs::repository::RepositoryConfig::default().set_insecure(),
         )
         .unwrap();
-        let repo = std::sync::Arc::new(repo);
+        Arc::new(repo)
+    }
 
-        let reporter = std::sync::Arc::new(NullReporter);
-        let result =
-            import_oci_layout(&repo, OciLayoutKind::Directory, layout_path, None, reporter).await;
+    #[tokio::test]
+    async fn test_wrong_platform_rejected() {
+        let tempdir = tempfile::tempdir().unwrap();
+        foreign_platform_layout(tempdir.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(repo_dir.path());
+
+        let result = import_oci_layout(
+            &repo,
+            OciLayoutKind::Directory,
+            tempdir.path(),
+            None,
+            Arc::new(NullReporter),
+        )
+        .await;
         let err = result.expect_err("should fail with no matching platform");
         let err_msg = format!("{err:#}");
         assert!(
             err_msg.contains("No manifest found for platform"),
             "unexpected error: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_requested_platform_imported() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let (platform, manifest_desc) = foreign_platform_layout(tempdir.path());
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(repo_dir.path());
+
+        let (result, _) = import_oci_layout_for_platform(
+            &repo,
+            OciLayoutKind::Directory,
+            tempdir.path(),
+            None,
+            Arc::new(NullReporter),
+            Some(&platform),
+        )
+        .await
+        .expect("importing the requested platform's image");
+        assert_eq!(
+            result.manifest_digest.to_string(),
+            manifest_desc.digest().to_string(),
+            "manifest digest"
         );
     }
 }
