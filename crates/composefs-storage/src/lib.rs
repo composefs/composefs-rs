@@ -1,4 +1,4 @@
-//! Read-only access to containers-storage overlay driver.
+//! Access to containers-storage's overlay driver.
 //!
 //! This library provides efficient, capability-based access to container image
 //! storage using the overlay driver. All file operations are performed using
@@ -10,6 +10,8 @@
 //! The library is designed to access containers-storage (overlay driver) without
 //! requiring tar serialization. Instead, it provides direct file descriptor access
 //! to layer content, enabling zero-copy operations.
+//! The [`writer`] API also publishes OCI images and layers into a containers/storage
+//! overlay store.
 //!
 //! # Key Features
 //!
@@ -58,6 +60,7 @@ pub mod layer;
 pub mod lock;
 pub mod storage;
 pub mod tar_split;
+pub mod writer;
 
 // Stateless CstorLayerService implementing org.composefs.Oci
 #[cfg(feature = "layer-transfer")]

@@ -14,7 +14,7 @@ version.workspace = true
 default = ["containers-storage"]
 test = ["tar", "rand", "composefs/test"]
 boot = ["composefs-boot"]
-containers-storage = ["dep:cstorage", "dep:base64", "varlink", "cstorage/layer-transfer"]
+containers-storage = ["dep:base64", "varlink", "cstorage/layer-transfer"]
 varlink = ['dep:zlink', 'dep:zlink-core', 'composefs/varlink']
 
 [dependencies]
@@ -42,7 +42,7 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 rand = { version = "0.10.0", default-features = false, optional = true }
 tar = { version = "0.4.38", default-features = false, optional = true }
 tar-core = "0.1.0"
-tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.24.2", features = ["macros", "rt-multi-thread", "sync"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io", "io-util"] }
 # "log" makes tracing events fall back to `log` records when no tracing
 # subscriber is installed, so they reach composefs-ctl's env_logger.
