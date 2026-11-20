@@ -12,9 +12,11 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+tempfile = { version = "3.8.0", default-features = false }
 
 [dependencies.composefs]
 path = ".."
+features = ["test"]
 
 [[bin]]
 name = "read_image"
@@ -33,3 +35,17 @@ bench = false
 [[bin]]
 name = "generate-corpus"
 path = "generate_corpus.rs"
+
+[[bin]]
+name = "dumpfile"
+path = "fuzz_targets/dumpfile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "splitstream"
+path = "fuzz_targets/splitstream.rs"
+test = false
+doc = false
+bench = false
