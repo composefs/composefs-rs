@@ -1652,28 +1652,17 @@ pub fn dump_files<ObjectID: FsVerityHashValue>(
             }
 
             Inode::Leaf(leaf_id, _) => {
-                use composefs::generic_tree::LeafContent::*;
-                use composefs::tree::RegularFile::*;
-
                 if backing_path_only {
                     let leaf = fs.leaf(*leaf_id);
-                    match &leaf.content {
-                        Regular(f) => match f {
-                            Inline(..) | Sparse(..) => {
-                                writeln!(&mut out, "{} inline", file_path.display())?;
-                            }
-                            External(id, _) | ExternalNoVerity(id, _) => {
-                                writeln!(
-                                    &mut out,
-                                    "{} {}",
-                                    file_path.display(),
-                                    id.to_object_pathname()
-                                )?;
-                            }
-                        },
-                        _ => {
-                            writeln!(&mut out, "{} inline", file_path.display())?;
+                    let backing_path = match &leaf.content {
+                        composefs::generic_tree::LeafContent::Regular(f) => f.backing_path(),
+                        _ => None,
+                    };
+                    match backing_path {
+                        Some(path) => {
+                            writeln!(&mut out, "{} {}", file_path.display(), path.display())?
                         }
+                        None => writeln!(&mut out, "{} inline", file_path.display())?,
                     }
 
                     continue;
