@@ -21,9 +21,13 @@ async def machine() -> AsyncGenerator[testthing.VirtualMachine, None]:
 async def test_basic(machine: testthing.VirtualMachine) -> None:
     m = machine
 
-    # root filesystem is read-only
-    with pytest.raises(testthing.SubprocessError):
+    # root filesystem is read-only, or writable until a reboot with root.transient
+    transient = bool(os.getenv("ROOT_TRANSIENT"))
+    if transient:
         await m.execute("touch /a")
+    else:
+        with pytest.raises(testthing.SubprocessError):
+            await m.execute("touch /a")
 
     # the content of /sysroot is what we expect
     expected = set[str](("composefs", "state"))
@@ -37,6 +41,9 @@ async def test_basic(machine: testthing.VirtualMachine) -> None:
     await m.write("/etc/persists.conf", "hihi conf")
     await m.write("/var/persists.db", "hihi db")
     await m.reboot()
+    if transient:
+        with pytest.raises(testthing.SubprocessError):
+            await m.execute("test -e /a")
     assert await m.execute("cat /etc/persists.conf") == "hihi conf"
     await m.execute("rm /etc/persists.conf")
     assert await m.execute("cat /var/persists.db") == "hihi db"
