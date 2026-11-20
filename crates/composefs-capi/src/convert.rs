@@ -3,6 +3,7 @@ use std::ffi::{CStr, CString, OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 
+use anyhow::Context;
 use zerocopy::{FromBytes, IntoBytes};
 
 use composefs::fsverity::{FsVerityHashValue, Sha256HashValue};
@@ -134,29 +135,27 @@ fn ffi_node_to_leaf_content(node: &FfiNode) -> anyhow::Result<tree::LeafContent<
                 Ok(generic_tree::LeafContent::Regular(RegularFile::Inline(
                     Box::from(data),
                 )))
-            } else if node.digest_set {
-                let digest =
-                    Sha256HashValue::read_from_bytes(&node.digest).expect("digest size mismatch");
-                Ok(generic_tree::LeafContent::Regular(RegularFile::External(
-                    digest,
-                    node.inode.st_size,
-                )))
-            } else if !node.payload.is_null() {
-                let payload = unsafe { CStr::from_ptr(node.payload) };
-                let raw = payload.to_bytes();
-                let path = raw.strip_suffix(b".file").unwrap_or(raw);
-                let digest = Sha256HashValue::from_object_pathname(path)
-                    .map_err(|e| anyhow::anyhow!("invalid digest path: {e}"))?;
-                Ok(generic_tree::LeafContent::Regular(
-                    RegularFile::ExternalNoVerity(digest, node.inode.st_size),
-                ))
-            } else if node.inode.st_size > 0 {
-                Ok(generic_tree::LeafContent::Regular(RegularFile::Sparse(
-                    node.inode.st_size,
-                )))
-            } else {
+            } else if node.inode.st_size == 0 {
+                // libcomposefs ignores the payload and digest of empty files
                 Ok(generic_tree::LeafContent::Regular(RegularFile::Inline(
                     Box::new([]),
+                )))
+            } else {
+                // Like libcomposefs, the payload (e.g. ostree's `xx/<checksum>.file`)
+                // is the redirect as is, and the digest only goes into the metacopy
+                // xattr: they needn't be related.
+                let redirect = (!node.payload.is_null()).then(|| {
+                    Box::from(OsStr::from_bytes(
+                        unsafe { CStr::from_ptr(node.payload) }.to_bytes(),
+                    ))
+                });
+                let verity = node.digest_set.then(|| {
+                    Sha256HashValue::read_from_bytes(&node.digest).expect("digest size mismatch")
+                });
+                Ok(generic_tree::LeafContent::Regular(RegularFile::external(
+                    redirect,
+                    verity,
+                    node.inode.st_size,
                 )))
             }
         }
@@ -187,7 +186,9 @@ fn ffi_node_to_leaf_content(node: &FfiNode) -> anyhow::Result<tree::LeafContent<
 ///
 /// The returned pointer is a newly allocated root node with ref_count=1.
 /// The caller is responsible for calling lcfs_node_unref on it.
-pub(crate) fn filesystem_to_ffi_tree(fs: &tree::FileSystem<Sha256HashValue>) -> *mut FfiNode {
+pub(crate) fn filesystem_to_ffi_tree(
+    fs: &tree::FileSystem<Sha256HashValue>,
+) -> anyhow::Result<*mut FfiNode> {
     let mut root = Box::new(FfiNode::default());
     stat_to_ffi(&fs.root.stat, &mut root);
     root.inode.st_mode |= libc::S_IFDIR;
@@ -198,9 +199,14 @@ pub(crate) fn filesystem_to_ffi_tree(fs: &tree::FileSystem<Sha256HashValue>) -> 
 
     let root_ptr = Box::into_raw(root);
 
-    fs_dir_to_ffi(&fs.root, &fs.leaves, &nlinks, root_ptr, &mut leaf_node_map);
+    if let Err(e) = fs_dir_to_ffi(&fs.root, &fs.leaves, &nlinks, root_ptr, &mut leaf_node_map) {
+        // SAFETY: root_ptr came from Box::into_raw above and every node
+        // created so far is attached to it, so this frees them all.
+        unsafe { crate::node::lcfs_node_unref(root_ptr) };
+        return Err(e);
+    }
 
-    root_ptr
+    Ok(root_ptr)
 }
 
 fn fs_dir_to_ffi(
@@ -209,7 +215,7 @@ fn fs_dir_to_ffi(
     nlinks: &[u32],
     parent: *mut FfiNode,
     leaf_node_map: &mut HashMap<usize, *mut FfiNode>,
-) {
+) -> anyhow::Result<()> {
     for (name, inode) in dir.sorted_entries() {
         match inode {
             generic_tree::Inode::Directory(subdir) => {
@@ -220,13 +226,15 @@ fn fs_dir_to_ffi(
                 child.name = CString::new(name_bytes).map_or(ptr::null_mut(), CString::into_raw);
                 child.parent = parent;
 
+                // Attach it before recursing, so that on an error the caller
+                // frees it with the rest of the tree.
                 let child_ptr = Box::into_raw(child);
-                fs_dir_to_ffi(subdir, leaves, nlinks, child_ptr, leaf_node_map);
                 unsafe {
                     let mut children = (*parent).children_as_vec();
                     children.push(child_ptr);
                     (*parent).children_put_back(children);
                 }
+                fs_dir_to_ffi(subdir, leaves, nlinks, child_ptr, leaf_node_map)?;
             }
             generic_tree::Inode::Leaf(leaf_id, _) => {
                 let leaf = &leaves[leaf_id.0];
@@ -251,7 +259,8 @@ fn fs_dir_to_ffi(
 
                 let mut child = Box::new(FfiNode::default());
                 stat_to_ffi(&leaf.stat, &mut child);
-                leaf_content_to_ffi(&leaf.content, &mut child);
+                leaf_content_to_ffi(&leaf.content, &mut child)
+                    .with_context(|| format!("Converting {name:?}"))?;
                 let name_bytes = name.as_bytes();
                 child.name = CString::new(name_bytes).map_or(ptr::null_mut(), CString::into_raw);
                 child.parent = parent;
@@ -271,9 +280,13 @@ fn fs_dir_to_ffi(
             }
         }
     }
+    Ok(())
 }
 
-fn leaf_content_to_ffi(content: &tree::LeafContent<Sha256HashValue>, node: &mut FfiNode) {
+fn leaf_content_to_ffi(
+    content: &tree::LeafContent<Sha256HashValue>,
+    node: &mut FfiNode,
+) -> anyhow::Result<()> {
     match content {
         generic_tree::LeafContent::Regular(reg) => {
             node.inode.st_mode = (node.inode.st_mode & !libc::S_IFMT) | libc::S_IFREG;
@@ -291,10 +304,21 @@ fn leaf_content_to_ffi(content: &tree::LeafContent<Sha256HashValue>, node: &mut 
                     let path = digest.to_object_pathname();
                     node.payload = CString::new(path).map_or(ptr::null_mut(), CString::into_raw);
                 }
-                RegularFile::ExternalNoVerity(digest, size) => {
+                RegularFile::ExternalPath {
+                    redirect,
+                    verity,
+                    size,
+                } => {
                     node.inode.st_size = *size;
-                    let path = digest.to_object_pathname();
-                    node.payload = CString::new(path).map_or(ptr::null_mut(), CString::into_raw);
+                    if let Some(digest) = verity {
+                        node.digest.copy_from_slice(digest.as_bytes());
+                        node.digest_set = true;
+                    }
+                    if let Some(redirect) = redirect {
+                        node.payload = CString::new(redirect.as_bytes())
+                            .with_context(|| format!("Invalid redirect {redirect:?}"))?
+                            .into_raw();
+                    }
                 }
                 RegularFile::Sparse(size) => {
                     node.inode.st_size = *size;
@@ -322,4 +346,5 @@ fn leaf_content_to_ffi(content: &tree::LeafContent<Sha256HashValue>, node: &mut 
             node.inode.st_mode = (node.inode.st_mode & !libc::S_IFMT) | libc::S_IFSOCK;
         }
     }
+    Ok(())
 }
