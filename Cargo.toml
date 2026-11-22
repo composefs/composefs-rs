@@ -44,8 +44,8 @@ composefs-ostree = { version = "0.10.0", path = "crates/composefs-ostree", defau
 cap-std-ext = "5.1.2"
 ocidir = "0.9.0"
 
-zlink = { version = "0.8", default-features = false, features = ["tokio", "introspection", "proxy", "server", "service", "tracing"] }
-zlink-core = { version = "0.8", default-features = false, features = ["introspection", "std", "tracing"] }
+zlink = { version = "0.9", default-features = false, features = ["tokio", "introspection", "proxy", "server", "service", "tracing"] }
+zlink-core = { version = "0.9", default-features = false, features = ["introspection", "std", "tracing"] }
 
 [profile.profiling]
 inherits = "release"
