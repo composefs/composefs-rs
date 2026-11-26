@@ -1635,6 +1635,17 @@ pub fn dump_files<ObjectID: FsVerityHashValue>(
     let nlink_map = fs.nlinks();
 
     for file_path in files {
+        // The root directory has no basename, so it can't be looked up via
+        // split(). Handle it directly.
+        if file_path.as_os_str() == "/" {
+            if backing_path_only {
+                anyhow::bail!("{} is a directory", file_path.display());
+            }
+
+            dump_single_dir(&mut out, &fs.root, &fs, &nlink_map, file_path.clone())?;
+            continue;
+        }
+
         let (dir, file) = fs.root.split(file_path.as_os_str())?;
 
         let (_, file) = dir
