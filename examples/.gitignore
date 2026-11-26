@@ -2,6 +2,7 @@
 /*/VARS_CUSTOM.secboot.fd*
 /*/cfsctl
 /*/extra/usr/lib/dracut/modules.d/37composefs/composefs-setup-root
+/*/extra/usr/lib/dracut/modules.d/37composefs/setup-root-conf.toml
 /*/secureboot
 /*/tmp/
 /common/fix-verity/fix-verity.efi

@@ -16,6 +16,10 @@ install() {
     inst \
         "${moddir}/composefs-setup-root.service" \
         "${systemdsystemunitdir}/composefs-setup-root.service"
+    if [ -e "${moddir}/setup-root-conf.toml" ]; then
+        inst \
+            "${moddir}/setup-root-conf.toml" /usr/lib/composefs/setup-root-conf.toml
+    fi
 
     $SYSTEMCTL -q --root "${initdir}" add-wants \
         'initrd-root-fs.target' 'composefs-setup-root.service'
