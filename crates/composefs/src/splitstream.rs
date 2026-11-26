@@ -832,6 +832,7 @@ pub enum SplitStreamData<ObjectID: FsVerityHashValue> {
 /// [`Self::for_each_chunk`] preserves references. Both consume the remaining
 /// chunks, so reopen the stream to read it again. See [`SplitStreamWriter`]
 /// for a runnable write/read example using both methods.
+/// [`Self::next_chunk`] provides pull access with a reusable inline buffer.
 pub struct SplitStreamReader<ObjectID: FsVerityHashValue> {
     decoder: Decoder<'static, BufReader<Take<File>>>,
     inline_bytes: usize,
@@ -863,6 +864,15 @@ fn read_into_vec(reader: &mut impl Read, vec: &mut Vec<u8>, size: usize) -> Resu
     Ok(())
 }
 
+/// A splitstream fragment with inline bytes borrowed from the caller's buffer.
+#[derive(Debug)]
+pub enum SplitStreamChunk<'a, ObjectID: FsVerityHashValue> {
+    /// Literal bytes, possibly only part of an encoded inline span.
+    Inline(&'a [u8]),
+    /// An unresolved reference to an entire repository object.
+    External(ObjectID),
+}
+
 enum ChunkType<ObjectID: FsVerityHashValue> {
     Eof,
     Inline,
@@ -870,6 +880,33 @@ enum ChunkType<ObjectID: FsVerityHashValue> {
 }
 
 impl<ObjectID: FsVerityHashValue> SplitStreamReader<ObjectID> {
+    /// Read the next inline bytes or external object reference.
+    ///
+    /// Inline bytes are read into the caller's nonempty buffer and returned as
+    /// a borrowed slice, allowing the buffer to be reused without allocating
+    /// for each chunk. An inline span may be split across calls; its boundaries
+    /// have no semantic significance to the reconstructed stream. External
+    /// references remain unresolved. Returns `None` at the end of the stream.
+    pub fn next_chunk<'a>(
+        &mut self,
+        buffer: &'a mut [u8],
+    ) -> Result<Option<SplitStreamChunk<'a, ObjectID>>> {
+        ensure!(
+            !buffer.is_empty(),
+            "splitstream read buffer must not be empty"
+        );
+        match self.ensure_chunk(true, true, 0)? {
+            ChunkType::Eof => Ok(None),
+            ChunkType::External(id) => Ok(Some(SplitStreamChunk::External(id))),
+            ChunkType::Inline => {
+                let len = buffer.len().min(self.inline_bytes);
+                self.decoder.read_exact(&mut buffer[..len])?;
+                self.inline_bytes -= len;
+                Ok(Some(SplitStreamChunk::Inline(&buffer[..len])))
+            }
+        }
+    }
+
     /// Creates a new split stream reader from the provided file.
     ///
     /// Reads the header and reference tables during initialization, and checks
@@ -1766,6 +1803,39 @@ mod tests {
         let mut output = Vec::new();
         std::io::Read::read_to_end(&mut reader, &mut output)?;
         assert_eq!(&output, inline_data);
+        Ok(())
+    }
+
+    #[test]
+    fn next_chunk_preserves_data_and_external_references() -> Result<()> {
+        let tmp = tempdir();
+        let repo = create_test_repo(&tmp.path().join("repo"))?;
+        let inline = vec![42u8; 1024 * 1024 + 19];
+        let mut writer = repo.create_stream(0)?;
+        writer.write_inline(&inline);
+        writer.write_external(b"external")?;
+        writer.write_inline(b"tail");
+        let id = writer.done()?;
+        let mut reader =
+            SplitStreamReader::<Sha256HashValue>::new(repo.open_object(&id)?.into(), Some(0))?;
+        assert!(reader.next_chunk(&mut []).is_err());
+        let mut buffer = [0u8; 137];
+        let mut output = Vec::new();
+        let mut references = 0;
+        while let Some(chunk) = reader.next_chunk(&mut buffer)? {
+            match chunk {
+                SplitStreamChunk::Inline(bytes) => {
+                    assert!(bytes.len() <= 137);
+                    output.extend_from_slice(bytes);
+                }
+                SplitStreamChunk::External(id) => {
+                    references += 1;
+                    output.extend_from_slice(&repo.read_object(&id)?);
+                }
+            }
+        }
+        assert_eq!(references, 1);
+        assert_eq!(output, [inline.as_slice(), b"external", b"tail"].concat());
         Ok(())
     }
 }

@@ -21,6 +21,7 @@ pub mod boot;
 pub mod cstor;
 pub(crate) mod delta;
 pub mod image;
+pub mod image_source;
 pub mod layer;
 pub mod layer_sync;
 pub mod layer_transport;
@@ -29,6 +30,7 @@ pub mod oci_layout;
 /// Re-exported from [`composefs::progress`]; use that path directly in new code.
 pub mod progress;
 pub mod skopeo;
+pub use image_source::{ImageSource, ProducerCompletion};
 /// Import container images via skopeo's JSON proxy + varlink socket.
 ///
 /// Available when the `containers-storage` feature is enabled (which

@@ -28,7 +28,7 @@ use composefs::{
     INLINE_CONTENT_MAX_V0,
     fsverity::FsVerityHashValue,
     repository::{ImportContext, ObjectStoreMethod, Repository},
-    splitstream::{SplitStreamData, SplitStreamWriter},
+    splitstream::{SplitStreamChunk, SplitStreamWriter},
 };
 
 use crate::skopeo::TAR_LAYER_CONTENT_TYPE;
@@ -531,23 +531,19 @@ pub fn produce_layer_splitdirfdstream<ObjectID: FsVerityHashValue, W: std::io::W
         .context("Opening layer splitstream")?;
     let mut writer = SplitdirfdstreamWriter::new(out);
 
-    reader
-        .for_each_chunk(|chunk| {
-            match chunk {
-                SplitStreamData::Inline(data) => {
-                    writer.write_metadata(&data).map_err(anyhow::Error::from)?;
-                }
-                SplitStreamData::External(id) => {
-                    let size = object_size(repo, &id)?;
-                    let pathname = id.to_object_pathname();
-                    writer
-                        .write_file_backed_data(objects_dirfd_index, size, pathname.as_bytes())
-                        .map_err(anyhow::Error::from)?;
-                }
+    // Inline spans can be arbitrarily large in a repository splitstream. Emit
+    // bounded chunks instead of buffering a whole span or exceeding wire limits.
+    let mut buffer = vec![0; composefs::shared_internals::IO_BUF_CAPACITY];
+    while let Some(chunk) = reader.next_chunk(&mut buffer)? {
+        match chunk {
+            SplitStreamChunk::Inline(data) => writer.write_metadata(data)?,
+            SplitStreamChunk::External(id) => {
+                let size = object_size(repo, &id)?;
+                let pathname = id.to_object_pathname();
+                writer.write_file_backed_data(objects_dirfd_index, size, pathname.as_bytes())?;
             }
-            Ok(())
-        })
-        .context("Walking layer splitstream chunks")?;
+        }
+    }
 
     writer.finish().map_err(anyhow::Error::from)?;
     Ok(())
