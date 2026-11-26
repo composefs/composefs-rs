@@ -116,44 +116,95 @@ pub fn enable_verity_with_retry<H: FsVerityHashValue>(
     }
 }
 
-/// Enable fs-verity on the given file.  If the given file cannot be
-/// enabled because it is opened as writable, then a new copy of the
-/// file will be returned instead.  No attempt is made to sync the
-/// copied file contents to disk, it is up to the caller to do so if
-/// desired.
+/// A file that fs-verity was enabled on by [`enable_verity_maybe_copy`].
 ///
-/// Take special note that in the case where a copied file descriptor
-/// is returned, the returned file is created as a tempfile and is
-/// unlinked.  Presumably the caller should take care to make this
-/// file permanent, using a combination of `linkat` and `renameat` to
-/// replace the original file.
-///
-/// This uses `enable_verity_raw()` and `enable_verity_with_retry()`
-/// and is subject to the same restrictions.
-///
-/// # Arguments:
-/// * `dirfd`: A directory file descriptor, used to determine the placement (via O_TMPFILE) of the new file (if necessary).
-/// * `fd`: The file decriptor to enable verity on
-/// # Return Value:
-/// * `Ok(None)` is returned if verity was enabled on the original file
-/// * `Ok(Some(OwnedFd))` is returned if a copy was made
-pub fn enable_verity_maybe_copy<H: FsVerityHashValue>(
-    dirfd: impl AsFd,
-    fd: BorrowedFd,
-) -> Result<Option<OwnedFd>, EnableVerityError> {
-    match enable_verity_with_retry::<H>(&fd) {
-        Ok(()) => Ok(None),
-        Err(EnableVerityError::FileOpenedForWrite) => {
-            let fd = enable_verity_on_copy::<H>(dirfd, fd)?;
-            Ok(Some(fd))
-        }
-        Err(other) => Err(other),
+/// Only that function can create one, so holding a `VerityEnabled` means
+/// fs-verity really was enabled.  Use [`AsFd`] or `OwnedFd::from()` to get
+/// at the file.
+#[derive(Debug)]
+#[must_use]
+pub struct VerityEnabled {
+    fd: OwnedFd,
+    copied: bool,
+}
+
+impl VerityEnabled {
+    /// Whether fs-verity went onto a copy rather than the file that was
+    /// passed in.
+    ///
+    /// That happens when the file was open for writing elsewhere.  The
+    /// copy is an unlinked `O_TMPFILE` in the given directory, and
+    /// replaces the original: the original was closed, and does *not*
+    /// have fs-verity.  Any name the original has must not be used for
+    /// the result.
+    pub fn is_copy(&self) -> bool {
+        self.copied
     }
 }
 
-/// Enable fs-verity on a new copy of `fd`, consuming `fd` and
-/// returning the new copy.  The copy is created via O_TMPFILE
-/// relative to `dirfd`.
+impl From<VerityEnabled> for OwnedFd {
+    /// The file with fs-verity enabled, whichever it is.
+    fn from(enabled: VerityEnabled) -> Self {
+        enabled.fd
+    }
+}
+
+impl AsFd for VerityEnabled {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+/// Error from [`enable_verity_maybe_copy`], with the file handed back.
+#[derive(Error, Debug)]
+#[error("enabling fs-verity")]
+pub struct EnableVerityMaybeCopyError {
+    /// The file that was passed in.  It doesn't have fs-verity enabled
+    /// by this call (though with [`EnableVerityError::AlreadyEnabled`]
+    /// it already had it).
+    pub fd: OwnedFd,
+    /// What went wrong.
+    #[source]
+    pub error: EnableVerityError,
+}
+
+/// Enable fs-verity on the given file, or on a copy of it if it is open
+/// for writing elsewhere.
+///
+/// The file is consumed, and the one that ended up with fs-verity is
+/// returned (see [`VerityEnabled`]), so that the original can't be used
+/// by mistake after a copy was made.  On error, the file is handed back
+/// in the [`EnableVerityMaybeCopyError`].
+///
+/// A file can be open for writing elsewhere when another thread forked
+/// while a writable descriptor to it existed, and the child hasn't yet
+/// called `exec()`.  Rather than waiting for that, the data is copied to
+/// a new `O_TMPFILE` in `dirfd` (with the same permissions) and
+/// fs-verity is enabled there.  No attempt is made to sync the copy to
+/// disk; that is up to the caller.
+///
+/// This uses `enable_verity_with_retry()` and is subject to the same
+/// restrictions.
+pub fn enable_verity_maybe_copy<H: FsVerityHashValue>(
+    dirfd: impl AsFd,
+    fd: OwnedFd,
+) -> Result<VerityEnabled, EnableVerityMaybeCopyError> {
+    let result = match enable_verity_with_retry::<H>(&fd) {
+        Ok(()) => return Ok(VerityEnabled { fd, copied: false }),
+        Err(EnableVerityError::FileOpenedForWrite) => enable_verity_on_copy::<H>(dirfd, fd.as_fd()),
+        Err(other) => Err(other),
+    };
+    match result {
+        Ok(copy) => Ok(VerityEnabled {
+            fd: copy,
+            copied: true,
+        }),
+        Err(error) => Err(EnableVerityMaybeCopyError { fd, error }),
+    }
+}
+
+/// Enable fs-verity on a new copy of `fd`, returning the copy.  The copy
+/// is created via O_TMPFILE relative to `dirfd`.
 fn enable_verity_on_copy<H: FsVerityHashValue>(
     dirfd: impl AsFd,
     fd: BorrowedFd,
@@ -375,15 +426,14 @@ mod tests {
         let tf = rdonly_file_with(b"hello world");
 
         // first time: success
-        let tf = enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, tf.as_fd())
+        let tf: OwnedFd = enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, tf)
             .unwrap()
-            .unwrap_or(tf);
+            .into();
 
-        // second time: fail with "already enabled"
-        assert!(matches!(
-            enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, tf.as_fd()).unwrap_err(),
-            EnableVerityError::AlreadyEnabled
-        ));
+        // second time: fail with "already enabled", handing the fd back
+        let err = enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, tf).unwrap_err();
+        assert!(matches!(err.error, EnableVerityError::AlreadyEnabled));
+        let tf = err.fd;
 
         assert_eq!(
             measure_verity::<Sha256HashValue>(&tf).unwrap().to_hex(),
@@ -542,9 +592,9 @@ mod tests {
 
                 let is_copy = tokio::task::spawn_blocking(|| {
                     let ro_fd = rdonly_file_with(b"Hello world");
-                    enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, ro_fd.as_fd())
+                    enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, ro_fd)
                         .unwrap()
-                        .is_some()
+                        .is_copy()
                 })
                 .await
                 .unwrap();
@@ -619,9 +669,9 @@ mod tests {
         let tf = rdonly_file_with(b"hello world");
 
         // Enable with SHA-512 but then try to read with SHA-256
-        let tf = enable_verity_maybe_copy::<Sha512HashValue>(&*TD_FD, tf.as_fd())
+        let tf: OwnedFd = enable_verity_maybe_copy::<Sha512HashValue>(&*TD_FD, tf)
             .unwrap()
-            .unwrap_or(tf);
+            .into();
 
         assert!(matches!(
             measure_verity::<Sha256HashValue>(&tf).unwrap_err(),
@@ -644,9 +694,9 @@ mod tests {
         let tf = rdonly_file_with(b"hello world");
 
         // Enable with SHA-256 but then try to read with SHA-512
-        let tf = enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, tf.as_fd())
+        let tf: OwnedFd = enable_verity_maybe_copy::<Sha256HashValue>(&*TD_FD, tf)
             .unwrap()
-            .unwrap_or(tf);
+            .into();
 
         assert!(matches!(
             measure_verity::<Sha512HashValue>(&tf).unwrap_err(),
@@ -696,9 +746,7 @@ mod tests {
 
         fn assert_kernel_equal<H: FsVerityHashValue>(data: &[u8], expected: H) {
             let fd = rdonly_file_with(data);
-            let fd = enable_verity_maybe_copy::<H>(&*TD_FD, fd.as_fd())
-                .unwrap()
-                .unwrap_or(fd);
+            let fd: OwnedFd = enable_verity_maybe_copy::<H>(&*TD_FD, fd).unwrap().into();
             ensure_verity_equal(&fd, &expected).unwrap();
         }
 
@@ -717,8 +765,8 @@ mod tests {
         // succeed and hand us back the original file descriptor.
         let (tempdir, fd) = empty_file_in_tmpdir(OFlags::RDONLY, 0o644.into());
         let tempdir_fd = File::open(tempdir.path()).unwrap();
-        let fd = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd.as_fd()).unwrap();
-        assert!(fd.is_none());
+        let fd = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd).unwrap();
+        assert!(!fd.is_copy());
     }
 
     #[test]
@@ -730,9 +778,9 @@ mod tests {
         let tempdir_fd = File::open(tempdir.path()).unwrap();
         let mut fd = File::from(fd);
         let _ = fd.write(b"hello world").unwrap();
-        let fd = enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, fd.as_fd())
-            .unwrap()
-            .unwrap();
+        let fd =
+            enable_verity_maybe_copy::<Sha256HashValue>(&tempdir_fd, OwnedFd::from(fd)).unwrap();
+        assert!(fd.is_copy());
 
         // The new fd has the correct data
         assert!(
