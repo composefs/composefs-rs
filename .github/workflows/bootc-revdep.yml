@@ -22,7 +22,9 @@ permissions:
 jobs:
   bootc-test:
     name: Build and test bootc with local composefs-rs
-    if: never()
+    # Disabled on purpose; this job is not test coverage. Actions has no
+    # never() function, so that spelling failed every run at parse time.
+    if: false
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
